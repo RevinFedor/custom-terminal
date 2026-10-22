@@ -1,3 +1,5 @@
+import agentSendReadTiming from '../../shared/agent-send-read-timing.cjs';
+
 export const CODEX_PRESENCE_SNAPSHOT_FIELDS = Object.freeze([
   'success',
   'projectId',
@@ -177,8 +179,14 @@ export async function readCodexPtyPresence({
   projectId = null,
   invoke,
   fallbackBusy = false,
+  readTiming,
 }) {
-  const runtimeSnapshot = await invoke('codex:get-runtime-projection', { tabId, projectId });
+  agentSendReadTiming.recordAgentSendReadTiming(readTiming,tabId,'renderer-ipc-invoke',{}, {
+    emit:record=>console.log('[AgentSendReadTiming] '+JSON.stringify(record)),
+    now:()=>performance.timeOrigin+performance.now(),
+  });
+  const runtimeSnapshot = await invoke('codex:get-runtime-projection', { tabId, projectId,
+    ...(readTiming ? {readTiming} : {}) });
   const projected = projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy });
   if (!projected.complete || !projected.presence) {
     const missing = projected.missingFields.length > 0

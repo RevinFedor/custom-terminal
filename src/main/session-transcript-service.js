@@ -5,12 +5,17 @@ const { createHash } = require('node:crypto');
 const { canonicalSourceTicket } = require('./codex-canonical-source-proof');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
+const { currentReadControl, withReadControl, isHistoryReadCancelled, isHistoryReadUnavailable, createDemandRegistry } = require('./history-read-control');
+const { historyIpcDemands } = require('./history-ipc-demand');
+const { findDirectCodexPayloadSourceLeaf } = require('./codex-payload-source-leaf');
+const { readSourceLeafPage, streamSourceLeaf } = require('./history-source-leaf');
 const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
 const { historyRecordTimeFromRecord } = require('../shared/history-record-time.cjs');
 const { findTabMessageSourceLocation } = require('./tab-message-source-location');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
-const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
+const { ipcMain } = require('node:worker_threads').isMainThread && process.env.NOTED_HISTORY_READER_PROCESS !== '1'
+  ? require('electron') : {};
 const { codexProviderErrorMessage } = require('./codex-provider-error');
 const { claudeHistoryFailureFromRecord } = require('../shared/claude-provider-failure.cjs');
 const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
@@ -29,6 +34,8 @@ const {
 } = require('./history-response-timings');
 const {
   dehydrateHistoryEntries,
+  dehydrateHistoryEntriesAsync,
+  projectHistoryOnDemandAsync,
   HISTORY_PAYLOAD_ON_DEMAND,
   HISTORY_PAYLOAD_HEADER_VERSION,
   projectHistoryOnDemand,
@@ -36,6 +43,7 @@ const {
   sliceHistoryPayload,
   historyPayloadStash,
   capPayloadForRender,
+  HISTORY_PAYLOAD_RENDER_CAP,
 } = require('./history-payload-dehydrate');
 const {
   applyHistoryEntryWindow,
@@ -76,11 +84,43 @@ function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
 }
 
+function readControlOptions() {
+  const control = currentReadControl();
+  return control ? { control, assertCurrent: () => control.assertCurrent() } : {};
+}
+function assertHistoryRead() { currentReadControl()?.assertCurrent(); }
+const isHistoryPayloadCacheIoFailure = error =>
+  /^(?:SQLITE_(?:FULL|BUSY|LOCKED|READONLY|CANTOPEN|IOERR)(?:_|$)|ENOSPC$|EACCES$|EROFS$|EMFILE$)/
+    .test(String(error?.code || ''));
+async function readBoundary(operation) {
+  assertHistoryRead();
+  const result = await operation;
+  assertHistoryRead();
+  return result;
+}
+async function controlledHistoryRead(payload, operation) {
+  const control = payload?._readControl || currentReadControl();
+  return withReadControl(control, async () => {
+    control?.assertCurrent();
+    const result = await operation();
+    control?.assertCurrent();
+    return result;
+  });
+}
+function historyWirePayload(payload) {
+  // Local demand objects never enter structured clone, a revision, or a
+  // business-operation fingerprint. Main's reader captures the ALS control.
+  const { _readControl, ...wire } = payload;
+  return wire;
+}
+
 function decoratePromptSnapshot(service, { toolType, sessionId, entries }) {
+  assertHistoryRead();
   const store = service.promptPresentationStore;
   const revision = () => store?.getHistoryPromptPresentationRevision?.(toolType, sessionId) || 'none';
   let projected = entries, token = 'none', stable = false;
   for (let attempt = 0; attempt < (service.preparedHistoryStore ? 3 : 1); attempt++) {
+    assertHistoryRead();
     const before = service.preparedHistoryStore ? revision() : null;
     projected = decorateHistoryPromptPresentations(store, {
       toolType, sessionId, entries, recoverManagedImageRef: service.recoverManagedHistoryImageRef,
@@ -289,11 +329,11 @@ class SessionTranscriptService {
     this.codexResultSourceResolver = null;
     this.codexProviderForkMetadata = new Map();
     this.codexMaterializedCompactProofs = new Map();
-    this.codexLineageRecoveryInflight = new Map();
+    this.codexLineageRecoveryInflight = createDemandRegistry();
     this.codexForkPrefixDiagnosticSignatures = new Map();
     this.codexForkValidationFailures = new Map();
-    this.codexForkValidationInflight = new Map();
-    this.codexForkSourceProofInflight = new Map();
+    this.codexForkValidationInflight = createDemandRegistry();
+    this.codexForkSourceProofInflight = createDemandRegistry();
   }
 
   async getHistoryFreshnessContext(scope, sourceSessionIds = []) {
@@ -320,12 +360,16 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:subscribe', async (_event, payload = {}) => this.subscribe(payload));
     ipcMain.handle('agent-transcript:unsubscribe', async (_event, payload = {}) => this.unsubscribe(payload));
     ipcMain.handle('agent-transcript:refresh', async (_event, payload = {}) => this.refresh(payload));
+    this.historyIpcDemands = historyIpcDemands;
+    ipcMain.handle('agent-transcript:cancel-read', (event, payload) => this.historyIpcDemands.cancel(event, payload));
     const desktopRead = (method, payload) => payload.toolType === 'codex' && payload.readTransport === 'v8-1' && this.historyReader
       ? this.historyReader.call(method, payload, true) : this[method](payload);
-    ipcMain.handle('agent-transcript:get-timeline', async (_event, payload = {}) => desktopRead('getTimeline', payload));
-    ipcMain.handle('agent-transcript:get-history', async (_event, payload = {}) => desktopRead('getHistory', payload));
-    ipcMain.handle('agent-transcript:get-messages', async (_event, payload = {}) => this.getMessages(payload));
-    ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
+    const demanded = method => (event, payload = {}) => this.historyIpcDemands.run(event, payload,
+      request => desktopRead(method, request));
+    ipcMain.handle('agent-transcript:get-timeline', demanded('getTimeline'));
+    ipcMain.handle('agent-transcript:get-history', demanded('getHistory'));
+    ipcMain.handle('agent-transcript:get-messages', demanded('getMessages'));
+    ipcMain.handle('history:get-tool-payload', demanded('getToolPayload'));
     ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
     ipcMain.handle('agent-transcript:copy-codex-range', async (_event, payload = {}) => this.copyCodexVirtualRange(payload));
     ipcMain.handle('agent-transcript:export-codex-session', async (_event, payload = {}) => this.exportCodexSession(payload));
@@ -347,8 +391,12 @@ class SessionTranscriptService {
   }
 
   async getToolPayload(payload = {}) {
+    return controlledHistoryRead(payload, () => this._getToolPayload(payload));
+  }
+
+  async _getToolPayload(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
-    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getToolPayload', payload);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getToolPayload', historyWirePayload(payload));
     if (payload.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) return this._getOnDemandToolPayload(payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
@@ -369,11 +417,11 @@ class SessionTranscriptService {
     if (payloadLineage?.kind === 'unresolved') return { success: false, error: 'lineage_unresolved', lineageReason: payloadLineage.reason };
     const generationMatches = async () => {
       if (!payloadGeneration && toolType !== 'codex') return true;
-      const file = await this._resolveFilePath(toolType, sessionId, cwd);
-      const stat = file ? await fs.promises.stat(file).catch(() => null) : null;
+      const file = await readBoundary(this._resolveFilePath(toolType, sessionId, cwd));
+      const stat = file ? await readBoundary(fs.promises.stat(file).catch(() => null)) : null;
       if (!stat) return false;
       if (toolType === 'codex') {
-        await this.codexData._api.prepareCodexPayloadSource?.({ sessionId, cwd, filePath: file, stat });
+        await readBoundary(this.codexData._api.prepareCodexPayloadSource?.({ sessionId, cwd, filePath: file, stat }));
         const snapshot = this.preparedHistoryStore?.readSource({ sessionId, cwd });
         if (snapshot && snapshot.filePath === file && snapshot.size === stat.size
           && snapshot.mtimeMs === stat.mtimeMs && snapshot.ctimeMs === stat.ctimeMs
@@ -384,7 +432,31 @@ class SessionTranscriptService {
       }
       return payloadGeneration === stat.dev + ':' + stat.ino;
     };
-    if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
+    if (!await readBoundary(generationMatches())) return { success: false, error: 'history_payload_generation_changed', payloadId };
+    // New chunked payloads survive stash eviction/restart without decoding a
+    // full value or rebuilding raw History. The existing source/generation
+    // check above still fences this independent, disposable acceleration tier.
+    if (toolType === 'codex' && payloadLineage?.kind === 'physical' && this.preparedHistoryStore?.readPayloadPage) {
+      const source = this.preparedHistoryStore.readSource({ sessionId, cwd });
+      const limit = payload.expectedContentHash ? (payload.limit ?? HISTORY_PAYLOAD_RENDER_CAP) : HISTORY_PAYLOAD_RENDER_CAP;
+      if (!Number.isSafeInteger(limit) || limit < 2 || limit > HISTORY_PAYLOAD_RENDER_CAP
+        || (payload.offset != null && (!Number.isSafeInteger(payload.offset) || payload.offset < 0))) throw Error('history_payload_range_invalid');
+      const page = this.preparedHistoryStore.readPayloadPage({ sessionId, cwd }, payloadId, source, {
+        offset: payload.expectedContentHash ? (payload.offset ?? 0) : 0, limit,
+        expectedContentHash: payload.expectedContentHash,
+        exactRenderCap: !payload.expectedContentHash,
+      });
+      if (page) {
+        assertHistoryRead();
+        if (!page.success) return page;
+        if (!await readBoundary(generationMatches())) return { success: false, error: 'history_payload_generation_changed', payloadId };
+        if (!payload.expectedContentHash) return { success: true, source: 'disk', payloadId,
+          payload: page.payload, totalChars: page.totalChars, truncatedForRender: page.totalChars > HISTORY_PAYLOAD_RENDER_CAP };
+        return { ...page, success: true, source: 'disk', payloadId };
+      }
+    }
+    const directPage = await this._tryDirectCodexPayloadPage(payload);
+    if (directPage) return directPage;
     const virtualPayload = payloadLineage?.kind === 'virtual' ? await this._projectCodexVirtual(payloadLineage, cwd) : null;
     if (virtualPayload && !virtualPayload.success) return virtualPayload;
     if (virtualPayload) dehydrateHistoryEntries({ toolType, sessionId,
@@ -405,11 +477,18 @@ class SessionTranscriptService {
           if (!projected?.success) return projected;
           entries = projected.historyEntries || [];
         } else {
-          const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
-          if (!loaded?.success) return { success: false, error: loaded?.error || 'session not found' };
-          entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+          const project = this.codexData?._api?.projectCodexFullHistoryFromFile;
+          if (project) {
+            const projected = await readBoundary(project(sessionId, cwd, { payloadPolicy: 'full', ...readControlOptions() }));
+            if (!projected?.success) return projected;
+            entries = projected.entries;
+          } else {
+            const loaded = await readBoundary(this.codexData?._api?.loadSessionRecords?.(sessionId, cwd));
+            if (!loaded?.success) return { success: false, error: loaded?.error || 'session not found' };
+            entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+          }
         }
-        dehydrateHistoryEntries({
+        await dehydrateHistoryEntriesAsync({
           toolType,
           sessionId,
           entries,
@@ -426,6 +505,8 @@ class SessionTranscriptService {
         return { success: false, error: 'unsupported toolType' };
       }
     } catch (error) {
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return { success: false, error: String(error?.message || error) };
     }
     if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
@@ -439,12 +520,120 @@ class SessionTranscriptService {
     return { success: true, source: 'rebuild', payloadId, ...capped };
   }
 
+  async _tryDirectCodexPayloadPage(payload, { requireRow = false } = {}) {
+    const { sessionId, cwd, payloadId, payloadGeneration, entryUuid } = payload;
+    // Each existing endpoint has its own hash field. A cold direct miss must
+    // enforce the same field as its warm cache/stash path.
+    const contentHash = payload.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND
+      ? payload.contentHash : payload.expectedContentHash;
+    const api = this.codexData?._api;
+    if (normalizeToolType(payload.toolType) !== 'codex' || !sessionId || !payloadGeneration
+      || !String(payloadId || '').startsWith('result:') || !/^[a-f0-9]{64}$/.test(contentHash || '')
+      || (requireRow && !entryUuid) || !this.preparedHistoryStore?.readPayloadBinding
+      || typeof api?.getCodexPayloadGeneration !== 'function') return null;
+    // Only a physical raw-string result can use this path. Composite/exec/Task
+    // transformations keep their existing exact canonical path until migrated.
+    const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd,
+      childTabId: payload.tabId || null });
+    if (recovery.required && !recovery.success) return { success: false, error: 'lineage_unresolved',
+      lineageReason: recovery.reason };
+    if (this._resolveCodexLineage(sessionId, 'full').kind !== 'physical') return null;
+    const filePath = await readBoundary(this._resolveFilePath('codex', sessionId, cwd));
+    const stat = filePath ? await readBoundary(fs.promises.stat(filePath).catch(() => null)) : null;
+    if (!stat) return null;
+    await readBoundary(api.prepareCodexPayloadSource?.({ sessionId, cwd, filePath, stat }));
+    const cached = this.preparedHistoryStore.readSource({ sessionId, cwd });
+    if (cached && cached.filePath === filePath && cached.size === stat.size
+      && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs
+      && cached.fileIdentity === stat.dev + ':' + stat.ino) api.restoreCodexSourceSnapshot?.(cached);
+    const generation = api.getCodexPayloadGeneration(filePath, stat, sessionId);
+    if (!generation || generation !== payloadGeneration) return {
+      success: false, error: 'history_payload_generation_changed', payloadId };
+    const source = { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, sourceGeneration: generation };
+    const binding = this.preparedHistoryStore.readPayloadBinding({ sessionId, cwd }, payloadId,
+      source, { entryUuid, contentHash });
+    if (!binding?.sourceCallId) return null;
+    const control = currentReadControl();
+    const validateSource = async () => {
+      assertHistoryRead();
+      let now;
+      try { now = await fs.promises.stat(filePath); }
+      catch (error) {
+        if (['ENOENT', 'ENOTDIR'].includes(error?.code)) throw Object.assign(
+          new Error('History payload source disappeared'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        throw error;
+      }
+      if (now.size !== source.size || now.mtimeMs !== source.mtimeMs || now.ctimeMs !== source.ctimeMs
+        || now.dev + ':' + now.ino !== source.fileIdentity
+        || api.getCodexPayloadGeneration(filePath, now, sessionId) !== generation) {
+        throw Object.assign(new Error('History payload source changed'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+      }
+      assertHistoryRead();
+    };
+    const limit = payload.limit ?? HISTORY_PAYLOAD_RENDER_CAP;
+    if (!Number.isSafeInteger(limit) || limit < 2 || limit > HISTORY_PAYLOAD_RENDER_CAP) {
+      throw Error('history_payload_range_invalid');
+    }
+    const pageRequest = { offset: payload.offset ?? 0, limit, expectedContentHash: contentHash };
+    const describe = (page, origin) => ({ ...page, source: origin, payloadId, contentHash,
+      entryUuid: binding.entryUuid, encoding: 'text', toolType: 'codex', sessionId, payloadGeneration: generation });
+    // An exact row/source binding makes a persisted page usable directly on
+    // the on-demand route too. A cache body with another hash is a miss here;
+    // the current source locator remains the authority for rebuilding it.
+    const savedPage = this.preparedHistoryStore.readPayloadPage?.({ sessionId, cwd }, payloadId, source, pageRequest);
+    if (savedPage?.success) { await validateSource(); return describe(savedPage, 'disk'); }
+    const located = await findDirectCodexPayloadSourceLeaf({ filePath, payloadId,
+      expectedContentHash: binding.contentHash, totalChars: binding.totalChars,
+      sourceCallId: binding.sourceCallId, sourceRecordLine: binding.sourceRecordLine,
+      sourceSnapshot: source, control, validateSource });
+    if (!located) return null; // Never substitute a raw output for a transformed result.
+    const leafRead = { filePath, ref: located.ref, expectedSource: source, control, validateSource };
+    let page, pending, stageError;
+    try {
+      pending = this.preparedHistoryStore.createPendingPayloads?.({ sessionId, cwd });
+      if (pending?.setChunks && pending?.readPage) {
+        // Refill a lost cache with the complete leaf, without constructing a
+        // complete decoded string or rebuilding canonical History. The stage
+        // publishes only after the iterator's final source/hash proof.
+        await pending.setChunks(payloadId, streamSourceLeaf(leafRead), {
+          contentHash: binding.contentHash, totalChars: binding.totalChars, validateSource,
+        });
+        await validateSource();
+        page = pending.readPage(payloadId, pageRequest);
+        if (page?.success && this.preparedHistoryStore.savePayloadsAsync) {
+          await readBoundary(this.preparedHistoryStore.savePayloadsAsync({ sessionId, cwd }, pending));
+        }
+      }
+    } catch (error) {
+      stageError = error;
+      // Optional cache I/O cannot remove full History capability. Source,
+      // cancellation, UNKNOWN, hash and range failures keep their authority;
+      // only unavailable storage falls back to the same bounded leaf page.
+      if (!isHistoryPayloadCacheIoFailure(error)) throw error;
+      assertHistoryRead(); page = null;
+    } finally {
+      try { pending?.close(); }
+      catch (cleanupError) {
+        if (!stageError) {
+          if (!isHistoryPayloadCacheIoFailure(cleanupError)) throw cleanupError;
+          assertHistoryRead(); page = null;
+        }
+      }
+    }
+    if (!page) page = await readSourceLeafPage({ ...leafRead, ...pageRequest });
+    await validateSource();
+    return describe(page, 'source-leaf');
+  }
+
   async _getOnDemandToolPayload(payload) {
     const { toolType, sessionId, cwd, tabId, entryUuid, payloadId, payloadGeneration, contentHash } = payload;
     if (!['codex', 'claude'].includes(toolType) || !sessionId || !entryUuid || !payloadId
       || !payloadGeneration || !/^[a-f0-9]{64}$/.test(contentHash || '')) {
       return { success: false, error: 'history_payload_reference_required' };
     }
+    const directPage = await this._tryDirectCodexPayloadPage(payload, { requireRow: true });
+    if (directPage) return directPage;
     // Reuse the canonical bounded read (including worker/SSD/lineage). Besides
     // surviving stash eviction/restart this proves row membership, not merely
     // an arbitrary payload ID supplied by a client. No fallback to another SID.
@@ -557,16 +746,19 @@ class SessionTranscriptService {
   }
 
   async _projectCodexVirtual(lineage, cwd) {
+    assertHistoryRead();
     const store = this._getCodexVirtualTranscriptStore();
     if (!store) return { success: false, error: 'lineage_unresolved', lineageReason: 'virtual-projector-unavailable' };
     try {
       // A full client may be the first caller after worker restart. Prime
       // every unchanged physical generation before the canonical rebuild.
-      await this._readVirtualProjection(lineage, cwd);
-      const result = await store.project(lineage.descriptor, cwd);
+      await readBoundary(this._readVirtualProjection(lineage, cwd));
+      const result = await readBoundary(store.project(lineage.descriptor, cwd, readControlOptions()));
       if (result?.success) this.preparedHistoryStore?.saveVirtualProjection?.({ sessionId: lineage.descriptor.viewOwnerSessionId, cwd }, result);
       return result;
     } catch (error) {
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return {
         success: false,
         error: 'lineage_unresolved',
@@ -576,6 +768,7 @@ class SessionTranscriptService {
   }
 
   async _readVirtualProjection(lineage, cwd) {
+    assertHistoryRead();
     const api = this.codexData?._api;
     if (!this.preparedHistoryStore || !api?.beginCodexSourceRead) return null;
     const saved = this.preparedHistoryStore.readVirtualProjection({ sessionId: lineage.descriptor.viewOwnerSessionId, cwd }, lineage.descriptor);
@@ -584,25 +777,29 @@ class SessionTranscriptService {
     let childStat = null;
     try {
       for (const source of saved.physicalSources) {
-        const found = await api.findCodexSessionFile(source.sessionId, cwd);
+        const found = await readBoundary(api.findCodexSessionFile(source.sessionId, cwd));
         if (found?.filePath !== source.filePath) return null;
-        const stat = await fs.promises.stat(source.filePath);
+        const stat = await readBoundary(fs.promises.stat(source.filePath));
         if (stat.size !== source.size || stat.mtimeMs !== source.mtimeMs || stat.ctimeMs !== source.ctimeMs
           || source.fileIdentity !== stat.dev + ':' + stat.ino || !api.restoreCodexSourceSnapshot(source)) return null;
+        // Own the ticket before testing a demand that may have been revoked
+        // during beginRead's await; finally must release every acquired ticket.
         reads.push(await api.beginCodexSourceRead(source.filePath, source.sessionId));
+        assertHistoryRead();
         if (source.filePath === saved.filePath) childStat = stat;
       }
-      for (const read of reads) await api.assertCodexSourceRead(read);
+      for (const read of reads) await readBoundary(api.assertCodexSourceRead(read));
       return childStat ? { projection: saved, stat: childStat } : null;
     } catch (error) {
-      if (error.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+      if (error.code === 'CODEX_SOURCE_READ_INVALIDATED' || isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return null;
     } finally { for (const read of reads) api.finishCodexSourceRead(read); }
   }
 
   async _readVirtualHistoryPage(lineage, payload) {
     if (payload.dehydrate !== true) return null;
-    const cached = await this._readVirtualProjection(lineage, payload.cwd);
+    const cached = await readBoundary(this._readVirtualProjection(lineage, payload.cwd));
     if (!cached) return null;
     const { sessionId, cwd, tabId } = payload;
     const contentRevision = this._buildCodexContentRevision(sessionId, cwd, cached.projection);
@@ -612,13 +809,20 @@ class SessionTranscriptService {
       contentRevision: contentRevision?.token || null,
     });
     const request = { owner: { sessionId, cwd, tabId: tabId || null }, filePath: cached.projection.filePath,
-      stat: cached.stat, context, hydrate: normalizeHistoryRowWindowRequest(payload.hydrate) };
-    let page = this.preparedHistoryStore.readPrepared(request);
+      stat: cached.stat, context, hydrate: normalizeHistoryRowWindowRequest(payload.hydrate),
+      bounds: normalizeHistoryEntryWindowRequest(payload.bounds) };
+    let page = await this._readPrepared(request);
     if (page?.source.sourceGeneration !== cached.projection.childSnapshot.sourceGeneration) page = null;
-    let base = page ? null : this.preparedHistoryStore.readPrepared({ ...request,
-      kind: 'base', context: 'canonical:' + contentRevision.token, hydrate: null });
+    let base = page ? null : await this._readPrepared({ ...request,
+      kind: 'base', context: 'canonical:' + contentRevision.token, hydrate: null, bounds: null });
     if (base?.source.sourceGeneration !== cached.projection.childSnapshot.sourceGeneration) base = null;
     return page || base ? { projection: cached.projection, page, base } : null;
+  }
+
+  async _readPrepared(request) {
+    const store = this.preparedHistoryStore;
+    return readBoundary(store.readPreparedAsync
+      ? store.readPreparedAsync({ ...request, control: currentReadControl() }) : store.readPrepared(request));
   }
 
   _buildCodexContentRevision(sessionId, cwd, projected) {
@@ -675,6 +879,8 @@ class SessionTranscriptService {
       return result;
     } catch (error) {
       sourceVerificationBytes = error?.sourceVerificationBytes ?? sourceVerificationBytes;
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return unresolved(error?.reason || error?.message || 'result-source-resolution-failed',
         error?.retryable === true || error?.code === 'CODEX_SOURCE_READ_INVALIDATED');
     }
@@ -750,6 +956,8 @@ class SessionTranscriptService {
         contentRevision: this._buildCodexContentRevision(sessionId, cwd, projected)?.token,
       };
     } catch (error) {
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return { success: false, error: 'lineage_unresolved', lineageReason: error.reason || error.message };
     }
   }
@@ -1150,7 +1358,8 @@ class SessionTranscriptService {
           return { proven: true, meta };
         }
       } catch (error) {
-        if (error?.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+        if (error?.code === 'CODEX_SOURCE_READ_INVALIDATED' || isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+        assertHistoryRead();
         signature = null;
         reason = 'source-guard-unknown';
       }
@@ -1193,6 +1402,7 @@ class SessionTranscriptService {
     childTabId = null,
     visited = new Set(),
   } = {}) {
+    assertHistoryRead();
     if (!childSessionId) {
       return { required: false, success: false, reason: 'child-session-missing' };
     }
@@ -1212,11 +1422,11 @@ class SessionTranscriptService {
     }
     let meta = this.codexProviderForkMetadata.get(childSessionId) || null;
     if (!meta) {
-      const childFound = await api.findCodexSessionFile(childSessionId, cwd);
+      const childFound = await readBoundary(api.findCodexSessionFile(childSessionId, cwd));
       if (!childFound?.filePath) {
         return { required: !!legacyFork, success: false, reason: 'child-load-failed' };
       }
-      const childMetadata = await api.readCodexSessionMetadata(childFound.filePath);
+      const childMetadata = await readBoundary(api.readCodexSessionMetadata(childFound.filePath));
       meta = childMetadata?.meta?.id === childSessionId
         ? childMetadata.meta
         : null;
@@ -1310,6 +1520,7 @@ class SessionTranscriptService {
   }
 
   async ensureCodexProviderForkLineage(payload = {}) {
+    assertHistoryRead();
     const childSessionId = String(payload?.childSessionId || '').trim();
     if (!childSessionId) {
       return { required: false, success: false, reason: 'child-session-missing' };
@@ -1317,32 +1528,16 @@ class SessionTranscriptService {
     if (payload?.visited instanceof Set && payload.visited.has(childSessionId)) {
       return { required: true, success: false, reason: 'provider-lineage-cycle' };
     }
-    const existing = this.codexLineageRecoveryInflight.get(childSessionId);
-    if (existing) return existing;
-    const run = this._ensureCodexProviderForkLineage(payload);
-    this.codexLineageRecoveryInflight.set(childSessionId, run);
-    try {
-      return await run;
-    } finally {
-      if (this.codexLineageRecoveryInflight.get(childSessionId) === run) {
-        this.codexLineageRecoveryInflight.delete(childSessionId);
-      }
-    }
+    return this.codexLineageRecoveryInflight.run(childSessionId, currentReadControl(),
+      () => this._ensureCodexProviderForkLineage(payload));
   }
 
   async _verifyCodexForkSourceSnapshot(normalized, cwd, { includeRecords = false } = {}) {
     // Concurrent children of the same immutable prefix share only the in-flight
     // read. Do not keep another full transcript cache after verification ends.
     const key = JSON.stringify([cwd, normalized?.sourceSegments, includeRecords]);
-    const pending = this.codexForkSourceProofInflight.get(key);
-    if (pending) return pending;
-    const run = this._verifyCodexForkSourceSnapshotInner(normalized, cwd, { includeRecords });
-    this.codexForkSourceProofInflight.set(key, run);
-    try {
-      return await run;
-    } finally {
-      if (this.codexForkSourceProofInflight.get(key) === run) this.codexForkSourceProofInflight.delete(key);
-    }
+    return this.codexForkSourceProofInflight.run(key, currentReadControl(),
+      () => this._verifyCodexForkSourceSnapshotInner(normalized, cwd, { includeRecords }));
   }
 
   async _verifyCodexForkSourceSnapshotInner(normalized, cwd, { includeRecords = false } = {}) {
@@ -1352,13 +1547,14 @@ class SessionTranscriptService {
     }
     const records = [];
     for (const segment of normalized.sourceSegments) {
-      const found = await api.findCodexSessionFile(segment.physicalSessionId, cwd);
+      assertHistoryRead();
+      const found = await readBoundary(api.findCodexSessionFile(segment.physicalSessionId, cwd));
       if (!found?.filePath) return { success: false, reason: 'source-snapshot-file-missing' };
-      const stat = await fs.promises.stat(found.filePath);
+      const stat = await readBoundary(fs.promises.stat(found.filePath));
       if (stat.size < segment.toByte) {
         return { success: false, reason: 'source-snapshot-file-truncated' };
       }
-      const digest = await hashFileSegment(found.filePath, segment.fromByte, segment.toByte);
+      const digest = await readBoundary(hashFileSegment(found.filePath, segment.fromByte, segment.toByte, readControlOptions()));
       if (digest.sha256 !== segment.prefixDigest) {
         return { success: false, reason: 'source-snapshot-digest-changed' };
       }
@@ -1367,7 +1563,7 @@ class SessionTranscriptService {
             found.filePath,
             segment.fromByte,
             segment.toByte - 1,
-            { lineCount: segment.startLine },
+            { lineCount: segment.startLine, collectRecords: includeRecords, ...readControlOptions() },
           )
         : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: segment.startLine };
       if (parsed.errors > 0
@@ -1420,7 +1616,9 @@ class SessionTranscriptService {
         return [sessionId, found.filePath, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
       }));
       return JSON.stringify(files);
-    } catch {
+    } catch (error) {
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return null;
     }
   }
@@ -1440,10 +1638,8 @@ class SessionTranscriptService {
     if (signature && cached?.signature === signature) return { ...cached.result };
     this.codexForkValidationFailures.delete(key);
     const flightKey = key + ':' + signature;
-    const pending = this.codexForkValidationInflight.get(flightKey);
-    if (pending) return pending;
-    const run = (async () => {
-      const result = await this._prepareCodexLineageFromSnapshotInner(payload);
+    return this.codexForkValidationInflight.run(flightKey, currentReadControl(), async () => {
+      const result = await readBoundary(this._prepareCodexLineageFromSnapshotInner(payload));
       if (signature && result.success === false
         && /^(fork|rewind)-materialized-prefix-(mismatch|incomplete)$/.test(result.reason || '')) {
         const after = await this._codexForkValidationFileSignature(snapshot, payload.childSessionId, payload.cwd);
@@ -1455,13 +1651,7 @@ class SessionTranscriptService {
         }
       }
       return result;
-    })();
-    this.codexForkValidationInflight.set(flightKey, run);
-    try {
-      return await run;
-    } finally {
-      if (this.codexForkValidationInflight.get(flightKey) === run) this.codexForkValidationInflight.delete(flightKey);
-    }
+    });
   }
 
   async _prepareCodexLineageFromSnapshotInner({
@@ -1653,12 +1843,13 @@ class SessionTranscriptService {
   }
 
   async _ensureCodexProviderForkLineage(payload = {}) {
-    const prepared = await this.prepareCodexProviderForkLineage(payload);
+    const prepared = await readBoundary(this.prepareCodexProviderForkLineage(payload));
     if (!prepared.required || !prepared.success || prepared.alreadyPersisted) return prepared;
     if (!this.sessionHistoryStore?.saveSessionForkEvent) {
       return { ...prepared, success: false, reason: 'lineage-store-unavailable' };
     }
     try {
+      assertHistoryRead();
       const saved = this.sessionHistoryStore.saveSessionForkEvent(prepared.event);
       const manifest = normalizeCodexForkLineageManifest(saved?.lineageManifest, {
         sourceSessionId: prepared.event.sourceSessionId,
@@ -1675,6 +1866,8 @@ class SessionTranscriptService {
         + ' endByte=' + prepared.providerHistoryBase.endByteOffset);
       return { ...prepared, event: saved, alreadyPersisted: false };
     } catch (error) {
+      if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)) throw error;
+      assertHistoryRead();
       return { ...prepared, success: false, reason: error?.message || String(error) };
     }
   }
@@ -2148,8 +2341,12 @@ class SessionTranscriptService {
   }
 
   async getTimeline(payload = {}) {
+    return controlledHistoryRead(payload, () => this._getTimeline(payload));
+  }
+
+  async _getTimeline(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
-    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getTimeline', payload);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getTimeline', historyWirePayload(payload));
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
@@ -2279,6 +2476,7 @@ class SessionTranscriptService {
             });
           }
         } catch (historyEventError) {
+          if (isHistoryReadCancelled(historyEventError) || isHistoryReadUnavailable(historyEventError)) throw historyEventError;
           console.warn('[TranscriptService] Codex fork event reconcile failed session=' + shortId(sessionId) + ': ' + historyEventError.message);
         }
       }
@@ -2366,9 +2564,23 @@ class SessionTranscriptService {
     };
   }
 
+  // Main owns only the admitted header and byte-credit iterator. The worker
+  // retains the source proof until the consumer closes or drains this stream.
+  // This API does not claim that the legacy worker projector is bounded.
+  async openHistoryStream(payload = {}, options = {}) {
+    if (normalizeToolType(payload.toolType) !== 'codex' || !this.historyReader?.openStream) {
+      throw Object.assign(new Error('History stream reader unavailable'), { code: 'HISTORY_STREAM_UNAVAILABLE' });
+    }
+    return this.historyReader.openStream('getHistory', historyWirePayload(payload), options);
+  }
+
   async getHistory(payload = {}, sourceAttempt = 0, onPayload = null) {
+    return controlledHistoryRead(payload, () => this._getHistory(payload, sourceAttempt, onPayload));
+  }
+
+  async _getHistory(payload = {}, sourceAttempt = 0, onPayload = null) {
     const toolType = normalizeToolType(payload.toolType);
-    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getHistory', payload);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getHistory', historyWirePayload(payload));
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
@@ -2398,7 +2610,7 @@ class SessionTranscriptService {
           && witness.mtimeMs === source.mtimeMs
           && witness.fileIdentity === String(source.fileIdentity || '')
           && witness.ctimeMs === (Number.isFinite(source.ctimeMs) ? source.ctimeMs : null);
-        const stat = valid ? await fs.promises.stat(target.filePath).catch(() => null) : null;
+        const stat = valid ? await readBoundary(fs.promises.stat(target.filePath).catch(() => null)) : null;
         if (!stat || stat.size !== target.size || stat.mtimeMs !== target.mtimeMs
           || (target.fileIdentity && target.fileIdentity !== stat.dev + ':' + stat.ino)
           || (Number.isFinite(target.ctimeMs) && target.ctimeMs !== stat.ctimeMs)) rewriteReceipt = null;
@@ -2429,7 +2641,7 @@ class SessionTranscriptService {
       if (lineage.kind === 'unresolved') {
         return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
       }
-      const virtualPage = lineage.kind === 'virtual' ? await this._readVirtualHistoryPage(lineage, payload) : null;
+      const virtualPage = lineage.kind === 'virtual' ? await readBoundary(this._readVirtualHistoryPage(lineage, payload)) : null;
       const virtualProjected = lineage.kind === 'virtual'
         ? virtualPage?.projection || await this._projectCodexVirtual(lineage, cwd)
         : null;
@@ -2508,13 +2720,11 @@ class SessionTranscriptService {
       // appended since the cached projector's file cursor instead of
       // re-loading and replaying all 74K records of a giant rollout
       // (~3.5s → ~ms), and does not require the parsed records array to stay
-      // cached at all. Restricted to dehydrate consumers (desktop and
-      // opt-in HTTP): dehydration mutates the cached projector's shared action
-      // objects into previews+refs, which is stable across dehydrating calls
-      // but would poison an ordinary full-payload consumer — those keep the
-      // fresh one-shot build, as does getToolPayload's stash rebuild below
-      // for the same reason. Falls back to load+one-shot when the
-      // incremental API is absent (minimal test stubs).
+      // cached at all. Full-payload clients use a distinct request-scoped
+      // canonical reducer: no raw records[] and no reuse of a dehydrated
+      // graph. The full entries graph still scales with transcript content;
+      // this removes one allocation owner, not a whole-read bound. Minimal
+      // old doubles without the API retain their compatibility path.
       const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
       // The page store is worker-owned. A seek reads positional metadata and
       // selected bodies, without resurrecting an evicted parser. Its key also
@@ -2529,17 +2739,17 @@ class SessionTranscriptService {
       let prepared = virtualPage?.page || null;
       let basePrepared = virtualPage?.base || null;
       if (this.preparedHistoryStore && !virtualProjected && payload.dehydrate === true) {
-        const filePath = await this._resolveFilePath(toolType, sessionId, cwd);
-        const stat = filePath ? await fs.promises.stat(filePath).catch(() => null) : null;
-        if (stat) prepared = this.preparedHistoryStore.readPrepared({
-          owner: preparedOwner, filePath, stat, context: preparedContext, hydrate: rowWindowRequest,
+        const filePath = await readBoundary(this._resolveFilePath(toolType, sessionId, cwd));
+        const stat = filePath ? await readBoundary(fs.promises.stat(filePath).catch(() => null)) : null;
+        if (stat) prepared = await this._readPrepared({
+          owner: preparedOwner, filePath, stat, context: preparedContext, hydrate: rowWindowRequest, bounds: entryWindowRequest,
         });
         if (prepared && !this.codexData._api.restoreCodexSourceSnapshot(prepared.source)) prepared = null;
         if (!prepared && stat) {
           // Sidecar changes require the canonical rows for matching/binding,
           // never a parser graph. Full candidates preserve offscreen timing
           // ownership and inherited UUID semantics.
-          basePrepared = this.preparedHistoryStore.readPrepared({ owner: preparedOwner,
+          basePrepared = await this._readPrepared({ owner: preparedOwner,
             filePath, stat, context: 'canonical', kind: 'base' });
           if (basePrepared && !this.codexData._api.restoreCodexSourceSnapshot(basePrepared.source)) basePrepared = null;
         }
@@ -2571,19 +2781,21 @@ class SessionTranscriptService {
           ...(virtualProjected.frozenSnapshots || []),
           virtualProjected.childSnapshot,
         ].filter(Boolean);
-      } else if (payload.dehydrate === true && typeof projectFromFile === 'function') {
-        const projected = await projectFromFile(sessionId, cwd, {
+      } else if (typeof projectFromFile === 'function') {
+        const projected = await readBoundary(projectFromFile(sessionId, cwd, {
           tabId: payload.tabId,
           cacheOnly: payload.rewriteBaselineOnly === true,
           hydrate: rowWindowRequest,
-        });
+          ...(payload.dehydrate === true ? {} : { payloadPolicy: 'full' }),
+          ...readControlOptions(),
+        }));
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
         loadedFilePath = projected.filePath;
         projectedSessionMeta = projected.sessionMeta || null;
         projectedSnapshot = projected.sourceSnapshot || null;
       } else {
-        const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+        const loaded = await readBoundary(this.codexData?._api?.loadSessionRecords?.(sessionId, cwd));
         if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
         loadedFilePath = loaded.filePath;
@@ -2603,17 +2815,23 @@ class SessionTranscriptService {
       // as previews + refs; the renderer pulls full text on expand through
       // history:get-tool-payload. OPT-IN per call: ordinary HTTP clients keep
       // full payloads; on-demand-v1 adds its detached bounded projection below.
-      const sourceIsCurrent = () => (virtualProjected?.physicalSources || projectedSnapshots || [projectedSnapshot])
-        .every(source => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(source) !== false);
-      const refreshChangedSource = () => sourceAttempt < 2
-        ? this.getHistory(payload, sourceAttempt + 1, onPayload)
-        : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+      const sourceIsCurrent = () => {
+        assertHistoryRead();
+        return (virtualProjected?.physicalSources || projectedSnapshots || [projectedSnapshot])
+          .every(source => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(source) !== false);
+      };
+      const refreshChangedSource = () => {
+        assertHistoryRead();
+        return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1, onPayload)
+          : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+      };
       if (!sourceIsCurrent()) return refreshChangedSource();
       const payloadGeneration = projectedSnapshot?.sourceGeneration || projectedSnapshot?.fileIdentity || '';
       const prepareStart = performance.now();
       let preparePhaseAt = prepareStart;
       const preparePhases = {};
       const finishPreparePhase = (phase) => {
+        assertHistoryRead();
         const at = performance.now();
         preparePhases[phase] = Math.round((at - preparePhaseAt) * 10) / 10;
         preparePhaseAt = at;
@@ -2630,7 +2848,8 @@ class SessionTranscriptService {
         }));
       };
       if (payload.dehydrate === true && !prepared) {
-        const dehydration = dehydrateHistoryEntries({
+        const dehydrate = currentReadControl() ? dehydrateHistoryEntriesAsync : dehydrateHistoryEntries;
+        const dehydration = await dehydrate({
           toolType,
           sessionId,
           entries,
@@ -2657,7 +2876,10 @@ class SessionTranscriptService {
       const capturedPresentationRevision = promptSnapshot.revision;
       const presentationStable = promptSnapshot.stable;
       finishPreparePhase('promptPresentation');
-      let rowWindow = applyHistoryRowWindow(presentedEntries, rowWindowRequest);
+      let rowWindow = prepared?.entryWindow ? {
+        entries: presentedEntries, total: prepared.entryWindow.total, hydratedCount: prepared.entryWindow.total,
+        stubbedCount: 0, hydratedFrom: 0, hydratedTo: Math.max(0, prepared.entryWindow.total - 1), rowWindowApplied: false,
+      } : applyHistoryRowWindow(presentedEntries, rowWindowRequest);
       finishPreparePhase('rowWindow');
       let responseTimingBound = false;
       const persistPrepared = !!this.preparedHistoryStore && payload.dehydrate === true && !prepared;
@@ -2731,15 +2953,23 @@ class SessionTranscriptService {
           + ' span=' + rowWindow.hydratedFrom + '-' + rowWindow.hydratedTo
           + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
       }
-      const historyWindow = applyHistoryEntryWindow(rowWindow.entries, entryWindowRequest);
-      const settingsBaseline = codexSettingsWindowBaseline(rowWindow.entries, historyWindow, {
+      const historyWindow = prepared?.entryWindow ? { ...prepared.entryWindow, entries: rowWindow.entries }
+        : applyHistoryEntryWindow(rowWindow.entries, entryWindowRequest);
+      const settingsBaseline = codexSettingsWindowBaseline(rowWindow.entries,
+        prepared?.entryWindow ? { ...historyWindow, startIndex: 0 } : historyWindow, {
         sessionId, revision, payloadGeneration, contentRevision: contentRevision?.token || null,
       });
+      if (prepared?.entryWindow) {
+        settingsBaseline.before = prepared.settingsBefore;
+        settingsBaseline.window.startIndex = historyWindow.startIndex;
+      }
       const freshnessFields = payload.freshnessProof === true
         ? { freshnessReadSources: virtualProjected?.physicalSources || revision?.sources } : {};
-      if (payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) historyWindow.entries = projectHistoryOnDemand({
-        toolType, sessionId, entries: historyWindow.entries, onPayload,
-      });
+      if (payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) {
+        const project = currentReadControl() ? projectHistoryOnDemandAsync : projectHistoryOnDemand;
+        historyWindow.entries = await project({ toolType, sessionId, entries: historyWindow.entries, onPayload });
+        if (!sourceIsCurrent()) return refreshChangedSource();
+      }
       finishPreparePhase('entryWindow');
       // Recheck against the actual projection cursor, not the pre-await stat.
       if (rewriteReceipt && (!projectedSnapshot
@@ -2885,7 +3115,11 @@ class SessionTranscriptService {
             if (mapped && isDeepStrictEqual(mapped, row)) {
               carriedEntries.push({ sourceUuid: previous.uuid, uuid: row.uuid });
             } else changedEntries.push(row);
-            if (index % 256 === 255) await new Promise((resolve) => setImmediate(resolve));
+            if (index % 256 === 255) {
+              const control = currentReadControl();
+              if (control) await control.checkpoint(); else await new Promise((resolve) => setImmediate(resolve));
+              assertHistoryRead();
+            }
           }
           console.log('[TranscriptService:RewriteDelta] source=' + shortId(rewriteReceipt.sourceSessionId)
             + ' child=' + shortId(sessionId) + ' carried=' + carriedEntries.length + ' changed=' + changedEntries.length);

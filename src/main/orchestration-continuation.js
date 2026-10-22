@@ -57,7 +57,8 @@ function latestMatchesOriginal(latest, original, run) {
 }
 
 function createOrchestrationContinuationService({ store, receipts, readState, readOriginal, readLatest,
-  send, reconcile, deliver, emit = () => {}, now = Date.now, createReplacement, readInfo, reaudit, resumeReplacement, log = console } = {}) {
+  send, reconcile, deliver, emit = () => {}, now = Date.now, createReplacement, readInfo, reaudit, resumeReplacement,
+  readRestartHistoryProof = async () => null, log = console } = {}) {
   const inflight = new Map();
   const reject = async (runId, code, error, reason = code) => {
     const run = await store.get(runId);
@@ -80,7 +81,9 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     const baseRun = { ...run, targetExecutionContext: intent.baseExecutionContext };
     const original = await readOriginal(baseRun, { target, baseLookup: intent.baseLookup });
     const latest = await readLatest(baseRun, target);
-    if (original?.found !== true || original.sourceVerified !== true || !latestMatchesOriginal(latest, original, baseRun)) throw new Error('continuation_history_changed');
+    const restart = await readRestartHistoryProof({ run: baseRun, state: target, original, latest });
+    if (original?.found !== true || original.sourceVerified !== true || restart?.required && restart.covered !== true
+      || !latestMatchesOriginal(latest, original, baseRun) && restart?.covered !== true) throw new Error('continuation_history_changed');
     const sourceAfter = await readState(run.sourceTabId), targetAfter = await readState(run.targetTabId);
     const current = await store.getInternal(runId);
     if (terminal(current) || current?.continuationIntent?.operationId !== operationId
@@ -201,7 +204,10 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       target.continuationInput?.reason || 'continuation_input_unproven');
     targetExpected = continuationTargetExpectation(targetExpected, target);
     const latest = await readLatest(run, target);
-    if (!latestMatchesOriginal(latest, original, run)) return reject(runId, 'continuation_history_changed', 'Последний ход не относится к выбранному поручению. Создайте новый запрос, не продолжая чужую задачу.', latest?.code || 'continuation_history_changed');
+    const restart = await readRestartHistoryProof({ run, state: target, original, latest });
+    if (restart?.required && restart.covered !== true || !latestMatchesOriginal(latest, original, run) && restart?.covered !== true) {
+      return reject(runId, 'continuation_history_changed', 'Последний ход не относится к выбранному поручению. Создайте новый запрос, не продолжая чужую задачу.', latest?.code || 'continuation_history_changed');
+    }
     const afterSource = await readState(run.sourceTabId), afterTarget = await readState(run.targetTabId);
     if (!partyMatches(afterSource, sourceExpected) || !partyMatches(afterTarget, targetExpected)
       || afterSource.revision !== source.revision || afterTarget.revision !== target.revision

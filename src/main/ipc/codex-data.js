@@ -1,8 +1,11 @@
-const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
+const { ipcMain } = require('node:worker_threads').isMainThread
+  && process.env.NOTED_HISTORY_READER_PROCESS !== '1' ? require('electron') : {};
 const path = require('path');
 const fs = require('fs');
 const { causal: perfCausal } = require('../perf-causal-context');
-const { drainProjectionSteps } = require('../codex-turns-projection');
+const { drainProjectionSteps, createProjectionControl } = require('../codex-turns-projection');
+const { currentReadControl, createDemandRegistry, isHistoryReadCancelled,
+  isHistoryReadUnavailable } = require('../history-read-control');
 const { timelineResponsePreview } = require('../../shared/timeline-response-preview.cjs');
 const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
 const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
@@ -204,6 +207,7 @@ const _codexRecordSnapshots = new WeakMap();
 let _codexJsonlCacheRawBytes = 0;
 const _codexSessionSelectSkipLogged = new Set();
 const _codexJsonlInflight = new Map();
+const _codexJsonlDemands = createDemandRegistry();
 const _codexReadFence = new CodexReadFence();
 let _codexExternalReadPrepare = null;
 const _codexSourceGenerations = new CodexSourceGenerations({ pinned: (filePath) => (
@@ -2075,6 +2079,8 @@ async function inspectJsonlFiles(rootDir, maxFiles = 4000) {
 }
 
 async function parseJsonlFile(filePath, options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  demand?.assertCurrent();
   return perfCausal.run('codex.raw-records', { fileIdentity: filePath,
     caller: perfCausal.current()?.name || _describeJsonlReadCaller(),
     mode: options.forceFresh === true ? 'force-fresh' : 'lookup' }, async () => {
@@ -2089,27 +2095,27 @@ async function parseJsonlFile(filePath, options = {}) {
       } catch {
         // The fresh read below owns the retry and the resulting error.
       }
+      demand?.assertCurrent();
       if (_codexJsonlInflight.get(filePath) === pending) {
         _codexJsonlInflight.delete(filePath);
       }
     }
     invalidateCodexJsonlCache(filePath, { readRefresh: true });
   }
-  const inflight = _codexJsonlInflight.get(filePath);
-  if (inflight) {
-    const records = await inflight;
-    return copyCodexRecordSnapshot(records);
-  }
-  const load = _parseJsonlFileIncremental(filePath);
-  _codexJsonlInflight.set(filePath, load);
-  try {
-    const records = await load;
-    return copyCodexRecordSnapshot(records);
-  } finally {
-    if (_codexJsonlInflight.get(filePath) === load) {
-      _codexJsonlInflight.delete(filePath);
+  const records = await _codexJsonlDemands.run(filePath, demand, async jobControl => {
+    jobControl.assertCurrent();
+    // This map is now only the forceFresh barrier. Borrowing belongs to the
+    // demand registry: C must not join an abandoned A/B generation just because
+    // its stream has not reached the next cooperative boundary yet.
+    const load = _parseJsonlFileIncremental(filePath);
+    _codexJsonlInflight.set(filePath, load);
+    try { return await load; }
+    finally {
+      if (_codexJsonlInflight.get(filePath) === load) _codexJsonlInflight.delete(filePath);
     }
-  }
+  });
+  demand?.assertCurrent();
+  return copyCodexRecordSnapshot(records);
   });
 }
 
@@ -2322,7 +2328,11 @@ function readAuditRecordAddress(filePath, offset) {
 }
 
 async function readJsonlRange(filePath, startByte, endByte, options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  const assertCurrent = () => { demand?.assertCurrent(); options.assertCurrent?.(); };
+  assertCurrent();
   await _codexExternalReadPrepare?.(filePath);
+  assertCurrent();
   const records = options.records || [];
   const collectRecords = options.collectRecords !== false;
   let lineCount = Number(options.lineCount) || 0;
@@ -2335,9 +2345,11 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
   const metrics = options.metrics;
   if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0,
-    parseMs: 0, consumeMs: 0, framingMs: 0, readWaitMs: 0, maxBufferedBytes: 0 });
+    parseMs: 0, consumeMs: 0, framingMs: 0, readWaitMs: 0, maxBufferedBytes: 0,
+    maxCollectedRecords: records.length, maxConsumerRecords: 0 });
 
   const consume = async (chunk) => {
+    assertCurrent();
     if (!chunk?.length) return;
     const framingStarted = metrics ? performance.now() : 0;
     const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -2354,6 +2366,7 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
+      assertCurrent();
       const parseStarted = metrics ? performance.now() : 0;
       const rawLineBuffer = data.subarray(lineStart, newlineIndex);
       if (metrics) metrics.maxRecordBytes = Math.max(metrics.maxRecordBytes, rawLineBuffer.length);
@@ -2384,6 +2397,7 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
             });
           }
           if (collectRecords) records.push(decorated);
+          if (metrics) metrics.maxCollectedRecords = Math.max(metrics.maxCollectedRecords, records.length);
           parsed += 1;
         } catch {
           errors += 1;
@@ -2392,12 +2406,15 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
         // A consumer failure is not a malformed JSON record. Its owner must
         // discard the staged cursor rather than silently skip a valid event.
         if (decorated && typeof options.onRecord === 'function') {
+          assertCurrent();
+          if (metrics) metrics.maxConsumerRecords = 1;
           const consumeStarted = metrics ? performance.now() : 0;
           const consumed = options.onRecord(decorated, {
             filePath, fromByte: dataStartOffset + lineStart,
             toByte: dataStartOffset + newlineIndex + 1, startLine: lineCount,
           });
           if (consumed && typeof consumed.then === 'function') await consumed;
+          assertCurrent();
           if (metrics) metrics.consumeMs += performance.now() - consumeStarted;
         }
       }
@@ -2414,6 +2431,7 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
 
   if (endByte >= startByte) {
     let handle = null;
+    let readError = null;
     const expected = options.sourceStat;
     const assertSource = actual => {
       if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino
@@ -2426,6 +2444,7 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     try {
       if (expected) {
         handle = await fs.promises.open(filePath, 'r');
+        assertCurrent();
         assertSource(await handle.stat());
       }
       const stream = fs.createReadStream(filePath, {
@@ -2436,15 +2455,19 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       });
       let readWaitStarted = metrics ? performance.now() : 0;
       for await (const chunk of stream) {
+        assertCurrent();
         if (metrics) metrics.readWaitMs += performance.now() - readWaitStarted;
         if (typeof options.onChunk === 'function') options.onChunk(chunk, nextChunkOffset);
         await consume(chunk);
         if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
         // Progress follows processed chunks, not the filesystem's read-ahead.
         options.onProgress?.(nextChunkOffset - startByte);
+        if (demand?.checkpoint) await demand.checkpoint();
+        assertCurrent();
         if (metrics) readWaitStarted = performance.now();
       }
       if (handle) {
+        assertCurrent();
         // The same descriptor owns the bytes and both fstats. A pathname may
         // have been replaced while its old descriptor was still readable.
         assertSource(await handle.stat());
@@ -2453,9 +2476,18 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
           throw Object.assign(new Error('Codex source range was truncated during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
         }
       }
-    } finally { await handle?.close(); }
+    } catch (error) { readError = error; throw error; }
+    finally {
+      try { await handle?.close(); }
+      catch (error) {
+        // Async-iterator cancellation can already close the stream descriptor.
+        // A cleanup EBADF must never replace the typed demand/source failure.
+        if (!readError) throw error;
+      }
+    }
   }
 
+  assertCurrent();
   return {
     records,
     lineCount,
@@ -2717,7 +2749,9 @@ function _describeJsonlReadCaller() {
 
 async function _parseJsonlFileIncremental(filePath) {
   return retryInvalidatedCodexRead(async () => {
+    currentReadControl()?.assertCurrent();
     await _codexExternalReadPrepare?.(filePath);
+    currentReadControl()?.assertCurrent();
     const ticket = _codexReadFence.begin(filePath, 'raw');
     try { return await _parseJsonlFileIncrementalOnce(filePath, ticket); }
     finally { _codexReadFence.finish(ticket); }
@@ -2725,6 +2759,8 @@ async function _parseJsonlFileIncremental(filePath) {
 }
 
 async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
+  const assertCurrent = () => { currentReadControl()?.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  assertCurrent();
   let stat;
   try {
     stat = await fs.promises.stat(filePath);
@@ -2733,7 +2769,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
     return [];
   }
 
-  _codexReadFence.assertCurrent(ticket);
+  assertCurrent();
   const cached = _codexJsonlCache.get(filePath);
   const fileIdentity = stat.dev + ':' + stat.ino;
   const sameFile = cached?.fileIdentity === fileIdentity
@@ -2773,7 +2809,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
       leftoverBuffer: cached.leftoverBuffer,
       leftover: cached.leftover,
     });
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
     const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
     perfCausal.run('codex.raw-cache-publication', { mode: 'append', recordsAfter: cached.records.length + result.records.length }, () => {
     for (const record of result.records) {
@@ -2808,7 +2844,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
     deltaBytes: stat.size, recordsBefore: cached?.records.length ?? 0 });
   try {
     const result = await readJsonlRange(filePath, 0, stat.size - 1, { sourceStat: stat });
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
     const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
     perfCausal.run('codex.raw-cache-publication', { mode: 'full', recordsAfter: result.records.length }, () => {
     setCodexJsonlCacheEntry(filePath, {
@@ -2890,6 +2926,11 @@ async function loadCodexHistoricalObservedExecution(request) {
 
 function readCachedCodexCompletedResponse(request) {
   return _codexResultReader?.readCachedCompleted(request)
+    || { known: false, reason: 'result_cache_cold' };
+}
+
+function readCachedCodexInputInterval(request) {
+  return _codexResultReader?.readCachedInputInterval(request)
     || { known: false, reason: 'result_cache_cold' };
 }
 
@@ -3840,7 +3881,7 @@ function attachCodexQuestionReplyProof(entry, definitions, physicalSessionId) {
   else delete entry.questionReplyProof;
 }
 
-function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = false } = {}) {
+function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = false, metadataOnly = false } = {}) {
   const entries = seed.entries ?? [];
   const questionDefinitions = seed.questionDefinitions ?? new Map();
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
@@ -3890,7 +3931,7 @@ function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = fal
   const feed = (record) => {
     const payload = record.payload || {};
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
-    if (!mutationOnly) rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+    if (!mutationOnly && !metadataOnly) rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
 
     if (record.type === 'session_meta') {
       if (payload.cwd) sessionCwd = payload.cwd;
@@ -3926,6 +3967,10 @@ function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = fal
         }
       }
     }
+
+    // Legacy full History needs only this exact metadata/boundary reducer.
+    // Do not construct a second complete Timeline graph for that request.
+    if (metadataOnly) return;
 
     if (record.type === 'compacted') {
       pendingCompactCompanions += 1;
@@ -5692,48 +5737,155 @@ function _chainCodexProjection(sessionId, task) {
   return run;
 }
 
-async function feedCodexProjection(cached, records) {
+function codexProjectionControl(options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  const assertCurrent = () => { demand?.assertCurrent(); options.assertCurrent?.(); };
+  return { assertCurrent, schedule: demand?.checkpoint
+    ? () => demand.checkpoint() : () => new Promise(resolve => setImmediate(resolve)) };
+}
+
+async function feedCodexProjection(cached, records, options = {}) {
+  const control = codexProjectionControl(options);
   for (const record of records) {
+    control.assertCurrent();
     const metrics = cached.readMetrics;
     const feedStarted = metrics ? performance.now() : 0;
     cached.historyProjector.feed(record);
     cached.timelineProjector.feed(record);
     if (metrics) metrics.feedMs += performance.now() - feedStarted;
     const count = cached.historyProjector.getConsumedRecords();
-    if (count % 2048 === 0) {
+    if (options.checkpoints !== false && count % 2048 === 0) {
       const checkpointStarted = metrics ? performance.now() : 0;
-      const cloned = await cloneProjectionGraphAsync({
+      const candidate = {
         history: cached.historyProjector.exportState(),
         timeline: cached.timelineProjector.exportState(),
-      });
-      const state = cloned.value;
-      // A checkpoint must not pin 400MB of outputs that the active History
-      // already represents as expandable refs. Dehydrate the COPY only.
-      dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
-        entries: state.history.entries });
-      const approxBytes = await measureProjectionGraphBytes(state);
-      // Checkpoints are optional acceleration, never permission to exceed
-      // the existing bound. A cold fallback uses the already prepared records.
-      if (approxBytes <= _codexHistoryProjectorBudgetBytes / 4) {
-        retainCheckpoint(cached.checkpoints ||= [], { count, state, approxBytes });
+      };
+      const limit = _codexHistoryProjectorBudgetBytes / 4;
+      // Admission happens BEFORE another full graph is allocated. Refusing an
+      // optional accelerator does not refuse, truncate or re-read History.
+      const admittedBytes = await measureProjectionGraphBytes(candidate,
+        { ...control, stopAfterBytes: limit });
+      if (admittedBytes <= limit) {
+        const cloned = await cloneProjectionGraphAsync(candidate, undefined, control);
+        const state = cloned.value;
+        // Dehydrate the private checkpoint only; full legacy projection never
+        // enters this optional checkpoint path.
+        dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
+          entries: state.history.entries });
+        control.assertCurrent();
+        const approxBytes = await measureProjectionGraphBytes(state, control);
+        if (approxBytes <= limit) retainCheckpoint(cached.checkpoints ||= [], { count, state, approxBytes });
       }
       if (metrics) { metrics.checkpoints += 1; metrics.checkpointMs += performance.now() - checkpointStarted; }
     }
     if (count % 256 === 0) {
       const yieldStarted = metrics ? performance.now() : 0;
-      await new Promise((resolve) => setImmediate(resolve));
+      await control.schedule();
+      control.assertCurrent();
       if (metrics) metrics.yieldMs += performance.now() - yieldStarted;
     }
   }
 }
 
+// Cold legacy full History has a distinct request-owned graph. It never reuses
+// a cached/SSD continuation whose storage.prepare has detached payloads. One
+// reader-owned record feeds History plus Timeline metadata without a raw array.
+// Canonical pending calls can still retain that record. Accumulated rows,
+// pending-call payloads and individual JSON strings remain full;
+// this removes the raw-array duplicate, not the outstanding M2 graph bound.
+async function projectCodexFullHistoryStream(sessionId, cwd, options = {}) {
+  const controlOptions = codexProjectionControl(options);
+  controlOptions.assertCurrent();
+  const found = await findCodexSessionFile(sessionId, cwd,
+    options.sessionsDir ? { sessionsDir: options.sessionsDir } : {});
+  controlOptions.assertCurrent();
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  await _codexExternalReadPrepare?.(filePath);
+  controlOptions.assertCurrent();
+  const ticket = _codexReadFence.begin(filePath, 'history-full-stream');
+  const assertCurrent = () => { controlOptions.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  const control = createProjectionControl({ ...controlOptions, assertCurrent });
+  let finishPreparation = () => {};
+  try {
+    const stat = await fs.promises.stat(filePath);
+    assertCurrent();
+    finishPreparation = historyPreparationActivity.begin({ kind: 'history', sessionId,
+      tabId: options.tabId, bytes: stat.size, source: { toolType: 'codex', cwd } });
+    const cached = { sessionId, historyProjector: createCodexHistoryProjector(sessionId),
+      timelineProjector: createCodexTimelineProjector(sessionId, {}, { metadataOnly: true }) };
+    const metrics = {};
+    const read = await readJsonlRange(filePath, 0, stat.size - 1, {
+      sourceStat: stat, collectRecords: false, metrics, assertCurrent,
+      _readControl: options._readControl || options.control,
+      ...(options.highWaterMark ? { highWaterMark: options.highWaterMark } : {}),
+      onRecord: record => feedCodexProjection(cached, [record], {
+        ...options, assertCurrent, checkpoints: false,
+      }),
+      onProgress: bytes => finishPreparation.update?.({ completedBytes: bytes }),
+    });
+    assertCurrent();
+    finishPreparation.update?.({ completedBytes: stat.size, phase: 'preparing' });
+    const entries = await control.drain('historyFinalize', cached.historyProjector.finalizeSteps({
+      includeTurnCoordinates: options.includeTurnCoordinates === true,
+    }));
+    assertCurrent();
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
+    return { success: true, entries, sessionMeta: cached.timelineProjector.getSessionMeta(),
+      filePath, mode: 'full-stream', fedRecords: read.parsed, reusedRecords: 0,
+      readMetrics: { ...metrics, canonicalRows: entries.length,
+        timelineRows: cached.timelineProjector.peekEntries().length },
+      sourceSnapshot: { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, sourceGeneration, linkKind: 'end' } };
+  } finally { finishPreparation(); _codexReadFence.finish(ticket); }
+}
+
 function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
   return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
+    if (options.payloadPolicy === 'full') {
+      // A small/full hot graph can serve a runtime-only ownership refresh
+      // without replay. Completeness is affirmative and monotone: neither an
+      // SSD continuation nor an opaque prepare hook can claim it by absence
+      // of newly detached fields. Source changes never enter this shortcut.
+      if (_codexHistoryProjectors.get(sessionId)?.fullPayloadsPreserved === true) {
+        const advanced = await _advanceCodexProjection(sessionId, cwd, { ...options, cacheOnly: true });
+        if (advanced.success) {
+          try {
+            advanced.assertCurrent();
+            if (advanced.cached.fullPayloadsPreserved === true) {
+              const control = createProjectionControl({ ...codexProjectionControl(options), assertCurrent: advanced.assertCurrent });
+              // finalize refreshes Task cards and registers seeded pending
+              // spawns. Previously returned shallow rows may alias those
+              // cards, so even unchanged-source reuse needs a private graph.
+              // Strings are shared; graph shells remain O(graph), not bounded.
+              const state = (await cloneProjectionGraphAsync(advanced.cached.historyProjector.exportState(),
+                undefined, { ...codexProjectionControl(options), assertCurrent: advanced.assertCurrent })).value;
+              const history = createCodexHistoryProjector(sessionId, state);
+              const entries = await control.drain('historyFinalize', history.finalizeSteps({
+                includeTurnCoordinates: options.includeTurnCoordinates === true,
+              }));
+              advanced.assertCurrent();
+              return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta(),
+                fullPayloadsReused: true };
+            }
+          } finally { advanced.finishPreparation(); }
+        }
+      }
+      codexProjectionControl(options).assertCurrent();
+      if (options.cacheOnly === true) return { success: false, error: 'cached_projection_unavailable' };
+      return projectCodexFullHistoryStream(sessionId, cwd, options);
+    }
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
-      const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
-      const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
+      const controlOptions = codexProjectionControl(options);
+      const control = createProjectionControl({ ...controlOptions, assertCurrent: advanced.assertCurrent });
+      const entries = await control.drain('historyFinalize', advanced.cached.historyProjector.finalizeSteps({
+        includeTurnCoordinates: options.includeTurnCoordinates === true,
+      }));
+      const preparation = await prepareHistoryRowWindow(entries, options.hydrate, { yieldToMain: async () => {
+        advanced.assertCurrent(); await controlOptions.schedule(); advanced.assertCurrent();
+      } });
       advanced.assertCurrent();
       if (preparation?.elapsedMs >= 24) {
         console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
@@ -5751,7 +5903,8 @@ function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
-      const entries = advanced.cached.timelineProjector.finalize();
+      const control = createProjectionControl({ ...codexProjectionControl(options), assertCurrent: advanced.assertCurrent });
+      const entries = await control.drain('timelineFinalize', advanced.cached.timelineProjector.finalizeSteps());
       const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
       advanced.assertCurrent();
       return { ...advanced.result, entries, sessionMeta };
@@ -5763,9 +5916,7 @@ function rememberCodexProjection(sessionId, cached) {
   // LRU refresh + byte budget. Re-costed on every advance: an append grows
   // the projection, and a stale cost would let the cache drift past its
   // budget exactly on the sessions that grow fastest.
-  const previousCost = _codexHistoryProjectors.get(sessionId) === cached
-    ? (cached.approxBytes || 0)
-    : 0;
+  const previousCost = _codexHistoryProjectors.get(sessionId)?.approxBytes || 0;
   cached.approxBytes = (cached.checkpoints || []).reduce((bytes, item) => bytes + item.approxBytes, 0)
     + (cached.rewriteReceipt?.records.length || 0) * 160
     + estimateCodexProjectorCacheEntryBytes(
@@ -5806,24 +5957,35 @@ function rememberCodexProjection(sessionId, cached) {
 }
 
 async function _advanceCodexProjection(sessionId, cwd, options = {}) {
+  const demandControl = codexProjectionControl(options);
+  demandControl.assertCurrent();
   const startedAt = Date.now();
   const found = await findCodexSessionFile(sessionId, cwd, {
     ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
   });
+  demandControl.assertCurrent();
   if (!found) return { success: false, error: 'Codex session file not found' };
   const filePath = found.filePath;
   await _codexExternalReadPrepare?.(filePath);
+  demandControl.assertCurrent();
   const ticket = _codexReadFence.begin(filePath, 'projection');
+  const assertCurrent = () => { demandControl.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
   let stat;
   try {
     stat = await fs.promises.stat(filePath);
+    assertCurrent();
   } catch (error) {
+    if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)
+      || error?.code === 'CODEX_SOURCE_READ_INVALIDATED') {
+      _codexReadFence.finish(ticket); throw error;
+    }
     invalidateCodexHistoryProjectors(filePath);
     _codexReadFence.finish(ticket);
     return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
   }
 
-  let cached = _codexHistoryProjectors.get(sessionId) || null;
+  const committed = _codexHistoryProjectors.get(sessionId) || null;
+  let cached = committed;
   let releaseCold = null;
   try {
   if (cached && (cached.fileIdentity !== stat.dev + ':' + stat.ino || stat.size < cached.fileSize
@@ -5838,16 +6000,17 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
     && (stat.size > cached.fileSize || (stat.size === cached.fileSize && cached.fileMtimeMs === stat.mtimeMs && cached.fileCtimeMs === stat.ctimeMs));
   if (!warm && _codexProjectionStorage?.enterCold && !options.cacheOnly) {
     releaseCold = await _codexProjectionStorage.enterCold();
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
     stat = await fs.promises.stat(filePath);
+    assertCurrent();
   }
   if (!cached && _codexProjectionStorage && !options.cacheOnly) {
     cached = await restoreCodexRewriteCheckpoint(options.rewriteReceipt, { sessionId, cwd, filePath, stat, ticket });
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
   }
   if (!cached && _codexProjectionStorage && !options.cacheOnly) {
     const restored = await _codexProjectionStorage.read({ sessionId, cwd, filePath, stat });
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
     if (restored && restoreCodexSourceSnapshot(restored.snapshot)) {
       const { state, snapshot } = restored;
       cached = {
@@ -5888,9 +6051,24 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
   finishPreparation.update = (...args) => endActivity.update?.(...args);
   let preparationTransferred = false;
   try {
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
+    if (mode === 'append' && cached === committed) {
+      // Reducers mutate entries and pending-call aliases. Stage a graph copy;
+      // a cancelled read cannot advance the committed graph without its cursor.
+      // Strings remain shared, but this is still O(graph) ownership, not M2's
+      // future disk-backed reducer. It is charged explicitly as that limitation.
+      const state = (await cloneProjectionGraphAsync({
+        history: cached.historyProjector.exportState(), timeline: cached.timelineProjector.exportState(),
+      }, undefined, { ...demandControl, assertCurrent })).value;
+      assertCurrent();
+      cached = { ...cached,
+        historyProjector: createCodexHistoryProjector(sessionId, state.history),
+        timelineProjector: createCodexTimelineProjector(sessionId, state.timeline),
+        sourceProof: (cached.sourceProof || []).slice(), checkpoints: (cached.checkpoints || []).slice(),
+        ...(cached.preparedSourceProof ? { preparedSourceProof: cached.preparedSourceProof.slice() } : {}),
+      };
+    }
     if (mode === 'rebuild') {
-      _dropProjectorEntry(sessionId);
       // Self-contained read up to OUR stat.size — deliberately not coupled to
       // parseJsonlFile's records cache. Copying a cursor from that cache is
       // racy (the file can grow between our stat and the shared parse, and a
@@ -5907,6 +6085,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         sessionId,
         historyProjector,
         timelineProjector,
+        fullPayloadsPreserved: true,
         filePath,
         fileSize: stat.size,
         fileMtimeMs: stat.mtimeMs,
@@ -5924,7 +6103,8 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       const result = await readJsonlRange(filePath, 0, stat.size - 1, {
         sourceStat: stat,
         collectRecords: false,
-        onRecord: record => feedCodexProjection(cached, [record]),
+        _readControl: options._readControl || options.control, assertCurrent,
+        onRecord: record => feedCodexProjection(cached, [record], { ...options, assertCurrent }),
         onChunk: _codexProjectionStorage ? (chunk, offset) => cached.sourceProof.push({
           offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex'),
         }) : null,
@@ -5951,15 +6131,16 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       cached.rewriteReceipt = null;
       const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
         sourceStat: stat,
-        records: [],
+        collectRecords: false,
+        _readControl: options._readControl || options.control, assertCurrent,
         lineCount: cached.lineCount,
         leftoverBuffer: cached.leftoverBuffer,
+        onRecord: record => feedCodexProjection(cached, [record], { ...options, assertCurrent }),
         onChunk: _codexProjectionStorage && !cached.preparedSourceProof ? (chunk, offset) => (cached.sourceProof ||= []).push({
           offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex'),
         }) : null,
       });
-      await feedCodexProjection(cached, result.records);
-      fedRecords = result.records.length;
+      fedRecords = result.parsed;
       readBytes = stat.size - cached.fileSize;
       cached.fileSize = stat.size;
       cached.fileMtimeMs = stat.mtimeMs;
@@ -5972,11 +6153,14 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       }
     }
 
-    _codexReadFence.assertCurrent(ticket);
+    assertCurrent();
     cached.sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
     _codexProjectionStorage?.onRead?.({ bytes: readBytes, mode });
     if (_codexProjectionStorage && mode !== 'unchanged') {
-      _codexProjectionStorage.prepare?.(cached);
+      const preparation = _codexProjectionStorage.prepare?.(cached);
+      if (_codexProjectionStorage.prepare) cached.fullPayloadsPreserved = cached.fullPayloadsPreserved === true
+        && preparation?.fullHistoryPreserved === true;
+      assertCurrent();
       await _codexProjectionStorage.write({ sessionId, cwd, snapshot: {
         filePath, size: cached.fileSize, mtimeMs: cached.fileMtimeMs,
         ctimeMs: cached.fileCtimeMs, fileIdentity, sourceGeneration: cached.sourceGeneration,
@@ -5984,7 +6168,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       }, state: { history: cached.historyProjector.exportState(), timeline: cached.timelineProjector.exportState(),
         lineCount: cached.lineCount, leftoverBuffer: cached.leftoverBuffer, sourceProof: cached.sourceProof || [] },
         timelineEntries: cached.timelineProjector.finalize(), sessionMeta: cached.timelineProjector.getSessionMeta() });
-      _codexReadFence.assertCurrent(ticket);
+      assertCurrent();
     }
     rememberCodexProjection(sessionId, cached);
     if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
@@ -6000,7 +6184,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       success: true,
       cached,
       finishPreparation,
-      assertCurrent: () => _codexReadFence.assertCurrent(ticket),
+      assertCurrent,
       result: {
         success: true,
         filePath,
@@ -6024,9 +6208,8 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       },
     };
   } catch (error) {
-    // Append feeds the retained graph. Any failure before cursor commit must
-    // discard that owner so the next read cannot append onto a partial feed.
-    if (_codexHistoryProjectors.get(sessionId) === cached) _dropProjectorEntry(sessionId);
+    // The staged owner is private until rememberCodexProjection. Preserve the
+    // previous committed cache on cancellation or failed preparation.
     throw error;
   } finally { if (!preparationTransferred) finishPreparation(); }
 }
@@ -7325,7 +7508,11 @@ async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath
   if (!checkpoint) return miss('no-checkpoint-before-cut');
   await _codexExternalReadPrepare?.(source.filePath);
   const sourceTicket = _codexReadFence.begin(source.filePath, 'projection');
+  const control = codexProjectionControl({ assertCurrent: () => {
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+  } });
   try {
+    control.assertCurrent();
     if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))) return miss('source-stat-changed');
     let proofBytes = 0;
     for (const proof of receipt.sourceProof) {
@@ -7350,7 +7537,7 @@ async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath
     if (boundary?.__line !== pairs.length || !Number.isSafeInteger(boundary.__byteOffset)
       || boundary.__byteOffset <= pairs.at(-1).target.__byteOffset || boundary.__byteOffset > stat.size) return null;
     const mapping = createProjectionIdentityMap(receipt.sourceSessionId, sessionId, pairs);
-    const state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform)).value;
+    const state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform, control)).value;
     state.timeline.metaRecord = { payload: receipt.headerRecord.payload, __line: 0 };
     state.timeline.metaRecordPhysicalSessionId = sessionId;
     state.timeline.forkStartedAtMs = parseTimestampMs(receipt.headerRecord.payload.timestamp);
@@ -7358,12 +7545,13 @@ async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath
       && receipt.forkLiveStartLine < pairs.length ? receipt.forkLiveStartLine : undefined;
     state.history.sessionCwd = cwd;
     state.history.consumedRecords = pairs.length;
-    const backup = await cloneProjectionGraphAsync(state);
+    const backup = await cloneProjectionGraphAsync(state, undefined, control);
     _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
     if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))
       || !codexSourceSnapshotMatchesStat(receipt.targetSnapshot, await fs.promises.stat(filePath))) return null;
     _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
     if (!restoreCodexSourceSnapshot(receipt.targetSnapshot)) return null;
+    control.assertCurrent();
     console.log('[CodexRewriteProjection] owner=reader child=' + sessionId.slice(0, 8)
       + ' reused=' + pairs.length + ' reason=exact-worker-checkpoint');
     return { sessionId, filePath, fileSize: boundary.__byteOffset, fileIdentity: stat.dev + ':' + stat.ino,
@@ -7375,7 +7563,8 @@ async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath
       checkpoints: backup.approxBytes <= _codexHistoryProjectorBudgetBytes / 4
         ? [{ count: pairs.length, state: backup.value, approxBytes: backup.approxBytes }] : [] };
   } catch (error) {
-    if (error.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+    if (error.code === 'CODEX_SOURCE_READ_INVALIDATED' || isHistoryReadCancelled(error)
+      || isHistoryReadUnavailable(error)) throw error;
     console.warn('[CodexRewriteProjection] worker checkpoint miss reason=' + (error.code || error.message));
     return null;
   } finally { _codexReadFence.finish(sourceTicket); }
@@ -8533,7 +8722,11 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
   let currentTurnCanonicalUserText = null;
   let latestTokenCountInfo = null;
 
-  const push = (entry) => entries.push({ ...entry, turnIndex: currentTurnIndex });
+  const push = (entry) => {
+    const stored = { ...entry, turnIndex: currentTurnIndex };
+    entries.push(stored);
+    return stored;
+  };
   const compactText = (payload) => {
     const last = latestTokenCountInfo?.last_token_usage
       || latestTokenCountInfo?.total_token_usage
@@ -8568,10 +8761,11 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         // turn. Timeline already ignores it; the clean result projection must
         // keep the same boundary or it drops the final assistant tail.
         if (isCodexSubagentNotification(payload)) continue;
-        const userText = payload.message || extractTextContent(payload.content) || '';
         const presentedUserText = codexUserMessagePresentationText(record);
+        const userText = presentedUserText;
         const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
-        if (isCodexEnvironmentContextUserText(userText)) continue;
+        if (isCodexTurnAbortedUserText(userText)
+          || isCodexEnvironmentContextUserText(userText)) continue;
         if (isCodexProjectInstructionsUserText(userText)) {
           // Project instructions are a service preamble of the following
           // real user turn. Timeline does not mint an editable dot for them,
@@ -8605,7 +8799,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
               sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             });
           }
-        } else if (opts.includeUser) {
+        } else {
           if (pending?.entry) {
             pending.entry.text = presentedUserText;
             pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
@@ -8622,7 +8816,13 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
       } else if (payload.type === 'thread_rolled_back') {
         removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
         pendingProjectInstructions.length = 0;
+        pendingThinking = '';
+      } else if (payload.type === 'turn_aborted') {
+        pendingThinking = '';
       } else if (isCompactPayload(payload)) {
         if (!compactCompanionLines.has(record.__line)) {
           const sourceUuid = stableUuidForRecord(sessionId, record, 'codex-compact');
@@ -8644,11 +8844,12 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
     if (record.type !== 'response_item') continue;
 
     if (payload.type === 'message' && payload.role === 'user') {
-      const userText = codexUserMessageAuditText(record) || '';
       const presentedUserText = codexUserMessagePresentationText(record);
+      const userText = presentedUserText;
       const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
       if (!userText
         || userText.includes('<subagent_notification>')
+        || isCodexTurnAbortedUserText(userText)
         || isCodexEnvironmentContextUserText(userText)) continue;
       if (isCodexProjectInstructionsUserText(userText)) {
         pendingProjectInstructions.push(userText);
@@ -8668,14 +8869,14 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
           text: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
           sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         };
-        push(entry);
-      } else if (opts.includeUser) {
+        entry = push(entry);
+      } else {
         entry = {
           kind: 'user',
           text: presentedUserText,
           sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         };
-        push(entry);
+        entry = push(entry);
       }
       pendingResponseUsers.push({ entry, text: userText });
       continue;
@@ -8744,7 +8945,9 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
     }
   }
 
-  return entries;
+  // Filtering text must not remove structural user owners before rollback or
+  // carrier adoption. A user-only rollback still owns a turn with User OFF.
+  return opts.includeUser ? entries : entries.filter(entry => entry.kind !== 'user');
 }
 
 function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex Session Export') {
@@ -8794,22 +8997,46 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
   const minIndex = Math.min(startIndex, endIndex);
   const maxIndex = Math.max(startIndex, endIndex);
   const selected = timeline.slice(minIndex, maxIndex + 1);
-  const selectedTurns = new Set();
+  const selectedUserUuids = new Set();
   const selectedCompacts = new Set();
   for (const entry of selected) {
     if (entry.type === 'compact') {
       selectedCompacts.add(entry.uuid);
-    } else if (typeof entry.turnIndex === 'number') {
-      selectedTurns.add(entry.turnIndex);
+    } else if (entry.type === 'user') {
+      selectedUserUuids.add(entry.uuid);
     }
   }
 
   // Compact is a structural, selectable Timeline point. Its encrypted body is
   // never expanded into replacement_history; the clean projection carries
   // exactly one metadata line for both single-point and range copy.
-  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
+  const copyOptions = codexCopyOptions(opts);
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, { ...copyOptions, includeUser: true });
+  // Timeline and clean export are distinct projections. Their ordinal counters
+  // are not an identity: one ignored provider carrier used to shift every later
+  // Copy to an older turn. Join the selected canonical UUIDs first, then use
+  // only the matched clean projection's own turn coordinates.
+  const selectedTurns = new Set();
+  const matchedUserUuids = new Set();
+  for (const entry of cleanEntries) {
+    if ((entry.kind !== 'user' && entry.kind !== 'goal')
+      || !selectedUserUuids.has(entry.sourceUuid)) continue;
+    if (matchedUserUuids.has(entry.sourceUuid) || typeof entry.turnIndex !== 'number'
+      || selectedTurns.has(entry.turnIndex)) {
+      return { success: false, error: 'Selected Codex user identity is ambiguous in copy projection' };
+    }
+    matchedUserUuids.add(entry.sourceUuid);
+    selectedTurns.add(entry.turnIndex);
+  }
+  if (matchedUserUuids.size !== selectedUserUuids.size) {
+    console.warn('[CodexCopyRange] user identity mismatch'
+      + ' session=' + String(sessionId || '').slice(0, 8)
+      + ' selected=' + selectedUserUuids.size + ' matched=' + matchedUserUuids.size);
+    return { success: false, error: 'Selected Codex user identity not found in copy projection' };
+  }
   const filtered = cleanEntries.filter((entry) => {
     if (entry.kind === 'compact') return selectedCompacts.has(entry.sourceUuid);
+    if (entry.kind === 'user' && !copyOptions.includeUser) return false;
     return typeof entry.turnIndex === 'number' && selectedTurns.has(entry.turnIndex);
   });
 
@@ -8865,8 +9092,14 @@ function collectCodexTurnAssistantBlocks(records, sessionId, entryUuid) {
     includeToolSearch: false,
     includeOtherTools: false,
   }));
+  const cleanTarget = cleanEntries.find((entry) => (
+    (entry.kind === 'user' || entry.kind === 'goal') && entry.sourceUuid === target.uuid
+  ));
+  if (typeof cleanTarget?.turnIndex !== 'number') {
+    return { success: false, error: 'Selected Codex user identity not found in copy projection' };
+  }
   const assistantBlocks = cleanEntries
-    .filter((entry) => entry.kind === 'assistant' && entry.turnIndex === target.turnIndex)
+    .filter((entry) => entry.kind === 'assistant' && entry.turnIndex === cleanTarget.turnIndex)
     .map((entry) => entry.text);
   return { success: true, target, assistantBlocks };
 }
@@ -11936,7 +12169,7 @@ function register({ projectManager, transcriptService, historyMutationInput } = 
     }
   });
 
-  ipcMain.handle('codex:get-timeline', async (_event, payload = {}) => {
+  ipcMain.handle('codex:get-timeline', (event, request = {}) => require('../history-ipc-demand').historyIpcDemands.run(event, request, async payload => {
     // Legacy callers (including launch finalization) must see the same frozen
     // prefix + child tail as History. A physical-only empty answer can cause
     // the caller to discard a perfectly valid thin native fork after Stop.
@@ -11985,9 +12218,9 @@ function register({ projectManager, transcriptService, historyMutationInput } = 
       console.error('[CodexData] get-timeline error:', error);
       return { success: false, error: error.message };
     }
-  });
+  }));
 
-  ipcMain.handle('codex:get-full-history', async (_event, payload = {}) => {
+  ipcMain.handle('codex:get-full-history', (event, request = {}) => require('../history-ipc-demand').historyIpcDemands.run(event, request, async payload => {
     if (transcriptService?.getHistory) {
       return transcriptService.getHistory({
         ...payload,
@@ -12029,7 +12262,7 @@ function register({ projectManager, transcriptService, historyMutationInput } = 
       console.error('[CodexData] get-full-history error:', error);
       return { success: false, error: error.message };
     }
-  });
+  }));
 
   ipcMain.handle('codex:export-clean-session', async (_event, params = {}) => {
     try {
@@ -12462,6 +12695,7 @@ module.exports = {
     loadLatestCodexObservedExecution,
     loadCodexHistoricalObservedExecution,
     readCachedCodexCompletedResponse,
+    readCachedCodexInputInterval,
     getCodexResultReaderStats: () => codexResultReader().stats(),
     getCodexUserRecordIdentity,
     isCompactPayload,

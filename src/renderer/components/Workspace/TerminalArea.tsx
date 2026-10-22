@@ -585,7 +585,7 @@ function TerminalArea({
       // обработчик стоит на window в capture-фазе и срабатывает раньше цели,
       // поэтому исключение живёт здесь, по data-атрибутам.
       if ((e.target as HTMLElement)?.closest?.(
-        '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu]',
+        '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu], [data-pane-strip-group-count]',
       )) return;
       // Focus changes the header's RIGHT boundary because Git+split enters the
       // layout. Do not do that between pointerdown and click for a chip/badge:
@@ -1325,6 +1325,7 @@ function TerminalArea({
           paneChooserSlots(pane).map((slot: any) => slot.slotId).join(',') + '#' + (pane.selectedSlotId || ''),
           paneRectGeometryKey(rect),
           focusedPane ? 'focused' : 'idle',
+          presented,
           attachRowH,
           activityKey,
         ].join('|');

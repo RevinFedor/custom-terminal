@@ -39,14 +39,17 @@ test('actual background reconciliation publishes recovery and does not rerun a p
   const end = source.indexOf("\nipcMain.handle('codex:set-model-effort-intent'", start);
   const retirementStart = source.indexOf('function retireCodexScopedModelEffortIntent(');
   const retirementEnd = source.indexOf('function getCodexModelEffortIntentRecord(', retirementStart);
+  const guardStart = source.indexOf('function createCodexModelEffortIntentWriteGuard(');
+  const guardEnd = source.indexOf('function markCodexModelEffortIntentApplied(', guardStart);
   assert.ok(retirementStart >= 0 && retirementEnd > retirementStart);
+  assert.ok(guardStart >= 0 && guardEnd > guardStart);
   for (const proven of [true, false]) {
     const events = [];
     const presentation = [];
     const intent = { model: 'gpt-6-astra', effort: 'max', revision: 4, providerState: {} };
     const transfer = { id: 'codex-native-stash:C1', tabId: 'T', text: 'full original', images: 1, imagePaths: [{ id: 1, path: '/durable/image.png' }] };
     let pickerCalls = 0;
-    const schedule = vm.runInNewContext(source.slice(retirementStart, retirementEnd)
+    const schedule = vm.runInNewContext(source.slice(retirementStart, retirementEnd) + source.slice(guardStart, guardEnd)
       + source.slice(start, end) + '\nscheduleCodexModelEffortIntentReconcile', {
       codexModelEffortIntentApplicationProven,
       planCodexModelEffortIntentReconcile,

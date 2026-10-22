@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import React from 'react';
 import { transformSync } from 'esbuild';
 import * as linked from '../../utils/tabLinkedFiles.mjs';
+import * as hoverIntent from '../../utils/chipHoverIntent.mjs';
 
 // Execute the actual TSX/event handlers. Hook scheduling, stores, portal,
 // file tree and DOM are controlled: this does not prove browser hit-testing.
@@ -56,6 +57,7 @@ function fixture(files = [one], mode = 'menu') {
     '../../store/useWorkspaceStore': { useWorkspaceStore: { getState: () => ({ openProjects: new Map() }) } },
     '../../store/useUIStore': { useUIStore: selector => selector({ filePreview: null, lastLinkedFileByOwner: {} }) },
     '../../utils/tabLinkedFiles.mjs': linked,
+    '../../utils/chipHoverIntent.mjs': hoverIntent,
     '../../utils/missingFileTracker': { isFileMissing: () => false, probeFiles: async () => { probes++; }, subscribeMissingFiles: () => () => {} },
     '../../utils/tabLinkedFilePreview': { closeTabLinkedFile: id => closed.push(id) },
     './TabLinkedFileTree': { default: FileTree, __esModule: true },
@@ -99,7 +101,7 @@ function fixture(files = [one], mode = 'menu') {
   render();
   const advance = ms => { clock += ms; };
   const animationEnd = (values = {}) => event('data-tab-linked-files', 'onAnimationEnd', { animationName: 'tab-linked-file-hover-intent', ...values });
-  const settleHover = () => { advance(100); animationEnd(); };
+  const settleHover = () => { advance(hoverIntent.CHIP_HOVER_MS); animationEnd(); };
   const dispose = () => { triggerNode.isConnected = false; for (const slot of slots) slot?.cleanup?.(); };
   return { props, render, event, by, find, FileTree, opened, closed, listeners, advance, animationEnd, settleHover, dispose,
     attributes, triggerNode, stateWrites: () => stateWrites, probes: () => probes };
@@ -148,7 +150,7 @@ test('quick crossing cancels dwell; scale starts immediately without mounting, p
   const f = fixture(), probes = f.probes();
   f.event('data-tab-linked-files', 'onMouseEnter');
   assert.equal(f.attributes.get('data-linked-files-opening'), '1');
-  const writes = f.stateWrites(); f.advance(70);
+  const writes = f.stateWrites(); f.advance(40);
   assert.equal(f.stateWrites(), writes); assert.equal(f.probes(), probes);
   assert.equal(f.by('data-tab-linked-files-popup').length, 0);
   f.event('data-tab-linked-files', 'onMouseLeave'); f.advance(100); f.animationEnd();
@@ -202,12 +204,16 @@ test('animation completion checks actual hover even when no leave callback was d
   assert.equal(f.attributes.size,0); assert.equal(f.listeners.size,0);
 });
 
-test('dwell is one100ms finite transform animation; no polling, per-frame callbacks, layout growth or permanent GPU reservation', () => {
+test('dwell uses the shorter shared60ms/1.04 token; group badge has the same finite scale and actual hit box', () => {
   const css=fs.readFileSync(new URL('./TabLinkedFiles.css',import.meta.url),'utf8');
-  assert.match(css,/animation: tab-linked-file-hover-intent 100ms linear/);
+  const group=fs.readFileSync(new URL('./PaneStripCollapsedGroup.css',import.meta.url),'utf8');
+  assert.equal(hoverIntent.CHIP_HOVER_MS,60);assert.equal(hoverIntent.CHIP_HOVER_SCALE,1.04);
+  assert.match(css,/animation: tab-linked-file-hover-intent var\(--noted-chip-hover-ms\) linear/);
   const keyframes=css.match(/@keyframes tab-linked-file-hover-intent \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(keyframes); assert.match(keyframes,/from \{ transform: scale\(1\); \}/);
-  assert.match(keyframes,/to \{ transform: scale\(1\.04\); \}/);
+  assert.match(keyframes,/to \{ transform: scale\(var\(--noted-chip-hover-scale\)\); \}/);
+  assert.match(group,/transform-origin:center/);assert.match(group,/scale\(var\(--noted-chip-hover-scale\)\)/);
+  assert.doesNotMatch(group,/::before|inset:0 0 -50% -50%|scale\(1\.5\)/);
   assert.doesNotMatch(keyframes,/width|height|padding|margin|infinite/);
   assert.doesNotMatch(source,/setTimeout|setInterval|requestAnimationFrame/);
   assert.doesNotMatch(css,/will-change/);

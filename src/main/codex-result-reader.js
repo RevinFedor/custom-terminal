@@ -217,6 +217,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       if (epoch !== beginEpoch || !sameFile(before, after) || after.size < end
         || (after.size === before.size && statKey(before) !== statKey(after))) throw new Error('result-source-changed-during-read');
       nextParts.push({ segment, end, stat: before, hash, lineCount: result.lineCount,
+        parseErrors: (old?.parseErrors || 0) + (result.errors || 0),
         leftoverBuffer: result.leftoverBuffer, verified: old?.verified && old.end === end
           && statKey(old.stat) === statKey(before) });
     }
@@ -568,8 +569,67 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       return unavailable(candidates.length > 32 ? 'completed_response_scan_limit' : 'completed_response_not_cached');
     } catch (error) { return unavailable(error.message === 'response_text_not_cached' ? error.message : 'result_cache_unavailable'); }
   }
+  // Negative input proof from the existing verified structural index. This
+  // accessor never warms a cold reader or reads any prompt/assistant bodies.
+  async function readCachedInputInterval({ sessionId, cwd, from, through, readSourceRevision, maxInputs = 64 } = {}) {
+    const unavailable = reason => ({ known: false, reason });
+    const key = sessionId + ':' + (cwd || ''), entry = views.get(key), beginEpoch = epoch;
+    if (!entry || flights.has(key)) return unavailable(entry ? 'result_read_in_progress' : 'result_cache_cold');
+    if (typeof readSourceRevision !== 'function' || entry.sourceKey !== readSourceRevision()) return unavailable('result_lineage_unverified');
+    if (!entry.parts.length || entry.parts.length > 32 || entry.parts.some(part => !part.verified
+      || part.leftoverBuffer.length || part.parseErrors)) return unavailable('result_interval_gap');
+    const current = async () => {
+      for (const part of entry.parts) if (statKey(await fs.promises.stat(part.segment.filePath)) !== statKey(part.stat)) return false;
+      return epoch === beginEpoch && views.get(key) === entry && !flights.has(key)
+        && entry.sourceKey === readSourceRevision();
+    };
+    const matches = (context, record) => context?.provider === 'codex' && context.sessionId === record.__physicalSessionId
+      && context.turnId === turnId(record);
+    try {
+      if (!await current()) return unavailable('result_cache_stale');
+      const starts = entry.boundaries.filter(index => entry.rows[index].record.payload.type === 'task_started');
+      const anchors = starts.filter(index => matches(from?.executionContext, entry.rows[index].record));
+      if (anchors.length !== 1 || !from?.userUuid && !from?.sourceIdentity) return unavailable('result_interval_anchor_unproven');
+      const begin = anchors[0];
+      if (entry.rows.slice(begin).some(row => row.control)) return unavailable('result_interval_history_rewritten');
+      const byUuid = new Map(), bySource = new Map();
+      const groups = entry.coordinates.peekEntries().filter(item => item.type === 'user').map(item => {
+        const group = { item, members: [] }; byUuid.set(item.uuid, group);
+        for (const source of [item.sourceIdentity, ...(item.sourceIdentityAliases || [])]) if (source) bySource.set(source, group);
+        return group;
+      });
+      for (const [index, row] of entry.rows.entries()) if (row.user) {
+        const group = byUuid.get(row.user.uuid) || bySource.get(row.user.sourceIdentity);
+        if (group) group.members.push({ row, index });
+      }
+      const contains = (group, identity) => group.item.uuid === identity?.userUuid || group.members.some(({row}) =>
+        identity?.userUuid && row.user.uuid === identity.userUuid || identity?.sourceIdentity && row.user.sourceIdentity === identity.sourceIdentity);
+      const original = groups.filter(group => group.members.length && contains(group, from));
+      const latest = groups.filter(group => group.members.length && contains(group, through));
+      if (original.length !== 1 || latest.length !== 1) return unavailable('result_interval_edge_unproven');
+      const oldIndices = original[0].members.map(item => item.index);
+      const previous = entry.boundaries.filter(index => index < begin).at(-1) ?? -1;
+      const nextStart = starts.find(index => index > begin) ?? entry.rows.length;
+      if (Math.min(...oldIndices) <= previous || Math.max(...oldIndices) >= nextStart) return unavailable('result_interval_anchor_mismatch');
+      const cut = Math.min(begin, ...oldIndices);
+      const selected = groups.filter(group => group.members.some(item => item.index >= cut));
+      if (selected.length > Math.max(1, Math.min(256, maxInputs)) || selected.at(-1) !== latest[0]
+        || !matches(through?.executionContext, entry.rows[starts.at(-1)]?.record || {})) return unavailable('result_interval_edge_changed');
+      const ownedRows = new Set(selected.flatMap(group => group.members.map(item => item.row)));
+      if (entry.rows.slice(cut).some(row => row.kind === 'user' && !row.user.service && !ownedRows.has(row))) return unavailable('result_interval_unindexed_user');
+      if (!await current()) return unavailable('result_cache_stale');
+      return { known: true, complete: true, sourceRevision: entry.sourceKey,
+        users: selected.map(group => ({ userUuid: group.item.uuid,
+          aliases: group.members.map(({row}) => ({ userUuid: row.user.uuid, sourceIdentity: row.user.sourceIdentity,
+            auditHash: row.user.auditHash, sessionId: row.record.__physicalSessionId })),
+          locators: group.members.map(({row}) => ({ ...row.locator })) })),
+        executions: starts.filter(index => index >= begin).map(index => historicalContext(entry.rows[index].record, sessionId)),
+        ranges: entry.parts.map(part => ({ segmentId: part.segment.segmentId, physicalSessionId: part.segment.physicalSessionId,
+          fromByte: part.segment.fromByte || 0, toByte: part.end, frozen: !!part.segment.frozen })) };
+    } catch { return unavailable('result_interval_source_unavailable'); }
+  }
   return { load: request => enqueue(request, 'prompt'), loadObservedExecution,
-    loadLatestObservedExecution, loadHistoricalObservedExecution, readCachedCompleted, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
+    loadLatestObservedExecution, loadHistoricalObservedExecution, readCachedCompleted, readCachedInputInterval, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
     indexBytes: [...views.values()].reduce((sum, value) => sum + value.indexBytes, 0) }) };
 }
 

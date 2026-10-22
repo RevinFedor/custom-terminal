@@ -101,3 +101,36 @@ test('file-bearing requests fail locally for providers whose SC contract cannot 
     provider: 'claude', prompt: 'review', files: [{ path: '/tmp/a.md' }],
   }), /only for provider=chatgpt/);
 });
+
+test('continuing a completed read-only import creates author intent, not another read of the old final', () => {
+  const previous = { runKind: 'external-research', status: 'completed', resultComplete: true,
+    externalResearchConversationUrl: 'https://chatgpt.com/c/imported',
+    externalResearchIntent: { provider: 'chatgpt', options: { readOnlyImport: true,
+      importWaitForFinal: true, importTimeoutMs: 3600000, importIncludeActivity: false,
+      temporaryChat: false, autoClose: true } } };
+  const frozen = structuredClone(previous), body = { prompt: 'new physical-input review',
+    options: { mode: 'chat', model: '6', effort: 'xhigh' }, files: [{ path: '/tmp/new-evidence.txt' }] };
+  const next = continuationRequest(previous, body);
+  assert.deepEqual(next.options, { autoClose: true, effort: 'xhigh', mode: 'chat', model: '6', temporaryChat: false });
+  assert.equal(next.prompt, body.prompt); assert.deepEqual(next.files, body.files);
+  assert.equal(next.conversationUrl, previous.externalResearchConversationUrl); assert.deepEqual(previous, frozen);
+  assert.deepEqual(continuationRequest(previous, body, { validateMode: false, existingRequest: next }), next,
+    'the fixed author intent has the same fingerprint on repeat');
+});
+test('new continuation cannot inherit or explicitly smuggle import/draft execution flags', () => {
+  const previous = { runKind: 'external-research', status: 'completed', resultComplete: true,
+    externalResearchConversationUrl: 'https://chatgpt.com/c/owned', externalResearchIntent: {
+      provider: 'chatgpt', options: { mode: 'chat', composeOnly: true } } };
+  const next = continuationRequest(previous, { prompt: 'send new question', options: { readOnlyImport: true, composeOnly: true } });
+  assert.deepEqual(next.options, { mode: 'chat' });
+});
+for (const readOnlyImport of [true, false]) test(`historical frozen continuation remains an idempotent replay without rewriting its operation; readOnly=${readOnlyImport}`, () => {
+  const previous = { runKind: 'external-research', status: 'completed', resultComplete: true,
+    externalResearchConversationUrl: 'https://chatgpt.com/c/imported', externalResearchIntent: {
+      provider: 'chatgpt', options: { readOnlyImport: true, importWaitForFinal: true, autoClose: true } } };
+  const body = { prompt: 'already reserved question', options: { readOnlyImport, mode: 'chat', model: '6', effort: 'xhigh' } };
+  const existingRequest = normalizeExternalResearchRequest({ ...body, provider: 'chatgpt',
+    conversationUrl: previous.externalResearchConversationUrl, options: { ...previous.externalResearchIntent.options, ...body.options } });
+  const replay = continuationRequest(previous, body, { validateMode: false, existingRequest });
+  assert.deepEqual(replay, existingRequest);
+});

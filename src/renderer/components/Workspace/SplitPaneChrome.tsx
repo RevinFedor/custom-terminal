@@ -211,9 +211,6 @@ export function SplitPaneAttachRow({
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
-  const activeArea = useUIStore((s) => s.activeArea);
-  // Focus changes paint/hits only; the block always reserves its width.
-  const focusActionsVisible = focused && activeArea !== 'sidebar';
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
   // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
@@ -505,7 +502,9 @@ export function SplitPaneAttachRow({
         // number and the task squares land on the path text. Same number the
         // height above reserves — one resolver, so they cannot disagree.
         rowGap: seamH,
-        padding: '0 8px',
+        // Leave the 1px group stroke below the pane's own focus frame. The
+        // measured header height includes this inset for every surface.
+        padding: '2px 8px 0',
         background: 'transparent',
         boxSizing: 'border-box',
         zIndex: 3,
@@ -522,9 +521,8 @@ export function SplitPaneAttachRow({
       minWidth: 0,
       position: 'relative',
     }}>
-      {/* The focus-only buttons keep their width even while hidden. This
-          right float reserves only ONE row; a flex sibling would take that
-          width away from every wrapped row below it. */}
+      {/* Only visible window actions reserve this first row. A flex sibling
+          would take that width away from every wrapped row below it. */}
       <div
         data-split-pane-actions
         style={{
@@ -545,53 +543,6 @@ export function SplitPaneAttachRow({
         }}
       >
 
-      {/* Git follows the focused window from the application titlebar.
-          The remaining focus actions retain their geometry reservation.
-          Скрытый блок остаётся relative/hidden: место
-          сохранено, поэтому focus не меняет число строк вкладок. */}
-      <div
-        data-split-pane-focus-actions
-        data-wrap-reserved="1"
-        data-visible={focusActionsVisible ? '1' : '0'}
-        aria-hidden={!focusActionsVisible}
-        inert={!focusActionsVisible}
-        style={{
-          display: 'flex',
-          position: 'relative',
-          visibility: focusActionsVisible ? 'visible' : 'hidden',
-          alignItems: 'stretch',
-          alignSelf: 'stretch',
-          gap: 2,
-          flexShrink: 0,
-          opacity: focusActionsVisible ? 1 : 0,
-          pointerEvents: focusActionsVisible ? 'auto' : 'none',
-        }}
-      >
-      {/* This header is outside the translated/clipped terminal stage. A side
-          panel can fit its minimum grid while still losing its own titlebar. */}
-      {/* Keep the same22px action slot for empty/file/AI and side-terminal
-          presentation changes. Visibility cannot repack the wrapped strip. */}
-      <button type="button"
-        data-split-pane-terminal-slot
-        data-terminal-full-view-open={fullViewAvailable ? tabId : undefined}
-        disabled={!fullViewAvailable}
-        aria-hidden={!fullViewAvailable}
-        tabIndex={fullViewAvailable ? undefined : -1}
-        aria-label="Показать терминал поверх окон" title="Показать терминал поверх окон"
-        onPointerDown={event => { event.preventDefault(); event.stopPropagation(); }}
-        onClick={event => {
-          event.stopPropagation();
-          if (!fullViewAvailable) return;
-          useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-          const terminal = terminalRegistry.get(tabId)?.element
-            || document.querySelector(`[data-floating-terminal-tab-id="${CSS.escape(tabId)}"][data-floating-terminal-side="1"]`);
-          requestTerminalFullView(terminal, tabId);
-        }}
-        style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:22,flexShrink:0,alignSelf:'stretch',padding:0,
-          border:0,borderRadius:4,background:'transparent',color:'#a78bfa',cursor:'pointer',
-          visibility:fullViewAvailable?'visible':'hidden',pointerEvents:fullViewAvailable?'auto':'none'}}>
-        <BringToFront size={14} />
-      </button>
       {/* Split remains mounted and visible in every pane. `splitCan` changes
           only whether the action is available; it never changes geometry. */}
       <button
@@ -669,7 +620,6 @@ export function SplitPaneAttachRow({
       >
         <Columns2 size={12} />
       </button>
-      </div>
       {/* Три точки — действия этого окна: обмен, Timeline, поиск History.
           Кнопка доступна и вне фокуса, стоит последней у правого края.
 
@@ -815,6 +765,36 @@ export function SplitPaneAttachRow({
               style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',textAlign:'left',cursor:'pointer'}}
               onClick={()=>{if(sourceWindowId && useWorkspaceStore.getState().minimizeWorkspaceWindow(activeSpaceId,sourceWindowId))setStripMenu(null);}}>
               <Minimize2 size={13}/>Minimize
+            </button>
+            <button type="button" role="menuitem" data-split-strip-menu-item="terminal-full-view"
+              data-terminal-full-view-open={fullViewAvailable ? tabId : undefined}
+              disabled={!fullViewAvailable}
+              title={fullViewAvailable ? 'Показать терминал поверх окон' : 'Доступно при открытом боковом терминале'}
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,
+                background:'transparent',color:fullViewAvailable?'inherit':'#888',textAlign:'left',cursor:'pointer'}}
+              onMouseDown={event=>event.stopPropagation()}
+              onClick={event=>{
+                event.stopPropagation();
+                const store=useWorkspaceStore.getState(),ui=useUIStore.getState();
+                if(!fullViewAvailable || store.view!=='workspace' || store.activeSpaceId!==activeSpaceId
+                  || !store.openProjects.get(projectId)?.tabs.has(tabId)
+                  || !ui.sideTerminalOpenTabs[tabId] || resolveTabTerminalPrimary(ui,tabId))return;
+                if(paneIndex===null || paneIndex===undefined) {
+                  const shown=store.activeSpaceTab || {projectId:store.activeProjectId,
+                    tabId:store.openProjects.get(store.activeProjectId || '')?.activeTabId};
+                  if(store.splitPanes.length || shown.projectId!==projectId || shown.tabId!==tabId)return;
+                } else {
+                  const pane=sourceWindowId ? store.splitPanes.find(pane=>pane.windowId===sourceWindowId) : store.splitPanes[paneIndex];
+                  if(!pane || pane.displayHidden || pane.projectId!==projectId || pane.tabId!==tabId
+                    || !sourceWindowId && pane!==splitPanes[paneIndex])return;
+                }
+                setStripMenu(null);
+                store.activateCenterTab(projectId,tabId);
+                const terminal=terminalRegistry.get(tabId)?.element
+                  || document.querySelector(`[data-floating-terminal-tab-id="${CSS.escape(tabId)}"][data-floating-terminal-side="1"]`);
+                requestTerminalFullView(terminal,tabId);
+              }}>
+              <BringToFront size={13} style={{color:fullViewAvailable?'#a78bfa':undefined}}/>Terminal full view
             </button>
             {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item={canSearchInput?'search-input':'search-history'}
               onClick={(event)=>{

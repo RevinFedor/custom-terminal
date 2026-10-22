@@ -773,8 +773,8 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   const first = await fixture(t, { db });
   assert.deepEqual(db.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(),
     legacyRows.map((row) => ({ ...row, sourceDismissedAt: null, targetDismissedAt: null,
-      sourceAddressJson: null, targetAddressJson: null, cancelledAt: null, cancelledByTabId: null })));
-  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 6);
+      sourceAddressJson: null, targetAddressJson: null, cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null })));
+  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 7);
   assert.equal(first.calls.length, 0);
   assert.equal(first.changes.length, 0);
   const source = first.service.dismissMessage({ tabId: 'A', messageId: 'legacy-reply' }).message;
@@ -821,9 +821,9 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   assert.deepEqual(finalDb.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(), [
     { ...legacyRows[0], sourceDismissedAt: target.sourceDismissedAt,
       targetDismissedAt: target.targetDismissedAt, updatedAt: target.updatedAt, sourceAddressJson: null, targetAddressJson: null,
-      cancelledAt: null, cancelledByTabId: null },
+      cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null },
     { ...legacyRows[1], sourceDismissedAt: null, targetDismissedAt: null, sourceAddressJson: null, targetAddressJson: null,
-      cancelledAt: null, cancelledByTabId: null },
+      cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null },
   ]);
   assert.equal(final.calls.length, 0);
   assert.equal(final.changes.length, 0);

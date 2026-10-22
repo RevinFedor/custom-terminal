@@ -81,3 +81,21 @@ test('the lease follows scroller movement without recapturing chip rectangles', 
   cache.resolve({ ownerKey: 'center', clientX: 170, viewportLeft: 100, scrollLeft: 40, readChips });
   assert.equal(reads, 2, 'a new drag gesture must capture a new lease');
 });
+
+test('optional OPEN scope uses the same lease and row algorithm without turning an interior gap into a row start',()=>{
+  const cache=createHorizontalDragGeometryCache();let reads=0;
+  const boxes=[{id:'prior',left:10,right:80,top:0,bottom:26},{id:'x',left:0,right:494,top:36,bottom:62},
+    {id:'a',left:108,right:188,top:36,bottom:62},{id:'b',left:194,right:494,top:36,bottom:62}];
+  const base={ownerKey:'open',wrap:true,includeRowPlacement:true,clientY:45,readChips:()=>{reads++;return boxes;}};
+  const selectChips=chips=>({chips:chips.filter(chip=>['a','b'].includes(chip.id)),scopeId:'g'});
+  assert.equal(cache.resolve({...base,clientX:120}).rowStartId,'x','original whole-row algorithm sees its first ordinary chip');
+  const selected=cache.resolve({...base,clientX:120,selectChips});
+  assert.equal(selected.at,0);assert.equal(selected.scopeId,'g');assert.equal(selected.rowStartId,null);
+  assert.equal(cache.resolve({...base,clientX:160,selectChips}).at,1);
+  assert.equal(cache.resolve({...base,clientX:160,selectChips:()=>null}),null,'unknown scope stays unknown');
+  assert.equal(reads,1);
+  cache.clear();
+  const startsGroup=cache.resolve({...base,clientX:120,readChips:()=>{reads++;return boxes.filter(chip=>chip.id!=='x');},selectChips});
+  assert.equal(startsGroup.rowStartId,'a','a genuine next-row group start retains the existing row hint');
+  assert.equal(reads,2);
+});

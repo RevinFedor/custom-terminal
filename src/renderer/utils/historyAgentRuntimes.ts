@@ -1,4 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import agentSendReadTiming from '../../shared/agent-send-read-timing.cjs';
 import { buildCodexRunPayload, getCodexLaunchOptions } from './codexLaunch';
 import {
   isCompleteCodexSettingsRequest,
@@ -86,11 +87,12 @@ export interface AgentPtyPresence {
   runtimeSnapshot?: any;
 }
 
-export interface AgentPresenceRequestContext {
+export type AgentPresenceRequestContext = {
   consumer: 'history-panel';
   ownerKey: string;
   generation: number;
-}
+  readTiming?: never;
+} | {consumer:'send-preparation'; ownerKey?:never; generation?:never; readTiming:Record<string,unknown>};
 
 export interface AgentResumeResult {
   success: boolean;
@@ -248,6 +250,7 @@ export interface HistoryAgentRuntime {
     expectedTarget: AgentSendTarget;
     sendOperationKey?: string | null;
     sendAttemptId?: string | null;
+    readTiming?: Record<string, unknown>;
   }) => Promise<{ success: boolean; inputWritten?: boolean; error?: string; code?: string }>;
   startFresh?: (args: {
     tabId: string;
@@ -392,7 +395,7 @@ async function startFreshClaudePtySession({
 async function getCodexPtyPresence(
   tabId: string,
   projectIdHint?: string | null,
-  _requestContext?: AgentPresenceRequestContext,
+  requestContext?: AgentPresenceRequestContext,
 ): Promise<AgentPtyPresence> {
   const context = findTabRuntimeContext(tabId, projectIdHint);
   const tab = context?.tab || null;
@@ -401,6 +404,7 @@ async function getCodexPtyPresence(
     projectId: context?.projectId || projectIdHint || null,
     invoke: ipcRenderer.invoke.bind(ipcRenderer),
     fallbackBusy: !!tab?.aiBusy,
+    readTiming: requestContext?.consumer === 'send-preparation' ? requestContext.readTiming : undefined,
   }) as AgentPtyPresence;
   const runtimeSession = presence.runtimeSnapshot;
   const turnStateResolved = runtimeSession?.hasWatcher === true
@@ -1070,8 +1074,13 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   optimisticActiveOnInterrupt: false,
   getPresence: getCodexPtyPresence,
   hasPendingForkLaunch: hasPendingContextForkLaunch,
-  prepareMainComposerForSend: (tabId, options) => ipcRenderer.invoke(
-    'codex:prepare-main-composer-for-send', { tabId, ...options }),
+  prepareMainComposerForSend: (tabId, options) => {
+    agentSendReadTiming.recordAgentSendReadTiming(options.readTiming,tabId,'renderer-ipc-invoke',{}, {
+      emit:(record: unknown) => console.log('[AgentSendReadTiming] ' + JSON.stringify(record)),
+      now:() => performance.timeOrigin + performance.now(),
+    });
+    return ipcRenderer.invoke('codex:prepare-main-composer-for-send', { tabId, ...options });
+  },
   startFresh: startFreshCodexSession,
   resume: resumeCodexSession,
   sendPrompt: sendCodexPrompt,

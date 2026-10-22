@@ -729,6 +729,7 @@ interface FullHistoryEntry {
   statusReason?: string;
   statusChangedAt?: number;
   enterAttemptAt?: number;
+  sendInputTiming?: { version: 1; preparationStartedAt: number; payloadStartedAt?: number };
   statusAtSend?: AgentPtyStatus;
   rewindStatus?: 'rewinding' | 'done' | 'failed';
   optimisticAt?: number;
@@ -1929,6 +1930,8 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.statusReason !== right.statusReason ||
     left.statusChangedAt !== right.statusChangedAt ||
     left.enterAttemptAt !== right.enterAttemptAt ||
+    left.sendInputTiming?.preparationStartedAt !== right.sendInputTiming?.preparationStartedAt ||
+    left.sendInputTiming?.payloadStartedAt !== right.sendInputTiming?.payloadStartedAt ||
     left.historyReturn !== right.historyReturn ||
     left.statusAtSend !== right.statusAtSend ||
     left.rewindStatus !== right.rewindStatus ||
@@ -2622,15 +2625,16 @@ const useRehydratedPayload = (
     stateRef.current = { key: cacheKey, pending: true, failed: false };
     force();
     let cancelled = false;
+    const controller = new AbortController();
     void (async () => {
       try {
-        const result = await ipcRenderer.invoke('history:get-tool-payload', {
+        const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'history:get-tool-payload', {
           toolType: context.toolType,
           sessionId: context.sessionId,
           cwd: context.cwd,
           payloadId: ref.payloadId,
           payloadGeneration: context.payloadGeneration,
-        });
+        }, { signal: controller.signal });
         if (cancelled) return;
         if (result?.success && typeof result.payload === 'string') {
           const text = result.truncatedForRender
@@ -2646,7 +2650,15 @@ const useRehydratedPayload = (
       }
       if (!cancelled) force();
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      controller.abort();
+      // StrictMode or a collapse/reopen may reuse this same ref. A cancelled
+      // flight is no longer pending, and must not block the next real demand.
+      if (stateRef.current.key === cacheKey && stateRef.current.pending) {
+        stateRef.current = { key: cacheKey, pending: false, failed: false };
+      }
+    };
   }, [wanted, cacheKey, ref, context]);
 
   if (!ref || !cacheKey) return { text: preview, pending: false, failed: false };
@@ -4949,20 +4961,20 @@ const HistoryResearchReply = ({ result, source, phase, copied, onCopy, forceExpa
   </div>;
 };
 
-const HistorySendTimer = memo(({ startedAt, enterAttemptAt, status, changedAt, reason }: {
-  startedAt?: number; enterAttemptAt?: number; status?: HistoryPromptHandoffStatus; changedAt?: number; reason?: string;
+const HistorySendTimer = memo(({ sendInputTiming, status, changedAt }: {
+  sendInputTiming?: FullHistoryEntry['sendInputTiming']; status?: HistoryPromptHandoffStatus; changedAt?: number;
 }) => {
   const [now, setNow] = useState(() => Date.now());
-  const timing = historySendTimerState({ startedAt, enterAttemptAt, status, changedAt, reason }, now);
+  const timing = historySendTimerState({ sendInputTiming, status, changedAt }, now);
   const running = timing?.running === true;
   useEffect(() => {
     if (!running) return;
     setNow(Date.now());
     const clock = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(clock);
-  }, [startedAt, running]);
+  }, [sendInputTiming?.preparationStartedAt, running]);
   return timing ? <span className="hp-history-send-timer" data-history-send-timer
-    data-running={running} title={`${running ? 'Счёт идёт' : 'Счёт остановлен'} · время от Send до первого Enter сообщения в терминале`}>
+    data-running={running} title={`${running ? 'Счёт идёт' : sendInputTiming?.payloadStartedAt ? 'Счёт остановлен' : 'Подготовка прервана до вставки'} · от выхода из очереди приложения до начала вставки сообщения; запуск CLI включён`}>
     {timing.seconds}s
   </span> : null;
 });
@@ -5271,8 +5283,8 @@ const HistoryUserEntry = memo(({
               </button>
             </Tooltip>
           )}
-          {queueStatusPresentation && <HistorySendTimer startedAt={entry.optimisticAt}
-            enterAttemptAt={entry.enterAttemptAt} status={queueStatus} changedAt={entry.statusChangedAt} reason={entry.statusReason} />}
+          {queueStatusPresentation && <HistorySendTimer
+            sendInputTiming={entry.sendInputTiming} status={queueStatus} changedAt={entry.statusChangedAt} />}
           {canDismissPromptPresentation && (
             <Tooltip content={promptPresentationAction.kind === 'dismiss' ? 'Скрыть карточку. Не отменяет и не повторяет отправку'
               : returnEnabled ? 'Вернуть сообщение в input' : 'Ввод сообщения уже начат или его состояние проверяется'}>
@@ -13495,6 +13507,7 @@ function HistoryPanel({
     generation: number;
     trailingRefresh: boolean;
     promise: Promise<boolean>;
+    controller: AbortController;
   } | null>(null);
   const rewindPreviewOwnerRef = useRef({ tabId, sessionId });
 
@@ -16225,6 +16238,7 @@ function HistoryPanel({
       statusChangedAt?: number;
       semanticTags?: FullHistoryEntry['semanticTags'];
       enterAttemptAt?: number;
+      sendInputTiming?: FullHistoryEntry['sendInputTiming'];
       historyReturn?: any;
       applicationQueueMerge?: QueuedMessageMergeGuard | null;
       applicationQueuePosition?: number;
@@ -16261,6 +16275,7 @@ function HistoryPanel({
       sessionId: resolvedSessionId,
       optimisticAt: submittedAt,
       enterAttemptAt: meta.enterAttemptAt,
+      sendInputTiming: meta.sendInputTiming,
       historyReturn: meta.historyReturn,
       statusChangedAt,
       promptChips: normalizeComposerChips(meta.promptChips || [])
@@ -16345,6 +16360,7 @@ function HistoryPanel({
               statusReason: entry.statusReason,
               statusChangedAt,
               enterAttemptAt: entry.enterAttemptAt ?? candidate.enterAttemptAt,
+              sendInputTiming: entry.sendInputTiming ?? candidate.sendInputTiming,
               historyReturn: entry.historyReturn ?? candidate.historyReturn,
               promptChips: entry.promptChips,
               imagePaths: entry.imagePaths,
@@ -16945,6 +16961,7 @@ function HistoryPanel({
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
           enterAttemptAt: record.enterAttemptAt,
+          sendInputTiming: record.sendInputTiming,
           historyReturn: record.historyReturn,
           applicationQueueMerge: record.applicationQueueMerge,
           applicationQueuePosition: record.applicationQueuePosition,
@@ -16966,6 +16983,7 @@ function HistoryPanel({
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
           enterAttemptAt: record.enterAttemptAt,
+          sendInputTiming: record.sendInputTiming,
           historyReturn: record.historyReturn,
           promptChips,
           imagePaths,
@@ -17407,7 +17425,7 @@ function HistoryPanel({
   }, [acknowledgeMaterializedHistoryReceipt, removeLocalPromptEntry, sessionId, tabId, toolType]);
 
   // Load full history
-  const runHistoryLoad = useCallback(async (isRefresh = false) => {
+  const runHistoryLoad = useCallback(async (isRefresh = false, signal?: AbortSignal) => {
     const ownerKeyAtStart = historyOwnerKey;
     const generationAtStart = historyOwnerGenerationRef.current;
     const loadSequence = ++historyLoadSequenceRef.current;
@@ -17549,7 +17567,7 @@ function HistoryPanel({
             }
           : null,
       };
-      let result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, requestPayload);
+      let result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, requestPayload, { signal });
       if (result?.success && result.delta === true && isCurrentOwner()) {
         // Reassembly needs the exact baseline the digest described. The raw
         // ref is owner-scoped and set together with the revision ref, so a
@@ -17579,7 +17597,7 @@ function HistoryPanel({
             ' reason=' + (!baselineValid
               ? (baseline.length === 0 ? 'no-baseline' : 'revision-moved')
               : 'missing-row'));
-          result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, { ...requestPayload, ifRevision: null });
+          result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, { ...requestPayload, ifRevision: null }, { signal });
         }
       }
       if (!isCurrentOwner()) {
@@ -18009,21 +18027,24 @@ function HistoryPanel({
       generation: number;
       trailingRefresh: boolean;
       promise: Promise<boolean>;
+      controller: AbortController;
     } = {
       ownerKey,
       generation,
       trailingRefresh: false,
       promise: Promise.resolve(false),
+      controller: new AbortController(),
     };
     flight.promise = (async () => {
       let nextIsRefresh = isRefresh;
       let ok = false;
       do {
         flight.trailingRefresh = false;
-        ok = await runHistoryLoad(nextIsRefresh);
+        ok = await runHistoryLoad(nextIsRefresh, flight.controller.signal);
         nextIsRefresh = true;
       } while (
         flight.trailingRefresh &&
+        !flight.controller.signal.aborted &&
         historyOwnerKeyRef.current === ownerKey &&
         historyOwnerGenerationRef.current === generation
       );
@@ -18928,6 +18949,7 @@ function HistoryPanel({
           optimisticAt: handoff.submittedAt,
           statusChangedAt: handoff.statusChangedAt,
           enterAttemptAt: handoff.enterAttemptAt,
+          sendInputTiming: handoff.sendInputTiming,
           historyReturn: handoff.historyReturn,
           promptChips: normalizeComposerChips(handoff.promptChips)
             .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
@@ -19130,6 +19152,14 @@ function HistoryPanel({
     return () => {
       deferredWarmRefreshCancelRef.current?.();
       deferredWarmRefreshCancelRef.current = null;
+      // Release this read consumer before the former owner's continuation can
+      // decode/apply. This does not invalidate the shared source or another
+      // panel's borrower, and hiding a retained panel does not run this cleanup.
+      const flight = historyLoadFlightRef.current;
+      if (flight?.ownerKey === historyOwnerKey && flight.generation === generation) {
+        flight.trailingRefresh = false;
+        flight.controller.abort();
+      }
       viewportPaintProbeRef.current?.cancel(viewportPaintOwner);
       surfacePresentedProbeRef.current?.cancel(viewportPaintOwner);
       // Geometry is captured continuously while the owner is alive (see the
@@ -20558,6 +20588,11 @@ function HistoryPanel({
         // The next read establishes the new content generation. Do not put
         // a physical inode into that field or reset the same replacement twice.
         payloadGenerationRef.current = { ownerKey: historyOwnerKey, value: '' };
+        const flight = historyLoadFlightRef.current;
+        if (flight?.ownerKey === historyOwnerKey) {
+          flight.trailingRefresh = false;
+          flight.controller.abort();
+        }
         historyOwnerGenerationRef.current += 1;
         setFileRewriteEpoch((value) => value + 1);
         // This is a different physical document, not a live tail update.

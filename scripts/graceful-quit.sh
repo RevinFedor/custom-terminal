@@ -11,10 +11,26 @@
 set -u
 
 DEADLINE="${1:-5}"
+REQUIRE_GRACEFUL="${2:-}"
+WAIT_ONLY="${3:-}"
+TARGET_PID="${4:-}"
 APP_NAME="Noted Terminal"
 QUIT_FALLBACK="none"
 
 is_running() {
+  if [ -n "${TARGET_PID}" ]; then
+    case "${TARGET_PID}" in *[!0-9]*|'') return 1 ;; esac
+    # A detached MCP hub may retain the same executable path. Wait only for
+    # the exact Main PID captured by the API, without touching its children.
+    if kill -0 "${TARGET_PID}" 2>/dev/null; then return 0; fi
+    # EPERM is not absence. A fresh process lookup distinguishes it from the
+    # expected ESRCH after exit; an unavailable lookup remains running/unknown.
+    local target_lookup target_status
+    target_lookup="$(ps -p "${TARGET_PID}" -o pid= 2>/dev/null)"
+    target_status=$?
+    if [ "${target_status}" -eq 1 ] && [ -z "${target_lookup}" ]; then return 1; fi
+    return 0
+  fi
   pgrep -f "/Applications/${APP_NAME}.app" > /dev/null 2>&1
 }
 
@@ -22,7 +38,11 @@ if ! is_running; then
   exit 0
 fi
 
-echo "[graceful-quit] requesting graceful quit of '${APP_NAME}' (deadline ${DEADLINE}s)…"
+if [ "${WAIT_ONLY}" = "--wait-only" ]; then
+  echo "[graceful-quit] waiting for captured Main pid=${TARGET_PID} (deadline ${DEADLINE}s)…"
+else
+  echo "[graceful-quit] requesting graceful quit of '${APP_NAME}' (deadline ${DEADLINE}s)…"
+fi
 
 # Snapshot report identities BEFORE asking Cocoa to quit. `find -newer` cannot
 # be used here: macOS may touch the mtime/ctime of an old `.ips` while indexing
@@ -40,7 +60,9 @@ fi
 # AppleScript 'quit' triggers Cocoa applicationShouldTerminate, which Electron
 # maps to app.quit() → our before-quit handler (with event.preventDefault()
 # + graceful Ctrl+C fan-out → app.quit() again to actually exit).
-osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
+if [ "${WAIT_ONLY}" != "--wait-only" ]; then
+  osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
+fi
 
 # Poll until process disappears or deadline passes.
 # NOTE: DEADLINE is REAL SECONDS. The previous loop did `sleep 0.25; SECS+=1`,
@@ -56,6 +78,11 @@ START_TS=$(date +%s)
 while is_running; do
   ELAPSED=$(( $(date +%s) - START_TS ))
   if [ "${ELAPSED}" -ge "${DEADLINE}" ]; then
+    if [ "${REQUIRE_GRACEFUL}" = "--require-graceful" ]; then
+      echo "[graceful-quit] graceful exit is not confirmed; build:i-c stopped without killing the app"
+      rm -f "${CRASH_BASELINE}"
+      exit 1
+    fi
     echo "[graceful-quit] app did NOT exit in ${DEADLINE}s — falling back to pkill (JSONL of unfinished turns may be lost)"
     QUIT_FALLBACK="SIGTERM"
     pkill -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
@@ -106,6 +133,10 @@ rm -f "${CRASH_BASELINE}" 2>/dev/null || true
 if [ -n "${CRASHED}" ]; then
   echo "[graceful-quit] ВНИМАНИЕ: приложение не вышло штатно, а аварийно завершилось."
   echo "[graceful-quit] отчёт: ${CRASHED}"
+  if [ "${REQUIRE_GRACEFUL}" = "--require-graceful" ]; then
+    echo "[graceful-quit] build:i-c stopped: graceful shutdown proof unavailable"
+    exit 1
+  fi
   echo "[graceful-quit] уборка при закрытии оборвана на середине; установка продолжается."
 elif [ "${QUIT_FALLBACK}" != "none" ]; then
   echo "[graceful-quit] применён fallback ${QUIT_FALLBACK}; штатный выход не подтверждён"

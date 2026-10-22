@@ -9,8 +9,10 @@ Workflow организует окна и вкладки независимо о
 
 Цветные группы оконной полосы хранятся в metadata workflow `stripColorGroups`
 (version/revision/groups), независимо от глобальных sidebar-групп. CURRENT Source20Oct
-записывает их прежним `commitWorkspace`/mutation journal: только explicit
-`stripColorGroupEdits` с точным field basis может изменить или очистить definition.
+записывает их прежним `commitWorkspace`/mutation journal: explicit
+`stripColorGroupEdits` с точным field basis меняет definition. Source22Oct также
+принимает explicit ordinary release intent: Main сам вычисляет IN/OUT moving roots
+по raw basis/owner/activity, сохраняя order+membership той же transaction.
 Incidental полный snapshot сохраняет более свежий Main field, даже если renderer
 уже принял latest organization revision. Unknown/null/future basis не означает
 пустой набор; потерянный ACK восстанавливается тем же mutation ID.
@@ -24,6 +26,38 @@ activate/remount; более новая локальная перестанов�
 definition/basis. Recolor сохраняет прежних закрытых участников того же workflow;
 CREATE требует active membership, unknown/foreign не превращаются в ready-empty.
 Эта authority не разрешает Send/Stop/Full и не меняет общий global-group CAS.
+
+Поздняя публикация A не заменяет синхронно принятую local release pair B.
+Неизвестный preflush, ещё не submitted command и submitted UNKNOWN различаются;
+очередь хранит exact preparation/frozen continuation и восстанавливает прежний
+request/key. Оба session writers сохраняют recovery envelope, но queued intent
+без command key после restart не даёт права автоматически отправить новый key.
+При настоящем foreign basis/owner/activity конфликте B остаётся unreconciled.
+Свежий canonical read и проверенный `stripReleaseDeferrals` позволяют сохранить
+независимое U; receipt `deferredStripReleases` явно называет несохранённые поля B.
+Успех U в таком случае не означает durable успех B. Номинальный согласованный
+B+U сохраняется полностью. Проверка допуска читает directory identity profile,
+без извлечения чужих `record_json`; это не общий предел памяти каталога.
+
+Source21Oct optional `group.collapsed` — часть того же field/group CAS; toggle
+повышает definition revision, не меняя raw tabIds/color/unknown fields. Incidental
+snapshot не может сбросить его. OPEN-fit использует отдельный `arrange` intent в
+прежнем `stripColorGroupEdits`: exact owner/before-slots/basis и перестановка только
+representative среди своих placed members. Цвет/group revision при этом прежние.
+Main сохраняет canonical extensions slots; ACK adopt применяет этот order только
+к captured window при отсутствии более нового локального order. Navigation/close
+отзывают reveal, но не переписывают уже принятый durable результат. Source не
+восстанавливает старый состав из order-only drop presentation или после await.
+
+Source22Oct selected-first selection использует тот же representative-only
+arrange и не меняет color/group revision. Перед решением «уже первый, no-op»
+существующая очередь сначала восстанавливает прежний accepted/unknown arrange;
+иначе select2 с потерянным ACK, затем select1 теряет последнее намерение.
+Rebase разрешён только exact witness той же операции/basis/owner/before/order,
+не произвольной более новой DnD-публикацией. Ожидание обычной activation/readiness
+не удерживает organization lane; поздняя смерть UI отзывает reveal/focus, но не
+усвоение уже принятого durable результата. Направление absolute-ряда — read-only
+geometry metadata, не новый membership/order proof и не исполнение вкладки.
 
 Пользователь отказался от Projects как обязательных контейнеров директорий:
 одно окно может содержать вкладки разных cwd, а один репозиторий — участвовать

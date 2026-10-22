@@ -9,8 +9,9 @@ const { createTerminalReplayJournal } = require('./terminal-replay-journal');
 const { createXtermWritePump } = require('../shared/xterm-write-pump.cjs');
 const { createCodexSettingsMutationQueue } = require('./codex-settings-mutation-queue');
 const artifacts = require('./terminal-history-preview-diagnostic');
+const { createCodexSlashInputDiagnostic } = require('./codex-slash-input-diagnostics');
 
-async function fixture(t) {
+async function fixture(t, { command = '/model' } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-raw-control-test-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const terminal = new Terminal({ cols: 78, rows: 59, scrollback: 1000, allowProposedApi: true });
@@ -28,9 +29,15 @@ async function fixture(t) {
     replayJournal: createTerminalReplayJournal(), committedFrameGeneration: 0, pendingResizeWriteSeq: null };
   const owner = { tabId: 'T', lifecycleGeneration: 'L', mirrorGeneration: 'M', runSeq: 1, stopRevision: 0, inputRevision: 0 };
   const queue = createCodexSettingsMutationQueue();
-  const receipt = { command: '/model', identity: { tabId: 'T', terminalToken: pty,
+  const receipt = { command, identity: { tabId: 'T', terminalToken: pty,
     terminalLifecycleGeneration: 'L', terminalRunSeq: 1, terminalStopRevision: 0, mirrorGeneration: 'M', inputRevision: 0 },
-    diagnostic: { traceId: 'trace-control-1', record() {}, publish() {} } };
+  };
+  receipt.diagnostic = createCodexSlashInputDiagnostic({ tabId: 'T', command: receipt.command, identity: receipt.identity,
+    operationId: 'owned-control-operation', now: () => at, readState: () => ({
+      writeSeq: state.writeSeq, flushedSeq: state.flushedSeq, sameTerminal: true, sameMirror: true,
+      committedWriteSeq: state.lastCommittedVisibleSnapshot?.writeSeq,
+    }) });
+  state.codexSlashInputDiagnostic = receipt.diagnostic;
   assert.equal(queue.rememberUnsubmittedInput(pty, receipt), true);
   const ctx = { Buffer, crypto: require('node:crypto'), app: { getPath: () => directory }, queueMicrotask,
     console: { log: x => logs.push(x), warn: x => logs.push(x), error: x => logs.push(x) }, ...redraw, ...forensics, ...artifacts,
@@ -70,12 +77,13 @@ async function fixture(t) {
     state.flushedSeq = meta.seq; ctx.commitHeadlessVisibleBufferSnapshot('T', state, meta.seq);
   } });
   const delivered = [];
-  const emit = async data => { delivered.push(data); raw.output(pty, data, owner); ctx.writeHeadlessTerminalMirror('T', data);
+  const emit = async data => { delivered.push(data); receipt.diagnostic.record('raw-output', { chars: data.length });
+    raw.output(pty, data, owner); ctx.writeHeadlessTerminalMirror('T', data);
     assert.equal((await state.writePump.drain()).failed, null); };
   const capture = async (patch = {}) => {
     const result = await ctx.captureTerminalHistoryPreviewDiagnostic({ tabId: 'T', toolType: 'codex',
       incidentReason: 'slash-input-frame-timeout', context: { source: 'owned-short-control-frame',
-        traceId: receipt.diagnostic.traceId, command: '/model' }, ...patch });
+        traceId: receipt.diagnostic.traceId, command: receipt.command }, ...patch });
     const packet = JSON.parse(await fs.readFile(result.artifactPath, 'utf8'));
     await writer.drain(); return { result, packet, manifest: packet.diagnostic.rawWindow.manifestPath };
   };
@@ -144,4 +152,89 @@ test('an old release cannot close the current receipt and diagnostic failures ca
   assert.equal(h.queue.getUnsubmittedInput(h.pty), null);
   await h.receipt.rawCompletionCapture;
   assert.deepEqual(h.writes, []); assert.equal(h.readiness.length, 1);
+});
+
+test('scalar differentiating: durable failure retains exact owned fd/raw/pump trace, independent of rotating console', async t => {
+  const h = await fixture(t); await h.emit('baseline');
+  h.receipt.diagnostic.record('outbound-fd-callback', { taskId: 7, writeKind: 'paste', writtenBytes: 19, complete: true });
+  const c = await h.capture(), trace = c.packet.diagnostic.ownedControlTrace;
+  assert.equal(trace?.available, true, 'durable error packet omitted the exact scalar receipt trace');
+  assert.equal(trace.boundary, 'failure'); assert.equal(trace.snapshot.traceId, h.receipt.diagnostic.traceId);
+  assert.equal(trace.snapshot.outboundTasks[0].stages['outbound-fd-callback'].last.writtenBytes, 19);
+  const frozen = JSON.stringify(trace.snapshot);
+  h.at(69000); await h.emit('late');
+  assert.equal(JSON.stringify(c.packet.diagnostic.ownedControlTrace.snapshot), frozen, 'late data cannot rewrite original failure boundary');
+  assert.deepEqual(h.writes, []);
+});
+
+test('scalar differentiating: separate completion captures late stages before receipt retirement, without renewing raw TTL', async t => {
+  const h = await fixture(t); await h.emit('baseline'); const c = await h.capture();
+  const deadline = [...h.timers.values()][0].deadline; h.at(deadline); h.expire();
+  h.at(69000); await h.emit('late exact-owner bytes');
+  const before = h.receipt.diagnostic.snapshot();
+  h.receipt.unsubscribe = () => { h.receipt.diagnostic.record('mirror-disposed', { disposed: true }); };
+  h.ctx.releaseCodexOwnedModelInput(h.pty, h.receipt, 'owned-input-cleared');
+  const done = await h.receipt.rawCompletionCapture;
+  const packet = JSON.parse(await fs.readFile(done.artifactPath, 'utf8'));
+  assert.equal(packet.diagnostic.ownedControlTrace?.available, true, 'final packet lost trace after queue/mirror retirement');
+  assert.equal(packet.diagnostic.ownedControlTrace.boundary, 'pre-release');
+  assert.equal(packet.diagnostic.ownedControlTrace.snapshot.stages['raw-output'].lastAt, 69000);
+  assert.equal(packet.diagnostic.ownedControlTrace.snapshot.stages['mirror-disposed'], undefined);
+  assert.deepEqual(packet.diagnostic.ownedControlTrace.snapshot, before);
+  assert.equal((await h.manifest(c.manifest)).summary.end.reason, 'tail-deadline');
+  assert.equal(h.raw.snapshot().activePins, 0); assert.deepEqual(h.writes, []);
+});
+
+for (const field of ['inputRevision', 'stopRevision', 'runSeq', 'lifecycleGeneration', 'mirrorGeneration']) {
+  test('foreign ' + field + ' cannot attach an old scalar control trace', async t => {
+    const h = await fixture(t); await h.emit('baseline');
+    if (field === 'mirrorGeneration') h.state.generation = 'FOREIGN';
+    else h.owner[field] = typeof h.owner[field] === 'number' ? h.owner[field] + 1 : 'FOREIGN';
+    const c = await h.capture(); assert.notEqual(c.packet.diagnostic.ownedControlTrace?.available, true);
+    assert.equal(h.queue.getUnsubmittedInput(h.pty), h.receipt); assert.deepEqual(h.writes, []);
+  });
+}
+
+test('scalar snapshot failure does not suppress raw evidence, cleanup or readiness wake', async t => {
+  const h = await fixture(t); await h.emit('baseline');
+  h.receipt.diagnostic.snapshot = () => { throw Error('controlled-scalar-fault'); };
+  const c = await h.capture(); assert.equal(c.packet.diagnostic.rawWindow.available, true);
+  assert.equal(c.packet.diagnostic.ownedControlTrace, undefined);
+  assert.equal(h.ctx.releaseCodexOwnedModelInput(h.pty, h.receipt, 'owned-input-cleared'), true);
+  await h.receipt.rawCompletionCapture;
+  assert.equal(h.queue.getUnsubmittedInput(h.pty), null); assert.deepEqual(h.writes, []);
+  assert.equal(h.readiness.length, 1);
+});
+
+test('failure scalar boundary is detached before held renderer response and never admits arbitrary text', async t => {
+  const h = await fixture(t); await h.emit('baseline');
+  let release, entered;
+  const wait = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  h.ctx.requestTerminalIncidentRendererSnapshot = async () => { entered(); await wait; return { unavailable: true }; };
+  h.receipt.diagnostic.record('outbound-fd-callback', { taskId: 7, writeKind: 'paste', writtenBytes: 19, complete: true });
+  for (let i = 0; i < 200; i++) h.receipt.diagnostic.record('check', { text: 'MUST_NOT_ENTER_SCALARS', checks: i });
+  const pending = h.capture(); await started;
+  h.at(9000); h.receipt.diagnostic.record('raw-output', { chars: 4 }); release();
+  const c = await pending, trace = c.packet.diagnostic.ownedControlTrace.snapshot;
+  assert.equal(trace.stages['raw-output'].lastAt, 1000);
+  assert.equal(trace.stages.check.count, 200); assert.ok(trace.droppedEvents > 0);
+  assert.ok(trace.events.length <= trace.limits.maxEvents);
+  assert.doesNotMatch(JSON.stringify(trace), /MUST_NOT_ENTER_SCALARS/);
+  assert.ok(Buffer.byteLength(JSON.stringify(trace)) < 64 * 1024);
+});
+
+test('replacement terminal cannot attach the former receipt scalar trace', async t => {
+  const h = await fixture(t); await h.emit('baseline');
+  h.ctx.terminals.set('T', { pid: 456 });
+  const c = await h.capture(); assert.equal(c.packet.diagnostic.ownedControlTrace, undefined);
+  assert.equal(h.queue.getUnsubmittedInput(h.pty), h.receipt); assert.deepEqual(h.writes, []);
+});
+
+for (const command of ['/fast', '/compact']) test('exact ' + command + ' scalar trace follows its own control, not another command', async t => {
+  const h = await fixture(t, { command }); await h.emit('baseline'); const c = await h.capture();
+  assert.equal(c.packet.diagnostic.ownedControlTrace.snapshot.command, command);
+  assert.equal(c.packet.diagnostic.ownedControlTrace.snapshot.operationId, 'owned-control-operation');
+  h.ctx.releaseCodexOwnedModelInput(h.pty, h.receipt, 'owned-input-cleared');
+  const done = await h.receipt.rawCompletionCapture, packet = JSON.parse(await fs.readFile(done.artifactPath, 'utf8'));
+  assert.equal(packet.diagnostic.ownedControlTrace.snapshot.command, command); assert.deepEqual(h.writes, []);
 });

@@ -48,7 +48,7 @@ function strip(paneKey = 'pane:0', spaceId = 'w') {
   return element;
 }
 
-function fixture({free = false, noLease = false, sourcePaneKey = 'pane:0'} = {}) {
+function fixture({free = false, noLease = false, internalScope = true, sourcePaneKey = 'pane:0'} = {}) {
   const window = eventHost(), frames = new Map(), subscribers = new Set();
   const writes = [], effects = [], pointerMoves = [], sidebarDrops = [];
   let frameId = 0, pointed = strip(sourcePaneKey), current = true, acceptSidebar = false;
@@ -113,7 +113,7 @@ function fixture({free = false, noLease = false, sourcePaneKey = 'pane:0'} = {})
   const model = load(path.join(directory, 'paneStripSelectionModel.mjs'));
   const source = {owner: 'pane', rootTabId: 'b', sourcePaneKey, sourceSpaceId: 'w',
     entries: ['b', 'c'].map(tabId => ({projectId: 'p', tabId})),
-    ...(!noLease && {groupDrag: {boundary: free ? {kind: 'free'} : model.paneStripGroupDragBoundary(
+    ...(!noLease && {groupDrag: {internalScope:!free&&internalScope,boundary: free ? {kind: 'free'} : model.paneStripGroupDragBoundary(
       [{id: 'color', revision: 4, tabIds: ['a', 'b', 'c']}],
       {sourceIds: ['b', 'c'], order: ['x', 'a', 'b', 'c', 'z']}), isCurrent: () => current}}),
   };
@@ -154,7 +154,7 @@ function clean(f) {
   assert.deepEqual(f.effects.slice(-3), ['preview-remove', 'cursor-release', 'interaction-end']);
 }
 
-test('locked member gesture never publishes sidebar adoption or workflow/project hover navigation', t => {
+test('collapsed member-origin gesture never publishes sidebar adoption or workflow/project hover navigation', t => {
   const f = fixture(); t.after(() => f.dispose());
   f.adopt(); f.start();
   for (const kind of ['workflow', 'project']) {
@@ -223,8 +223,8 @@ test('synchronous legacy center writer receives clamped scope and returns its ac
   assert.equal(f.writes[0][4].at,2);
 });
 
-test('free and unscoped drags preserve hover navigation, sidebar priority and cross-pane legacy drop', t => {
-  for (const options of [{free: true}, {noLease: true}]) {
+test('free, ordinary grouped and unscoped drags preserve hover navigation, sidebar priority and cross-pane legacy drop', t => {
+  for (const options of [{free: true}, {internalScope: false}, {noLease: true}]) {
     for (const adopted of [true, false]) {
       const f = fixture(options); t.after(() => f.dispose()); f.start();
       for (const kind of ['workflow', 'project']) {

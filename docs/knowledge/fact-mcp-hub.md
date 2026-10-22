@@ -8,6 +8,18 @@ sc-desktop). При ~10 открытых сессиях это 60-70 проце�
 измерено панелью ресурсов (phys_footprint). Замер до миграции: 70 процессов,
 2030 МБ; после перезапуска всех вкладок останется один комплект ~200-300 МБ.
 
+## Что можно доказать после принудительного Build Install
+
+SOURCE20.10 installer сохраняет доступные server PID/start/pending counts и
+client presence до Quit и после запуска Noted. В самом hub пока нет долговечного
+журнала всех RPC с exact tab/provider-turn owner: ChildServer pending — RAM Map,
+а clients — TTL presence. Нулевой count и пропавший HTTP-клиент не доказывают Stop
+удалённой операции. Detached hub/children могут пережить Quit; external/plugin/
+отдельные stdio MCP вообще не покрыты этим источником. Поэтому installer report
+различает сохранённый/остановленный процесс и неизвестный исход вызовов, не
+называет все MCP прерванными и не даёт права replay. Build Install имеет отдельную
+сохранённую typed job в правом per-tab request dock, а не в глобальном health chip.
+
 ## Архитектура
 
 ```
@@ -62,6 +74,14 @@ Hub перечитывает SC file fence до всех Browser spawn paths и 
 durable host receipts. Неполный profile scope shared child не разрешает его retirement.
 После worker-open ACK host отвечает release_ready, но запускается только после
 финального Main activation commit. Другие пять bindings/lifecycle не заменяются.
+SOURCE20.10 различает этот commit и generation текущего процесса: после обычного
+restart того же durable host подтверждённая activation остаётся действующей через
+точную lineage enrolled process, прежние config/authority/fence/receipt. Исторический
+cohort не переписывается. Один released ingress, новый PID или пустой журнал не
+разрешают запуск; incomplete activation, новая maintenance и неизвестный child spawn
+остаются закрытыми. До этой правки новый Noted hub снова блокировал Browser, хотя
+SC activation-resume честно подтверждал завершённый прежний barrier.
+Проверены private host/journals и отрицательные guards, не installed rollout.
 Старый живой hub под hold не становится cooperative от изменения файлов: controller
 возвращает typed bootstrap blocker, не shutdown/spawn. Это enrolled cohort protocol,
 не certification старых VR/bridge/loaded-CS authority и не installed assertion.

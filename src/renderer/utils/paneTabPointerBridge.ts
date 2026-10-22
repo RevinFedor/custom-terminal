@@ -30,9 +30,9 @@ export function updatePaneTabPointer(
   source: PaneTabDragSource,
   input: { clientX?: number; clientY?: number; metaKey?: boolean; pointerId?: number },
 ) {
-  // Locked strip members never enter the sidebar adoption transport. This
-  // does not end their physical gesture or the strip's clamped preview.
-  if(source.groupDrag && source.groupDrag.boundary?.kind!=='free') {
+  // A collapsed member-origin peek keeps its internal scope. Ordinary grouped
+  // roots use the same transport; their release changes membership atomically.
+  if(source.groupDrag?.internalScope || source.groupDrag?.boundary?.kind==='blocked') {
     cancelPaneTabPointer();return;
   }
   snapshot = {

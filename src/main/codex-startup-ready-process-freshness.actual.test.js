@@ -9,6 +9,7 @@ const ts = require('typescript');
 const { EventEmitter } = require('node:events');
 const { createProcessTreeSnapshotSingleFlight } = require('./process-tree-snapshot-single-flight');
 const { AI_PROCESS_LOOKUP_STATUS, AiProcessLookupError, inspectProcessLookup } = require('./ai-process-liveness');
+const agentSendReadTiming = require('../shared/agent-send-read-timing.cjs');
 
 // Actual Main verifier, process-cache gate, descendant traversal and scope guards.
 // Only the OS snapshot, composer/settings proof and publication ports are controlled.
@@ -32,7 +33,7 @@ function fixture({ launch = true, established = false } = {}) {
   const launchPayload = { launchId: 'launch:1', startedAt: 50 };
   const events = new EventEmitter();
   const context = {
-    path, AI_PROCESS_LOOKUP_STATUS, AiProcessLookupError, inspectProcessLookup,
+    path, AI_PROCESS_LOOKUP_STATUS, AiProcessLookupError, inspectProcessLookup, agentSendReadTiming,
     nodePerformance: { now: () => state.now, timeOrigin: 10000 },
     PROCESS_TREE_SNAPSHOT_TTL_MS: 750, processTreeSnapshotCache: null,
     terminals: new Map([['T', terminal]]),
@@ -99,6 +100,31 @@ test('committed startup composer checks the live process instead of reusing the 
   assert.equal(h.state.captures[1].forceFresh, true);
   assert.deepEqual(h.state.publications, ['finish-startup', 'internal-ready', 'ready']);
   assert.equal(h.context.codexTuiReadyTabs.has('T'), true);
+});
+
+test('actual ready publication brackets the existing event and preserves its payload and order',async()=>{
+  const h=fixture(),sent=[];await h.seedPreLaunchAbsent();
+  h.context.mainWindow={isDestroyed:()=>false,webContents:{send:(channel,payload)=>{
+    sent.push({channel,payload});h.state.now+=5;
+  }}};
+  assert.equal(await h.mark({expectedLaunchId:'launch:1'}),true);
+  assert.equal(sent.length,1);assert.equal(sent[0].channel,'codex:tui-ready');
+  assert.deepEqual(Object.keys(sent[0].payload).sort(),['reason','tabId','ts']);
+  assert.equal(sent[0].payload.tabId,'T');assert.equal(sent[0].payload.reason,'headless-startup-frame');
+  const prefix='[AgentSendReadTiming] ',rows=h.state.logs.filter(line=>line.startsWith(prefix)).map(line=>JSON.parse(line.slice(prefix.length)));
+  assert.deepEqual(rows.map(row=>row.phase),['ready-publication-before','ready-publication-after']);
+  assert.equal(rows[1].abs-rows[0].abs,5);assert.ok(rows.every(row=>row.eventTs===sent[0].payload.ts&&row.launchId==='launch:1'));
+  assert.deepEqual(h.state.publications,['finish-startup','internal-ready','ready']);
+});
+
+test('only the observational logger may fail without suppressing actual ready publication',async()=>{
+  const h=fixture();await h.seedPreLaunchAbsent();let sends=0;
+  const normal=h.context.console.log;h.context.console.log=(line,...rest)=>{
+    if(line.startsWith('[AgentSendReadTiming]'))throw Error('diagnostic failed');return normal(line,...rest);
+  };
+  h.context.mainWindow={isDestroyed:()=>false,webContents:{send:()=>{sends++;}}};
+  assert.equal(await h.mark({expectedLaunchId:'launch:1'}),true);assert.equal(sends,1);
+  assert.deepEqual(h.state.publications,['finish-startup','internal-ready','ready']);
 });
 
 test('concurrent startup verifiers share the same fresh physical observation', async () => {

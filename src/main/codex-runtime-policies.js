@@ -49,9 +49,18 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       if (state.deadlineTimer) clearTimer(state.deadlineTimer);
       state.timer = state.deadlineTimer = null;
     }
+    const failed = state.type === 'resume-goal'
+      && (phase === 'manual' && reason !== 'user-choice-required' || reason === 'provider-result-unobserved');
+    const captureDiagnostic = failed && !state.failureReported;
+    if (captureDiagnostic) state.failureReported = true;
     publish(tabId, { operationId: state.id, type: state.type, policy: state.policy,
       phase, reason, actionWritten: state.actionWritten, detectedAt: state.detectedAt,
-      frameSeq: state.frameSeq, resultFrameSeq: state.resultFrameSeq || null });
+      frameSeq: state.frameSeq, resultFrameSeq: state.resultFrameSeq || null,
+      actionAttempted: !!state.actionAttempted, requestId: state.goalRequest?.requestId || null,
+      actionFrameSeq: state.actionFrameSeq || null,
+      writeAttemptAt: state.writeAttemptAt || null, writeReturnedAt: state.writeReturnedAt || null,
+      captureDiagnostic, owner: { lifecycleGeneration: state.owner.lifecycleGeneration,
+        runSeq: state.owner.runSeq, inputRevision: state.owner.inputRevision } });
     log('[CodexRuntimePolicy] tab=' + tabId + ' operation=' + state.id + ' type=' + state.type
       + ' policy=' + state.policy + ' phase=' + phase + ' reason=' + reason
       + ' actionWritten=' + state.actionWritten + ' frame=' + state.frameSeq
@@ -150,12 +159,16 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
           const key = dialog.selectedIndex === target ? '\r' : dialog.selectedIndex < target ? '\x1b[B' : '\x1b[A';
           const allowed = () => current(tabId, state, true) && state.actionToken === token
             && state.phase !== 'manual' && state.phase !== 'handled';
-          if (key === '\r') { state.actionAttempted = true; state.actionFrameSeq = frame.seq; }
+          if (key === '\r') {
+            state.actionAttempted = true; state.actionFrameSeq = frame.seq;
+            state.writeAttemptAt = now(); state.writeReturnedAt = null;
+          }
           else {
             state.selectionFrameSeq = frame.seq;
             state.expectedSelectedIndex = dialog.selectedIndex + (key === '\x1b[B' ? 1 : -1);
           }
           const written = await sendKey(tabId, key, { owner, expectedFrame: frame, guard: allowed, dialogType: state.type });
+          if (key === '\r') state.writeReturnedAt = now();
           if (written?.written !== true && written?.written !== false) {
             setPhase(tabId, state, 'manual', 'policy-key-outcome-unknown'); return;
           }
@@ -267,9 +280,10 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     if (state?.phase === 'handled' && frame.seq <= state.resultFrameSeq) return;
     if (state) clear(tabId);
     const preferences = readPolicy(tabId);
+    const resume = resolveCodexResumeGoalPreference(preferences.resumeOverride, preferences.resumeGoal);
     const policy = dialog.type === 'usage-exhaustion'
       ? preferences.usage === 'stop-all' ? 'stop-all' : 'continue'
-      : resolveCodexResumeGoalPreference(preferences.resumeOverride, preferences.resumeGoal) ? 'resume' : 'leave-paused';
+      : resume === null ? 'manual' : resume ? 'resume' : 'leave-paused';
     state = { id: 'codex-policy-' + operationNamespace + '-' + (++sequence), owner, type: dialog.type, policy,
       detectedAt: now(), frameSeq: frame.seq, lastSeenSeq: frame.seq, phase: null, actionWritten: false,
       actionAttempted: false, actionToken: {}, timer: null,
@@ -277,8 +291,9 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     states.set(tabId, state);
     setPhase(tabId, state, 'detected', 'committed-provider-dialog');
     if (manualReason) { setPhase(tabId, state, 'manual', manualReason); return; }
-    armDeadline(tabId, state);
     if (!dialog.interactive) { setPhase(tabId, state, 'manual', 'dialog-options-unproven'); return; }
+    if (policy === 'manual') { setPhase(tabId, state, 'manual', 'user-choice-required'); return; }
+    armDeadline(tabId, state);
     void act(tabId, state);
   }
   function read(tabId) {
@@ -316,12 +331,13 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
         && dialog.selectedIndex === state.expectedSelectedIndex))) status = 'available';
     return { operationId: state.id, status, reason, phase: state.phase, policy: state.policy,
       requestId: state.goalRequest?.requestId || null,
-      action: state.goalRequest?.action || state.policy,
+      action: state.goalRequest?.action || (state.policy === 'manual' ? null : state.policy),
       availableActions: status === 'available' || recoveryAvailable ? ['resume', 'leave-paused'] : [],
       recoveryAvailable, recoveryFrameSeq: recoveryAvailable ? state.lastSeenSeq : null,
       selectedIndex: dialog?.type === 'resume-goal' ? dialog.selectedIndex : null,
-      frameSeq: state.lastSeenSeq, resultFrameSeq: state.resultFrameSeq || null,
+      initialFrameSeq: state.frameSeq, frameSeq: state.lastSeenSeq, resultFrameSeq: state.resultFrameSeq || null,
       actionWritten: state.actionWritten, actionAttempted: state.actionAttempted, keyWritten: !!state.keyWritten,
+      writeAttemptAt: state.writeAttemptAt || null, writeReturnedAt: state.writeReturnedAt || null,
       composerReady: !!state.composerProofSeq, choiceConfirmed: !!state.choiceConfirmed,
       runtimeLive: !!owner?.live, currentOperation: owned,
       owner: { lifecycleGeneration: state.owner.lifecycleGeneration, runSeq: state.owner.runSeq,
@@ -391,11 +407,13 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       state.actionWritten = state.actionAttempted = state.choiceConfirmed = state.keyWritten = false;
       state.confirmationUnobserved = false;
       state.actionFrameSeq = state.resultFrameSeq = state.composerProofSeq = state.selectionFrameSeq = null;
+      state.writeAttemptAt = state.writeReturnedAt = null;
       state.expectedSelectedIndex = null;
     }
     state.goalRequest = record;
     state.policy = action;
     state.actionToken = {};
+    state.failureReported = false;
     setPhase(tabId, state, 'detected', view.recoveryAvailable ? 'explicit-goal-recovery' : 'explicit-goal-action');
     armDeadline(tabId, state);
     void act(tabId, state);

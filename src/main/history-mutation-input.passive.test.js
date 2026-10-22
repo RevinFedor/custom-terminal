@@ -56,6 +56,7 @@ function mainFixture(t, provider = 'codex') {
     getSessionMaterialization: () => ({ materialized: true }),
     readAgentSendDestinationAtWriteBoundary: () => ({ toolType: provider, sessionId: state.sid }),
     scheduleProjectActivityBroadcast() {}, scheduleCodexModelEffortIntentReconcile: async () => {},
+    scheduleCodexFastIntentReconcile() {}, // unrelated settings wake leaf of the extracted actual Main handler
   });
   vm.runInContext(code(['captureSavedHistoryRuntime', 'captureAiProcessLookupScope', 'aiProcessLookupScopeCurrent',
     'readMainPublicRuntimeSnapshot', 'readHistoryMutationInputBoundary']), context);

@@ -17,8 +17,8 @@ type Props = {
   tokenChip?: React.ReactNode; note?: React.ReactNode; researchModel?: any;
   onExpand: () => void; onNavigatePrompt: () => void; onNavigateAnswer: () => void;
   onSourceNavigate: () => void; onCopy: (text: string) => void;
-  loadResponse: (preview: any) => Promise<string>;
-  loadImages: (entry: any) => Promise<any[]>;
+  loadResponse: (preview: any, signal?: AbortSignal) => Promise<string>;
+  loadImages: (entry: any, signal?: AbortSignal) => Promise<any[]>;
 };
 
 function Attachment({ part }: { part: any }) {
@@ -60,10 +60,11 @@ export function TimelineEntryPreview(props: Props) {
   useEffect(() => {
     if (!expanded || !needsImageDetails || group || imageDetails?.key === imageKey) return;
     let cancelled = false;
-    void props.loadImages(entry).then(refs => {
+    const controller = new AbortController();
+    void props.loadImages(entry, controller.signal).then(refs => {
       if (!cancelled) setImageDetails({ key: imageKey, refs });
     }).catch(() => { if (!cancelled) setImageDetails({ key: imageKey, refs: [] }); });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   }, [expanded, needsImageDetails, imageKey, imageDetails?.key, props.loadImages, !!group]);
   const preview = timelineFinalPreview(entry);
   const descriptorKey = preview ? JSON.stringify([preview.uuid, preview.sourceIdentity, preview.contentRevision,
@@ -79,13 +80,14 @@ export function TimelineEntryPreview(props: Props) {
   useEffect(() => {
     if (!expanded || !preview?.truncated || group) return;
     let cancelled = false;
+    const controller = new AbortController();
     setFullResponse(null);
-    props.loadResponse(preview).then(text => {
+    props.loadResponse(preview, controller.signal).then(text => {
       if (!cancelled) setFullResponse({ key: descriptorKey, text });
     }).catch(error => {
       if (!cancelled) setFullResponse({ key: descriptorKey, error: error instanceof Error ? error.message : String(error) });
     });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   }, [expanded, descriptorKey, props.loadResponse, !!group]);
 
   const answer = expanded && fullResponse?.key === descriptorKey && fullResponse.text !== undefined

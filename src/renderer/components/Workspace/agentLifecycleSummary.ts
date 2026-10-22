@@ -28,10 +28,11 @@ export interface AgentLifecycleSummary {
   onRetry?: () => void;
   goalOperationId?: string;
   goalControlsBlocked?: boolean;
+  goalStartupPending?: boolean;
   goalActions?: {
     operationId: string;
     availableActions: Array<'resume' | 'leave-paused'>;
+    pendingAction?: 'resume' | 'leave-paused' | null;
     onChoose?: (action: 'resume' | 'leave-paused') => void;
-    onRefresh?: () => void;
   };
 }

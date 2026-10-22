@@ -17,6 +17,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
+import { callWorkingDirectoryOperation } from './working-directory-operation.mjs';
 import { buildPromptCatalog, buildPromptResult, selectPrompt } from './terminal-prompt-catalog.mjs';
 const execFileAsync = promisify(execFile);
 
@@ -649,10 +650,25 @@ async function selectVoiceInstallInstance() {
   return [...unique.values()][0];
 }
 
-async function httpPostVoice(endpoint, body) {
+async function verifyVoiceBuildInstall(requireForce = false) {
   const token = readSharedToken();
   if (!token) throw new Error('Shared web token not found at ' + TOKEN_PATH);
   const inst = await selectVoiceInstallInstance();
+  const identityResponse = await fetch('http://127.0.0.1:' + inst.port + '/api/me', {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const identity = await identityResponse.json();
+  if (!identityResponse.ok || identity.application !== 'voice-record' || identity.pid !== inst.pid
+    || identity.capabilities?.terminalBuildInstall?.version < 2
+    || identity.capabilities?.terminalBuildInstall?.durableRequests !== true) {
+    throw new Error('Voice Record build installer update required: exact durable request API is unavailable; no install POST sent');
+  }
+  if (requireForce && identity.capabilities.terminalBuildInstall.force !== true) throw new Error('Voice Record FORCE installer update required; no install POST sent');
+  return { inst, token };
+}
+
+async function httpPostVoice(endpoint, body) {
+  const { inst, token } = await verifyVoiceBuildInstall(body?.force === true);
   // A possibly dispatched install must not fall through to a second app after
   // HTTP/transport failure. Read this exact owner's job before any new request.
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
@@ -1035,6 +1051,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'current_context',
   'inspect_tabs',
   'list_agent_models',
+  'get_codex_settings', 'set_codex_model_effort', 'set_codex_fast',
   'list_windows',
   'create_tab',
   'create_window',
@@ -1052,6 +1069,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'reconcile_send_receipt', 'release_send_queue_head',
   'get_codex_goal', 'resolve_codex_goal',
   'rewind_history', 'get_history_operation', 'rewind_ai',
+  'change_working_directory', 'get_working_directory_operation',
 ]);
 
 const TOOLS = [
@@ -1167,6 +1185,33 @@ const TOOLS = [
         cwd: { type: 'string', description: 'Optional project path used to select the running Noted Terminal instance.' },
       },
     },
+  },
+  {
+    name: 'get_codex_settings',
+    description: 'Read current and requested Codex model/effort/Fast without sending a prompt. Current native proof and pending desired settings are separate. Use for one explicit check or after a lost settings ACK, not a polling loop.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      tabId: { type: 'string', minLength: 1 },
+      cwd: { type: 'string', description: 'Optional path used only to select the owning Noted Terminal instance.' },
+    }, required: ['tabId'] },
+  },
+  {
+    name: 'set_codex_model_effort',
+    description: 'Choose Codex model and/or effort without sending a prompt, including while streaming. Uses the same desired-settings owner as desktop controls; it does not stop or resume the agent. Read list_agent_models before a model-specific choice and use modelSelection. Omit either field to retain the proven other setting. queued means intent saved, not native application. After an unknown ACK inspect get_codex_settings; do not automatically repeat the choice.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      tabId: { type: 'string', minLength: 1 },
+      modelSelection: MODEL_SELECTION_SCHEMA,
+      effort: { type: 'string', minLength: 1, maxLength: 64, description: 'An effort supported by the selected model in list_agent_models.' },
+      cwd: { type: 'string', description: 'Optional path used only to select the owning Noted Terminal instance.' },
+    }, required: ['tabId'], anyOf: [{ required: ['modelSelection'] }, { required: ['effort'] }] },
+  },
+  {
+    name: 'set_codex_fast',
+    description: 'Set Codex Fast on or off without sending a prompt, including while streaming. enabled is an absolute desired value, never a toggle. Uses the desktop Fast intent and native input guards. queued is not application proof. After an unknown ACK inspect get_codex_settings; do not automatically repeat the choice.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      tabId: { type: 'string', minLength: 1 },
+      enabled: { type: 'boolean' },
+      cwd: { type: 'string', description: 'Optional path used only to select the owning Noted Terminal instance.' },
+    }, required: ['tabId', 'enabled'] },
   },
   {
     name: 'list_prompts',
@@ -1290,6 +1335,17 @@ const TOOLS = [
       type: 'object',
       properties: {},
     },
+  },
+  {
+    name: 'await_dependencies',
+    description: 'Inside the current app-injected Loop check only: defer this check until a specific existing delegated run/SC Research result or addressed-question reply is ready. Loop stays ON and the task stays unfinished. Call once near the end, then finish the answer. No polling, cancellation, new Research or Send. Exact source/turn and dependency ownership are checked by the app.',
+    inputSchema: { type: 'object', properties: {
+      dependencies: { type: 'array', minItems: 1, maxItems: 32, items: { type: 'object',
+        properties: { kind: { type: 'string', enum: ['run', 'message'] }, id: { type: 'string' } },
+        required: ['kind', 'id'], additionalProperties: false } },
+      reason: { type: 'string', description: 'The result needed for the remaining work.' },
+      reviewToken: { type: 'string', description: 'Exact loop_review_token from this current app-injected Loop message.' },
+    }, required: ['dependencies', 'reason', 'reviewToken'], additionalProperties: false },
   },
   {
     name: 'complete_task',
@@ -2181,6 +2237,28 @@ const TOOLS = [
     },
   },
   {
+    name: 'change_working_directory',
+    description: 'Change one existing Codex tab working directory through a durable Main operation. Retains its conversation, waits for its active turn, protects draft/queued/unknown input, uses proven shell cwd persistence and explicit one-off Resume -C, then verifies native cwd/writer/inputReady. Does not change global Always preferences, rewrite history, submit prompts or move workflows. Required stable operationId BEFORE call; acceptance is not completion. Lost ACK: read get_working_directory_operation with SAME identity, never replay raw cd/Resume or invent another ID.',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: {
+        tabId: { type: 'string', minLength: 1, maxLength: 1024 },
+        operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' },
+        expectedSessionId: { type: 'string', minLength: 1, maxLength: 160, description: 'Exact current saved conversation SID; never inferred from text.' },
+        targetCwd: { type: 'string', minLength: 1, maxLength: 4096, description: 'Absolute destination directory. This changes tab cwd, unlike project routing hints.' },
+        expectedCwd: { type: 'string', minLength: 1, maxLength: 4096, description: 'Optional exact current source cwd guard.' },
+        resume: { type: 'boolean', description: 'Default true: continue the retained conversation after changing cwd. false leaves it stopped.' },
+        projectId: { type: 'string', description: 'Optional project routing hint, not a destination project/workflow.' },
+      }, required: ['tabId', 'operationId', 'expectedSessionId', 'targetCwd'] },
+  },
+  {
+    name: 'get_working_directory_operation',
+    description: 'Read ONE working-directory operation receipt by original tabId/operationId. Read-only, no Stop/cd/Resume or replay after unknown outcome. cwdChanged/processStopped/launchWritten/inputReady are separate facts; a failed operation may have changed cwd. Receipt inputReady is historical, not current; optional includeStatus reads current runtime separately. Not a polling loop.',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: { tabId: { type: 'string', minLength: 1, maxLength: 1024 },
+        operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' },
+        includeStatus: { type: 'boolean' }, projectId: { type: 'string' } }, required: ['tabId', 'operationId'] },
+  },
+  {
     name: 'rewind_history',
     description: 'Rewind saved history through the existing app Stop/rewrite/adopt/Resume executor (Codex copy-on-write). Only exact session/user identity; no native menu, AI-summary, text/index guessing or fallback. Choose a stable operationId BEFORE this MCP call so ACK loss/restart cannot lose the recovery key. Reads/retries must retain that exact ID and unchanged request. Acceptance/202 is not completion/readiness or proof of a clean prefix; use get_history_operation for an explicit receipt read. Restores a structured draft but does not submit its prompt.',
     inputSchema: {
@@ -2278,17 +2356,19 @@ const TOOLS = [
   },
   {
     name: 'build_install_noted_terminal',
-    description: 'Ask the external Voice Record app to run Noted Terminal `npm run build:install`. Use this instead of run_command/build:i when the caller is inside Noted Terminal: the app will quit/reinstall/reopen, while Voice Record survives and can send a completion prompt back to the originating AI tab after the original tab/session is restored. This tool returns as soon as Voice Record accepts the job; it does not wait for the build. Before spawning the build, Voice Record OBSERVES the running prod app via GET /api/active-loaders and waits until every OTHER blocker goes idle: live Claude/Codex/Gemini turns and shell commands that were actually launched by Restart after. Manual shell commands like `npm run dev`, `npm run build`, or `./deploy.sh` are not blockers by themselves. The caller\'s own tab is excluded so it never deadlocks on itself. Progress (current blockers / phase pending→observing→building→finished) is visible in Voice Record GET /api/terminal/build-install under job.phase and job.wait.',
+    description: 'Ask the installed Voice Record sibling to rebuild CURRENT Noted Terminal and return to the exact agreed tab/session. Returns after durable request acceptance; finish this source turn after ACK. The app-owned install-eligibility API waits for all local turns, FIFO/preparation/physical input and unknown persistence, including the source. Strictly saved external SC Research survives restart without cancel/detach. requestId is the unchanged retry key; read GET /api/terminal/build-install?requestId=... after a lost ACK, never create a second hook. Requires current Voice Record and Noted source/eligibility APIs; old app absence is update-required. No tool reload updates either running app.',
     inputSchema: {
       type: 'object',
       properties: {
+        requestId: { type: 'string', description: 'Exact retry key. After a lost ACK preserve this ID and the unchanged request; never create a second hook to check delivery.' },
+        force: { type: 'boolean', description: 'Explicit one-operation FORCE: skip activity/loader/MCP idle waits, preserve candidate/identity/cancellation checks, return an interruption/recovery report to the exact source. Default false; not a fallback or permission to replay UNKNOWN.' },
         prompt: {
           type: 'string',
           description: 'Optional success prompt Voice Record should send back to the originating AI tab after install and session restore. Default is a short Russian completion message.',
         },
         notifyOnSuccess: {
           type: 'boolean',
-          description: 'Default true. Set false for a fire-and-forget install that still excludes the originating busy tab from the idle wait but sends no success prompt after restart.',
+          description: 'Default true. Set false for status-only install with no success prompt after restart; all local input/turn guards still apply.',
         },
         failurePrompt: {
           type: 'string',
@@ -2436,6 +2516,39 @@ async function callTool(name, args) {
     case 'list_agent_models': {
       const target = projectHint(args, PARENT_TAB_ID());
       return JSON.stringify(await httpApiGet(target, '/api/agent-models'), null, 2);
+    }
+
+    case 'get_codex_settings':
+    case 'set_codex_model_effort':
+    case 'set_codex_fast': {
+      const allowed = ['tabId', 'cwd', ...(name === 'set_codex_fast' ? ['enabled']
+        : name === 'set_codex_model_effort' ? ['modelSelection', 'effort'] : [])];
+      const validText = (value, max) => typeof value === 'string' && !!value.trim()
+        && value.length <= max && !/[\u0000-\u001f]/.test(value);
+      if (!args || Object.keys(args).some(key => !allowed.includes(key))
+        || !validText(args.tabId, 1024) || args.cwd !== undefined && !validText(args.cwd, 4096)
+        || name === 'set_codex_fast' && typeof args.enabled !== 'boolean'
+        || name === 'set_codex_model_effort' && (args.modelSelection === undefined && args.effort === undefined
+          || args.effort !== undefined && !validText(args.effort, 64)
+          || args.modelSelection !== undefined && (!args.modelSelection || Array.isArray(args.modelSelection)
+            || Object.keys(args.modelSelection).some(key => !['kind', 'id'].includes(key))
+            || !['catalog', 'custom'].includes(args.modelSelection.kind) || !validText(args.modelSelection.id, 512)))) {
+        throw new Error('invalid_codex_settings_request');
+      }
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() }, args.tabId);
+      const me = await httpApiGet(target, '/api/me');
+      const support = me?.capabilities?.codexSettings;
+      if (support?.version !== 1 || support.standalone !== true || support.busy !== true || support.fast !== 'absolute') {
+        throw new Error('app_update_required: Update Noted Terminal for standalone Codex settings. No prompt or settings mutation was sent.');
+      }
+      const root = '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/codex/';
+      const result = name === 'get_codex_settings' ? await httpApiGet(target, root + 'settings')
+        : name === 'set_codex_fast' ? await httpApiPost(target, root + 'fast', { enabled: args.enabled })
+          : await httpApiPost(target, root + 'settings', {
+            ...(args.modelSelection !== undefined ? { modelSelection: args.modelSelection } : {}),
+            ...(args.effort !== undefined ? { effort: args.effort } : {}),
+          });
+      return JSON.stringify(result, null, 2);
     }
 
     case 'list_prompts': {
@@ -2688,6 +2801,15 @@ async function callTool(name, args) {
       }, null, 2);
     }
 
+    case 'await_dependencies': {
+      if (EXTERNAL_MODE || !PARENT_TAB_ID()) throw new Error('await_dependencies requires its owning full Noted Terminal session');
+      const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
+      const me = await httpApiGet(target, '/api/me');
+      if (me?.capabilities?.loopDependencies?.version !== 1) throw new Error('This Noted Terminal needs an app update for await_dependencies. Nothing was completed or resent.');
+      return JSON.stringify(await httpApiPost(target,
+        '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/await-dependencies',
+        { dependencies: args.dependencies, reason: args.reason, reviewToken: args.reviewToken, sourceMeta: buildSourceMeta() }), null, 2);
+    }
     case 'complete_task': {
       if (EXTERNAL_MODE || !PARENT_TAB_ID()) {
         throw new Error('complete_task is available only inside the full Noted Terminal session that owns this MCP process');
@@ -3708,6 +3830,14 @@ async function callTool(name, args) {
       });
     }
 
+    case 'change_working_directory':
+    case 'get_working_directory_operation': {
+      const target = projectHint(args, args.tabId);
+      return JSON.stringify(await callWorkingDirectoryOperation(name, args, {
+        target, get: httpApiGet, post: httpApiPost,
+      }), null, 2);
+    }
+
     case 'rewind_history': {
       const { tabId, operationId, request } = historyOperationArgs(args);
       let mutationAttempted = false;
@@ -3783,6 +3913,7 @@ async function callTool(name, args) {
     }
 
     case 'build_install_noted_terminal': {
+      const requestId = args.requestId || randomUUID();
       const returnToTabId = args.returnToTabId || args.tabId || PARENT_TAB_ID() || '';
       const target = projectHint({ projectId: args.projectId, cwd: args.cwd }, returnToTabId || undefined);
       let sessionId = args.sessionId || '';
@@ -3821,17 +3952,31 @@ async function callTool(name, args) {
         pollMs: args.pollMs || undefined,
       } : undefined;
 
-      const result = await httpPostVoice('/api/terminal/build-install', { returnTo });
+      let result;
+      try {
+        if (args.force === true && (!returnTo?.tabId || !returnTo.sessionId || returnTo.notifyOnSuccess === false)) {
+          throw new Error('FORCE requires an exact source tab/session and the success report callback');
+        }
+        await verifyVoiceBuildInstall(args.force === true);
+        if (returnTo) await httpApiPost(target, '/api/build-install/source', { ...returnTo, force: args.force === true, installRequestId: requestId });
+        result = await httpPostVoice('/api/terminal/build-install', { requestId, returnTo, force: args.force === true });
+      } catch (error) {
+        error.message += '\nInstall requestId=' + requestId + '. Read GET /api/terminal/build-install?requestId='
+          + encodeURIComponent(requestId) + ' or retry only the identical request with this same requestId.';
+        throw error;
+      }
       const job = result.body?.job || {};
       let text = 'Voice Record accepted Noted Terminal build:install.';
       text += '\nVoice Record: pid=' + result.pid + ' port=' + result.port;
       if (job.id) text += '\nJob: ' + job.id;
-      text += '\nVoice Record will first WAIT for every other Noted Terminal blocker (neighbour tabs/projects mid-turn or a Restart-after-owned shell command) to go idle before spawning the build; your own tab' + (returnToTabId ? ' (' + returnToTabId + ')' : '') + ' is excluded from that wait. Manual shell commands are not blockers by themselves. Live blockers + phase are in GET /api/terminal/build-install (job.phase / job.wait).';
+      text += '\nRequest: ' + requestId;
+      if (args.force === true) text += '\nFORCE skips activity/loader/MCP idle waits. The same source receives an interruption/recovery report; unknown calls are never replayed automatically.';
+      if (args.force !== true) text += '\nVoice Record waits for local turns and input, including this source turn. Finish this turn after ACK. Strictly saved external Research survives restart; it is not cancelled or detached. Live blockers and preserved waits are in GET /api/terminal/build-install (job.phase / job.wait).';
       if (returnTo) {
         text += '\nReturn target: tab=' + (returnTo.tabId || '-') + (sessionId ? ' session=' + sessionId : ' session=(not yet known)');
         if (tabName || commandType) text += ' (' + [tabName, commandType].filter(Boolean).join(', ') + ')';
         text += args.notifyOnSuccess === false
-          ? '\nSuccess callback disabled; the return target is retained only to exclude this busy tab from the idle wait.'
+          ? '\nSuccess callback disabled; exact source provenance and all local guards are retained.'
           : '\nVoice Record will wait for Noted Terminal to reopen, for this tab/session to be restored, then it will send the completion prompt via the Project API scenario send path.';
       } else {
         text += '\nNo return target was available, so this is fire-and-forget with status only in Voice Record GET /api/terminal/build-install.';

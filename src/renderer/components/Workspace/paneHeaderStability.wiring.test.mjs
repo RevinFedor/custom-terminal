@@ -28,11 +28,11 @@ test('each stable pane publishes its measured header height through a pane-scope
   assert.match(area, /var\(\${TAB_SURFACE_HEADER_HEIGHT_VAR}, var\(\${splitPaneHeaderHeightVar\(layoutPaneIndex\)}/);
 });
 
-test('unfocused Git+split hides paint, preserves wrap width, and keeps ellipsis mounted', () => {
+test('Split and ellipsis keep their geometry without a hidden terminal reservation', () => {
   assert.match(chrome, /position: 'relative'/);
-  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
-  assert.match(chrome, /data-wrap-reserved="1"/);
+  assert.doesNotMatch(chrome, /data-split-pane-focus-actions|data-split-pane-terminal-slot|focusActionsVisible/);
   assert.doesNotMatch(chrome, /endInsetPx|focusActionsWidth/);
+  assert.match(chrome, /data-split-button/);
   assert.match(chrome, /data-split-strip-menu-button/);
   assert.doesNotMatch(chrome, /stripAutoReveal/);
 });

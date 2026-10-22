@@ -12,7 +12,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const {ensureMainFieldReceipts,reconcileMainFieldRevision} = require('./execution-main-field-receipts');
-const { app } = require('node:worker_threads').isMainThread ? require('electron') : {};
+const { app } = require('node:worker_threads').isMainThread
+  && process.env.NOTED_HISTORY_READER_PROCESS !== '1' ? require('electron') : {};
 const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');

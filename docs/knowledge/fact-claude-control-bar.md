@@ -245,12 +245,20 @@ feedback: client-проверка сверяет цвет Enter и логиче�
 
 ## Codex mode в том же bar
 
-**2026-09-08 — уточнение model/effort:** сохранение выбора и его применение
-разделены. После клика Model/Effort/Quick показывают ожидание и недоступны до
-подтверждения применения либо явной ошибки; сами busy-turn/paste не запрещают
-первый выбор. Ожидание читается из main и не сбрасывается переходом на другую
-вкладку. Это заменяет прежнее требование принимать следующий UI-выбор во время
-применения; внешняя API-очередь сохраняется. См.
+**Model/effort: сохранение выбора и применение разделены.** Busy-turn/paste сами
+не запрещают первый выбор. Историческое правило08.09 блокировало весь pending
+период; SOURCE20Oct уточняет desktop Codex: очередь Resume/readiness и подготовку
+Main до первого control input можно заменить новой desired revision. Иначе
+старый сохранённый Sol при Resume блокировал выбор Astra ещё до `/model`, а
+handler молча возвращался. Pending-пара выделяется как неподтверждённая, не live.
+После начала native control input Model/Effort/Quick блокируются до settlement;
+локальный незавершённый save также блокирует повтор. Main activity несёт optional
+`replaceable:true` лишь пока ВСЕ её операции ещё заменяемы; отсутствие поля
+консервативно означает прежнюю блокировку. Это presentation, не input-ready proof.
+Новый intent проверяется снова у первой записи; уже начатый picker не бросается
+посреди draft/Enter, а завершается под прежними guards. Отказ явного обработчика
+имеет log/reason и visible refusal; side effort flyout не остаётся активным
+при заблокированном parent. Внешняя API-очередь и owner/UNKNOWN checks сохранены. См.
 `fix-codex-settings-history-rollback.md` — включая ошибочное возвращение Ultra
 из старой History и ограничения проверки.
 
@@ -273,7 +281,7 @@ Codex Model/Effort хранятся на вкладке (`codexModel`, `codexEff
 
 Codex Model/Effort controls могут сохранять tab-scoped выбор до materialized session id, но busy-режим разделён не по типу параметра, а по способу применения: Model и Effort остаются clickable при `task_started`, потому что оба идут через native `/model` picker и подтверждаются его success-result. Если probe даёт `hasDraft=null` или picker падает, ControlBar не сохраняет выбранное значение как будто оно применилось, а фокусирует терминал и пишет diagnostic log вместо пользовательского уведомления. Для этого ControlBar читает `tab.aiBusy` как Codex turn-busy отдельно от `isCommandRunning`: OSC-состояние отвечает «процесс жив», а rollout busy отвечает «идёт ответ; новая связка model/effort станет настройкой последующей работы». Диагностический минимум в логах правого кластера — `turnBusy`, `hasDraft` и `source`; если пользователь видит `Working...`, но model/effort не применяются live, сначала сверяй именно эти поля.
 
-Runtime-настройки принадлежат доказанному writer, а не одному tab-state. Поэтому частичная смена только модели/effort и quick-toggle блокируются, если writer сменился или ещё неизвестен; явная полная пара остаётся доступным recovery-действием. После успеха proof owner сохраняется вместе с текущим writer. Если свежий Codex ещё не создал первый rollout, полная пара получает одноразовое доказательство для точного PTY/launch generation; его принимает только первый process-proven writer после durable binding. Для Codex 0.145 обычный `Max` меняет persistent default и сохраняет существующий Plan override, а `Ultra` действует только в текущем разговоре и требует отдельного точного acknowledgement.
+Runtime-настройки принадлежат доказанному launch/writer, а не одному tab-state. До его появления Model/Effort/Quick сохраняют полную desired-пару в Main; отсутствие proof запрещает физическую запись, не сохранение выбора. После успеха proof owner сохраняется вместе с текущим writer. Если свежий Codex ещё не создал первый rollout, пара получает одноразовое доказательство для точного PTY/launch generation; его принимает только первый process-proven writer после durable binding. Для Codex 0.145 обычный `Max` меняет persistent default и сохраняет существующий Plan override, а `Ultra` действует только в текущем разговоре и требует отдельного точного acknowledgement.
 
 ## Empty PTY controls и launch order
 

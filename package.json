@@ -17,6 +17,7 @@
     "build:i": "npm run build:install",
     "build:i-obs": "node scripts/build-when-idle.js",
     "build:i-cont": "node scripts/build-and-continue.js",
+    "build:i-c": "node scripts/build-and-continue-immediate.cjs",
     "_rebuild": "node scripts/node-pty-build.mjs",
     "_test:e2e": "cd runtime-tests && npx playwright test",
     "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed",
@@ -24,7 +25,7 @@
     "build:app": "node scripts/build-public-app.mjs",
     "rebuild:native": "node scripts/setup-native.mjs",
     "build:markdown": "npm run build --workspace @gt-editor/markdown-editor",
-    "test:setup": "node --test scripts/public-setup.test.mjs scripts/node-pty-build.test.mjs scripts/install-terminal-mcp.test.mjs scripts/install-claude-turn-hook.test.mjs scripts/runtime-api-key.test.mjs"
+    "test:setup": "node --test scripts/public-setup.test.mjs scripts/node-pty-build.test.mjs scripts/install-terminal-mcp.test.mjs scripts/install-claude-turn-hook.test.mjs scripts/runtime-api-key.test.mjs scripts/packaged-user-message-search.test.mjs"
   },
   "build": {
     "appId": "com.noted.terminal",
@@ -51,7 +52,15 @@
       "build-resources/icon-dev.png",
       "mobile-web/dist/**/*",
       "package.json",
-      "!logs/**"
+      "!logs/**",
+      {
+        "from": "node_modules/micromark-util-subtokenize",
+        "to": "node_modules/micromark-util-subtokenize",
+        "filter": [
+          "**/*",
+          "!node_modules/**/*"
+        ]
+      }
     ],
     "extraResources": [
       {

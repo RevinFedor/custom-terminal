@@ -71,7 +71,7 @@ test('mixed/subset/future/stale/not-ready edits reject before writing, exact rec
 });
 test('DnD capture fences group revision, order, exact membership, navigation away-return and window identity; unrelated runtime publication is harmless',()=>{
   for(const change of ['color','order','membership','navigation','window','runtime']) {
-    const {state,lease}=fixture(),capture=capturePaneStripGroupDrag({getState:()=>state,owner:lease,sourceIds:['b']});
+    const {state,lease}=fixture(),capture=capturePaneStripGroupDrag({getState:()=>state,owner:lease,sourceIds:['b'],internalScope:true});
     assert.equal(capture.boundary.end,1);assert.ok(capture.isCurrent());
     if(change==='color')state.spaces[0].stripColorGroups.revision++;
     if(change==='order')state.splitPanes[0].tabs.reverse();

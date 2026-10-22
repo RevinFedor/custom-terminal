@@ -102,6 +102,14 @@ test('moved controls preserve saved values and call the same setters without mou
   ]);
 });
 
+test('manual Goal policy is visible, can be saved as null and never changes the usage policy', () => {
+  const { controls, calls, html } = renderPolicies({ codexResumePausedGoal: null });
+  const goal = controls.get('codex-resume-goal-policy');
+  assert.equal(goal.value, 'manual'); assert.match(html, /Спрашивать каждый раз/);
+  goal.onChange({ currentTarget: { value: 'manual' } });
+  assert.deepEqual(calls, [['goal', null]]);
+});
+
 test('no default model keeps effort disabled and the existing empty-value normalization', () => {
   const { controls, calls } = renderPolicies({ defaultCodexModel: 'none', defaultCodexEffort: 'none', selectedDefaultCodexModel: null });
   assert.equal(controls.get('codex-default-model').value, '');

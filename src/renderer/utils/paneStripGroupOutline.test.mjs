@@ -14,17 +14,18 @@ test('noncontiguous members cannot put a foreign intervening chip inside a frame
   assert.equal(output.length,2);assert.deepEqual(output.map(p=>p.tabIds),[['a'],['c']]);
   assert.ok(output.every(p=>!p.edges.some(e=>e.x1<86&&e.x2>166)));
 });
-test('wrapped group has solid occupied silhouette and only the unoccupied upper tail is dashed',()=>{
+test('wrapped group follows occupied silhouettes without extending into either empty row margin',()=>{
   const output=buildPaneStripGroupOutlines({chips:[chip('foreign',0),chip('a',86),chip('b',0,36),chip('c',86,36),chip('other',172,36)],
     groups:[{id:'g',tabIds:['a','b','c'],color:'#123456'}],rows:[{top:0,left:0,right:300},{top:36,left:0,right:300}]});
-  assert.equal(output.length,2);assert.ok(output[0].solid);assert.ok(output[0].dashed);
-  assert.equal(output[1].dashed,'');assert.ok(output[0].edges.filter(e=>e.dashed).every(e=>e.x1>=166.5&&e.x2>=166.5));
+  assert.equal(output.length,2);assert.ok(output.every(p=>p.solid&&p.dashed===''));
+  assert.ok(output[0].edges.every(e=>e.x1>=85.5&&e.x2>=85.5&&e.x1<=166.5&&e.x2<=166.5));
   assert.ok(output[1].edges.every(e=>e.x1<=166.5&&e.x2<=166.5));
 });
-test('a foreign trailing chip prevents drawing a dashed tail across it; first row honors the action-block edge',()=>{
+test('window and first-row action edges never become part of a group frame',()=>{
   const groups=[{id:'g',tabIds:['a','b'],color:'#123456'}];
   const [bounded]=buildPaneStripGroupOutlines({chips:[chip('a',0),chip('b',0,36)],groups,rows:[{top:0,left:0,right:120},{top:36,left:0,right:200}]});
-  assert.equal(bounded.clip.right,120);assert.ok(bounded.edges.some(e=>e.x2>120));
+  assert.equal(bounded.clip,undefined);assert.equal(bounded.dashed,'');
+  assert.ok(bounded.edges.every(e=>e.x1>=-.5&&e.x2>=-.5&&e.x1<=80.5&&e.x2<=80.5));
   const [foreign]=buildPaneStripGroupOutlines({chips:[chip('a',0),chip('foreign',86),chip('b',0,36)],groups,rows:[{top:0,left:0,right:300}]});
   assert.equal(foreign.dashed,'');
 });
@@ -50,22 +51,42 @@ test('file bump rounds both outward and inward turns without adding an internal 
  assert.ok(!p.edges.some(e=>e.y1===20&&e.y2===20));
  assert.ok(!/NaN|Infinity/.test(p.solid));
 });
-test('wrapped rows stay open at both strip edges and round only the actual group ends',()=>{
+test('a wrapped group has straight open cuts at the last card and next row first card',()=>{
  const [first,last]=buildPaneStripGroupOutlines({chips:[chip('a',0),chip('b',0,36)],groups:[{id:'g',tabIds:['a','b'],color:'#123456'}],rows:[{top:0,left:0,right:120},{top:36,left:0,right:200}],radius:6});
- assert.equal((first.solid.match(/A6 6 /g)||[]).length,2);assert.ok(!first.dashed.includes('A'));
- assert.ok(first.edges.filter(e=>e.dashed).every(e=>e.y1===e.y2));
- assert.ok(first.edges.filter(e=>e.dashed).every(e=>e.x2>120),'horizontal dashes reach beyond the clipped edge');
- assert.ok(!last.edges.some(e=>e.x1===e.x2&&e.x1<=0),'continued row must not close on its left');
- assert.equal((last.solid.match(/A6 6 /g)||[]).length,2);
- assert.equal(first.clip.right,120);assert.equal(last.clip.left,0);
+ for(const p of [first,last]){
+  assert.equal((p.solid.match(/A6 6 /g)||[]).length,2);assert.equal(p.dashed,'');assert.equal(p.clip,undefined);
+  assert.ok(p.edges.every(e=>e.x1>=-.5&&e.x2>=-.5&&e.x1<=80.5&&e.x2<=80.5));
+ }
+ assert.ok(!first.edges.some(e=>e.x1===80.5&&e.x2===80.5),'continuation has no right wall');
+ assert.ok(!last.edges.some(e=>e.x1===-.5&&e.x2===-.5),'continuation has no left wall');
+ assert.ok(first.solid.includes('M5.5 -0.5L80.5 -0.5'));
+ assert.ok(first.solid.includes('M5.5 24.5L80.5 24.5'));
+ assert.ok(last.solid.includes('M-0.5 35.5L74.5 35.5'));
+ assert.ok(last.solid.includes('M-0.5 60.5L74.5 60.5'));
 });
-test('a middle row has two open ends, dashed empty margins and an intact file bump',()=>{
+test('foreign chips on either side of a row wrap keep group ends closed and rounded',()=>{
+ const groups=[{id:'g',tabIds:['a','b'],color:'#123456'}];
+ for(const chips of [
+  [chip('a',0),chip('foreign',86),chip('b',0,36)],
+  [chip('a',0),chip('foreign',0,36),chip('b',86,36)],
+ ]){
+  const output=buildPaneStripGroupOutlines({chips,groups,radius:6});
+  assert.equal(output.length,2);
+  assert.ok(output.every(p=>(p.solid.match(/A6 6 /g)||[]).length===4));
+ }
+});
+test('a middle-row file bump returns to the card base; absent files never lower the empty margin',()=>{
  const middle=chip('b',12,36);middle.files=[{left:20,right:70,top:56,bottom:67}];
  const [first,p,last]=buildPaneStripGroupOutlines({chips:[chip('a',0),middle,chip('c',0,72)],groups:[{id:'g',tabIds:['a','b','c'],color:'#fff'}],rows:[{top:0,left:0,right:120},{top:36,left:0,right:150},{top:72,left:0,right:200}],radius:6});
- assert.ok(p.edges.some(e=>e.dashed&&e.x1<0));assert.ok(p.edges.some(e=>e.dashed&&e.x2>150));
- assert.ok(!p.edges.some(e=>e.x1===e.x2&&(e.x1<0||e.x1>150)));
+ assert.equal(p.dashed,'');assert.equal(p.clip,undefined);
+ assert.ok(p.edges.every(e=>e.x1>=11.5&&e.x2>=11.5&&e.x1<=92.5&&e.x2<=92.5));
  assert.ok(p.edges.some(e=>e.y1===67.5&&e.y2===67.5&&e.x1<=20&&e.x2>=70));
- assert.deepEqual([p.clip.left,p.clip.right],[0,150]);assert.ok(first.solid.includes('A6 6'));assert.ok(last.solid.includes('A6 6'));
+ assert.ok(p.edges.some(e=>e.y1===60.5&&e.y2===60.5&&e.x1>=70.5));
+ assert.ok(!p.edges.some(e=>e.y1===67.5&&e.y2===67.5&&e.x2>70.5));
+ assert.ok(!p.edges.some(e=>e.x1===e.x2&&(e.x1===11.5||e.x1===92.5)),'middle row has two open cuts');
+ assert.ok(p.solid.includes('M11.5 35.5L92.5 35.5'),'top reaches both actual card edges');
+ assert.ok(p.solid.includes('A'),'file bump keeps its rounded turns');
+ assert.ok(first.solid.includes('A6 6'));assert.ok(last.solid.includes('A6 6'));
 });
 test('tight chip geometry bounds large corner radius and zero radius keeps the original silhouette',()=>{
  const options={chips:[{id:'a',left:0,right:4,top:0,bottom:2}],groups:[{id:'g',tabIds:['a'],color:'#123456'}]};

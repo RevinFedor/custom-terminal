@@ -54,6 +54,17 @@ linked Markdown/`publish_context_update`. Иначе уточняющий воп
   явный содержательный ответ; уточнение оформляется новым вопросом. Reply
   не требует автоматического ответного acknowledgement агентом.
 
+Явная операция `build:i-c` добавляет узкий post-delivery restart binding.
+Если вопрос был доставлен в A, захвачен именно этот участник/вопрос, а единственный
+restart continuation подтверждён canonical FIFO request/attempt/audit в B,
+продолжившийся B может ответить на этот вопрос. Старый `deliverySessionId=A`,
+исходные поля вопроса и prompt сохраняются; произвольный accepted Resume alias
+без операции и квитанции по-прежнему недостаточен. Issued binding переживает
+SQLite reopen и проверяется при reply reservation и последующей delivery после
+await. Обратный адрес исходного sender имеет отдельный proof; право responder
+не переносит автоматически всю переписку A на B. Готовый reply во время downtime
+доставляет прежний message owner, без повторного вопроса/нового reply ID.
+
 Шрам14.10 Ai Mindset→4898: usable writer отправителя не подтверждает адресата.
 У остановленного Codex сохранённый SID был виден, но coherent Main snapshot
 не переносил canResume; message resolver поэтому отказал503 до reservation.

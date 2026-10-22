@@ -273,9 +273,37 @@ function hostHeld(host, ingressFile) {
     const plans = readJournal(path.join(path.dirname(ingressFile), 'research-host-plans.json'))
     const plan = plans.plans.find(v => v.barrierId === hold.barrierId && v.migrationId === hold.migrationId)
     const permit = plan?.activationPermit
-    return permit?.committed !== true || permit.releaseDigest !== hold.release?.releaseDigest
-      || !plan.hosts.some(h => h.hostId === host.hostId && h.generation === host.generation
-        && h.configurationDigest === host.configurationDigest && h.ingressAuthorityDigest === validateIngressAuthority(host.ingressAuthority, ingressFile))
+    const ingress = readBoundIngress(host.ingressAuthority, host.ingressEpoch, host.ingressBasis)
+    const fence = ingress.fences.find(f => f.barrierId === hold.barrierId)
+    const authority = validateIngressAuthority(host.ingressAuthority, ingressFile)
+    const receipt = hold.receipt
+    if (permit?.version !== 1 || permit.committed !== true || permit.barrierId !== hold.barrierId
+      || permit.releaseDigest !== hold.release?.releaseDigest || !Array.isArray(permit.workers) || !permit.workers.length
+      || !id(permit.nativeJournalStoreEpoch) || !/^[a-f0-9]{64}$/.test(permit.nativeCoverageDigest || '')
+      || plan?.version !== 1 || plan.phase !== 'retired' || !/^[a-f0-9]{64}$/.test(plan.receiptDigest || '')
+      || plan.ingressEpoch !== ingress.storeEpoch || plan.fenceId !== hold.fenceId || plan.fenceDigest !== hold.fenceDigest
+      || plan.barrierRevision !== hold.barrierRevision || fence?.state !== 'released'
+      || fence.fenceId !== hold.fenceId || fence.digest !== hold.fenceDigest
+      || fence.releasedRevision !== hold.barrierRevision + 1 || fence.releaseDigest !== permit.releaseDigest
+      || hold.configurationDigest !== host.configurationDigest || hold.ingressAuthorityDigest !== authority
+      || receipt?.version !== 1 || receipt.hostId !== host.hostId || receipt.generation !== hold.preparedGeneration
+      || receipt.barrierId !== hold.barrierId || receipt.migrationId !== hold.migrationId
+      || receipt.fenceId !== hold.fenceId || receipt.fenceDigest !== hold.fenceDigest
+      || receipt.configurationDigest !== host.configurationDigest || receipt.ingressAuthorityDigest !== authority
+      || receipt.disposition !== 'host_local_execution_authority_retired' || receipt.replayPermission !== false
+      || hold.release?.receiptId !== receipt.receiptId) return true
+    const enrolled = plan.hosts?.find(h => h.hostId === host.hostId && h.generation === receipt.generation
+      && h.configurationDigest === host.configurationDigest && h.ingressAuthorityDigest === authority)
+    if (!enrolled) return true
+    if (enrolled.generation === host.generation) return !sameProcess(enrolled.process, host.process)
+    // Main's completed activation is historical authority, not a lease on the
+    // old hub PID. Only the same durable host writer's lineage can inherit it.
+    // A new generation alone, released ingress alone, or a new empty journal
+    // is insufficient. Keep the original cohort/receipts and UNKNOWN carry.
+    return !Array.isArray(host.lineage)
+      || host.lineage.some(row => !id(row?.generation) || !row.process || row.generation === host.generation)
+      || new Set(host.lineage.map(row => row.generation)).size !== host.lineage.length
+      || !host.lineage.some(row => row.generation === enrolled.generation && sameProcess(row.process, enrolled.process))
   })
 }
 function authorized(req, token) {

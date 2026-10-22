@@ -280,7 +280,7 @@ test('workflow metadata durable и project имеет одного родите�
 });
 
 
-test('действия окна остаются в потоке при скрытом focus-блоке', () => {
+test('видимые действия окна остаются в потоке без скрытого terminal-блока', () => {
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
   const at = chrome.indexOf('data-split-pane-actions');
   const box = chrome.slice(at, at + 1800);
@@ -289,8 +289,7 @@ test('действия окна остаются в потоке при скры
   assert.match(box, /flexShrink: 0/);
   assert.match(box, /height: chipH/);
   assert.match(box, /alignItems: 'stretch'/);
-  assert.match(chrome, /data-wrap-reserved="1"/);
-  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+  assert.doesNotMatch(chrome, /data-split-pane-focus-actions|data-split-pane-terminal-slot|focusActionsVisible/);
   assert.doesNotMatch(chrome, /focusActionsWidth|endInsetPx/);
 });
 

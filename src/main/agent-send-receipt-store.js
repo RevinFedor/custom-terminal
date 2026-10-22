@@ -1207,6 +1207,10 @@ class AgentSendReceiptStore {
       const receipt = {
         ...(record.receipt || {}),
         ...context,
+        ...(record.receipt?.sendInputTiming ? { sendInputTiming: record.receipt.sendInputTiming }
+          : context.preflightScope?.preparation ? { sendInputTiming: {
+            version: 1, preparationStartedAt: context.preflightScope.preparation.startedAt,
+          } } : {}),
         operationKey,
         attemptId,
         sessionId: exactTargetSessionId || record.sessionId || null,
@@ -1425,6 +1429,27 @@ class AgentSendReceiptStore {
     })());
   }
 
+  recordPayloadAttempt({ tabId, handoffId, operationKey, attemptId, payloadStartedAt, authoredCommand }) {
+    if (!operationKey || !attemptId || !Number.isFinite(payloadStartedAt) || payloadStartedAt <= 0) return null;
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || record.tabId !== tabId || record.handoffId !== handoffId || record.attemptId !== attemptId) return null;
+      // A native slash explicitly authored as this message is a payload; a
+      // preparation /model,/fast,/compact for another message is not.
+      if (typeof authoredCommand === 'string' && ![record.receipt?.promptText, record.receipt?.transportText]
+        .some(value => typeof value === 'string' && value.trim() === authoredCommand.trim())) return null;
+      const timing = record.receipt?.sendInputTiming;
+      if (timing?.version !== 1 || !Number.isFinite(timing.preparationStartedAt) || timing.preparationStartedAt <= 0) return null;
+      if (timing.payloadStartedAt) return { ...timing, newlyStarted: false };
+      const next = { version: 1, preparationStartedAt: timing.preparationStartedAt, payloadStartedAt };
+      // Reuse the existing receipt-only statement. Do not change delivery,
+      // updatedAt, state, cancellation, slot, payload, audit or admission.
+      this.statements.enterTiming.run({ operationKey, attemptId,
+        receiptJson: encodeJson({ ...(record.receipt || {}), sendInputTiming: next }) });
+      return { ...next, newlyStarted: true };
+    })();
+  }
+
   recordEnterAttempt({ tabId, handoffId, operationKey, attemptId, enterAttemptAt }) {
     if (!operationKey || !attemptId || !Number.isFinite(enterAttemptAt) || enterAttemptAt <= 0) return null;
     return this.db.transaction(() => {
@@ -1489,6 +1514,8 @@ class AgentSendReceiptStore {
       const mergedReceipt = {
         ...(record.receipt || {}),
         ...nextReceipt,
+        // Transport/audit replies do not own this Main call-boundary clock.
+        ...(record.receipt?.sendInputTiming ? { sendInputTiming: record.receipt.sendInputTiming } : {}),
       };
       if (exactSendPreflightRefusal(record, nextReceipt)) {
         Object.assign(mergedReceipt, { success: false, accepted: false, submitted: false,

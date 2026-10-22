@@ -2,7 +2,7 @@
 
 // A bounded extension of the EXISTING external flight-recorder artifact store.
 // No file IO or payload/DOM inspection on the Main or renderer input path.
-const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, sanitizeWorkCapsule, fitCausalRecord } = require('../shared/perf-causal-schema.cjs');
+const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, sanitizeWorkCapsule, fitCausalRecord, sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
 const STRING_FIELDS = new Set(['sourceBoot', 'sourceKind', 'spanId', 'parentSpanId', 'name', 'kind', 'phase', 'state', 'outcome',
   'actionId', 'readId', 'requestId', 'tabId', 'sessionId', 'fileIdentity', 'caller', 'mode', 'reason', 'threadCpuSource',
   'threadCpuUnavailableReason', 'gcCoverage', 'cpuCoverage', 'keyClass', 'event', 'owner', 'visibility', 'incidentId',
@@ -42,6 +42,12 @@ function cleanCausalRecord(input, origin, receivedAt) {
     const capsule = sanitizeWorkCapsule(fields.workCapsule.value);
     if (capsule) record.workCapsule = capsule;
   }
+  if(fields.sqlWitness) {
+    const sql=sanitizeSqlWitness(fields.sqlWitness.value,0);
+    if(!sql || (fields.sourcePid && fields.sourcePid.value!==origin.pid))return null;
+    record.sqlWitness=sql;
+  }
+  if(record.kind==='sql-witness' && !record.sqlWitness)return null;
   return record;
 }
 
@@ -52,7 +58,24 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
   const bound = (value, limit) => Number.isInteger(value) && value > 0 ? Math.min(value, limit) : limit;
   maxPerMinute = bound(maxPerMinute, 60); maxQueued = bound(maxQueued, 64); maxRecordBytes = bound(maxRecordBytes, 2048);
   const pending = [], sources = new Map(), active = new Map(), recent = [];
-  const entered = new Map(), persisted = new Map();
+  const entered = new Map(), persisted = new Map(), sqlSources = new Map();
+  let sqlSourceEvictions=0;
+  const observeSql=data=>{
+    if(!data.sqlWitness)return null;
+    const id=JSON.stringify([data.sourcePid,data.sourceBoot]),prior=sqlSources.get(id);
+    if(prior && prior.sqlWitness.revision>=data.sqlWitness.revision)return null;
+    if(!prior && sqlSources.size>=64){sqlSources.delete(sqlSources.keys().next().value);sqlSourceEvictions++;}
+    const observed={sourcePid:data.sourcePid,sourceBoot:data.sourceBoot,
+      sourceSeq:Number.isSafeInteger(data.sourceSeq) && data.sourceSeq>=0?data.sourceSeq:null,
+      emittedAbs:Number.isFinite(data.emittedAbs)?data.emittedAbs:null,
+      watchdogReceivedAbs:data.watchdogReceivedAbs,sqlWitness:data.sqlWitness,
+      currentState:'UNKNOWN',reason:'last-observation-not-current-proof',persistence:'received-only'};
+    sqlSources.set(id,observed);return observed;
+  };
+  const sqlPersistence=(data,status)=>{
+    const entry=sqlSources.get(JSON.stringify([data.sourcePid,data.sourceBoot]));
+    if(entry && entry.sqlWitness.revision===data.sqlWitness?.revision)entry.persistence=status;
+  };
   // Fixed shares prevent a flood in one category from spending all sixty
   // ordinary records. Reduced test limits leave the remainder to detail.
   const normalLimits = { work: Math.max(1, Math.floor(maxPerMinute * 32 / 60)), health: Math.max(1, Math.floor(maxPerMinute * 8 / 60)) };
@@ -103,6 +126,7 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
     let data = cleanCausalRecord(input, origin, at);
     if (!data) { counts.droppedMalformed++; lose(category, 'malformed'); return false; }
     counts.received++;
+    observeSql(data);
     const source = observeSequence(data, origin);
     const key = summaryKey(data);
     if (key) active.delete(spanKey(data, data.summaryId));
@@ -113,8 +137,9 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
       if (entered.size > 128) { entered.delete(entered.keys().next().value); counts.enteredEvictions++; }
     }
     if (key) data.enteredRecordMissing = !entered.has(spanKey(data, data.summaryId));
+    const beforeFit=data;
     data = fitCausalRecord(data, maxRecordBytes);
-    if (!data) { counts.droppedBytes++; lose(category, 'bytes'); return false; }
+    if (!data) { counts.droppedBytes++; lose(category, 'bytes'); sqlPersistence(beforeFit,'byte-drop'); return false; }
     const encoded = JSON.stringify(data);
     // Even rate-limited records maintain the bounded live span context. A stall
     // incident receives this context, rather than an opaque old IPC age string.
@@ -131,7 +156,7 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
     // Reserve separate small space for actual stall/resume boundaries. Neither
     // stream is unbounded; a loss is surfaced in the next recorder heartbeat.
     if (critical ? source.critical >= 12 : source.count >= maxPerMinute || source.normal[category] >= normalLimits[category]) {
-      counts.droppedRate++; lose(category, 'rate'); return false;
+      counts.droppedRate++; lose(category, 'rate'); sqlPersistence(data,'rate-drop'); return false;
     }
     if (pending.length >= maxQueued) {
       // Only strictly lower-priority evidence may be evicted. In particular,
@@ -141,16 +166,20 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
         if (priority[pending[i].category] < priority[category]
           && (index < 0 || priority[pending[i].category] < priority[pending[index].category])) index = i;
       }
-      if (index < 0) { counts.droppedQueue++; lose(category, 'queue'); return false; }
-      const [evicted] = pending.splice(index, 1); counts.droppedQueue++; lose(evicted.category, 'evicted');
+      if (index < 0) { counts.droppedQueue++; lose(category, 'queue'); sqlPersistence(data,'queue-drop'); return false; }
+      const [evicted] = pending.splice(index, 1); counts.droppedQueue++; lose(evicted.category, 'evicted'); sqlPersistence(evicted.data,'queue-evicted');
     }
     if (critical) source.critical++; else { source.count++; source.normal[category]++; }
+    sqlPersistence(data,'queued-not-persisted');
     pending.push({ line: encoded + '\n', at, data, key, category });
     return true;
   }
   function reconcile(snapshot, origin) {
     if (!snapshot || !Number.isInteger(origin?.pid) || origin.pid <= 0
       || typeof snapshot.sourceBoot !== 'string' || !Number.isFinite(snapshot.emittedAbs)) return;
+    const sql=sanitizeSqlWitness(snapshot.sqlWitness,0);
+    if(sql)observeSql({sourcePid:origin.pid,sourceBoot:snapshot.sourceBoot,sourceSeq:snapshot.sourceSeq,
+      emittedAbs:snapshot.emittedAbs,sqlWitness:sql,watchdogReceivedAbs:now()});
     // A completed work may arrive well after the incident's twenty-second
     // window, or without any enter packet. Its own interval remains intact.
     for (const work of (Array.isArray(snapshot.completedWork) ? snapshot.completedWork.slice(-8) : [])) {
@@ -210,6 +239,7 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
             || receipt.name !== name) throw new Error('causal append not confirmed');
         } else artifacts.write(name, lines, true); // Older observer adapters: no persistence ACK.
         counts.written += group.items.length;
+        for(const item of group.items)sqlPersistence(item.data,receipt?'append-confirmed':'legacy-write-unconfirmed');
         for (const item of group.items) if (item.key && receipt) {
           persisted.set(item.key, { sourcePid: item.data.sourcePid, sourceBoot: item.data.sourceBoot,
             summaryId: item.data.summaryId, revision: item.data.revision });
@@ -221,7 +251,7 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
         if (error?.code === 'CAUSAL_TORN_BUCKET') counts.tornBucketRecords += group.items.length;
         if (bucketFull) counts.droppedBucket += group.items.length; else counts.diskErrors++;
         counts.droppedQueue += group.items.length;
-        for (const item of group.items) lose(item.category, bucketFull ? 'bucket' : 'disk');
+        for (const item of group.items) {lose(item.category, bucketFull ? 'bucket' : 'disk');sqlPersistence(item.data,bucketFull?'bucket-drop':'disk-unknown');}
         if (at - lastErrorAt > 30000) {
           lastErrorAt = at;
           const reason = bucketFull ? error.code === 'CAUSAL_NORMAL_BUCKET_FULL' ? 'normal-hour-cap' : 'total-hour-cap'
@@ -235,6 +265,8 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
     snapshot() { return { limits: { maxPerMinute, criticalPerMinute: 12, maxQueued, maxRecordBytes },
       normalLimits: { ...normalLimits },
       counts: { ...counts, losses: Object.fromEntries(Object.entries(losses).map(([key, value]) => [key, { ...value }])) },
+      sqlSourceEvictions,sqlSourcesOmitted:Math.max(0,sqlSources.size-8),
+      sqlWitnesses:[...sqlSources.values()].slice(-8).map(e=>({...e,sqlWitness:sanitizeSqlWitness(e.sqlWitness,0)})),
       queued: pending.length, persistedSummaries: persisted.size, flushLagMs: lastFlushLagMs,
       active: [...active.values()].slice(-8), recent: recent.slice(-8) }; },
   };

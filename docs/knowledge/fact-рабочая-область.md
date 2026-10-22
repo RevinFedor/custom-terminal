@@ -598,7 +598,7 @@ NULL не должен попадать в `join` picker и ронять context
 
 ## Действия панели видны всегда и держат постоянную геометрию
 
-Git принадлежит общей шапке. Оконный focus-блок сохраняет место через `visibility:hidden` вне фокуса; `⋮` остаётся доступным. Переходы empty/file/AI/chooser не добавляют подпись «Нет вкладки» или X в action-block. Отдельный22px слот показа бокового терминала всегда в потоке первой строки: неприменимая кнопка hidden/disabled, без hit/focus. Его появление не меняет ширину блока; hidden-window inventory остаётся самостоятельной причиной изменения числа кнопок. Не вводить fixed height всей полосы: следующая строка чипов использует всю ширину, а реальная высота по-прежнему приходит от ResizeObserver.23 Source/render/handler/wiring checks20Oct подтверждают эту структуру, не actual pixels или производительность приложения.
+Git принадлежит общей шапке. Split и `⋮` видны без focus-only обёртки. По прямому уточнению Fedor20Oct скрытый22px слот терминала удалён: прежний показ бокового терминала поверх workspace доступен через `⋮ → Terminal full view`, без дополнительного резерва первой строки. Неприменимость действия блокирует пункт меню, а не оставляет пустую кнопку в шапке. Переходы empty/file/AI/chooser не добавляют «Нет вкладки» или X; Close window остаётся только у пустого окна. Верхний2px отступ отделяет групповую обводку от рамки фокусного окна. Следующие строки используют полную ширину; высота остаётся измеряемой через ResizeObserver, без fixed height. Текущую границу Source и установленной версии см. в рабочем `docs/tmp/оптимизация-history.md`.
 
 ## Три разных «убрать», и только одно закрывает окно
 
@@ -764,14 +764,32 @@ Release/cancel завершает **три части одного жеста в
 Физическая очистка не означает возврат полосы к старому порядку до async ACK.
 `paneTabDropPresentation` отдельно удерживает exact before/after frozen request,
 подтверждённый layout receipt смонтированной целевой полосы. После accepted apply
-он ждёт совпадения **реальных base props полос**, включая промежуточные React commits:
+он ждёт совпадения **реальных base props полос**, включая order, effective rows
+и raw group basis, а также промежуточные React commits:
 обновлённый store при старых props retained-родителя ещё не завершает handoff.
 Этот owner не удерживает capture/cursor/body targets и не выдаёт durable ACK.
 Reject, смена navigation/scope или новый writer снимают именно свой feedback;
 поздний A не очищает B и не возвращает foreground reveal удалённому target.
 Retained chrome регистрируется по своему workflow/stable window ID, dormant host
-не подменяет видимый receipt. Свежий drag из projected chip захватывает canonical
-source, а не временное видимое положение; прежний CAS остаётся обязательным.
+не подменяет видимый receipt. Удержанный preview не меняет logical source; release
+синхронно устанавливает следующую local пару order+membership до ACK. Свежий drag
+из released projected chip использует именно эту пару, не старые retained props
+или временный ordinal. Main CAS и durable receipt остаются обязательными.
+
+Проверка released presentation сравнивает row descriptor запроса с его effective
+формой на измеренной `receipt.stripWidth`; исходный frozen descriptor для Main
+сохраняется. Положительная конечная ширина обязательна для явного row break,
+а tolerance остаётся 0,5px. Изменение ширины само по себе не завершает handoff:
+каждая retained-полоса должна получить canonical base IDs, raw group basis и
+effective base rows на своей текущей ширине. Изменение только membership также
+инвалидирует прежнюю геометрию того же owner; новый observer не создаётся.
+Нулевая ширина не доказывает готовую геометрию.
+
+Chrome cache включает `presented`, поэтому активация dormant окна обновляет
+измерение полосы без смены keys/types History и terminal children. Право позднего
+ACK вернуть foreground отдельно связано с captured drag session: новый жест
+отзывает только reveal старого, а обычный pointerup его сохраняет. Это не меняет
+`isCurrent` допуска уже принятой durable команды и не даёт права повторного write.
 
 Идентичность окна — `{spaceId, paneKey}`, а не один `pane:0`: нулевое окно двух workflow — два разных места. Тот же составной ключ владеет снимком геометрии. Без `spaceId` cross-workflow drop ошибочно считался reorder внутри старого окна и сохранял показанной чужую вкладку.
 

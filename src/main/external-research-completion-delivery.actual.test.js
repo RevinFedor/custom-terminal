@@ -16,8 +16,11 @@ const webFile=path.join(__dirname,'web-server.js'),ast=ts.createSourceFile(webFi
 const names=['prepareExternalCompletionRequest','prepareOrchestrationCompletionContent','readExternalResearchResult','reconcileExternalResearchRun',
 'externalResearchAnswerText','boundedExternalResearchResult','orchestrationUrls','withOrchestrationUrls','orchestrationNotificationText',
 'orchestrationPresentationSnapshot','sendOrchestrationCompletionNotification','orchestrationSourceReceiptProof','reconcileOrchestrationSourceFollowup',
-'startOrchestrationStartupRecovery','stopOrchestrationStartupRecovery','reconcileActiveOrchestrations','reconcileOrchestrationSourceReceiptPins','releaseOrchestrationSourceProof','revokeExternalOperationalDelivery','revokeExternalCompletionDelivery','promptFingerprint','shortId'];
+'startOrchestrationStartupRecovery','stopOrchestrationStartupRecovery','reconcileActiveOrchestrations','reconcileOrchestrationSourceReceiptPins','releaseOrchestrationSourceProof','revokeExternalOperationalDelivery','revokeExternalCompletionDelivery','externalResearchCancellationReceipt','performOrchestrationAction','cancelPendingOrchestrationContinuation','promptFingerprint','shortId'];
 const actual=names.map(name=>{const n=ast.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text===name);assert(n,name);return n.getText(ast);}).join('\n');
+let cancelRouteBody;
+(function visit(node){if(ts.isIfStatement(node)&&node.expression.getText(ast)==="orchestrationCancelMatch && req.method === 'POST'")cancelRouteBody=node.thenStatement.getText(ast);ts.forEachChild(node,visit);})(ast);
+assert(cancelRouteBody,'actual public cancellation route');
 const bounded=async p=>{let timer;try{return await Promise.race([p,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('owned test deadline')),8000);})]);}finally{clearTimeout(timer);}};
 const target={toolType:'codex',sessionId:'source-S'};
 async function fixture(t,options={}){
@@ -42,8 +45,10 @@ async function fixture(t,options={}){
  readScenarioDestination:async()=>({...hooks.source}),
  resolveAgentSessionInfo:async()=>{if(hooks.beforeInfo)await hooks.beforeInfo();return hooks.source;},armOrchestrationSourceProof:async()=>({success:true}),
  orchestrationSourceProofCoordinator:{release:async()=>true},emitOrchestrationChanges(){},emitOrchestrationRun(){},finalizeSettledOrchestrations:async()=>{},getAgentTurnResult:null,getAgentResponseState:null,readAgentObservedResponse:null,
- processDueOrchestrationPolicies:async()=>{},scheduleOrchestrationPolicyTimer:async()=>{},dispatchNextDeferredOrchestrationForTarget:async()=>{}});
+ processDueOrchestrationPolicies:async()=>{},scheduleOrchestrationPolicyTimer:async()=>{},dispatchNextDeferredOrchestrationForTarget:async()=>{},
+ decId:decodeURIComponent,readBody:async req=>req.body,sendJson:(_res,status,body)=>({status,body})});
  vm.runInContext(actual,context);
+ vm.runInContext(`async function cancelViaPublicRoute(body={}) { const req={method:'POST',body},res={},orchestrationCancelMatch=[null,'R']; ${cancelRouteBody} }`,context);
  const identity=request=>({operationKey:request.sendOperationKey,surface:'desktop-history',tabId:request.tabId,provider:request.provider,sessionId:request.sessionId,
  handoffId:request.handoffId,requestFingerprint:registry.fingerprintAgentSendRequest(request),promptHash:promptAuditFingerprint(request.prompt),promptLength:request.prompt.length});
  const promote=record=>receipts.promoteFromAudit({success:true,operationKey:record.operationKey,attemptId:record.attemptId,provider:sourceTarget.toolType,sessionId:record.sessionId||options.materializedSessionId||hooks.source.sessionId||'source-S',
@@ -53,6 +58,7 @@ async function fixture(t,options={}){
  const freeze=contents.freeze.bind(contents);contents.freeze=value=>{if(hooks.failFreeze-->0)throw Object.assign(Error('owned content write'),{code:'SQLITE_IOERR'});return freeze(value);};
  runs=new runApi.OrchestrationRunStore(file,{onOperationalRevoked:context.revokeExternalOperationalDelivery,onCompletionRevoked:context.revokeExternalCompletionDelivery});
  queue=new AgentSendQueue({store:receipts,ready:()=>hooks.ready,execute:async(request,scope)=>{
+ try {
  if(hooks.beforeInput)await hooks.beforeInput(request);if(request.completionDeliveryRef)await local.resolveCompletionRequest(runs,request);
  if(request.operationalNoticeRef)await resolveOperationalRequest(runs,request);
  const pinFailure=require('../shared/agent-send-target-precondition.cjs').agentSendTargetPreconditionFailure(request.expectedTarget,hooks.source);
@@ -63,6 +69,7 @@ async function fixture(t,options={}){
  if(!hooks.source.sessionId&&options.materializedSessionId)hooks.source.sessionId=options.materializedSessionId;
  receipts.settleAttempt(key.operationKey,begun.attemptId,{submitted:true,auditPending:true,status:'audit-pending'});
  if(hooks.audit)assert.equal(promote(receipts.get(key.operationKey)).promoted,true);return receipts.get(key.operationKey).receipt;
+ } finally { hooks.inputAttemptFinished?.(); }
  },publish:record=>{if(record.handoffId.startsWith('orchestration-complete:'))coordinator?.wakeDelivery('R','receipt');}});
  Object.assign(context,{agentSendReceiptStore:receipts,agentSendQueue:queue});
  // Configure only the first fixture owner. Reopening must exercise the real
@@ -190,6 +197,51 @@ test('restart after Enter before audit preserves UNKNOWN; late receipt finishes 
 for(const gate of['beforeContent','beforeInfo','beforeEnqueue'])for(const change of['suppress','replace'])test(`${change} across ${gate} fences input`,async t=>{
  const h=await fixture(t);h.hooks[gate]=async()=>{h.hooks[gate]=null;if(change==='suppress')await h.runs.markNotification('R','suppressed');else{await h.runs.patch('R',{sourceSendTarget:{toolType:'codex',sessionId:'replacement'}});await h.runs.persistStrict();}};
  await h.run();assert.equal(h.effects.inputs.length,0);assert.equal(h.effects.starts,0);if(change==='suppress')assert.equal((await h.runs.get('R')).notificationStatus,'suppressed');
+});
+for(const surface of ['api','action'])for(const gate of ['beforeContent','beforeEnqueue','beforeInput'])test(`public ${surface} cancel after SC done at ${gate} revokes delivery, retaining the final and birth across restart`,async t=>{
+ const h=await fixture(t,{operationalPrompts:false});const birth=structuredClone((await h.runs.getInternal('R')).externalResearchDeliveryBirth);
+ const inputAttemptFinished=new Promise(resolve=>{h.hooks.inputAttemptFinished=resolve;});
+ let result;h.hooks[gate]=async()=>{h.hooks[gate]=null;result=surface==='api'?(await h.context.cancelViaPublicRoute()).body:await h.context.performOrchestrationAction('R','cancel');};
+ await h.service.deliver('R');if(gate==='beforeInput')await bounded(inputAttemptFinished);assert.equal(result?.ok,true);assert.equal(h.effects.inputs.length,0);
+ const r=await h.runs.getInternal('R');assert.equal(r.status,'completed');assert.equal(r.resultComplete,true);assert.equal(r.notificationSuppressed,true);assert.equal(local.authorized(r),false);
+ assert.deepEqual(r.externalResearchDeliveryBirth,birth);await h.reopen();await h.service.deliver('R');assert.equal(h.effects.inputs.length,0);assert.equal(h.effects.starts,0);
+});
+test('public cancellation after done retires ACTIVE FIFO HEAD with a strict durable fence',async t=>{
+ const h=await fixture(t,{ready:false,operationalPrompts:false});let admit;const admitted=new Promise(r=>admit=r);h.hooks.afterEnqueue=async()=>admit();
+ const work=h.service.deliver('R');await bounded(admitted);const result=await h.context.cancelViaPublicRoute();
+ h.hooks.ready=true;h.queue.resume();await bounded(work);assert.equal(result.body.ok,true);assert.equal(h.effects.inputs.length,0);
+ assert.equal(h.queue.item('history:source:orchestration-complete:R').state,'cancelled');assert.equal(h.receipts.isDeliveryCancelled('history:source:orchestration-complete:R'),true);
+ await h.reopen();await h.service.deliver('R');assert.equal(h.effects.inputs.length,0);
+});
+test('settled UI detach revokes proven-no-input waiting delivery and does not resume it on readiness',async t=>{
+ const h=await fixture(t,{operationalPrompts:false});h.hooks.beforeInput=async()=>{throw Object.assign(Error('draft occupied'),{code:'source_draft_not_empty'});};
+ await h.service.deliver('R');assert.equal((await h.runs.get('R')).notificationStatus,'waiting-for-input');
+ const result=await h.context.performOrchestrationAction('R','detach');assert.equal(result.ok,true);h.hooks.beforeInput=null;
+ await h.context.sendOrchestrationCompletionNotification(await h.runs.getInternal('R'),{sourceReady:true});assert.equal(h.effects.inputs.length,0);
+ await h.reopen();await h.service.deliver('R');assert.equal(h.effects.inputs.length,0);
+});
+test('cancel after lost completion ACK preserves UNKNOWN receipt and never claims that the past input was undone',async t=>{
+ const h=await fixture(t,{audit:false,operationalPrompts:false});h.hooks.afterEnqueue=async()=>{throw Error('lost ACK');};
+ await h.service.deliver('R');await new Promise(resolve=>setImmediate(resolve));assert.equal(h.effects.inputs.length,1);
+ const key='history:source:orchestration-complete:R',before=h.receipts.get(key);assert.equal((await h.runs.get('R')).notificationStatus,'unconfirmed');
+ const result=await h.context.cancelViaPublicRoute();assert.equal(result.body.ok,true);assert.equal(result.body.cancellation.deliveryIntentCancelled,true);
+ assert.equal(result.body.cancellation.sourceInput,'unknown');assert.equal(result.body.cancellation.tooLate,false);
+ const after=h.receipts.get(key);assert.equal(after.attemptId,before.attemptId);assert.equal(after.state,before.state);assert.deepEqual(after.receipt,before.receipt);
+ await h.reopen();await h.service.deliver('R');assert.equal(h.effects.inputs.length,1);assert.equal(h.promote().promoted,true);
+ const again=await h.context.cancelViaPublicRoute();assert.equal(again.body.cancellation.sourceInput,'confirmed');assert.equal(again.body.cancellation.tooLate,true);
+ await h.service.deliver('R');assert.equal(h.effects.inputs.length,1);
+});
+test('public cancel reports tooLate for a confirmed source input while retaining completed result',async t=>{
+ const h=await fixture(t,{operationalPrompts:false});await h.service.deliver('R');assert.equal(h.effects.inputs.length,1);
+ const result=await h.context.cancelViaPublicRoute();assert.equal(result.body.ok,true);assert.equal(result.body.cancellation.tooLate,true);
+ assert.equal(result.body.cancellation.sourceInput,'confirmed');assert.equal(result.body.run.status,'completed');assert.equal(result.body.run.resultComplete,true);
+});
+test('cancellation strict write failure has no success ACK, and same cancel retry preserves suppression',async t=>{
+ const h=await fixture(t,{operationalPrompts:false});const rename=fs.promises.rename;let fail=true;
+ fs.promises.rename=async(from,to)=>{if(to===h.file&&fail){fail=false;throw Object.assign(Error('cancel rename failed'),{code:'EIO'});}return rename(from,to);};
+ try{await assert.rejects(h.context.cancelViaPublicRoute(),/cancel rename failed/);}finally{fs.promises.rename=rename;}
+ assert.equal((await h.runs.get('R')).notificationSuppressed,true);assert.equal((await h.context.cancelViaPublicRoute()).body.ok,true);
+ await h.reopen();await h.service.deliver('R');assert.equal(h.effects.inputs.length,0);
 });
 test('ACTIVE FIFO HEAD suppression cancels original admission',async t=>{const h=await fixture(t,{ready:false});let admit;const admitted=new Promise(r=>admit=r);h.hooks.afterEnqueue=async()=>admit();
  const pending=h.run();await bounded(admitted);await h.runs.markNotification('R','suppressed');h.hooks.ready=true;h.queue.resume();await pending;assert.equal(h.effects.inputs.length,0);assert.equal(h.queue.item('history:source:orchestration-complete:R').state,'cancelled');});

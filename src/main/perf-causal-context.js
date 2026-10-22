@@ -3,7 +3,7 @@
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createHash } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
-const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, compactWorkSummary } = require('../shared/perf-causal-schema.cjs');
+const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, compactWorkSummary, sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
 
 const ID_FIELDS = new Set(['tabId', 'sessionId', 'actionId', 'readId', 'requestId', 'fileIdentity']);
 const TEXT_FIELDS = new Set(['caller', 'mode', 'reason', 'threadCpuSource', 'threadCpuUnavailableReason', 'gcCoverage']);
@@ -39,6 +39,24 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
     expired:0, acknowledged:0, unknownAcks:0, sqlOutsideWork:0, invalidSites:0,
     untimedSql:0, counterOverflow:0, attempts:0, retryExhausted:0 };
   let executingWork = null, gcAggregate = null, lastGcAttempt = -Infinity;
+  // Only scalar identities/counters are retained, never Statement/result refs.
+  let activeSql=null,lastCompletedSql=null,sqlSequence=0,sqlRevision=0;
+  let sqlWindow=-Infinity,sqlPairs=0,sqlPackets=0;
+  const rollSqlWindow=at=>{if(at-sqlWindow>=60000){sqlWindow=at;sqlPairs=0;sqlPackets=0;}};
+  const sqlTotals=()=>({attempted:0,completed:0,errors:0,allReturned:0,rows:0,maxRows:0});
+  const sqlStats=sqlTotals(),sqlSites=new Map();
+  const sqlHealth={preCallAttempts:0,suppressed:0,settleSuppressed:0,transportFailures:0,unavailable:0,siteOverflow:0};
+  const sqlSnapshot=(maxSites=16)=>sanitizeSqlWitness({version:1,revision:sqlRevision,sequence:sqlSequence,
+    collectionState:enabled?'enabled':'disabled',
+    active:activeSql,lastCompleted:lastCompletedSql,totals:sqlStats,sites:[...sqlSites.values()],health:sqlHealth},maxSites);
+  const publishSql=()=>{
+    try {
+      // Admission is never a persistence ACK and never gates the callback.
+      const before=losses.transport;
+      send({kind:'sql-witness',sqlWitness:sqlSnapshot(0)});
+      if(losses.transport!==before)sqlHealth.transportFailures++;
+    } catch {sqlHealth.unavailable++;}
+  };
   const sqlOperations = new Map([['prepare',0],['get',1],['all',2],['run',3]]);
   const site = value => typeof value==='string' && /^[\w.:-]{1,64}$/.test(value);
   const increment = (target,key,value=1) => { target[key]=Math.min(Number.MAX_SAFE_INTEGER,(target[key] || 0)+value); };
@@ -187,22 +205,71 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
     sql(siteId, operation, callback) {
       if(!enabled)return callback();
       const work=executingWork,index=sqlOperations.get(operation);
-      if(!work){workHealth.sqlOutsideWork++;return callback();}
+      if(!work)workHealth.sqlOutsideWork++;
       if(index===undefined || !site(siteId)){workHealth.invalidSites++;return callback();}
       let start;
-      try { start=now(); } catch { workHealth.untimedSql++;return callback(); }
-      let failed=false;
-      try { return callback(); }
+      try { start=now(); } catch { workHealth.untimedSql++;sqlHealth.unavailable++;return callback(); }
+      const previous=activeSql;
+      let capsule=null,stats=null,publish=false;
+      try {
+        if(sqlSequence<Number.MAX_SAFE_INTEGER && sqlRevision<Number.MAX_SAFE_INTEGER-1) {
+          capsule={sequence:++sqlSequence,siteId,operation,enteredAbs:start,
+            workId:work?.summaryId || null,parentSpanId:storage.getStore()?.spanId || null,
+            parentSqlSequence:previous?.sequence || null};
+          activeSql=capsule;sqlRevision++;increment(sqlStats,'attempted');
+          stats=sqlSites.get(siteId);
+          if(!stats && sqlSites.size<16){stats={siteId,...sqlTotals()};sqlSites.set(siteId,stats);}
+          if(stats)increment(stats,'attempted');else increment(sqlHealth,'siteOverflow');
+          // Four materializing calls/minute, at most eight ordinary packets.
+          // Other phases remain visible in snapshots; no per-get packet flood.
+          if(operation==='all') {
+            rollSqlWindow(start);
+            if(sqlPairs<4 && sqlPackets<8){sqlPairs++;sqlPackets++;publish=true;increment(sqlHealth,'preCallAttempts');publishSql();}
+            else increment(sqlHealth,'suppressed');
+          }
+        } else increment(sqlHealth,'unavailable');
+      } catch {increment(sqlHealth,'unavailable');}
+      let failed=false,result,nativeStart=null;
+      // Exclude diagnostic publication from the pre-existing SQL duration.
+      try {nativeStart=now();} catch {workHealth.untimedSql++;sqlHealth.unavailable++;}
+      try { result=callback();return result; }
       catch(error){failed=true;throw error;}
       finally {
+        // Restore even if diagnostics fail, including nested/reentrant calls.
+        activeSql=previous;
+        let elapsed=null;
+        try {if(nativeStart!==null)elapsed=Math.max(0,now()-nativeStart);} catch {workHealth.untimedSql++;sqlHealth.unavailable++;}
         try {
-          const elapsed=Math.max(0,now()-start);
-          work.counts[index]++;work.sqlMs[index]+=elapsed;
-          work.sqlMaxMs=Math.max(work.sqlMaxMs,elapsed);if(failed)work.sqlErrors++;
-          let cell=work.cells.get(siteId);
-          if(!cell && work.cells.size<16){cell={siteId,counts:[0,0,0,0],ms:[0,0,0,0],maxMs:0,errors:0};work.cells.set(siteId,cell);}
-          if(cell){cell.counts[index]++;cell.ms[index]+=elapsed;cell.maxMs=Math.max(cell.maxMs,elapsed);if(failed)cell.errors++;}
-          else {work.overflow.operations++;work.overflow.ms+=elapsed;work.overflow.maxMs=Math.max(work.overflow.maxMs,elapsed);}
+          if(capsule) {
+            increment(sqlStats,'completed');if(stats)increment(stats,'completed');
+            if(failed){increment(sqlStats,'errors');if(stats)increment(stats,'errors');}
+            // O(1), only after success. No property/string/row enumeration.
+            let rows=null;
+            if(!failed && operation==='all' && Array.isArray(result)) {
+              try {const length=result.length;
+                if(Number.isSafeInteger(length) && length>=0)rows=length;
+              } catch {increment(sqlHealth,'unavailable');}
+            }
+            if(rows!==null)for(const target of [sqlStats,stats].filter(Boolean)) {
+              increment(target,'allReturned');increment(target,'rows',rows);target.maxRows=Math.max(target.maxRows,rows);
+            }
+            lastCompletedSql={...capsule,outcome:failed?'error':'success',rows};sqlRevision++;
+            if(publish) {
+              rollSqlWindow(now());
+              if(sqlPackets<8){sqlPackets++;publishSql();}
+              else increment(sqlHealth,'settleSuppressed');
+            }
+          }
+        } catch {increment(sqlHealth,'unavailable');}
+        try {
+          if(work && elapsed!==null) {
+            work.counts[index]++;work.sqlMs[index]+=elapsed;
+            work.sqlMaxMs=Math.max(work.sqlMaxMs,elapsed);if(failed)work.sqlErrors++;
+            let cell=work.cells.get(siteId);
+            if(!cell && work.cells.size<16){cell={siteId,counts:[0,0,0,0],ms:[0,0,0,0],maxMs:0,errors:0};work.cells.set(siteId,cell);}
+            if(cell){cell.counts[index]++;cell.ms[index]+=elapsed;cell.maxMs=Math.max(cell.maxMs,elapsed);if(failed)cell.errors++;}
+            else {work.overflow.operations++;work.overflow.ms+=elapsed;work.overflow.maxMs=Math.max(work.overflow.maxMs,elapsed);}
+          }
         } catch { workHealth.untimedSql++; }
       }
     },
@@ -259,7 +326,8 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
         completedWork.push(compactWorkSummary(entry.summary,2));
       }
       if(delivery && enabled)flushGc(at);
-      return { schema: CAUSAL_SCHEMA_VERSION, sourceBoot: boot, sourceSeq: seq, emittedAbs: at, losses: { ...losses },
+      return { schema: CAUSAL_SCHEMA_VERSION, sourcePid: pid, sourceBoot: boot, sourceSeq: seq, emittedAbs: at, losses: { ...losses },
+      sqlWitness:sqlSnapshot(),
       completedWork,workHealth:{...workHealth,retained:retainedWork.size,
         pending:[...retainedWork.values()].filter(e=>!e.acknowledged).length},
       coverage:{sql:'explicit-sites-only',iteratorExecution:'uncovered',startupBeforeConfigure:'uncovered',

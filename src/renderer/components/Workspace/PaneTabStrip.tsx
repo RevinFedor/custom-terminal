@@ -25,6 +25,7 @@ import {
 } from '../../utils/paneTabDragBridge';
 import {panePresentationKey} from '../../utils/paneTabDropPresentation.mjs';
 import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
+import {workflowDragRequest} from '../../utils/workflowDragModel.mjs';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import type { SharedTabActivityMaps } from './TabSignals';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
@@ -36,9 +37,13 @@ import NewTabMenuRows from './NewTabMenuRows';
 import {PaneStripSelectionContext,usePaneStripSelectionController} from './PaneStripSelection';
 import PaneStripGroupOutline from './PaneStripGroupOutline';
 import {paneStripOutlineGap} from '../../utils/paneStripSelectionModel.mjs';
-import {readPaneStripOwnerEntries,readyPaneStripOutlineGroups,readPaneStripActiveGroups} from '../../utils/paneStripGroupsModel.mjs';
+import {readPaneStripOwnerEntries,readyPaneStripOutlineGroups} from '../../utils/paneStripGroupsModel.mjs';
+import {paneStripColorGroupsBasis,paneStripLayoutOwner,paneStripSlotOrder,projectActivePaneStripGroups} from '../../../shared/pane-strip-color-groups.cjs';
 import {normalizePaneStripRowPlacement,projectPaneStripRowPlacement} from '../../../shared/pane-strip-row-placement.cjs';
 import {readPaneStripRowPlacement} from '../../../shared/pane-strip-row-layout.cjs';
+import {paneStripCollapsedRuns} from '../../utils/paneStripCollapseModel.mjs';
+import PaneStripCollapsedGroup from './PaneStripCollapsedGroup';
+import type {PaneStripGroupControl} from './PaneStripCollapsedGroup';
 
 export interface StripEntry { projectId: string; tabId: string }
 
@@ -78,6 +83,8 @@ export default function PaneTabStrip({
 }: PaneTabStripProps) {
   const stripRootRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const [collapseLayoutRevision,setCollapseLayoutRevision]=useState(0);
+  const invalidateCollapsedLayout=useCallback(()=>setCollapseLayoutRevision(value=>value+1),[]);
   const activeSpaceId = useWorkspaceStore((s) => spaceId || s.activeSpaceId);
   const paneKey = paneStripKey(paneIndex);
   const paneDrag = usePaneTabDragSnapshot();
@@ -106,11 +113,14 @@ export default function PaneTabStrip({
   const releasedStrip = presentation?.strips.find((strip:any)=>strip.key===presentationKey);
   const baseEntriesKey = entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   const baseIds = React.useMemo(() => entries.map((entry) => entry.tabId), [baseEntriesKey]);
+  const logicalEntries:StripEntry[]=releasedStrip?.entries||entries;
+  const logicalEntriesKey=logicalEntries.map(entry=>`${entry.projectId}:${entry.tabId}`).join('|');
+  const logicalIds=React.useMemo(()=>logicalEntries.map(entry=>entry.tabId),[logicalEntriesKey]);
   const desiredPreviewEntries = React.useMemo(() => {
     if (!paneDrag.active || !paneDrag.source || paneDrag.target?.paneKey !== paneKey
       || paneDrag.target?.spaceId !== activeSpaceId) return releasedStrip?.entries || null;
-    return moveEntriesToIndex(entries, paneDrag.source.entries, paneDrag.target.at);
-  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, activeSpaceId,releasedStrip]);
+    return moveEntriesToIndex(logicalEntries, paneDrag.source.entries, paneDrag.target.at);
+  }, [logicalEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, activeSpaceId,releasedStrip]);
   const horizontalPreview = useHorizontalOrderPreview(
     baseIds,scrollerRef,'[data-strip-item]','data-strip-tab-id',
     { animate: false,projectionIds:desiredPreviewEntries?.map((entry:StripEntry)=>entry.tabId) || null },
@@ -130,19 +140,20 @@ export default function PaneTabStrip({
   const targetHere=paneDrag.active && paneDrag.source && paneDrag.target?.paneKey===paneKey
     && paneDrag.target?.spaceId===activeSpaceId;
   const projectedRows=targetHere ? projectPaneStripRowPlacement({current:storedRowPlacement,
-    baseOrder:baseIds,order:previewEntries.map(entry=>entry.tabId),sourceIds:paneDrag.source!.entries.map(entry=>entry.tabId),
+    baseOrder:logicalIds,order:previewEntries.map(entry=>entry.tabId),sourceIds:paneDrag.source!.entries.map(entry=>entry.tabId),
     rowStartId:paneDrag.target?.rowStartId,width:paneDrag.target?.stripWidth || stripWidth})
     : releasedStrip ? releasedStrip.rowPlacement : baseRowPlacement;
   const rowPlacement=normalizePaneStripRowPlacement(projectedRows,{order:previewEntries.map(entry=>entry.tabId),width:stripWidth});
   const rowStarts=new Set<string>(rowPlacement?.rowStartIds || []);
-  const layoutKey=JSON.stringify([stripWidth,rowPlacement?.rowStartIds || []]);
+  const layoutKey=JSON.stringify([stripWidth,rowPlacement?.rowStartIds || [],collapseLayoutRevision]);
   const inStrip = previewEntries.length > 1;
   useLayoutEffect(()=>{
     if(stripRootRef.current?.closest('[data-pane-focus-isolated="1"]')) {
       forgetPaneTabStrip(surfaceOwner.current);return;
     }
     observePaneTabStrip(surfaceOwner.current,{workflowId:activeSpaceId,windowId,centerKey,paneKey,
-      baseEntries:entries,entries:previewEntries,baseRowPlacement,rowPlacement,stripWidth});
+      baseEntries:logicalEntries,canonicalEntries:entries,entries:previewEntries,baseRowPlacement,rowPlacement,stripWidth,layoutKey,
+      baseGroupState:groupState,groupState:effectiveGroupState});
   });
   useLayoutEffect(()=>()=>forgetPaneTabStrip(surfaceOwner.current),[]);
   useLayoutEffect(()=>{
@@ -167,17 +178,47 @@ export default function PaneTabStrip({
     return paneStripRenderItems(slots || [], previewEntries);
   }, [slots, entriesKey, previewEntries]);
   const indexOfTab = new Map(previewEntries.map((entry, i) => [entry.tabId, i]));
-  const stripSelection=usePaneStripSelectionController({workflowId:activeSpaceId,windowId,paneIndex,entries,presented});
+  const stripSelection=usePaneStripSelectionController({workflowId:activeSpaceId,windowId,paneIndex,entries:logicalEntries,presented,rootRef:stripRootRef});
   const groupState=useWorkspaceStore(state=>state.spaces.find(space=>space.id===activeSpaceId)?.stripColorGroups);
-  const stripGroups=groupState?.version===1&&Array.isArray(groupState.groups)?readPaneStripActiveGroups(useWorkspaceStore.getState(),activeSpaceId):[];
+  const flatItems=renderItems.flatMap(item=>item.kind==='chooser'?[item]:item.tabIds.map(tabId=>({kind:'tab' as const,projectId:item.projectId,tabId})));
+  const previewRequest=React.useMemo(()=>{
+    if(!targetHere||!paneDrag.source?.workflowDrag)return null;
+    try{return workflowDragRequest(paneDrag.source.workflowDrag,{workflowId:activeSpaceId,target:paneDrag.target});}
+    catch{return null;}
+  },[targetHere,paneDrag.source?.workflowDrag,paneDrag.target,activeSpaceId]);
+  const previewRelease=previewRequest?.stripGroupReleases?.find((value:any)=>value.workflowId===activeSpaceId);
+  const previewOwner=previewRequest&&paneStripLayoutOwner(previewRequest.workflows.find((change:any)=>change.workflowId===activeSpaceId)?.layout,
+    {windowId,paneIndex,centerKey});
+  const displayedSlots=flatItems.map(item=>item.kind==='chooser'?{slotId:item.slotId}:{projectId:item.projectId,tabId:item.tabId});
+  // The compiler supplies the same IN/OUT plan used at release. It remains a
+  // reversible view while held, and must match the actual mixed-slot layout.
+  const previewBasisMatches=React.useMemo(()=>{
+    try{return !!previewRelease&&paneStripColorGroupsBasis(groupState)===previewRelease.basis;}catch{return false;}
+  },[previewRelease,groupState]);
+  const previewPair=previewBasisMatches&&!!previewOwner
+    &&JSON.stringify(paneStripSlotOrder(previewOwner.slots))===JSON.stringify(paneStripSlotOrder(displayedSlots));
+  const releasedGroupKnown=!!releasedStrip&&Object.prototype.hasOwnProperty.call(releasedStrip,'groupState');
+  const effectiveGroupState=previewPair?previewRelease.nextState:releasedGroupKnown?releasedStrip.groupState:groupState;
+  const stripGroups=effectiveGroupState?.version===1&&Array.isArray(effectiveGroupState.groups)
+    ?projectActivePaneStripGroups(effectiveGroupState.groups,id=>useWorkspaceStore.getState().tabCatalog?.[id]?.active):[];
+  const currentPane=paneIndex===null?null:useWorkspaceStore.getState().splitPanes.find(pane=>pane.windowId===windowId);
+  const collapsedItems=paneStripCollapsedRuns(flatItems,stripGroups,shownTabId,currentPane?.history?.map(entry=>entry.tabId)||[]);
+  const collapsedGroupIds=new Set(collapsedItems.filter(item=>item.kind==='collapsed-group').map(item=>item.group.id));
   const knownOutlineGroups=useRef(new Set<string>());
   const canonicalOutlineEntries=readPaneStripOwnerEntries(useWorkspaceStore.getState(),{workflowId:activeSpaceId,windowId,paneIndex});
   const canonicalOutlineKey=canonicalOutlineEntries?.map(entry=>`${entry.projectId}:${entry.tabId}`).join('|');
-  const outlineGroups=React.useMemo(()=>readyPaneStripOutlineGroups(stripGroups,previewEntries,canonicalOutlineEntries,knownOutlineGroups.current),
-    [stripGroups,entriesKey,canonicalOutlineKey]);
+  const outlineGroups=React.useMemo(()=>readyPaneStripOutlineGroups(stripGroups,previewEntries,
+    previewPair||releasedGroupKnown?previewEntries:canonicalOutlineEntries,knownOutlineGroups.current),
+    [stripGroups,entriesKey,canonicalOutlineKey,previewPair,releasedGroupKnown]);
   // Actual linkedTitleLayout uses the configured gap minus 1px as overhang.
   // Keep that title/chip geometry and add only the one missing strip pixel.
   const rowGap=paneStripOutlineGap(TAB_STRIP_ROW_GAP,Math.max(0,TAB_STRIP_ROW_GAP)-1);
+  const renderChip=(entry:StripEntry,groupControl?:PaneStripGroupControl)=><PaneTabChip
+    projectId={entry.projectId} tabId={entry.tabId} shown={entry.tabId===shownTabId}
+    paneFocused={focused} paneIndex={paneIndex} inSplit={inSplit} index={indexOfTab.get(entry.tabId)??0}
+    inStrip={inStrip} sharedActivity={sharedActivity} groupControl={groupControl}
+    previewOnly={!releasedStrip&&!baseEntryIds.has(entry.tabId)} releasedPlacement={!!releasedStrip}
+    dragPlaceholder={paneDrag.active&&paneDrag.source?.entries.some(value=>value.tabId===entry.tabId)}/>;
 
   // Empty header space is a real target too. Chip targets own their own exact
   // edge; this parent handles gaps/trailing space and computes
@@ -366,6 +407,8 @@ export default function PaneTabStrip({
         ref={scrollerRef}
         data-pane-tab-strip-scroller
         data-pane-tab-strip-wrap="true"
+        data-strip-canonical-ids={collapsedGroupIds.size?JSON.stringify(previewEntries.map(entry=>entry.tabId)):undefined}
+        data-strip-layout-key={layoutKey}
         data-pane-tab-drop-zone="strip"
         data-pane-key={paneKey}
         data-space-id={activeSpaceId}
@@ -381,11 +424,28 @@ export default function PaneTabStrip({
           // subtracting it with a negative margin leaves the strip's hit box
           // over the content below and can steal its top controls' clicks.
           minWidth: 0,
-          overflowX: 'clip',
-          overflowY: 'clip',
+          overflowX: collapsedGroupIds.size?'visible':'clip',
+          overflowY: collapsedGroupIds.size?'visible':'clip',
         }}
       >
-        {renderItems.map((item, itemIndex) => (item.kind === 'chooser' ? (
+        {collapsedGroupIds.size?collapsedItems.map(item=>item.kind==='collapsed-group'?<React.Fragment key={`collapsed:${item.group.id}`}>
+          {rowStarts.has(item.entries[0].tabId)&&<br data-pane-strip-row-start={item.entries[0].tabId} aria-hidden="true"/>}
+          <PaneStripCollapsedGroup group={item.group} entries={item.entries} representative={item.representative}
+            workflowId={activeSpaceId} windowId={windowId} paneIndex={paneIndex} rowGap={rowGap} presented={presented}
+            membershipPreview={previewPair&&groupState?.groups?.find((group:any)=>group.id===item.group.id)?.revision!==item.group.revision}
+            dragging={paneDrag.active} sourceHere={paneDrag.source?.entries.some(entry=>item.group.tabIds.includes(entry.tabId))}
+            layoutKey={JSON.stringify([stripWidth,rowPlacement?.rowStartIds||[]])}
+            renderChip={renderChip} onPresentation={invalidateCollapsedLayout}/>{' '}
+        </React.Fragment>:item.kind==='chooser'?<React.Fragment key={`chooser:${item.slotId}`}>
+          <span style={{display:'inline-flex',verticalAlign:'top',padding:'1px 0',marginBottom:rowGap,wordSpacing:'normal'}}>
+            <PaneChooserChip slotId={item.slotId} paneIndex={paneIndex} selected={item.slotId===selectedSlotId} paneFocused={focused}/>
+          </span>{' '}
+        </React.Fragment>:<React.Fragment key={item.tabId}>
+          {rowStarts.has(item.tabId)&&<br data-pane-strip-row-start={item.tabId} aria-hidden="true"/>}
+          <span data-strip-item data-strip-tab-id={item.tabId} style={{display:'inline-flex',alignItems:'center',verticalAlign:'top',marginBottom:rowGap,wordSpacing:'normal',flexShrink:0,minWidth:0}}>
+            {renderChip(item)}
+          </span>{' '}
+        </React.Fragment>):renderItems.map((item, itemIndex) => (item.kind === 'chooser' ? (
           <React.Fragment key={`chooser:${item.slotId}`}>
             {/* The chooser compensates its border with -1px margins. Keep its
                 physical top/bottom aligned with the adjacent full cards. */}
@@ -432,7 +492,8 @@ export default function PaneTabStrip({
         )))}
       </div>
       <PaneStripGroupOutline rootRef={stripRootRef} scrollerRef={scrollerRef}
-        entriesKey={entriesKey} layoutKey={layoutKey} groups={outlineGroups} presented={presented}/>
+        entriesKey={entriesKey} layoutKey={JSON.stringify([stripWidth,rowPlacement?.rowStartIds||[]])}
+        groups={outlineGroups.filter(group=>!collapsedGroupIds.has(group.id))} presented={presented}/>
       {/* Портал по той же причине, что и у прочих меню шапки: строка низкая и
           обрезает своё содержимое. */}
       {newTabMenu && createPortal(

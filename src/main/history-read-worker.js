@@ -1,6 +1,9 @@
 'use strict';
 
-const { parentPort, workerData } = require('node:worker_threads');
+const { parentPort, workerData } = require('./history-read-runtime').getHistoryReadRuntime();
+const { createReadControl, currentReadControl, withReadControl, createReadAdmission,
+  createDemandRegistry, historyReadCancelled, isHistoryReadCancelled } = require('./history-read-control');
+const { openProcessEpochReader } = require('./history-process-epochs');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const requestContext = new AsyncLocalStorage();
 for (const level of ['log', 'warn', 'error']) console[level] = (...args) => parentPort.postMessage({
@@ -10,6 +13,8 @@ for (const level of ['log', 'warn', 'error']) console[level] = (...args) => pare
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const v8 = require('node:v8');
+const { HistoryByteSender } = require('./history-byte-stream');
+const { encodeHistoryStream, streamLimits } = require('./history-stream-codec');
 const { performance } = require('node:perf_hooks');
 const { httpReadCorrelation } = require('./http-read-diagnostics');
 const DIAGNOSTIC_SCHEMA = 1, MAX_PHASE_GROUPS = 16;
@@ -23,7 +28,8 @@ const DatabaseManager = require('./database');
 const codexData = require('./ipc/codex-data');
 const { createSessionTranscriptService } = require('./session-transcript-service');
 const { HistoryPreparedCache, exactSource } = require('./history-prepared-cache');
-const { historyPayloadStash, dehydrateHistoryEntries } = require('./history-payload-dehydrate');
+const { historyPayloadStash, dehydrateHistoryEntries, HISTORY_PAYLOAD_HEADER_VERSION } = require('./history-payload-dehydrate');
+const { applyHistoryEntryWindow } = require('./history-entry-window');
 const { historyPreparationActivity } = require('./history-preparation-activity');
 const { observeHistoryResponseTimingBindings } = require('./history-response-timings');
 const { PromptQueueAssetStore } = require('./prompt-queue-assets');
@@ -44,19 +50,23 @@ emitDiagnostic('database-ready-end', { configured: !!db });
 // Parsed data is valid for the exact parser/preparation implementation. A
 // source update must not silently reuse a previous version's interpretation.
 const schemaHash = crypto.createHash('sha256');
+let sourceModuleCount=0, workerSourceSHA256=null;
 schemaHash.update(process.versions.v8);
 const srcRoot = require('node:path').resolve(__dirname, '..');
 for (const filename of Object.keys(require.cache).filter(name => name.startsWith(srcRoot + require('node:path').sep)
   && /\.(?:js|cjs)$/.test(name)).sort()) {
   schemaHash.update(require('node:path').relative(srcRoot, filename));
-  schemaHash.update(fs.readFileSync(filename));
+  const sourceBytes=fs.readFileSync(filename);
+  schemaHash.update(sourceBytes);sourceModuleCount++;
+  if(filename===__filename)workerSourceSHA256=crypto.createHash('sha256').update(sourceBytes).digest('hex');
 }
+const sourceSchemaSHA256=schemaHash.digest('hex');
 const startupCacheDiagnostics = [];
 emitDiagnostic('cache-init-begin');
 const cache = new HistoryPreparedCache({ directory: workerData.cacheDirectory, maxBytes: workerData.diskBudgetBytes,
   onDiagnostic: event => { if (startupCacheDiagnostics.length < 8) startupCacheDiagnostics.push(event); },
   indexBudgetBytes: workerData.indexBudgetBytes,
-  schema: '1-' + schemaHash.digest('hex').slice(0, 20) });
+  schema: '1-' + sourceSchemaSHA256.slice(0, 20) });
 emitDiagnostic('cache-init-end', { enabled: cache.enabled });
 const slowMs = Number.isFinite(workerData.diagnosticSlowMs) ? Math.max(0, workerData.diagnosticSlowMs) : 100;
 const token = value => typeof value === 'string' && /^[\w.:-]{1,80}$/.test(value) ? value : 'other';
@@ -68,7 +78,7 @@ function emitDiagnostic(event, fields = {}) {
   const now = stamp();
   try { parentPort.postMessage({ event: 'diagnostic', diagnostic: { schema: DIAGNOSTIC_SCHEMA, side: 'worker', event,
     clientId: workerData.diagnosticClientId || null, workerGeneration: workerData.diagnosticGeneration || 0,
-    producerBoot: workerBoot, seq: ++diagnosticSequence,
+    producerBoot: workerBoot, producerPid:process.pid, seq: ++diagnosticSequence,
     emittedAbs: now.abs, emittedPerf: now.perf, ...fields } }); } catch { diagnosticSendErrors++; }
 }
 let phaseWindowAt = -Infinity, phaseWindowCount = 0, phaseGlobalOmitted = 0;
@@ -170,14 +180,14 @@ for (const event of startupCacheDiagnostics) emitDiagnostic('cache-startup', {
 startupCacheDiagnostics.length = 0;
 // Cache summaries are emitted inside these operations. Their elapsed times
 // include nested codec/I/O/prune work; do not subtract or sum them as CPU time.
-for (const operation of ['readPrepared', 'savePrepared', 'readTimeline', 'saveTimeline', 'readContinuation', 'saveContinuation',
-  'readSource', 'readSourceProof', 'saveSourceHeader', 'readPayload', 'savePayload', 'savePayloads', 'readVirtualProjection', 'saveVirtualProjection',
-  'readVirtualState', 'saveVirtualState']) {
+for (const operation of ['readPrepared', 'readPreparedAsync', 'savePrepared', 'readTimeline', 'saveTimeline', 'readContinuation', 'saveContinuation', 'saveContinuationAsync',
+  'readSource', 'readSourceProof', 'saveSourceHeader', 'readPayload', 'savePayload', 'savePayloads', 'savePayloadsAsync', 'readVirtualProjection', 'saveVirtualProjection',
+  'readVirtualState', 'saveVirtualState', 'saveVirtualStateAsync']) {
   const original = cache[operation];
   cache[operation] = function (...args) {
     const context = requestContext.getStore();
     if (!context) return original.apply(this, args);
-    const item = { operation, started: stamp() };
+    const item = { operation: operation.replace(/Async$/, ''), started: stamp() };
     const active = context.cacheOperations ||= [];
     active.push(item);
     const end = beginWorkPhase(operation);
@@ -238,43 +248,114 @@ function rememberWrittenSource(filePath) {
 }
 let sourceBytes = 0, sourceVerificationBytes = 0;
 const api = codexData._api;
-const sourceEpochs = new Int32Array(workerData.sourceEpochBuffer);
-const sourceRewriteEpochs = new Int32Array(workerData.sourceRewriteEpochBuffer || workerData.sourceEpochBuffer);
+const processEpochs = openProcessEpochReader(workerData.sourceEpochFile);
+const { sourceEpochs, sourceRewriteEpochs } = processEpochs;
 const sourceEpochSlots = new Map(), epochPending = new Map();
 const epochSlot = file => sourceEpochSlots.get(file) ?? 0;
-cache.assertCurrent = () => {
-  const context = requestContext.getStore();
-  if (context && [...context.sources].some(file => context.sourceEpochs[epochSlot(file)] !== Atomics.load(sourceEpochs, epochSlot(file)))) {
+function assertContextSource(context) {
+  if (context?.captureError) throw context.captureError;
+  const captured = context?.snapshotEpochs || context?.sourceEpochs;
+  const epochs = context?.snapshotEpochs ? sourceRewriteEpochs : sourceEpochs;
+  if (captured && [...context.sources].some(file => captured[epochSlot(file)] !== Atomics.load(epochs, epochSlot(file)))) {
     phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' });
     throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
   }
+}
+cache.assertCurrent = () => {
+  currentReadControl()?.assertCurrent();
+  processEpochs.refresh(); // synchronous publication/codec/SQLite boundary
+  assertContextSource(requestContext.getStore());
 };
+const ownedContexts = new WeakMap();
+function makeOwnedControl(context, signal) {
+  const control = createReadControl({ signal,
+    assertSourceCurrent: () => assertContextSource(context),
+    refreshSourceCurrent: () => processEpochs.refresh(),
+    runOwned: operation => requestContext.run(context, operation),
+    adoptReadDependencies: otherControl => {
+      const other = ownedContexts.get(otherControl);
+      if (!other) return;
+      processEpochs.refresh(); assertContextSource(other);
+      const captured = context.snapshotEpochs || context.sourceEpochs;
+      const borrowed = context.snapshotEpochs ? other.rewriteSourceEpochs : other.sourceEpochs;
+      for (const file of other.sources || []) {
+        const slot = epochSlot(file);
+        if (!captured || !borrowed || captured[slot] !== borrowed[slot]) {
+          throw Object.assign(new Error('Shared History read source epoch differs'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        }
+        context.sources.add(file);
+      }
+      const admission = coldOwners.get(otherControl);
+      if (admission) retainCold(admission, control, context);
+      // Merge the producer's bounded diagnostic counters without copying its
+      // correlation/demand identity. Nested jobs start from their owner's
+      // counters, hence max preserves cumulative progress without double sum.
+      for (const field of ['sourceBytes', 'verificationBytes', 'fedRecords', 'rebuilds', 'ramHits', 'ssdHits',
+        'loadedRecords', 'sourceSize', 'consumedRecords', 'lineCount', 'observationEvents', 'observationOmitted',
+        'coldAdmissionMs', 'coldQueueDepth', 'coldQueuedAbs', 'coldQueuedPerf', 'coldAdmittedAbs', 'coldAdmittedPerf']) {
+        if (Number.isFinite(other[field])) context[field] = Math.max(context[field] || 0, other[field]);
+      }
+      for (const field of ['unmeasuredRecordRead', 'catalogScan', 'fullStream', 'exceptional', 'continuationRestored']) context[field] ||= other[field];
+      if (other.streamMetrics) context.streamMetrics = other.streamMetrics;
+      for (const [category, value] of Object.entries(other.cacheReasons || {})) {
+        context.cacheReasons[category] = Math.max(context.cacheReasons[category] || 0, value);
+      }
+    },
+    forkSignal: nextSignal => {
+      // Shared work has its own cold/staging/preparation lifetime. Cancelling
+      // A must not close these resources while B still owns a demand lease.
+      const owned = { ...context, payloads: null, preparations: [], assets: new Map(),
+        coldAdmission: null, coldRelease: null, cacheOperations: [] };
+      const forked = makeOwnedControl(owned, nextSignal);
+      owned.payloads = withReadControl(forked, () => cache.createPendingPayloads(owned.payload));
+      const admission = coldOwners.get(control);
+      if (admission) retainCold(admission, forked, owned);
+      return forked;
+    },
+  });
+  context.control = control;
+  ownedContexts.set(control, context);
+  control.onSettled(() => {
+    for (const finish of context.preparations || []) finish();
+    context.payloads?.close();
+    if (!signal?.aborted && context.assets?.size) send({ event: 'assets', refs: [...context.assets.values()] });
+  });
+  return control;
+}
 function prepareSourceEpoch(filePath) {
   // Every source access participates, including raw/search/payload/virtual
   // reads whose public DTO contains no revision or filePath.
   const context = requestContext.getStore();
+  const control = currentReadControl();
+  control?.assertCurrent();
   context?.sources.add(filePath);
-  if (epochPending.has(filePath)) {
-    const endWait = beginWorkPhase('source-epoch');
-    requestPhase(context, 'source-epoch-join');
-    return epochPending.get(filePath).promise.finally(() => endWait());
-  }
   if (sourceEpochSlots.has(filePath)) return Promise.resolve();
   const endWait = beginWorkPhase('source-epoch');
-  let resolve; const registered = new Promise(done => { resolve = done; });
-  const promise = registered.then(async () => {
-    const owner = requestContext.getStore()?.payload;
+  let registration = epochPending.get(filePath);
+  if (!registration) {
+    let resolve;
+    const registered = new Promise(done => { resolve = done; });
+    registration = { resolve, promise: registered.finally(() => {
+      if (epochPending.get(filePath) === registration) epochPending.delete(filePath);
+    }) };
+    epochPending.set(filePath, registration);
+    requestPhase(context, 'source-epoch-request');
+    send({ event: 'source-epoch', filePath, diagnostic: context?.correlation });
+  } else requestPhase(context, 'source-epoch-join');
+  // Slot registration is tiny shared infrastructure, not A's read Promise.
+  // Each borrower runs its own demand check and source restoration afterwards.
+  return registration.promise.then(async () => {
+    control?.assertCurrent();
+    processEpochs.refresh();
+    const owner = context?.payload;
     if (owner?.sessionId) {
       // A full-payload client may arrive before desktop after a restart.
       const saved = cache.readSource(owner);
       const stat = saved?.filePath === filePath ? await fs.promises.stat(filePath).catch(() => null) : null;
+      control?.assertCurrent();
       if (saved && exactSource(saved, stat)) api.restoreCodexSourceSnapshot(saved);
     }
-  }).finally(() => { epochPending.delete(filePath); endWait(); });
-  epochPending.set(filePath, { promise, resolve });
-  requestPhase(context, 'source-epoch-request');
-  send({ event: 'source-epoch', filePath, diagnostic: context?.correlation });
-  return promise;
+  }).finally(endWait);
 }
 api.setCodexExternalReadPrepare(prepareSourceEpoch);
 api.setCodexExternalReadVersion(file => Atomics.load(sourceEpochs, epochSlot(file)));
@@ -294,6 +375,8 @@ if (db) for (const method of ['bindHistoryPromptPresentationEntry', 'bindHistory
   const bind = db[method].bind(db);
   db[method] = (...args) => {
     const context = requestContext.getStore();
+    currentReadControl()?.assertCurrent();
+    processEpochs.refresh();
     if (context && [...context.sources].some(file => context.sourceEpochs[epochSlot(file)] !== Atomics.load(sourceEpochs, epochSlot(file)))) {
       throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
     }
@@ -306,50 +389,62 @@ api.setCodexProjectionRuntimeBudgetBytes(workerGraphBudget - virtualGraphBudget)
 for (const ownership of workerData.ownership || []) recordCodexProcessActionOwnership(ownership);
 // One cold parser at a time; disk-page hits do not join this lane. Thus a
 // visible warm seek can finish while another session yields during cold work.
-let coldActive = false; const coldWaiters = [];
-async function acquireCold() {
-  if (coldActive) await new Promise(resolve => coldWaiters.push(resolve));
-  else coldActive = true;
-  let released = false;
-  return () => {
-    if (released) return; released = true;
-    const next = coldWaiters.shift();
-    if (next) next(); else coldActive = false;
-  };
+const coldLane = createReadAdmission(), coldOwners = new WeakMap();
+function retainCold(admission, control, context) {
+  if (coldOwners.has(control)) return;
+  coldOwners.set(control, admission); admission.owners++;
+  control.onSettled(() => {
+    if (--admission.owners === 0) { admission.release?.(); requestPhase(context, 'cold-released'); }
+  });
 }
 async function enterCold() {
   const context = requestContext.getStore();
-  if (!context) return acquireCold();
+  const control = currentReadControl();
+  if (!context || !control) return coldLane.acquire(control);
   // Keep admission through yielded preparation/commit. Otherwise many cold
   // requests could accumulate full transient graphs while writing in turns.
-  if (!context.coldAdmission) {
+  if (!coldOwners.has(control)) {
     const queued = stamp();
     context.coldQueuedAbs = queued.abs; context.coldQueuedPerf = queued.perf;
-    context.coldQueueDepth = coldWaiters.length + Number(coldActive);
+    context.coldQueueDepth = coldLane.waiting + Number(coldLane.active);
     requestPhase(context, 'cold-queued', { queueDepth: context.coldQueueDepth });
-    context.coldAdmission = acquireCold().then(release => {
+    const admission = { owners: 0, release: null, promise: null };
+    admission.promise = coldLane.acquire(control).then(release => {
       const admitted = stamp();
       context.coldAdmittedAbs = admitted.abs; context.coldAdmittedPerf = admitted.perf;
       context.coldAdmissionMs = admitted.perf - queued.perf; context.coldRelease = release;
       requestPhase(context, 'cold-admitted', { coldAdmissionMs: context.coldAdmissionMs });
+      admission.release = release;
+      if (!admission.owners) release();
     });
+    retainCold(admission, control, context);
   }
-  await context.coldAdmission;
+  await coldOwners.get(control).promise;
+  control.assertCurrent();
   return () => {}; // The owning RPC releases exactly once in its finally.
 }
 cache.enterCold = enterCold;
 
 const findSource = api.findCodexSessionFile;
 api.findCodexSessionFile = async (id, cwd) => {
+  currentReadControl()?.assertCurrent();
   const found = await findSource(id, cwd, workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {});
   if (found?.filePath) await prepareSourceEpoch(found.filePath);
   return found;
 };
 const load = api.loadSessionRecords;
 api.loadSessionRecords = async (id, cwd, options = {}) => {
+  const control = options._readControl || currentReadControl();
+  control?.assertCurrent();
+  // All worker raw-record consumers (messages/search/legacy payload recovery),
+  // including a full RAM records copy, share the same transient-work lane.
+  // Prepared SSD page readers do not call this API and retain their fast path.
+  await enterCold();
+  control?.assertCurrent();
   const end = beginWorkPhase('records-read');
   let result;
-  try { result = await load(id, cwd, { ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}) }); }
+  try { result = await load(id, cwd, { ...options, _readControl: control,
+    ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}) }); control?.assertCurrent(); }
   finally { end(); }
   const context = requestContext.getStore();
   if (context && result.success) {
@@ -369,17 +464,28 @@ function currentRewriteReceipt(id) {
 function observeProjection(result) {
   const context = requestContext.getStore();
   if (context && Number.isFinite(result?.fedRecords)) context.fedRecords += result.fedRecords;
+  if (context && result?.mode === 'full-stream') {
+    const bytes = Number(result.readMetrics?.bytes) || 0;
+    context.fullStream = true; context.sourceBytes += bytes; sourceBytes += bytes;
+    context.sourceSize = result.sourceSnapshot?.size;
+    context.streamMetrics = {};
+    for (const name of ['maxCollectedRecords', 'maxConsumerRecords', 'maxRecordBytes', 'maxBufferedBytes', 'canonicalRows', 'timelineRows']) {
+      if (Number.isFinite(result.readMetrics?.[name])) context.streamMetrics[name] = result.readMetrics[name];
+    }
+    phaseDiagnostic({ phase: 'source-read', outcome: 'rebuild', reason: 'full-stream', bytes });
+  }
   return result;
 }
 api.projectCodexFullHistoryFromFile = async (id, cwd, options = {}) => {
   const end = beginWorkPhase('history-projection');
   try { return observeProjection(await originalHistory(id, cwd, {
-    ...options, rewriteReceipt: currentRewriteReceipt(id),
+    ...options, _readControl: options._readControl || currentReadControl(), rewriteReceipt: currentRewriteReceipt(id),
     ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
   })); } finally { end(); }
 };
 const originalTimeline = api.projectCodexTimelineFromFile;
 api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
+  currentReadControl()?.assertCurrent();
   const found = await api.findCodexSessionFile(id, cwd);
   const stat = found?.filePath ? await fs.promises.stat(found.filePath).catch(() => null) : null;
   const saved = stat ? cache.readTimeline({ sessionId: id, cwd }, found.filePath, stat) : null;
@@ -391,12 +497,14 @@ api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
     };
   }
   return observeProjection(await originalTimeline(id, cwd, {
-    ...options, rewriteReceipt: currentRewriteReceipt(id),
+    ...options, _readControl: options._readControl || currentReadControl(), rewriteReceipt: currentRewriteReceipt(id),
     ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
   }));
 };
 
 async function verifyPrefix(filePath, stat, restored) {
+  const control = currentReadControl();
+  control?.assertCurrent();
   if (exactSource(restored.snapshot, stat) || writtenSources.has(filePath)) return true;
   // Across worker/app restart, growth alone cannot prove an intact prefix.
   // Verify cached chunk hashes without parsing JSON or materializing records.
@@ -409,12 +517,14 @@ async function verifyPrefix(filePath, stat, restored) {
       let remaining = proof.bytes;
       const buffer = Buffer.alloc(Math.min(1024 * 1024, remaining));
       while (remaining) {
+        await control?.checkpoint();
         const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining), offset);
         if (!bytesRead) return false;
         sourceVerificationBytes += bytesRead;
         const context = requestContext.getStore(); if (context) context.verificationBytes += bytesRead;
         hash.update(buffer.subarray(0, bytesRead)); offset += bytesRead; remaining -= bytesRead;
       }
+      control?.assertCurrent();
       if (hash.digest('hex') !== proof.hash) return false;
     }
     const after = await handle.stat();
@@ -463,11 +573,11 @@ api.setCodexProjectionStorage({
       return restored;
     } finally { restoreLease?.(); }
   },
-  write({ sessionId, cwd, snapshot, state, timelineEntries, sessionMeta }) {
+  async write({ sessionId, cwd, snapshot, state, timelineEntries, sessionMeta }) {
     const context = requestContext.getStore();
     if (context) { context.sourceSize = snapshot.size; context.lineCount = state.lineCount; }
     const payloads = context?.payloads || new Map();
-    const stored = cache.saveContinuation({ sessionId, cwd }, snapshot, state, payloads);
+    const stored = await cache.saveContinuationAsync({ sessionId, cwd }, snapshot, state, payloads);
     if (stored) payloads.clear();
     cache.saveTimeline({ sessionId, cwd }, snapshot, timelineEntries, sessionMeta);
     rememberWrittenSource(snapshot.filePath);
@@ -487,8 +597,9 @@ api.setCodexProjectionStorage({
     if (context) context.consumedRecords = cached.historyProjector.getConsumedRecords();
     // Charge/store the graph we actually retain, not the pre-dehydration
     // outputs. Full payloads and the continuation commit atomically together.
-    dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
+    const dehydration = dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
       entries: cached.historyProjector.peekEntries(), stash: historyPayloadStash });
+    return { fullHistoryPreserved: dehydration.dehydrated === 0 };
   },
 });
 api.observeCodexReadInvalidation(({ filePath, readRefresh, sourceAppend }) => {
@@ -542,6 +653,8 @@ const service = createSessionTranscriptService({ codexData, promptPresentationSt
 });
 service.snapshotAssertCurrent = () => {
   const context = requestContext.getStore();
+  currentReadControl()?.assertCurrent();
+  processEpochs.refresh();
   if (!context?.snapshotEpochs || [...context.sources].some(file =>
     context.snapshotEpochs[epochSlot(file)] !== Atomics.load(sourceRewriteEpochs, epochSlot(file)))) {
     throw Object.assign(new Error('Codex snapshot source invalidated'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
@@ -569,6 +682,12 @@ historyPreparationActivity.subscribe(snapshot => send({ event: 'preparation', sn
 observeHistoryResponseTimingBindings(payload => send({ event: 'timing-bound', payload }));
 const chains = new Map();
 const queueDepths = new Map(); // Diagnostic-only; entries follow the existing RPC chains.
+const requests = new Map();
+const replyAcknowledgements = new Map();
+const byteStreams = new Map();
+const rpcDemands = createDemandRegistry();
+const shareableReads = new Set(['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages',
+  'searchHistory', 'searchCatalogCandidate', 'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession', 'readSessionSnapshot']);
 const originalReceipt = api.getCodexRewriteReceipt;
 api.getCodexRewriteReceipt = (id, source) => {
   const receipt = currentRewriteReceipt(id);
@@ -576,12 +695,24 @@ api.getCodexRewriteReceipt = (id, source) => {
 };
 
 parentPort.on('message', message => {
+  if (message.event === 'stream-credit') {
+    byteStreams.get(message.id)?.credit(message); return;
+  }
+  if (message.event === 'reply-consumed') {
+    replyAcknowledgements.get(message.id)?.(); return;
+  }
+  if (message.event === 'cancel') {
+    requests.get(message.id)?.abort(historyReadCancelled()); return;
+  }
   if (message.event === 'source-epoch') {
     if (message.slot) sourceEpochSlots.set(message.filePath, message.slot);
     const pending = epochPending.get(message.filePath);
     pending?.resolve(); return;
   }
   if (message.event === 'invalidate') {
+    // Another synchronous Main update can overlap this cache notice. An odd
+    // fence cannot authorize a read; the next request boundary re-observes it.
+    try { processEpochs.refresh(); } catch (error) { emitDiagnostic('source-fence-observation', { errorCode: error.code }); }
     api.invalidateJsonlCache(message.filePath, message);
     publishCacheMemory();
     return;
@@ -597,13 +728,20 @@ parentPort.on('message', message => {
   const { id, method } = message;
   // UI correlation is transport context only, never input to source/cache
   // identity, revision construction or a returned transcript DTO.
-  const { diagnosticActionId, diagnosticReadId, ...payload } = message.payload || {};
+  const { diagnosticActionId, diagnosticReadId, _readControl, ...payload } = message.payload || {};
   const key = JSON.stringify([payload.sessionId, payload.cwd]);
   const received = stamp();
   count('requests');
   const context = { payload, phases: new Map(), droppedPhaseGroups: 0, sourceBytes: 0, verificationBytes: 0,
     fedRecords: 0, rebuilds: 0, ramHits: 0, ssdHits: 0, coldAdmissionMs: 0, exceptional: false,
     cacheReasons: { missingFile: 0, diskEvicted: 0, sourceChange: 0, version: 0, disabled: 0, error: 0, other: 0 } };
+  try { processEpochs.refresh(); } catch (error) { context.captureError = error; }
+  Object.assign(context, { payloads: null, sources: new Set(), sourceEpochs: sourceEpochs.slice(),
+    rewriteSourceEpochs: sourceRewriteEpochs.slice(),
+    snapshotEpochs: method === 'readSessionSnapshot' ? sourceRewriteEpochs.slice() : null, preparations: [], assets: new Map() });
+  const controller = new AbortController();
+  requests.set(id, controller);
+  const control = makeOwnedControl(context, controller.signal);
   const correlation = { requestId: id, callId: message.diagnostic?.callId ?? id,
     attempt: message.diagnostic?.attempt || 1, method: identity(method), tool: identity(payload.toolType),
     tab: identity(payload.tabId), session: identity(payload.sessionId),
@@ -617,9 +755,12 @@ parentPort.on('message', message => {
   const sessionQueueDepth = queueDepths.get(key) || 0;
   queueDepths.set(key, sessionQueueDepth + 1);
   requestPhase(context, 'request-received', { sessionQueueDepth });
-  let executionStart, executionEnd, serializationStart, serializationEnd;
-  const work = async () => {
+  let executionStart = received, executionEnd, serializationStart, serializationEnd;
+  const work = async executionControl => {
+    const control = executionControl, context = ownedContexts.get(control);
     executionStart = stamp();
+    control.assertCurrent();
+    await control.checkpoint(); // after session queue, before admission or any read
     requestPhase(context, 'execution-begin', { sessionQueueMs: executionStart.perf - received.perf });
     if (method === 'stats') return { value: { cache: cache.stats(), projector: api.getCodexHistoryProjectorStats(), sourceBytes, sourceVerificationBytes,
       virtual: { ...service.codexVirtualTranscriptStore?.stats(), budgetBytes: virtualGraphBudget }, workerGraphBudget,
@@ -629,20 +770,32 @@ parentPort.on('message', message => {
     if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory', 'searchCatalogCandidate',
       'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession', 'prepareCodexRewrite', 'readSessionSnapshot'].includes(method)) throw new Error('history_read_method');
     context.rewriteReceipt = message.rewriteReceipt || null;
-    Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(),
-      snapshotEpochs: method === 'readSessionSnapshot' ? sourceRewriteEpochs.slice() : null, preparations: [], assets: new Map() });
-    return requestContext.run(context, async () => {
+    return withReadControl(control, async () => {
+      context.payloads ||= cache.createPendingPayloads(payload);
       const serviceEnd = beginWorkPhase('service-work');
       const memoryRead = method === 'searchCatalogCandidate' ? beginHistoryReadDiagnostic('catalog-projection', {
         sessionId: payload.sessionId, provider: 'codex', readId: correlation.diagnosticReadId,
       }) : null;
       try {
         if (method === 'searchCatalogCandidate' || method === 'readSessionSnapshot') { context.catalogScan = true; await enterCold(); }
+        // Legacy full-payload History builds a fresh transient graph rather
+        // than seeking a prepared page. It must share the existing cold lane;
+        // otherwise concurrent HTTP catch-up reads bypass its admission.
+        // Prepared/dehydrated page hits keep their independent fast path.
+        if (method === 'getHistory' && payload.dehydrate !== true) await enterCold();
+        await control.checkpoint();
         const prepared = method === 'prepareCodexRewrite'
-          ? await api.projectCodexFullHistoryFromFile(payload.sessionId, payload.cwd) : null;
-        const result = prepared ? { success: prepared.success, error: prepared.error, mode: prepared.mode,
+          ? await api.projectCodexFullHistoryFromFile(payload.sessionId, payload.cwd, { _readControl: control }) : null;
+        // A ref-aware producer can expose its cursor and leaf resolver under
+        // the same read control. The legacy producer remains explicitly
+        // identified: byte framing alone does not bound its preparation.
+        const streamResult = message.stream && method === 'getHistory' && typeof service.getHistoryStream === 'function'
+          ? await service.getHistoryStream({ ...payload, _readControl: control }, message.stream) : null;
+        if (streamResult?.release) control.onSettled(streamResult.release);
+        const result = streamResult ? streamResult.value : prepared ? { success: prepared.success, error: prepared.error, mode: prepared.mode,
           fedRecords: prepared.fedRecords, reusedRecords: prepared.reusedRecords || 0, sourceSnapshot: prepared.sourceSnapshot }
-          : await service[method](payload);
+          : await service[method]({ ...payload, _readControl: control });
+        await control.checkpoint();
         const epochs = context.snapshotEpochs ? sourceRewriteEpochs : sourceEpochs;
         const capturedEpochs = context.snapshotEpochs || context.sourceEpochs;
         const readProof = [...context.sources].map(filePath => ({ filePath,
@@ -651,24 +804,39 @@ parentPort.on('message', message => {
           phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' });
           throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
         }
-        if (context.payloads.size) cache.savePayloads(payload, context.payloads);
+        if (context.payloads.size) { control.assertCurrent(); await cache.savePayloadsAsync(payload, context.payloads); }
         memoryRead?.end('success', { totalIterations: result?.totalIterations, matches: result?.bestMatches?.length });
-        return { value: result, readProof };
+        return { value: result, readProof, streamOptions: streamResult ? {
+          metadata: streamResult.metadata, leafResolver: streamResult.leafResolver, sourceGraph: 'ref-cursor',
+        } : { sourceGraph: 'legacy-owned-array' } };
       } catch (error) {
         memoryRead?.end('error', { errorCode: error.code });
         throw error;
       } finally {
         serviceEnd();
-        if (context.assets.size) send({ event: 'assets', refs: [...context.assets.values()] });
-        for (const finish of context.preparations) finish();
-        context.coldRelease?.();
-        if (context.coldRelease) requestPhase(context, 'cold-released');
+        // The owner keeps preparation/staging/cold leases through encoding and
+        // process send. Shared jobs retain their own reference after A aborts.
       }
     });
   };
-  const run = (chains.get(key) || Promise.resolve()).catch(() => {}).then(work);
-  chains.set(key, run);
+  const enqueue = executionControl => {
+    const queued = (chains.get(key) || Promise.resolve()).catch(() => {}).then(() => work(executionControl));
+    chains.set(key, queued);
+    queued.finally(() => { if (chains.get(key) === queued) chains.delete(key); }).catch(() => {});
+    return queued;
+  };
+  // Register actual identical-request consumers BEFORE the session queue.
+  // Otherwise B is only a queued future call and A looks like the last demand.
+  // Different methods/windows remain independent reads; they are not silently
+  // merged into a different response contract.
+  const run = Promise.resolve().then(() => !message.stream && shareableReads.has(method)
+    ? rpcDemands.run(JSON.stringify([method, payload, message.rewriteReceipt || null, !!message.binary]), control, enqueue) : enqueue(control));
+  let terminalPosted = false;
+  let streamStarted = false;
+  let acknowledgeReply;
+  const acknowledgedReply = new Promise(resolve => { acknowledgeReply = resolve; });
   const reply = (body, resultBytes = null, transfer = []) => {
+    if (terminalPosted) return;
     const ready = stamp();
     const executionMs = executionEnd.perf - executionStart.perf;
     const exceptional = context.exceptional || !!body.error || body.result?.success === false || !!body.result?.error
@@ -689,12 +857,13 @@ parentPort.on('message', message => {
       serializationStartAbs: serializationStart?.abs, serializationStartPerf: serializationStart?.perf,
       serializationEndAbs: serializationEnd?.abs, serializationEndPerf: serializationEnd?.perf,
       serializationMs: serializationEnd ? serializationEnd.perf - serializationStart.perf : null,
-      replyReadyAbs: ready.abs, replyReadyPerf: ready.perf, resultBytes, transport: message.binary ? 'v8-transfer' : 'structured-clone',
-      source: context.catalogScan ? 'catalog-scan' : context.rebuilds ? 'raw-rebuild' : context.sourceBytes ? 'raw-append' : context.ssdHits ? 'ssd' : context.ramHits ? 'ram'
+      replyReadyAbs: ready.abs, replyReadyPerf: ready.perf, resultBytes, transport: message.binary ? 'v8-process-copy' : 'structured-clone-process',
+      source: context.catalogScan ? 'catalog-scan' : context.fullStream ? 'full-stream' : context.rebuilds ? 'raw-rebuild' : context.sourceBytes ? 'raw-append' : context.ssdHits ? 'ssd' : context.ramHits ? 'ram'
         : context.unmeasuredRecordRead ? 'records-cache-or-raw' : 'unobserved',
       sourceBytes: context.unmeasuredRecordRead ? null : context.sourceBytes, projectionSourceBytes: context.sourceBytes,
       sourceSize: context.sourceSize, loadedRecords: context.loadedRecords, verificationBytes: context.verificationBytes,
       fedRecords: context.fedRecords, consumedRecords: context.consumedRecords, lineCount: context.lineCount,
+      ...(context.streamMetrics ? { streamMetrics: context.streamMetrics } : {}),
       ramHits: context.ramHits, ssdHits: context.ssdHits, rebuilds: context.rebuilds, outcome, reason, exceptional };
     publishCacheMemory();
     // Terminal witness is reserved outside the request-detail budget. It still
@@ -704,7 +873,10 @@ parentPort.on('message', message => {
       phaseGlobalOmitted, diagnosticSendErrors, lastProgress: context.lastProgress || null });
     diagnostic.observationHealth = { lastSeq: diagnosticSequence, sendErrors: diagnosticSendErrors,
       omitted: context.observationOmitted || 0, globalOmitted: phaseGlobalOmitted };
+    if (!body.error) { control.assertCurrent(); processEpochs.refresh(); assertContextSource(context); }
+    replyAcknowledgements.set(id, acknowledgeReply);
     send({ ...body, diagnostic }, transfer);
+    terminalPosted = true;
     const posted = stamp();
     if (exceptional || posted.perf - received.perf >= slowMs) {
       const stats = cache.stats();
@@ -716,32 +888,96 @@ parentPort.on('message', message => {
         timing: 'elapsed-wall; cold/cache phases nested in execution; overlapping phases are not summed CPU' });
     }
   };
-  run.then(({ value: result, readProof }) => {
+  const produced = run.then(async ({ value: result, readProof, streamOptions }) => {
     executionEnd = stamp();
+    await control.checkpoint(); // cancellation after build/save, before codec
+    if (message.stream) {
+      const limits = streamLimits(message.stream);
+      let value = result, metadata = streamOptions?.metadata || {
+        success: result?.success, error: result?.error, sourceGraph: streamOptions?.sourceGraph,
+      };
+      if (message.stream.projection === 'history-entries') {
+        if (message.stream.format !== 'json') throw new TypeError('history_entries_requires_json');
+        if (streamOptions?.sourceGraph === 'ref-cursor') {
+          if (!metadata?.result || !Number.isSafeInteger(metadata.entryCount) || typeof metadata.etag !== 'string') {
+            throw new TypeError('history_stream_cursor_metadata_required');
+          }
+          value = result.entries;
+        } else {
+          const selected = result?.boundsApplied === true ? result
+            : { ...result, ...applyHistoryEntryWindow(result?.entries, payload.bounds || payload) };
+          const { entries, ...header } = selected;
+          value = entries || [];
+          const hash = crypto.createHash('sha1');
+          if (message.stream.payloadPolicy) hash.update(message.stream.payloadPolicy + ':headers:' + HISTORY_PAYLOAD_HEADER_VERSION + ':');
+          for (let index = 0; index < value.length; index++) {
+            if (index) hash.update('|');
+            const entry = value[index];
+            hash.update(`${entry?.uuid || ''}:${entry?.queueStatus || ''}:${entry?.deliveryStatus || ''}`);
+            if ((index + 1) % 128 === 0) await control.checkpoint();
+          }
+          metadata = { result: header, entryCount: value.length,
+            firstUuid: selected.firstUuid ?? value[0]?.uuid ?? null,
+            lastUuid: selected.lastUuid ?? value[value.length - 1]?.uuid ?? null,
+            etag: hash.digest('hex').slice(0, 16), sourceGraph: 'legacy-owned-array' };
+        }
+      }
+      control.assertCurrent(); processEpochs.refresh(); assertContextSource(context);
+      const codecStats = {}, creditStats = {};
+      const assertStreamCurrent = () => {
+        processEpochs.refresh(); assertContextSource(context);
+        // The first byte is admitted against the complete dependency set.
+        // A lazy leaf may read those same pinned sources, never silently add
+        // a new source after Main has accepted an incomplete proof.
+        if (context.sources.size !== readProof.length || readProof.some(source => !context.sources.has(source.filePath))) {
+          throw Object.assign(new Error('History stream dependencies changed'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        }
+      };
+      const sender = new HistoryByteSender({ id, send, control, ...limits, stats: creditStats,
+        assertCurrent: assertStreamCurrent });
+      byteStreams.set(id, sender); streamStarted = true;
+      try {
+        await sender.pump(encodeHistoryStream(value, { format: message.stream.format || 'json', frameBytes: limits.frameBytes,
+          control, leafResolver: streamOptions?.leafResolver, stats: codecStats }), metadata, readProof);
+        count('completed'); publishCacheMemory();
+        emitDiagnostic('stream-complete', { ...context.correlation, outcome: 'success',
+          sourceGraph: streamOptions?.sourceGraph, transport: 'byte-credit-process-copy', ...creditStats, codec: codecStats });
+      } finally { byteStreams.delete(id); }
+      return;
+    }
     if (message.binary) {
       serializationStart = stamp();
       const data = new Uint8Array(v8.serialize(result));
       serializationEnd = stamp();
-      // Transfer bytes, not tens of thousands of objects through main. Only
-      // this small witness is needed there to reject a revoked response.
+      await control.checkpoint(); // V8 serialize itself is synchronous
+      // Preserve v8-1 and the small admission witness. UtilityProcess copies
+      // these bytes; this does not bound the full DTO or serialization peak.
       reply({ id, readProof, result: { __notedHistoryTransport: 'v8-1', data,
         proof: { filePath: result.filePath, error: result.error,
           sourcePaths: (result.revision?.sources || []).map(source => source.filePath) } } }, data.byteLength, [data.buffer]);
-    } else reply({ id, readProof, result });
+    } else { control.assertCurrent(); reply({ id, readProof, result }); }
   }, error => { executionEnd = stamp(); reply({ id, error: { message: error.message, code: error.code,
     ...(typeof error.lineageReason === 'string' ? { lineageReason: error.lineageReason } : {}) } }); })
     .catch(error => { try {
+      if (streamStarted) { count('errors'); return; } // Sender emitted the exact terminal stream error.
       if (serializationStart && !serializationEnd) serializationEnd = stamp();
       reply({ id, error: { message: error.message, code: error.code } });
-    } catch {} })
-    .finally(() => {
-      if (chains.get(key) === run) chains.delete(key);
+    } catch {} });
+  produced.finally(async () => {
+      // postMessage enqueues/copies; its return is not consumption. HTTP
+      // callers ACK at transport settlement, other callers at Main delivery.
+      if (terminalPosted) await acknowledgedReply;
+      replyAcknowledgements.delete(id);
+      control.finish(); requests.delete(id);
+    }).catch(() => {});
+  produced.finally(() => {
       const remaining = queueDepths.get(key) - 1;
       if (remaining) queueDepths.set(key, remaining); else queueDepths.delete(key);
-    });
+    }).catch(() => {});
 });
 
-emitDiagnostic('worker-ready', { cacheEnabled: cache.enabled, cacheSchema: require('node:path').basename(cache.directory),
+emitDiagnostic('worker-ready', { workerSourceSHA256,sourceSchemaSHA256,sourceModuleCount,sourceDirectory:__dirname,
+  codeWitness:'cached source files read at boot; pair with fresh process and immutable ASAR proof',cacheEnabled: cache.enabled, cacheSchema: require('node:path').basename(cache.directory),
   slowMs, phaseGroups: MAX_PHASE_GROUPS, workerGraphBudget, virtualGraphBudget,
   capabilities: { cacheOnDiagnostic: typeof cache.diagnose === 'function', sourceOnRead: 'projection-storage-only',
     recordReadBytes: false, binaryBytes: true, structuredCloneBytes: false },

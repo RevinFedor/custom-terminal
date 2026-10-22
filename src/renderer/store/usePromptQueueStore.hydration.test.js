@@ -58,7 +58,7 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   const queueModule = require(outfile);
   assert.equal(queueModule.makeDefaultPromptTitle('/compact'), '/compact');
   assert.equal(queueModule.makeDefaultPromptTitle('  /compact\tcustom instructions  '), '/compact custom instructions');
-  assert.equal(queueModule.makeDefaultPromptTitle('/Users/example/file'), '[17 символов]');
+  assert.equal(queueModule.makeDefaultPromptTitle('/Users/example/file'), '[19 символов]');
   assert.equal(queueModule.getQueuedPromptLocalCommand('/compact\nexplain'), null);
   assert.equal(queueModule.getQueuedPromptLocalCommand('/compact', 1), null);
   assert.equal(queueModule.getQueuedPromptLocalCommand('/compact', 0, 1), null);

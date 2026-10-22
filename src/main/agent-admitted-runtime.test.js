@@ -8,7 +8,7 @@ const { EventEmitter } = require('node:events');
 const http = require('node:http');
 const readiness = require('./agent-ready-wait');
 const { validateFreshAgentRuntimeStatus } = require('./project-api-runtime-contract');
-const source = fs.readFileSync(require.resolve('./web-server'), 'utf8');
+const source = fs.readFileSync(process.env.IOS35_CANDIDATE_WEB || require.resolve('./web-server'), 'utf8');
 const tree = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
 const fn = name => tree.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(tree);
 const owned = launchId => ({ toolType: 'claude', commandType: 'claude', launchId, launchGeneration: launchId,
@@ -34,6 +34,13 @@ test('actual public stamp preserves exact null/current owner in coherent reads a
   const replacement = stamp({ type: 'busy', busy: true, launchId: 'L3', lifecycleGeneration: 'G3' });
   assert.equal(replacement.processPid, null); assert.equal(replacement.writerSessionId, null);
   assert.equal(replacement.inputReady, false, 'a partial new-owner event never carries prior ready proof');
+  assert.equal(stamp({ readSessionId: null, codexReadSessionId: 'legacy-alias' }).readSessionId,
+    'legacy-alias', 'partial legacy aliases retain their existing compatibility semantics');
+  assert.equal(stamp({ coherent: true, toolType: 'codex', launchId: 'L3', codexReadSessionId: 'alias-only' }).readSessionId,
+    'alias-only', 'coherent alias-only older producers remain supported');
+  assert.equal(stamp({ toolType: 'codex', launchId: 'L4', readSessionId: null,
+    codexReadSessionId: 'stale-owner-alias' }).readSessionId, null,
+    'an explicit new-owner revoke also outranks its old alias');
 });
 function webHarness() {
   let current = owned('L2');
@@ -46,6 +53,24 @@ function webHarness() {
   vm.runInContext(['waitForAgentReady', 'readFreshReadyRuntimeStatus', 'coherentPublicRuntimeSnapshot'].map(fn).join('\n'), context);
   return { context, set: value => { current = value; } };
 }
+test('actual coherent Codex status explicit read revoke clears the older compatibility alias', async () => {
+  const ctx = vm.createContext({ ...readiness, validateFreshAgentRuntimeStatus,
+    publicRuntimeSnapshots: new Map(), conversationOwners: null,
+    fingerprintAgentSendRequest: require('./agent-send-receipt-registry').fingerprintAgentSendRequest,
+    readAgentRuntimeSnapshot: async () => ({ coherent: true, toolType: 'codex', commandType: 'codex',
+      status: 'starting', readSessionId: null, sessionId: null, writerSessionId: null,
+      writerConfirmed: false, writerUsableForMutation: false, canCopySessionId: false,
+      inputReady: false, lifecycleGeneration: 'G:8', terminalRunSeq: 8 }),
+  });
+  vm.runInContext(['normalizePublicRuntimeStatus','stampPublicRuntimeSnapshot','coherentPublicRuntimeSnapshot'].map(fn).join('\n'), ctx);
+  const status = await ctx.coherentPublicRuntimeSnapshot('T', { toolType: 'codex', commandType: 'codex',
+    status: 'starting', readSessionId: 'same-source', codexReadSessionId: 'same-source',
+    sessionId: null, writerConfirmed: false, canCopySessionId: true, lifecycleGeneration: 'G:7' });
+  assert.equal(status.readSessionId, null, 'explicit current Main revoke must outrank the pre-await alias');
+  assert.equal(status.codexReadSessionId, null); assert.equal(status.canCopySessionId, false);
+  assert.equal(status.writerConfirmed, false); assert.equal(status.writerUsableForMutation, false);
+  assert.equal(status.lifecycleGeneration, 'G:8');
+});
 test('actual web waiter must pin the admitted L1, not the first observed L2', async () => {
   const h = webHarness();
   await assert.rejects(() => h.context.waitForAgentReady('T', 1000, owned('L1')), e => e.code === 'agent_ready_owner_changed');

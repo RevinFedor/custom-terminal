@@ -6,6 +6,7 @@ import {moveEntriesToIndex} from './horizontalReorder.mjs';
 import {removeLayoutTabs,stableJson,layoutReferences} from '../../shared/workflow-organization.cjs';
 import {dragPlacement,dragRelation,dragFamily} from '../../shared/workflow-drag.cjs';
 import {projectPaneStripLayoutRows} from '../../shared/pane-strip-row-layout.cjs';
+import {preparePaneStripGroupRelease} from '../../shared/pane-strip-group-admission.cjs';
 
 const freeze = value => {
   if(value && typeof value==='object' && !Object.isFrozen(value)) {
@@ -22,7 +23,7 @@ export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTa
   const catalog=workflowTabCatalog(state), guards={};
   for(const [id,owner] of catalog) {
     if(!owner.active || owner.tab.archived || owner.tab.isArchived || owner.tab.archivedAt || owner.tab.deleted)continue;
-    const member=state.tabWorkflowMembership[id]; if(!member)continue;
+    const member=state.pendingTabWorkflowMembership?.[id] || state.tabWorkflowMembership[id]; if(!member)continue;
     guards[id]={...dragRelation(owner.tab),namespace:owner.projectId,workflowId:member.workflowId,
       membershipRevision:member.revision,groupId:state.globalGroups?.tabGroups[id] || null,
       groupRevision:state.globalGroups?.membershipRevisions?.[id] || 0,
@@ -55,12 +56,14 @@ export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTa
     reserveOrder:[...(space.reserveOrder || [])],
     reserveRootOrder:[...(space.reserveRootOrder || [])],
     kind:space.kind || 'user',
+    ...(space.stripColorGroups===undefined?{}:{stripColorGroups:space.stripColorGroups}),
   }]));
   if(!workflows[sourceWorkflowId])return null;
   return freeze(json({version:1,gestureId,origin,sourceWorkflowId,sourceId,sourcePaneKey,
     multiSelected:requested.length>1,
     presentationRootOrder:origin==='sidebar' ? tree.map(node=>node.id):[],
     sourceRootIds,sourceNodes,rootTabIds,familyIds,paneEntries,paneFamilyIds,guards,workflows,
+    stripGroupActivity:Object.fromEntries(Object.entries(state.tabCatalog || {}).map(([id,tab])=>[id,tab.active])),
     groupDefinitions:(state.globalGroups?.groups || []).map(group=>({id:group.id,revision:group.revision,reserveWorkflowId:group.reserveWorkflowId || null})),
     groupMembers:Object.fromEntries((state.globalGroups?.groups || []).map(group=>[group.id,
       Object.entries(state.globalGroups?.tabGroups || {}).filter(([,id])=>id===group.id).map(([id])=>id)])),
@@ -78,7 +81,7 @@ export function workflowDragSourceValid(admission,state) {
   if(!sameIds(dragFamily(records,admission.rootTabIds),admission.familyIds)
     || !sameIds(dragFamily(records,admission.paneEntries.map(entry=>entry.tabId),{physicalOnly:true}),admission.paneFamilyIds))return false;
   if(!admission.familyIds.every(id=>{
-    const owner=catalog.get(id),expected=admission.guards[id],member=state.tabWorkflowMembership[id];
+    const owner=catalog.get(id),expected=admission.guards[id],member=state.pendingTabWorkflowMembership?.[id] || state.tabWorkflowMembership[id];
     return owner && active(owner)
       && member?.revision===expected?.membershipRevision && member?.workflowId===expected.workflowId
       && owner.projectId===expected.namespace && stableJson(dragRelation(owner.tab))===stableJson(dragRelation(expected))
@@ -204,8 +207,32 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
   const sourcePlacements=Object.fromEntries(Object.entries(admission.workflows).map(([id,space])=>[id,
     layoutReferences(space.layout).filter(ref=>family.has(ref.tabId)).map(({tabId,namespace,path,kind})=>({tabId,namespace,path,kind}))])
     .filter(([,refs])=>refs.length));
+  // Release fixes one logical pair. The same pure intent is published locally
+  // and recomputed inside Main's existing transaction; held preview writes none.
+  const stripGroupReleases=[];
+  for(const change of workflows) {
+    const baseline=admission.workflows[change.workflowId];
+    if(!baseline?.stripColorGroups?.groups?.length)continue;
+    const targetPane=target && change.workflowId===workflowId && target.paneIndex!=null
+      ? baseline.layout.splitPanes?.[target.paneIndex]:null;
+    const targetOwner=target && change.workflowId===workflowId ? {paneIndex:target.paneIndex ?? null,
+      windowId:targetPane?.windowId || null,centerKey:target.paneIndex==null
+        ? baseline.layout.activeProjectId || admission.paneEntries[0]?.projectId:null}:null;
+    const rootTabIds=target ? admission.paneEntries.map(entry=>entry.tabId):admission.rootTabIds;
+    // Whole workflow/group actions keep their existing semantics. Ordinary
+    // root placement alone changes colored-strip membership.
+    if(admission.sourceNodes.some(node=>node.groupId))continue;
+    if(!target && !rootTabIds.some(id=>layoutReferences(baseline.layout).some(ref=>ref.tabId===id)
+      &&!layoutReferences(change.layout).some(ref=>ref.tabId===id)))continue;
+    const prepared=preparePaneStripGroupRelease({workflowId:change.workflowId,field:baseline.stripColorGroups,
+      beforeLayout:change.beforeLayout,layout:change.layout,rootTabIds,
+      placementTabIds:target && !moveMembership?rootTabIds:movingFamilyIds,targetOwner,
+      isActive:id=>admission.stripGroupActivity?.[id]});
+    stripGroupReleases.push(prepared.intent);
+  }
   return {version:1,mutationId:`workflow-drag:${admission.gestureId}`,expectedRevision:admission.expectedRevision,
     gestureId:admission.gestureId,sourceRootTabIds:admission.rootTabIds,sourceFamilyIds:admission.familyIds,
     paneRootTabIds:admission.paneEntries.map(entry=>entry.tabId),paneFamilyIds:admission.paneFamilyIds,guardedFamilyIds,movingFamilyIds,
-    tabs,workflows,groupScopes,sourcePlacements,emptyGroupMoves,targetWorkflowId:workflowId,destinationKind:target?'window':'reserve'};
+    tabs,workflows,groupScopes,sourcePlacements,emptyGroupMoves,stripGroupReleases,
+    targetWorkflowId:workflowId,destinationKind:target?'window':'reserve'};
 }

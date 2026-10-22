@@ -26,7 +26,7 @@ const line = row => JSON.stringify(row) + '\n';
 const meta = cwd => ({ type: 'session_meta', payload: { id: SID, cwd, history_mode: 'legacy' } });
 const settings = effort => ({ type: 'turn_context', payload: { model: 'source-model', effort } });
 
-async function fixture(t, { heavy = false, empty = false } = {}) {
+async function fixture(t, { heavy = false, empty = false, recent = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-resume-proof-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const sessionsDir = path.join(root, 'sessions');
@@ -36,9 +36,15 @@ async function fixture(t, { heavy = false, empty = false } = {}) {
   if (heavy) fs.appendFileSync(created.filePath, line({ type: 'compacted', payload: {
     replacement_history: [{ type: 'message', content: 'x'.repeat(8 * 1024 * 1024) }],
   } }));
+  if (recent) fs.appendFileSync(created.filePath, line(settings('high'))
+    + line({ type: 'event_msg', payload: { type: 'user_message', message: 'recent fixture only' } }));
   let fullReads = 0;
+  const launches = [];
   const scopedApi = { ...api,
-    loadResumeSource: (sid, cwd, options) => api.loadResumeSource(sid, cwd, { ...options, sessionsDir }),
+    loadResumeSource: async (sid, cwd, options) => {
+      const result = await api.loadResumeSource(sid, cwd, { ...options, sessionsDir });
+      launches.push({ options, result }); return result;
+    },
     inspectConversationMaterializationFromFile: (sid, cwd) =>
       api.inspectConversationMaterializationFromFile(sid, cwd, { sessionsDir }),
     loadSessionRecords: async () => { fullReads++; throw Error('full/raw Resume reader forbidden'); },
@@ -55,13 +61,65 @@ async function fixture(t, { heavy = false, empty = false } = {}) {
     codexDataModule: { _api: scopedApi }, codexConversationMaterializationCache: new Map(),
   });
   vm.runInContext(prefix, context);
-  return { ...created, root, sessionsDir, context, scopedApi, fullReads: () => fullReads,
+  return { ...created, root, sessionsDir, context, scopedApi, launches, fullReads: () => fullReads,
     run: patch => context.runCodexCommandFromPayloadInner(null, {
       tabId: 'T', command: 'codex-c', sessionId: SID, cwd: root,
       model: 'tab-choice', effort: 'low', modelSource: 'tab-or-explicit', effortSource: 'tab-or-explicit',
       ...patch,
     }) };
 }
+
+test('actual Main ordinary Resume selects launch-purpose reader and keeps unknown full counts', async t => {
+  const h = await fixture(t, { heavy: true, recent: true });
+  const result = await h.run();
+  assert.equal(h.launches[0].options.purpose, 'launch');
+  assert.equal(h.launches[0].result.mode, 'launch-window');
+  assert.equal(result.commandSettings.allowed, true);
+  assert.equal(result.commandSettings.model, 'source-model');
+  assert.equal(result.commandSettings.effort, 'high');
+  assert.equal(result.sourceMaterialization.materialized, true);
+  assert.equal(result.sourceMaterialization.userTurns, null);
+  assert.equal(h.context.codexConversationMaterializationCache.get(SID).userTurns, null);
+  assert.equal(h.fullReads(), 0);
+});
+
+test('actual Main count expressions preserve unknown independently from known zero/positive', () => {
+  for (const [name, variable] of [
+    ['projectCodexRuntimeSnapshotFromEvents', 'visibleMaterialization'],
+    ['broadcastAiRuntimeStatus', 'cachedMaterialization'],
+    ['getCodexRuntimeSessionSnapshot', 'conversationMaterialization'],
+  ]) {
+    const declaration = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    let expression;
+    const visit = node => {
+      if (ts.isPropertyAssignment(node) && node.name.getText(tree) === 'timelineCount') expression = node.initializer;
+      ts.forEachChild(node, visit);
+    };
+    visit(declaration);
+    assert.ok(expression, name);
+    for (const value of [null, undefined, NaN, 0, 17]) {
+      const observed = vm.runInNewContext(expression.getText(tree), {
+        [variable]: { userTurns: value }, lineageSourceSessionId: null,
+      });
+      assert.equal(observed, Number.isFinite(value) ? value : null, name + ':' + value);
+    }
+  }
+  const live = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'processCodexTurnLine');
+  let expression;
+  const visit = node => {
+    if (ts.isObjectLiteralExpression(node) && node.properties.some(property =>
+      ts.isPropertyAssignment(property) && property.name.getText(tree) === 'userTurns')) expression = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(live);
+  assert.ok(expression);
+  const next = vm.runInNewContext('(' + expression.getText(tree) + ')', {
+    previousMaterialization: { userTurns: null, userRecords: null },
+  });
+  assert.equal(next.userTurns, null, 'one new live user is not an exact count of the omitted history');
+  assert.equal(next.userRecords, null);
+  assert.equal(next.materialized, true);
+});
 
 test('actual main Resume proof reaches launch with exact source pair without calling full/raw loader', async t => {
   const h = await fixture(t, { heavy: true });

@@ -4,6 +4,10 @@ const crypto = require('node:crypto');
 const { startSnapshotPrune } = require('./workflow-snapshot-prune');
 const { orderedWorkflows } = require('../shared/workflow-order.cjs');
 const {mergePaneStripColorGroups,paneStripColorGroupEdits,assertPaneStripGather}=require('../shared/pane-strip-color-groups.cjs');
+const {assertPaneStripGroupRelease,paneStripGroupReleases}=require('../shared/pane-strip-group-admission.cjs');
+const {assertPaneStripPair}=require('../shared/pane-strip-pair-guard.cjs');
+const {dragFamily,dragPlacement}=require('../shared/workflow-drag.cjs');
+const {paneStripColorGroupsBasis}=require('../shared/pane-strip-color-groups.cjs');
 const {
   ORGANIZATION_VERSION, EXECUTION_SUBJECT_VERSION, INBOX_WORKFLOW_ID,
   clone, fail, id, stableJson, supported, supportedLayout, mergeLayout, layoutReferences, removeLayoutTabs, planMigration,
@@ -380,9 +384,10 @@ class WorkflowOrganization {
   readDirectoryState() {
     return this.read(() => {
       const publication = this.getPublication();
-      const workflows = this.db.prepare(`SELECT workflow_id,kind,revision,metadata_json
+      const workflows = this.db.prepare(`SELECT workflow_id,kind,revision,metadata_json,layout_json
         FROM workflow_org_workflows WHERE deleted_generation IS NULL OR deleted_generation=0 ORDER BY rowid`).all()
-        .map(row => ({ id: row.workflow_id, kind: row.kind, revision: row.revision, metadata: parse(row.metadata_json) }));
+        .map(row => ({ id: row.workflow_id, kind: row.kind, revision: row.revision, metadata: parse(row.metadata_json),
+          layout: parse(row.layout_json) }));
       const prepared = this.prepareTabRead({ directory: true });
       const tabs = this.db.prepare('SELECT tab_id,subject_version,execution_json,revision FROM workflow_org_tabs ORDER BY rowid')
         .all().map(row => this.readTab(row.tab_id, prepared, row));
@@ -438,12 +443,45 @@ class WorkflowOrganization {
       if (!member || member.workflowId !== workflowId) fail('workflow_layout_membership_conflict', { tabId: ref.tabId });
     }
   }
-  writeLayout(workflow, layout, generation) {
-    if (stableJson(workflow.layout) === stableJson(layout)) return;
+  stripActivity(tabId) {
+    const tab=this.readTab(tabId,this.prepareTabRead({directory:true})),row=tab?.nativeRow||tab?.legacyRow;
+    return row ? row.execution_archived!==1 : undefined;
+  }
+  releaseStripGroups(workflow,layout,intent) {
+    if(intent===undefined)return workflow.metadata.stripColorGroups;
+    if(intent.workflowId!==workflow.id)fail('workflow_drag_strip_group_release_owner_changed');
+    // Admission needs current binding/activity/physical-family fields, not a
+    // second full record/native-body census at release. Reuse the existing
+    // directory projection and its exact source-binding checks in this read.
+    const records=this.read(()=>{
+      const prepared=this.prepareTabRead({directory:true});
+      const rows=this.db.prepare('SELECT tab_id,subject_version,execution_json,revision FROM workflow_org_tabs ORDER BY rowid').all();
+      return Object.fromEntries(rows.map(row=>this.readTab(row.tab_id,prepared,row))
+        .filter(tab=>tab.nativeRow&&tab.nativeRow.execution_archived!==1).map(tab=>[tab.tabId,tab.nativeRow]));
+    });
+    const family=new Set(dragFamily(records,intent.rootTabIds||[],{physicalOnly:true}));
+    if(!Array.isArray(intent.placementTabIds)||intent.placementTabIds.some(id=>!family.has(id)))
+      fail('workflow_drag_strip_group_release_source_changed');
+    if(intent.targetOwner&&intent.rootTabIds.some(tabId=>this.getMembership(tabId)?.workflowId!==workflow.id))
+      fail('workflow_drag_strip_group_release_owner_changed');
+    return assertPaneStripGroupRelease(intent,{workflowId:workflow.id,field:workflow.metadata.stripColorGroups,
+      beforeLayout:workflow.layout,layout,rootTabIds:intent.rootTabIds,placementTabIds:intent.placementTabIds,
+      targetOwner:intent.targetOwner,isActive:tabId=>this.stripActivity(tabId)}).nextState;
+  }
+  assertLayoutPair(workflow,layout,stripColorGroups=workflow.metadata.stripColorGroups) {
+    assertPaneStripPair({workflowId:workflow.id,beforeLayout:workflow.layout,afterLayout:layout,
+      beforeGroups:workflow.metadata.stripColorGroups,afterGroups:stripColorGroups,isActive:tabId=>this.stripActivity(tabId)});
+  }
+  writeLayout(workflow, layout, generation, release) {
+    const stripColorGroups=this.releaseStripGroups(workflow,layout,release);
+    const metadata={...workflow.metadata};
+    if(stripColorGroups===undefined)delete metadata.stripColorGroups;else metadata.stripColorGroups=stripColorGroups;
+    if (stableJson(workflow.layout) === stableJson(layout)&&stableJson(workflow.metadata)===stableJson(metadata)) return;
     this.validateLayout(workflow.id, layout);
+    this.assertLayoutPair(workflow,layout,stripColorGroups);
     this.journal(generation, { reason: 'layout-edit', workflowId: workflow.id, before: workflow.layout, after: layout });
-    this.db.prepare('UPDATE workflow_org_workflows SET layout_json=?,revision=revision+1 WHERE workflow_id=?')
-      .run(stableJson(layout), workflow.id);
+    this.db.prepare('UPDATE workflow_org_workflows SET layout_json=?,metadata_json=?,revision=revision+1 WHERE workflow_id=?')
+      .run(stableJson(layout),stableJson(metadata), workflow.id);
   }
   prunePlacements(tabIds, generation) {
     for (const workflow of this.listWorkflows()) this.writeLayout(workflow, removeLayoutTabs(workflow.layout, tabIds), generation);
@@ -505,6 +543,28 @@ class WorkflowOrganization {
       // every complete renderer snapshot, including a snapshot with no spaces.
       if (!requested.has(INBOX_WORKFLOW_ID)) requested.set(INBOX_WORKFLOW_ID, this.getWorkflow(INBOX_WORKFLOW_ID).metadata);
       const stripGroupEdits=paneStripColorGroupEdits(requested,request.stripColorGroupEdits);
+      const stripReleases=paneStripGroupReleases(requested,request.stripGroupReleases);
+      for(const workflowId of stripReleases.keys())if(stripGroupEdits.has(workflowId))fail('workflow_drag_strip_group_release_invalid');
+      const deferredStripReleases=[];
+      if(request.stripReleaseDeferrals!==undefined) {
+        if(!Array.isArray(request.stripReleaseDeferrals))fail('workflow_strip_release_deferral_invalid');
+        const seen=new Set();
+        for(const deferral of request.stripReleaseDeferrals) {
+          const workflowId=deferral?.workflowId,space=requested.get(workflowId),old=this.getWorkflow(workflowId);
+          if(!space||!old||seen.has(workflowId)||stripReleases.has(workflowId)||stripGroupEdits.has(workflowId)
+            ||Object.keys(deferral).some(key=>!['workflowId','basis','placement'].includes(key)))fail('workflow_strip_release_deferral_invalid');
+          seen.add(workflowId);
+          // This snapshot explicitly asks to save canonical W while retaining
+          // a known-rejected local release separately. It does not claim that
+          // release succeeded, omit W silently, or grant replay of UNKNOWN.
+          if(deferral.basis!==paneStripColorGroupsBasis(old.metadata.stripColorGroups)
+            ||stableJson(deferral.placement??null)!==stableJson(dragPlacement(old.layout))
+            ||paneStripColorGroupsBasis(space.stripColorGroups)!==deferral.basis
+            ||space.layout===undefined||stableJson(dragPlacement(space.layout))!==stableJson(deferral.placement))
+            fail('workflow_strip_release_deferral_changed');
+          deferredStripReleases.push({workflowId,fields:['layout','stripColorGroups']});
+        }
+      }
       const removed = previous.filter(workflow => !requested.has(workflow.id));
       const deletedIds = new Set(removed.map(workflow => workflow.id));
       const supplied = Array.isArray(request.tabWorkflowMembership)
@@ -538,24 +598,34 @@ class WorkflowOrganization {
         const fields = clone(space);
         delete fields.layout;
         const metadata = { ...mergeLayout(old?.metadata || {}, fields), id: workflowId };
-        const stripColorGroups=mergePaneStripColorGroups(old?.metadata?.stripColorGroups,fields.stripColorGroups,
+        let stripColorGroups=mergePaneStripColorGroups(old?.metadata?.stripColorGroups,fields.stripColorGroups,
           stripGroupEdits.get(workflowId),tabId=>{
             const tab=this.readTab(tabId);
             const member=tab?.membership?.workflowId===workflowId;
             return {member,active:member&&tab.executionResolved===true&&!!tab.nativeRow&&tab.nativeRow.execution_archived!==1};
           });
-        if(stripColorGroups===undefined)delete metadata.stripColorGroups;else metadata.stripColorGroups=stripColorGroups;
         const proposedLayout = space.layout === undefined ? old?.layout || {} : mergeLayout(old?.layout || {}, space.layout);
+        if(stripReleases.has(workflowId)) {
+          stripColorGroups=this.releaseStripGroups(old,proposedLayout,stripReleases.get(workflowId));
+          if(stableJson(fields.stripColorGroups??null)!==stableJson(stripColorGroups??null))
+            fail('workflow_drag_strip_group_release_changed');
+        }
+        if(stripColorGroups===undefined)delete metadata.stripColorGroups;else metadata.stripColorGroups=stripColorGroups;
         const gathered=stripGroupEdits.has(workflowId)?assertPaneStripGather(old?.layout,proposedLayout,
           old?.metadata?.stripColorGroups,stripColorGroups,stripGroupEdits.get(workflowId)):null;
         if(gathered?.pane)proposedLayout.splitPanes[gathered.paneIndex].tabs=gathered.slots;
         else if(gathered)proposedLayout.centerStrips={...proposedLayout.centerStrips,[gathered.centerKey]:gathered.slots};
         const foreign = layoutReferences(proposedLayout).filter(ref => this.getMembership(ref.tabId)?.workflowId !== workflowId).map(ref => ref.tabId);
         const layout = removeLayoutTabs(proposedLayout, foreign);
+        if(deferredStripReleases.some(value=>value.workflowId===workflowId)
+          &&(stableJson(dragPlacement(layout))!==stableJson(dragPlacement(old.layout))
+            ||paneStripColorGroupsBasis(stripColorGroups)!==paneStripColorGroupsBasis(old.metadata.stripColorGroups)))
+          fail('workflow_strip_release_deferral_changed');
         if (foreign.length) this.journal(generation, { reason: 'snapshot-placement-prune', workflowId, before: proposedLayout, after: layout });
         if (!old) this.insertWorkflow({ id: workflowId, kind: 'user', revision: 1, metadata, layout });
         else {
           this.validateLayout(workflowId, layout);
+          this.assertLayoutPair(old,layout,stripColorGroups);
           if (stableJson(old.metadata) !== stableJson(metadata) || stableJson(old.layout) !== stableJson(layout)) {
             this.journal(generation, { reason: 'snapshot-workflow', before: old });
             this.db.prepare('UPDATE workflow_org_workflows SET metadata_json=?,layout_json=?,revision=? WHERE workflow_id=?')
@@ -571,7 +641,8 @@ class WorkflowOrganization {
       const metadata = this.getPublication().metadata;
       this.db.prepare('UPDATE workflow_org_meta SET metadata_json=? WHERE singleton=1')
         .run(stableJson({ ...metadata, workflowOrder: [...requested.keys()] }));
-      return { workflowOrder: [...requested.keys()], deletedWorkflowIds: [...deletedIds] };
+      return { workflowOrder: [...requested.keys()], deletedWorkflowIds: [...deletedIds],
+        ...(deferredStripReleases.length?{deferredStripReleases}:{}) };
     });
   }
   createTab(request) {
@@ -646,7 +717,8 @@ class WorkflowOrganization {
     return this.mutate('saveLayout', request, generation => {
       if (!Number.isSafeInteger(request.expectedWorkflowRevision)) fail('workflow_layout_revision_required');
       const workflow = this.workflowRequired(request.workflowId, request.expectedWorkflowRevision);
-      this.writeLayout(workflow, mergeLayout(workflow.layout, request.layout), generation);
+      const releases=paneStripGroupReleases(new Map([[workflow.id,workflow]]),request.stripGroupReleases);
+      this.writeLayout(workflow, mergeLayout(workflow.layout, request.layout), generation,releases.get(workflow.id));
       return { workflowId: workflow.id, workflowRevision: this.getWorkflow(workflow.id).revision };
     });
   }

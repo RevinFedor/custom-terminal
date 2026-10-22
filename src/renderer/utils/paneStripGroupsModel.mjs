@@ -1,6 +1,6 @@
 import {paneTabs} from './splitPanesModel.mjs';
 import {editPaneStripColorGroups,paneStripGroupDragBoundary,classifyPaneStripColorSelection,normalizeStripGroupColor} from './paneStripSelectionModel.mjs';
-import {validatePaneStripColorGroups,paneStripLayoutOwner,gatherPaneStripSlots,paneStripSlotOrder,projectActivePaneStripGroups} from '../../shared/pane-strip-color-groups.cjs';
+import {validatePaneStripColorGroups,paneStripColorGroupsBasis,paneStripLayoutOwner,gatherPaneStripSlots,paneStripSlotOrder,projectActivePaneStripGroups} from '../../shared/pane-strip-color-groups.cjs';
 import {captureSpaceLayout} from './workspaceSpacesModel.mjs';
 import {stableJson} from '../../shared/workflow-organization.cjs';
 
@@ -38,7 +38,7 @@ export function readPaneStripOwnerEntries(state,{workflowId,windowId,paneIndex})
 
 /** Read-only lease for the existing DnD owner. No subscription or DOM reads.
  * Order has its own fence: merely recoloring cannot grant a stale insertion. */
-export function capturePaneStripGroupDrag({getState,owner,sourceIds}) {
+export function capturePaneStripGroupDrag({getState,owner,sourceIds,internalScope=false}) {
   const state=getState();let source;
   try{source=readPaneStripGroupState(state,owner.workflowId);}catch{
     return {boundary:{kind:'blocked',reason:'strip-groups-unavailable'},isCurrent:()=>false};
@@ -54,13 +54,16 @@ export function capturePaneStripGroupDrag({getState,owner,sourceIds}) {
     try {return !readPaneStripGroupState(next,owner.workflowId).groups.some(group=>
       group.tabIds.some(id=>sourceIds.includes(id)));}catch{return false;}
   }};
-  const key=entriesKey(order),revision=source.revision,navigationRevision=state.navigationRevision;
-  const memberships=sourceIds.map(id=>JSON.stringify(state.tabWorkflowMembership[id] ?? null));
-  return {boundary,owner:{...owner},revision,isCurrent:()=>{
-    const next=getState(),entries=readPaneStripOwnerEntries(next,owner);
-    if(!entries || entriesKey(entries)!==key || next.navigationRevision!==navigationRevision)return false;
-    try {if(readPaneStripGroupState(next,owner.workflowId).revision!==revision)return false;}catch{return false;}
-    return sourceIds.every((id,index)=>JSON.stringify(next.tabWorkflowMembership[id] ?? null)===memberships[index]);
+  const key=entriesKey(order),revision=source.revision,navigationRevision=state.navigationRevision,basis=paneStripColorGroupsBasis(source);
+  const proofOwner={...owner,centerKey:owner.paneIndex===null?(state.centerStripKey?.()||state.activeProjectId):null};
+  const member=(value,id)=>value.pendingTabWorkflowMembership?.[id]||value.tabWorkflowMembership[id]||null;
+  const memberships=sourceIds.map(id=>JSON.stringify(member(state,id)));
+  return {boundary,internalScope:internalScope&&boundary.kind==='group',owner:{...owner},revision,isCurrent:()=>{
+    const next=getState(),layout=next.activeSpaceId===owner.workflowId?captureSpaceLayout(next):next.spaces.find(space=>space.id===owner.workflowId)?.layout;
+    const placed=paneStripLayoutOwner(layout,proofOwner),entries=placed?.slots.filter(entry=>entry.tabId);
+    if(!entries || entriesKey(entries)!==key || internalScope&&(next.activeSpaceId!==owner.workflowId||next.navigationRevision!==navigationRevision))return false;
+    try {if(paneStripColorGroupsBasis(readPaneStripGroupState(next,owner.workflowId))!==basis)return false;}catch{return false;}
+    return sourceIds.every((id,index)=>JSON.stringify(member(next,id))===memberships[index]);
   }};
 }
 
@@ -100,13 +103,13 @@ export function preparePaneStripGroupColor(state,lease,color,newId) {
 export function applyPaneStripGatherPublication(state,spaces,publishedSpaces,request) {
   let result={spaces};
   for(const edit of request?.stripColorGroupEdits||[]) {
-    if(!edit.gather)continue;
+    const placement=edit.gather||edit.arrange;if(!placement)continue;
     const space=spaces.find(space=>space.id===edit.workflowId),published=publishedSpaces.find(space=>space.id===edit.workflowId);
     if(!space||!published)continue;
     const layout=state.activeSpaceId===space.id?captureSpaceLayout(state):space.layout;
-    const current=paneStripLayoutOwner(layout,edit.gather.owner),incoming=paneStripLayoutOwner(published.layout,edit.gather.owner);
+    const current=paneStripLayoutOwner(layout,placement.owner),incoming=paneStripLayoutOwner(published.layout,placement.owner);
     if(!current||!incoming)continue;
-    const before=stableJson(paneStripSlotOrder(edit.gather.beforeSlots)),proposed=paneStripLayoutOwner(request.spaces.find(item=>item.id===space.id)?.layout,edit.gather.owner);
+    const before=stableJson(paneStripSlotOrder(placement.beforeSlots)),proposed=paneStripLayoutOwner(request.spaces.find(item=>item.id===space.id)?.layout,placement.owner);
     if(stableJson(paneStripSlotOrder(current.slots))!==before&&stableJson(paneStripSlotOrder(current.slots))!==stableJson(paneStripSlotOrder(proposed?.slots||[])))continue;
     const key=slot=>JSON.stringify(paneStripSlotOrder([slot])[0]),local=new Map(current.slots.map(slot=>[key(slot),slot]));
     const slots=incoming.slots.map(slot=>({...slot,...local.get(key(slot))}));

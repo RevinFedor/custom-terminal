@@ -29,6 +29,22 @@ test('initial ready snapshot resolves without requiring another event', async ()
   assert.equal(events.listenerCount(READINESS_CHANGED_EVENT), 0);
 });
 
+test('directory operation waits for the owned writer after an early composer-ready edge', async () => {
+  const { CODEX_SETTINGS_WRITER_ADOPTED_EVENT } = require('./codex-settings-writer-transition');
+  const eventBus = new EventEmitter();
+  let status = { toolType: 'codex', status: 'active', inputReady: true, writerConfirmed: false,
+    launchId: 'L1', lifecycleGeneration: 'G1' }, done = false;
+  const pending = waitForAgentReadyTransition({ tabId: 'T', eventBus, requireWriter: true,
+    expectedOwner: { launchId: 'L1', lifecycleGeneration: 'G1' }, readStatus: async () => status })
+    .then(value => { done = true; return value; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(done, false);
+  status = { ...status, writerConfirmed: true, sessionId: 'owned' };
+  eventBus.emit(CODEX_SETTINGS_WRITER_ADOPTED_EVENT, null, { tabId: 'T' });
+  assert.equal((await pending).sessionId, 'owned');
+  assert.equal(eventBus.listenerCount(CODEX_SETTINGS_WRITER_ADOPTED_EVENT), 0);
+  assert.equal(eventBus.listenerCount('agent:input-owner-changed-internal'), 0);
+});
+
 test('expected launch rejects Stop or replacement before accepting another ready session', async () => {
   for (const replacement of [
     { sessionId: 'other', launchId: 'L2', lifecycleGeneration: 'G2' },

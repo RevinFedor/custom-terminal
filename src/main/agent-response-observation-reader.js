@@ -125,7 +125,8 @@ function createAgentResponseObservationReader({
   function capture(tabId) {
     const raw = captureState(tabId);
     return { ...raw, revision: JSON.stringify([raw.revision, raw.known, raw.exists, raw.toolType,
-      raw.sessionId, raw.cwd, raw.busy, raw.transitioning, raw.backgroundWorkCount, raw.goalWork, revision(tabId)]) };
+      raw.sessionId, raw.cwd, raw.busy, raw.transitioning, raw.backgroundWorkCount, raw.goalWork,
+      raw.turn?.completionEligible === true, raw.turn?.intentId || null, revision(tabId)]) };
   }
 
   async function getAgentResponseState(tabId) {
@@ -164,6 +165,8 @@ function createAgentResponseObservationReader({
       state.executionContext = executionContext;
       const subject = executionContext ? currentResponseSubject({ ...before, busy, executionContext }) : null;
       if (subject) state.currentSubject = subject;
+      if (subject) state.loopTaskProtocol = { eligible: before.turn?.completionEligible === true,
+        intentId: before.turn?.intentId || null };
       if (busy === null) state.error = before.error || 'response_busy_unknown';
       return state;
     } catch (error) {
@@ -264,16 +267,55 @@ function createAgentResponseObservationReader({
     if (!subject) return failure('response_subject_unresolved');
     return { subject, result: { found: true, sourceVerified: true,
       executionContext: subject.targetExecutionContext,
+      userUuid: loaded.userUuid || null, sourceIdentity: loaded.sourceIdentity || null,
       ...(Number.isSafeInteger(loaded.turnIndex) ? { turnIndex: loaded.turnIndex } : {}) } };
   }
 
-  async function readAgentObservedResponse({ tabId, expectedSessionId, subject: inputSubject, maxChars, purpose } = {}) {
+  async function readClaudeInputInterval({ tabId, expectedSessionId, from, through }) {
+    const unavailable = reason => ({ known: false, reason });
+    const before = await getAgentResponseState(tabId);
+    if (ownerError(before, expectedSessionId, null) || before.toolType !== 'claude' || before.busy !== false
+      || before.transitioning !== false || !from?.userUuid || !through?.subject?.promptUserUuid) return unavailable('restart_interval_owner_unstable');
+    const data = await loadSessionTurns(expectedSessionId, before.cwd, { provider: 'claude', forceFresh: true });
+    const source = data?.sourceSnapshot, map = data?.recordMap, branch = [...(data?.branchUuids || [])];
+    if (!source?.fileIdentity || !map || !branch.length) return unavailable('restart_interval_source_unknown');
+    // Claude's explicit parent links prove the active interval. A skipped or
+    // missing record in this chain is a gap, never evidence of no manual input.
+    const covered = new Set(); let cursor = branch.at(-1), found = false;
+    for (let i = 0; cursor && i < 10000; i++) {
+      const record = map.get(cursor);
+      if (!record || !data.branchUuids.has(cursor) || covered.has(cursor)) return unavailable('restart_interval_gap');
+      covered.add(cursor); if (cursor === from.userUuid) { found = true; break; }
+      cursor = record.parentUuid;
+    }
+    if (!found) return unavailable('restart_interval_anchor_unproven');
+    const users = (data.turns || []).filter(turn => ['user', 'queued_command'].includes(turn.kind) && covered.has(turn.userUuid));
+    if (!users.length || users.length > 64 || users[0].userUuid !== from.userUuid
+      || users.at(-1).userUuid !== through.subject.promptUserUuid) return unavailable('restart_interval_edge_changed');
+    const indexed = new Set(users.flatMap(turn => [turn.userUuid, ...(turn.userUuids || [])]));
+    for (const uuid of covered) {
+      const record = map.get(uuid), content = record.message?.content;
+      if (record.type === 'user' && !indexed.has(uuid) && !(Array.isArray(content)
+        && content.length && content.every(item => item.type === 'tool_result'))) return unavailable('restart_interval_unindexed_user');
+    }
+    const stat = await require('node:fs').promises.stat(source.filePath).catch(() => null);
+    const after = await getAgentResponseState(tabId);
+    if (!stat || source.fileIdentity !== stat.dev + ':' + stat.ino || source.size !== stat.size
+      || source.mtimeMs !== stat.mtimeMs || source.ctimeMs !== stat.ctimeMs || after.revision !== before.revision
+      || ownerError(after, expectedSessionId, null) || after.busy !== false) return unavailable('restart_interval_source_changed');
+    return { known: true, complete: true, sourceRevision: JSON.stringify(source), executions: [],
+      users: users.map(turn => ({ userUuid: turn.userUuid, aliases: [{ userUuid: turn.userUuid,
+        sessionId: expectedSessionId }] })), ranges: [source] };
+  }
+
+  async function readAgentObservedResponse({ tabId, expectedSessionId, subject: inputSubject, maxChars, purpose, from, through } = {}) {
     // Reuse the existing private Main callback, without adding an unprovided
     // web option or an idle override to the ordinary completion reader.
     if (purpose === 'continuation-history') {
       if (inputSubject != null) return failure('continuation_history_requires_latest');
       return readContinuationLatestIdentity({ tabId, expectedSessionId, maxChars });
     }
+    if (purpose === 'continuation-input-interval') return readClaudeInputInterval({ tabId, expectedSessionId, from, through });
     if (!tabId || !expectedSessionId) return failure('response_identity_required');
     const explicit = inputSubject != null;
     let subject = explicit ? normalizeSubject(inputSubject) : null;

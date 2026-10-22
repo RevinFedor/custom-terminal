@@ -265,6 +265,7 @@ interface ExternalTabContextMenu {
   isCurrent?: () => boolean;
   onClose?: () => void;
   paneSelection?: import('./PaneStripSelection').PaneStripSelectionLease;
+  hoverOwnerTabId?: string;
 }
 
 /**
@@ -298,7 +299,7 @@ export function openTabContextMenuAt(
   tabId: string,
   x: number,
   y: number,
-  options?: Pick<ExternalTabContextMenu, 'renameHost' | 'singleTarget' | 'isCurrent' | 'onClose' | 'paneSelection'>,
+  options?: Pick<ExternalTabContextMenu, 'renameHost' | 'singleTarget' | 'isCurrent' | 'onClose' | 'paneSelection' | 'hoverOwnerTabId'>,
 ): void {
   window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
     detail: { projectId, tabId, x, y, ...options },
@@ -9754,6 +9755,9 @@ function TabBar({
           ref={contextMenuRef}
           data-tab-context-menu
           data-tab-context-menu-host={renameHostRef.current || undefined}
+          data-tab-menu-owner-id={externalContextMenuRef.current?.hoverOwnerTabId||contextMenu.tabId}
+          data-pane-strip-selection-owner={externalContextMenuRef.current?.paneSelection
+            ?JSON.stringify([externalContextMenuRef.current.paneSelection.workflowId,externalContextMenuRef.current.paneSelection.windowId??externalContextMenuRef.current.paneSelection.paneIndex]):undefined}
           data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl"
           style={{

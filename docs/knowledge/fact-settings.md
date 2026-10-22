@@ -3,6 +3,22 @@
 ## Intro
 Модальное окно настроек (`Cmd+,`) является единым центром управления конфигурацией приложения, включая шрифты, цвета, горячие клавиши и параметры AI-агентов.
 
+## Режимы интерфейса
+
+Source22Oct: прежний блок «Режим новых вкладок» называется «Режимы интерфейса».
+History/Terminal по-прежнему задаёт только начальную поверхность новых AI-вкладок.
+Три независимых default-OFF режима оконных групп: selected-first order,
+outside-click-only close и instant badge-hover. Instant не меняет close policy;
+selected-first не включает остальные. Их пользовательские переходы описаны в
+`fact-tabs.md::Свёрнутая группа в оконной полосе`.
+
+Все три идут через прежний SQLite app-state owner, без отдельного localStorage
+writer. Missing key — OFF без seed write. Поздний hydrate не затирает даже
+явный локальный повторный выбор OFF; старый ACK/error не меняет status нового
+выбора. Неизвестный save не откатывает RAM как будто SQL точно не записал:
+настройки честно показывают unconfirmed/error и предлагают явный retry текущего
+выбора. Retry загрузки читает, не пишет старый snapshot поверх нового intent.
+
 ## User Flow: Настройка AI
 1. Пользователь переходит на вкладку **"AI"**.
 2. В левой колонке выбирает промпт из списка компактных карточек.
@@ -98,7 +114,11 @@ Main+renderer. Контракт и приёмка — `fact-tab-task-plan.md`.
 ## Codex: политики Goal и usage
 
 Системные → «Настройки моделей» имеет две независимые сохранённые политики: Goal — автоматически
-Resume (default) либо Leave paused (`codexResumePausedGoal`); исчерпание usage —
+Resume либо Leave paused (`codexResumePausedGoal`); Source21Oct добавляет явное
+«Спрашивать каждый раз»: null/отсутствие настройки не выбирает Goal автоматически.
+Сохранённые true/false не мигрируются в manual; explicit launch override прежний.
+Автовыбор показывает loader на выбранной кнопке, отказ — ошибку со снимком,
+не кнопку refresh. Незаданная политика оставляет обе ручные кнопки. Исчерпание usage —
 Continue with Luna Reserve (default) либо Stop всех текущих Codex-вкладок
 (`codexUsageExhaustionPolicy`). Последнее использует общий process Stop, не
 composer interrupt. Выбор хранится в app-state с local cache; поздняя hydration

@@ -14,6 +14,7 @@
 // stays reachable by exact identity — preview + identity, never silent loss.
 
 const crypto = require('node:crypto');
+const { currentReadControl } = require('./history-read-control');
 const { makeHistoryRowStub } = require('./history-entry-window');
 const { historyActionHeaderFacts } = require('../shared/history-action-header.cjs');
 const { normalizeHistoryRecordTime } = require('../shared/history-record-time.cjs');
@@ -99,14 +100,26 @@ class HistoryPayloadStash {
 
 // One shared stash: eviction pressure is global, matching real memory.
 const historyPayloadStash = new HistoryPayloadStash();
-const historyPayloadHash = text => crypto.createHash('sha256').update(text).digest('hex');
+const historyPayloadHash = text => {
+  const digest = crypto.createHash('sha256'), control = currentReadControl();
+  for (let from = 0; from < text.length;) {
+    control?.assertCurrent();
+    let to = Math.min(text.length, from + 32 * 1024);
+    if (to < text.length && /[\uD800-\uDBFF]/.test(text[to - 1]) && /[\uDC00-\uDFFF]/.test(text[to])) to--;
+    digest.update(text.slice(from, to)); from = to;
+  }
+  return digest.digest('hex');
+};
 
 // An additional CONSUMER projection, not another transcript parser or cache.
 // Canonical prepared pages remain compatible with desktop and full clients.
 // JSON is the existing wire representation of an action; paging below keeps
 // every byte available without inventing an incomplete args/diff schema.
 function projectHistoryOnDemand({ toolType, sessionId, entries, stash = historyPayloadStash, onPayload }) {
+  const control = currentReadControl();
+  control?.assertCurrent();
   const refFor = (payloadId, text, rowUuid, encoding) => {
+    control?.assertCurrent();
     stash.set(toolType, sessionId, payloadId, text);
     onPayload?.(payloadId, text);
     return { payloadId, totalChars: text.length, contentHash: historyPayloadHash(text), rowUuid, encoding };
@@ -133,10 +146,12 @@ function projectHistoryOnDemand({ toolType, sessionId, entries, stash = historyP
     return result;
   };
   return (entries || []).map(entry => {
+    control?.assertCurrent();
     if (!entry || entry.rowStub) return entry;
     const row = { ...entry };
     const summary = [];
     if (Array.isArray(entry.actions)) row.actions = entry.actions.map((action, index) => {
+      control?.assertCurrent();
       if (!action || typeof action !== 'object') return action;
       const actionRef = refFor('action:' + entry.uuid + ':' + index, JSON.stringify(action), entry.uuid, 'json');
       const facts = historyActionHeaderFacts(action);
@@ -199,6 +214,8 @@ const dehydrateHistoryEntries = ({
   if (!Array.isArray(entries)) return { dehydrated: 0, savedChars: 0 };
   let dehydrated = 0;
   let savedChars = 0;
+  const control = currentReadControl();
+  control?.assertCurrent();
 
   const stashPut = (payloadId, text) => {
     if (stash) stash.set(toolType, sessionId, payloadId, text);
@@ -206,10 +223,12 @@ const dehydrateHistoryEntries = ({
   };
 
   for (const entry of entries) {
+    control?.assertCurrent();
     if (!entry) continue;
 
     if (Array.isArray(entry.actions)) {
       for (let index = 0; index < entry.actions.length; index += 1) {
+        control?.assertCurrent();
         const action = entry.actions[index];
         const rawTool = action && action.tool === '__raw__' ? action.rawTool : null;
         if (!rawTool || typeof rawTool.result !== 'string') continue;
@@ -264,6 +283,32 @@ const dehydrateHistoryEntries = ({
   return { dehydrated, savedChars };
 };
 
+// Cooperative request path; synchronous callers keep their existing ABI.
+// A batch owns only the row-reference slice. A single canonical row or action
+// can still be large; these checkpoints do not claim to bound that leaf.
+async function dehydrateHistoryEntriesAsync(options) {
+  const control = options.control || currentReadControl();
+  let dehydrated = 0, savedChars = 0;
+  for (let from = 0; from < (options.entries || []).length; from += 32) {
+    control?.assertCurrent();
+    const batch = dehydrateHistoryEntries({ ...options, entries: options.entries.slice(from, from + 32) });
+    dehydrated += batch.dehydrated; savedChars += batch.savedChars;
+    if (control) await control.checkpoint(); else await new Promise(resolve => setImmediate(resolve));
+  }
+  control?.assertCurrent();
+  return { dehydrated, savedChars };
+}
+async function projectHistoryOnDemandAsync(options) {
+  const control = options.control || currentReadControl(), result = [];
+  for (let from = 0; from < (options.entries || []).length; from += 32) {
+    control?.assertCurrent();
+    result.push(...projectHistoryOnDemand({ ...options, entries: options.entries.slice(from, from + 32) }));
+    if (control) await control.checkpoint(); else await new Promise(resolve => setImmediate(resolve));
+  }
+  control?.assertCurrent();
+  return result;
+}
+
 /** Caps a payload for one render/IPC pass without touching the source. */
 const capPayloadForRender = (text) => {
   if (typeof text !== 'string') return { payload: '', truncatedForRender: false, totalChars: 0 };
@@ -290,5 +335,7 @@ module.exports = {
   HistoryPayloadStash,
   historyPayloadStash,
   dehydrateHistoryEntries,
+  dehydrateHistoryEntriesAsync,
+  projectHistoryOnDemandAsync,
   capPayloadForRender,
 };

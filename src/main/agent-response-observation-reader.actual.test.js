@@ -16,6 +16,7 @@ const materializers = require('./claude-orchestration-result');
 const { classifyOrchestrationResultProbe, RESULT_PROOF_KINDS } = require('./orchestration-result-proof');
 const { projectClaudePtyPresence } = require('./claude-pty-presence');
 const { projectCodexPublicRuntimeProjection } = require('./codex-runtime-contract');
+const { readBuildContinueOriginal } = require('./build-continue-proofs');
 
 const source = fs.readFileSync(require.resolve('./main'), 'utf8');
 const parsed = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
@@ -1075,6 +1076,32 @@ for (const mutation of ['input', 'launch', 'background-ABA', 'process-unknown', 
     assert.ok(identity.pending || identity.error);
   });
 }
+
+test('build continue reads original Codex via real Main historical reader, not an unselectable context-only prompt query', async t => {
+  const f = fixture(t, { provider: 'codex', rows: codexTurn('A', 'interrupted text', 'turn_aborted') });
+  const turn = f.begin('A'); f.finish(turn);
+  const subject = { kind: 'codex-execution', toolType: 'codex', sessionId: 'S',
+    targetExecutionContext: { provider: 'codex', sessionId: 'S', turnId: 'A', generation: turn.generation, processId: '321' } };
+  const old = await f.context._getAgentTurnResultForOrchestration({ toolType: 'codex', sessionId: 'S', cwd: f.dir,
+    targetExecutionContext: subject.targetExecutionContext, resultReadMode: 'source-proof' });
+  assert.equal(old.found, false, 'OLD original query does not select an execution');
+  const proof = await readBuildContinueOriginal({ source: { tabId: 'T', provider: 'codex', sessionId: 'S', cwd: f.dir }, subject },
+    { sessionId: 'S' }, { readObserved: request => f.reader.readAgentObservedResponse(request) });
+  assert.equal(proof.found, true, JSON.stringify(proof)); assert.equal(proof.sourceVerified, true);
+  assert.equal(proof.executionContext.turnId, 'A'); assert.equal(proof.complete, false);
+  assert.equal(proof.executionContext.generation, null, 'historical read never claims a live generation');
+});
+
+test('Claude metadata interval follows exact physical parent chain and exposes manual → callback', async t => {
+  const f = fixture(t, { provider: 'claude', rows: [cUser('old'), cAnswer('partial', 'partial', 'tool_use'),
+    cUser('manual'), cAnswer('manual-final', 'manual-final'), cUser('callback'), cAnswer('callback-final', 'callback-final')] });
+  const latest = await f.read(); assert.equal(latest.subject.promptUserUuid, 'callback');
+  const interval = await f.read({ purpose: 'continuation-input-interval', from: { userUuid: 'old' }, through: latest });
+  assert.equal(interval.known, true, JSON.stringify(interval));
+  assert.deepEqual(Array.from(interval.users, item => item.userUuid), ['old', 'manual', 'callback']);
+  f.write([cUser('foreign'), cAnswer('foreign-final', 'new')]);
+  assert.equal((await f.read({ purpose: 'continuation-input-interval', from: { userUuid: 'old' }, through: latest })).known, false);
+});
 
 for (const pending of ['prompt', 'catch-up', 'binding-conflict']) test('identity selection cannot bypass Main transition: ' + pending, async t => {
   const f = fixture(t, { provider: 'codex', rows: codexTurn('A', 'partial', 'turn_aborted') });

@@ -54,6 +54,7 @@ function load({ ipc, identityKnown = true, deferInitial = false } = {}) {
       if (name === 'net') return { createServer(fn) { onConnection = fn; return server; } };
       if (name === 'perf_hooks') return { performance: { timeOrigin: epoch, now: () => now } };
       if (name === './child-process-env') return { buildChildProcessEnv: () => ({}) };
+      if (name === '../shared/perf-causal-schema.cjs') return require('../shared/perf-causal-schema.cjs');
       if (name === './process-metrics-source') return { captureNativeSnapshot() {
         snapshots += 1;
         return identityKnown ? { ok: true, processes: [{ pid: MAIN_PID, startedAtTicks: 'private-start' }] } : { ok: false };

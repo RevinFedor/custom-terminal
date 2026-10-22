@@ -202,7 +202,7 @@ OAuth получили JSON200. Через `net.fetch` подтверждён т
 
 [Опубликованное письмо OpenAI29–30.09](https://www.reddit.com/r/OpenAI/comments/1wtlpx7/its_been_a_good_run/) описывает разовую выдачу существующим Pro200:62 500 credits с номинальной стоимостью$2 500, истекающие31.12.2026, в связи с переходом20×→10× Plus для Work/Codex с30.10. Старый allowance до29.10 подтверждён также [официальной страницей Pro tiers](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers). Совпадение суммы/плана/даты с live-балансами — основание связать их с этой выдачей, но `wham/usage` не отдаёт происхождение или expiry credit grant. Не переносить дату этой акции на любые credits: купленные credits имеют собственный12-месячный срок. Даты в `Usage resets` принадлежат другим сущностям и не являются сроком `credits.balance`.
 
-### Понижение подписки и уже выданные промо-кредиты — research08.10
+### Понижение подписки и уже выданные промо-кредиты — research08.10, перепроверено21.10
 
 Разделяй сохранение баланса, право расходовать его и доступ к моделям.
 Gift62 500 не является переносом Pro entitlements. По [официальной доступности
@@ -210,12 +210,26 @@ Gift62 500 не является переносом Pro entitlements. По [оф
 вPlus/Pro rollout, Free/Go не включены; [pricing](https://learn.chatgpt.com/docs/pricing)
 даётPlus Codex/credit overflow иAstra usage estimates, Free —Luna desktop.
 
+21.10 найдено прямое официальное подтверждение: [Work and Codex](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex)
+и [Astra usage guide](https://help.openai.com/en/articles/20001516-managing-usage-with-gpt-6-astra-in-work-and-codex)
+явно включают Astra вPlus Work/Codex и разрешают дополнительное использование
+заcredits послеограниченного included allowance. GPT-6 Pro вобычном Chat
+вPlus невходит; наличие Astra вCodex не сохраняет всеPro-возможности/режимы.
+Plus имеет5h/weekly usage windows; переключение моделей не восстанавливает общий
+allowance. [Personal credits FAQ](https://help.openai.com/en/articles/12642688-using-credits-for-flexible-usage-in-chatgpt-personal-plans)
+подтверждает included-first, затембаланс, но публичной гарантии сохранения именно
+Pro-transition grant62500 приdowngrade впрочитанных официальных условиях не найдено.
+
 Raw Reddit08.10 даёт подтверждения сохранения именно этого grant:
 [автор процитировал письменный ответ Support02.10](https://www.reddit.com/r/ChatGPTPro/comments/1wvdhuu/has_anyone_kept_the_62500_promo_credits_after/pdg4w0i/): unused credits неотзываются приdowngrade, expiry31.12.2026 не продлевается привозврате.
 Это опубликованный пересказ поддержки, не независимо проверенное публичное
 условие акции. [Другой автор тоже сообщил ответ Support](https://www.reddit.com/r/codex/comments/1wu6j56/if_i_downgrade_from_pro_200_to_plus_do_i_keep_the/).
 [Реальный Plus case05.10](https://www.reddit.com/r/ChatGPTPro/comments/1wygfu0/sitting_on_62k_credits_downgrade_to_plus_or_jump/pe2hc8b/): автор сообщил списание$20 иAstra; просмотренный screenshot показываетPlus$20 и62 435 credits.
 [После отмены/возврата наPlus](https://www.reddit.com/r/codex/comments/1wy98fy/how_to_use_credits_after_cancelled_sub/pe11j93/) другой пользователь сообщил, чторасходование работает.
+Оба треда перепрочитаны21.10 черезSC free API. В [свежем треде19.10](https://www.reddit.com/r/codex/comments/1x9uv9o/do_we_keep_the_62500_credit_grant_if_cancelling/php65e4/)
+снова подтверждают сохранение grant ирекомендуютPlus дляSol/Astra; это
+пользовательское подтверждение, не новая публичная гарантия OpenAI. Raw SC sources:
+6046 (19.10),5495 (Plus фактическиоплачен),5496 (расходование наPlus),5487 (Support quote).
 
 [Free case07.10](https://www.reddit.com/r/codex/comments/1wzr38a/how_to_use_61_with_credit_on_free_planjust_cancel/) имеет screenshots62 500 balance иpicker6Luna/5.6Terra/5.6Luna без6.1Sol.
 Наличие денег наэкране само по себе не доказывает расходование наFree:

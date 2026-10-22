@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import loopPolicy from '../../shared/loop-dependencies.cjs';
+import { buildInstallContinuationBlocks, buildInstallInheritedSources, initializeBuildInstallContinuations, subscribeBuildInstallContinuations } from '../utils/buildInstallContinuation.mjs';
 import {
   isOrchestrationCompletionBlocking,
   isOrchestrationInheritedActivity,
@@ -106,6 +108,9 @@ export type OrchestrationRun = {
   externalResearchMode?: string | null;
   externalResearchStatus?: string | null;
   externalResearchStage?: string | null;
+  externalResearchContinuationHint?: 'new_chat_required' | null;
+  externalResearchUiState?: { epoch?: string; revision?: number; sendState?: string; phase?: string | null;
+    attention?: boolean; parked?: boolean; recoveryStatus?: string | null };
   externalResearchConversationUrl?: string | null;
   externalResearchConversationId?: string | null;
   externalResearchContinuedFromRunId?: string | null;
@@ -192,6 +197,10 @@ function projections(runs: Iterable<OrchestrationRun>) {
       if (run.sourceProjectId) inheritedBusyProjectIds.add(run.sourceProjectId);
     }
   }
+  for (const source of buildInstallInheritedSources()) {
+    inheritedBusyTabIds.add(source.tabId);
+    if (source.projectId) inheritedBusyProjectIds.add(source.projectId);
+  }
   return { inheritedBusyTabIds, inheritedBusyProjectIds, completionBlockedTabIds };
 }
 
@@ -266,7 +275,13 @@ export const useOrchestrationStore = create<OrchestrationStore>((set, get) => ({
 }));
 
 export function isOrchestrationCompletionBlocked(tabId: string): boolean {
-  return useOrchestrationStore.getState().completionBlockedTabIds.has(tabId);
+  return buildInstallContinuationBlocks(tabId) || useOrchestrationStore.getState().completionBlockedTabIds.has(tabId);
+}
+
+export function isLoopOrchestrationBlocked(tabId: string): boolean {
+  const state = useOrchestrationStore.getState();
+  return buildInstallContinuationBlocks(tabId)
+    || !loopPolicy.loopExternalWaitAdmission([...state.activeRuns.values()], tabId, state.initialized);
 }
 
 export function subscribeOrchestrationRunChanges(
@@ -282,12 +297,14 @@ let listenerInstalled = false;
 export function initializeOrchestrationStore(): Promise<void> {
   if (!listenerInstalled) {
     listenerInstalled = true;
+    subscribeBuildInstallContinuations(() => useOrchestrationStore.setState(current => projections(current.activeRuns.values())));
     ipcRenderer.on('orchestration:changed', (_event: unknown, payload: { run?: OrchestrationRun }) => {
       if (payload?.run) useOrchestrationStore.getState().applyRun(payload.run);
     });
   }
   if (!initializationPromise) {
-    initializationPromise = ipcRenderer.invoke('orchestration:list-active')
+    initializationPromise = Promise.all([ipcRenderer.invoke('orchestration:list-active'), initializeBuildInstallContinuations()])
+      .then(([runs]) => runs)
       .then((runs: OrchestrationRun[]) => {
         useOrchestrationStore.getState().replaceActiveRuns(runs);
       })

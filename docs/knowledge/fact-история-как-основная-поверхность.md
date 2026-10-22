@@ -152,11 +152,17 @@ Enter заблокированы без запоминания нажатия и
 Над input остаётся только lifecycle терминала, например `Preparing codex session…`,
 а `PREPARING/SENDING/CONFIRMING` относятся к конкретному сообщению в History.
 
-Счётчик слева от ↩ показывает полные секунды от принятого жеста, включая
-подготовку и IN APP QUEUE, до первого вызова записи Enter именно этого сообщения.
-Это не таймер подтверждения: после Enter число фиксировано в CONFIRMING и native
-QUEUED, исчезает вместе с SENT. Durable arm и Enter настроек/launch его не завершают;
-write-throw сохраняет возможный Enter и не разрешает повтор. Типографика счётчика
+Счётчик слева от ↩ показывает полные секунды от начала подготовки ACTIVE HEAD
+Main FIFO до первого вызова записи payload именно этого сообщения. IN APP QUEUE
+не запускает часы; cold CLI launch/readiness и подготовка настроек входят в срок.
+Причина границы: пользователь измеряет начало вставки, а не время очереди или
+подтверждения. CONFIRMING, native QUEUED, служебные/launch Enter и durable arm
+не являются стоп-событием. Payload write-throw тоже фиксирует начало попытки,
+не доказывая доставку и не разрешая повтор; failed/cancelled до вставки имеют
+отдельную прерванную длительность подготовки. Старый Enter timestamp не подменяет
+отсутствующий payload timestamp. Вызов записи в PTY не доказывает, что CLI уже
+прочитал ввод или показал его на экране: время отображения — другая граница.
+После payload число фиксировано, исчезает вместе с SENT. Типографика счётчика
 общая с подписью статуса: размер, жирность и межбуквенное расстояние. Пока секунды
 растут, текст синий как PREPARING; при остановке — обычный белый, даже если
 соседний CONFIRMING loader ещё движется. Блика, мигания и переходной анимации нет.
@@ -877,6 +883,41 @@ canonical decoder, что parent History. Read/Search/Edit/Run/MCP/thinking
 показывает единый `HistoryTranscriptPresentation`; полный child user
 prompt сохраняет `<pasted_content>`-чипы. Предыдущее описание
 заглушки выше — шрам до этого reader-слоя, а не текущий контракт.
+
+**Выбранный Inspector не подставляет соседнего ребёнка.** Когда карточка ещё
+не получила child SID, Main разрешает её exact spawn call (включая canonical
+суффикс) из live/known registry. Miss непустого call остаётся unknown, даже если
+во вкладке работает ровно один другой ребёнок: такой fallback привязывал панель
+A к B, а renderer больше не искал A, поскольку SID уже заполнен. Legacy запрос
+без выбранного call сохраняет single-live lookup; late exact binding и открытие
+завершённого known child остаются доступны. Шрам21.10 подтверждён на actual Main
+helper с controlled registries; это не доказательство причины missing SID753.
+
+Один `success/pending` от чтения не объясняет бесконечный loader. Его прежний
+ответ отдельно обозначает `child-thread-unresolved`, `transcript-not-found`,
+`root-meta-pending`, `new-task-boundary-pending`. Existing `[SubagentSteps]`
+пишет bounded reader/tab/call/parent/child только при смене фазы того же lease,
+без body/path и дополнительного scan/timer. Reason диагностирует прежний wait,
+не разрешает читать copied parent до own root/NEW_TASK и не восстанавливает
+утраченный child SID сам. Main-only regression прошла10 cases; реальное открытие
+body и повторный скролл проверяются отдельно, не по наличию шапки или reason.
+
+**Первое уточнение ребёнку не является bootstrap.** После exact own NEW_TASK
+обычный user-carrier сохраняется и до первого child output. Подавляется только
+распознанный provider/plugin/environment context; парные носители инструкций
+дают один instruction chip. Response/event уточнения в любом порядке, а также
+single-carrier вариант проходят прежний canonical pairer ровно один раз.
+Шрам21.10: общий pre-first-output gate скрывал настоящий user вместе со служебным
+контекстом. Root/NEW_TASK граница и скрытие copied parent при ремонте сохранены.
+
+**Physical offset и недописанная строка принадлежат parser state.** Production
+Main передаёт retained projectionState: reader может дойти до physical EOF,
+сохранить незавершённые bytes и закончить запись при append. Sync/async helper
+без этого state возвращает offset до partial record, чтобы следующий вызов не
+потерял его начало. Проверяются UTF8 split/append и отсутствие дубля наEOF для
+обоих режимов. Прежние4MiB chunk/400steps caps не расширены; это не гарантия
+неограниченного stateless чтения одной giant record. Эти reader границы проверены
+Source/synthetic controls; доступ к настоящему child body и scroll — отдельно.
 
 **Актуальный владелец child transcript — единый Agent Inspector над composer.** Карточка Task/Agent в основной Virtuoso-ленте больше не вставляет внутрь себя вторую прокручиваемую History: клик выбирает `task:<toolUseId>` и открывает один docked inspector. Live-chip, завершённая карточка и bot-marker на Timeline ведут в этот же selection. Переход `running → completed` не закрывает открытую панель; меняются только статус и frozen duration. Кнопка `Agents` открывает один roster `Running / Completed / Interrupted`; он не рисует сразу все child transcripts. В normal flow остаётся только компактный chip-row; roster/Inspector абсолютно открываются над ним и не изменяют высоту History viewport. Верхняя грань resize'ит высоту; при смене selection панель сохраняет точный прямоугольник и показывает loader внутри. Имя и связь хранятся в durable Task-записи; row-window stub сохраняет малые agent identity/status/locator fields, чтобы глобальный roster не зависел от текущего hydration-window.
 

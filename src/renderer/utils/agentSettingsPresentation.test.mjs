@@ -54,3 +54,14 @@ test('source projection uses Main revision ordering before another Fork captures
   assert.equal(tab.providerState.codexSettingsIntentModel, 'B');
   assert.equal(projectTabProviderSnapshot(projects, 'gone', {}), false);
 });
+
+test('replaceable queued intent is still pending but does not pretend a physical write is busy', () => {
+  const providerState = { codexSettingsIntentRevision: 19, codexSettingsIntentAppliedRevision: 18 };
+  assert.equal(codexSettingsIntentIsWaiting({ isCodex: true, isCommandRunning: true, providerState }), true);
+  assert.deepEqual(settingsPresentation({ intentWaiting: true, intentTarget: 'model',
+    replaceQueuedIntent: true, activity: { busy: false } }), { busy: false, target: 'model' });
+  assert.deepEqual(settingsPresentation({ intentWaiting: true, intentTarget: 'model',
+    replaceQueuedIntent: true, activity: { busy: true, target: 'effort' } }), { busy: true, target: 'effort' });
+  assert.deepEqual(settingsPresentation({ intentWaiting: true, localBusy: true, localTarget: 'quick',
+    replaceQueuedIntent: true, activity: { busy: false } }), { busy: true, target: 'quick' });
+});

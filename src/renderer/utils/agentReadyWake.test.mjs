@@ -5,6 +5,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 import manualActionContract from '../../shared/agent-manual-action.cjs';
+import agentSendReadTiming from '../../shared/agent-send-read-timing.cjs';
 import codexPolicies from '../../main/codex-runtime-policies.js';
 import { runAgentSendFlow } from './agentSendFlow.mjs';
 import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
@@ -33,7 +34,7 @@ function harness(toolType = 'codex') {
     preparation.indexOf('export async function proveAgentComposerForSend('));
   const api = vm.runInNewContext(stripTypeScriptTypes(body.replace(/\bexport /g, ''))
     + '\n({ createAgentReadyWait, prepareAgentRuntimeForSend })', {
-    ...sendTargetContract, manualActionContract,
+    ...sendTargetContract, manualActionContract, agentSendReadTiming,
     ipcRenderer, AbortController, createAgentLaunchAdmission, Date: { now: () => now }, console: { log() {}, warn() {} },
     setTimeout: (callback, ms) => { const id = ++serial; timers.set(id, { callback, ms }); return id; },
     clearTimeout: id => timers.delete(id),

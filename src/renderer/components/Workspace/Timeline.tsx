@@ -1605,10 +1605,12 @@ function Timeline({
     ownerKey: string;
     promise: Promise<void> | null;
     trailingReason: string | null;
+    controller: AbortController | null;
   }>({
     ownerKey: timelineOwnerKey,
     promise: null,
     trailingReason: null,
+    controller: null,
   });
   const [entriesSnapshot, setEntriesSnapshot] = useState<{ ownerKey: string; entries: TimelineEntry[] }>({
     ownerKey: timelineOwnerKey,
@@ -3206,12 +3208,13 @@ function Timeline({
     if (Object.prototype.hasOwnProperty.call(compactSummaryCache, entry.uuid)) return;
 
     let cancelled = false;
+    const controller = new AbortController();
     (async () => {
       try {
         const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
           toolType: 'claude', sessionId, cwd, tabId, dehydrate: false,
           bounds: { aroundUuid: entry.uuid, radius: 1 }, source: 'Timeline.preview', reason: 'compact-summary',
-        });
+        }, { signal: controller.signal });
         if (cancelled) return;
         const fullEntry = Array.isArray(result?.entries)
           ? result.entries.find((item: any) => item?.uuid === entry.uuid)
@@ -3231,7 +3234,7 @@ function Timeline({
         }
       }
     })();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   }, [activeTooltipIndex, entries, sessionId, cwd, isGemini, isCodex, compactSummaryCache]);
 
   // ════════════════════════════════════════════════════════════
@@ -3589,10 +3592,12 @@ function Timeline({
     // Invalidate every older request before the browser can paint the new tab.
     // The next load owns a fresh generation and may commit only to this key.
     timelineLoadGenerationRef.current += 1;
+    timelineLoadFlightRef.current.controller?.abort();
     timelineLoadFlightRef.current = {
       ownerKey: timelineOwnerKey,
       promise: null,
       trailingReason: null,
+      controller: null,
     };
     // Clear the previous owner's rail synchronously, but do not hydrate a
     // large cached rail inside this layout boundary. On the primary History
@@ -3619,6 +3624,14 @@ function Timeline({
     setNotes({});
     setNotePositions({});
     setRewindMarkers(new Set());
+    return () => {
+      const flight = timelineLoadFlightRef.current;
+      if (flight.ownerKey !== timelineOwnerKey) return;
+      flight.trailingReason = null;
+      flight.controller?.abort();
+      // Physical unmount of the same owner must invalidate apply too.
+      timelineLoadGenerationRef.current += 1;
+    };
   }, [timelineOwnerKey, sessionId]);
 
   // Hydrate a cached rail only after the primary History owner has survived a
@@ -3677,7 +3690,7 @@ function Timeline({
   ]);
 
   // Load timeline and fork markers when sessionId changes
-  const runTimelineLoad = useCallback(async (reason = 'unknown') => {
+  const runTimelineLoad = useCallback(async (reason = 'unknown', signal?: AbortSignal) => {
     const ownerKeyAtStart = timelineOwnerKey;
     // A listener holding the previous callback may fire during a prop switch.
     // It must not invalidate the fresh owner's in-flight generation.
@@ -3685,7 +3698,7 @@ function Timeline({
     const loadGeneration = ++timelineLoadGenerationRef.current;
     const ownsLoad = () => (
       timelineOwnerKeyRef.current === ownerKeyAtStart &&
-      timelineLoadGenerationRef.current === loadGeneration
+      timelineLoadGenerationRef.current === loadGeneration && !signal?.aborted
     );
     const waitForTimelineApplySlot = async (phase: string) => {
       const outcome = await historyForegroundPriority.waitForBackgroundSlot({
@@ -3760,7 +3773,7 @@ function Timeline({
       };
       if (isGemini) {
         // Gemini: single IPC call, no fork markers or session chains
-        const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd, ...callerContext });
+        const timelineResult = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'gemini:get-timeline', { sessionId, cwd, ...callerContext }, { signal });
         await waitForTimelineApplySlot('gemini');
         if (!ownsLoad()) return;
         if (timelineResult.success) {
@@ -3781,7 +3794,7 @@ function Timeline({
           tabId,
           ifRevision: cachedSnapshot?.revision || null,
           ...callerContext,
-        });
+        }, { signal });
         const historyEventsResult = await ipcRenderer.invoke(
           'timeline:get-session-history-events',
           { sessionId, ...callerContext },
@@ -3838,12 +3851,12 @@ function Timeline({
         // (part of the 15:29 switch-window IPC storm).
         const cachedClaudeSnapshot = timelineSnapshotOwner.read() as TimelineSnapshotCacheRecord | null;
         const [timelineResult, markersResult] = await Promise.all([
-          ipcRenderer.invoke('claude:get-timeline', {
+          readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'claude:get-timeline', {
             sessionId,
             cwd,
             ifRevision: cachedClaudeSnapshot?.revision || null,
             ...callerContext,
-          }),
+          }, { signal }),
           ipcRenderer.invoke('timeline:get-session-history-events', { sessionId, ...callerContext })
         ]);
 
@@ -4002,10 +4015,12 @@ function Timeline({
 
     let flight = timelineLoadFlightRef.current;
     if (flight.ownerKey !== ownerKeyAtRequest) {
+      flight.controller?.abort();
       flight = {
         ownerKey: ownerKeyAtRequest,
         promise: null,
         trailingReason: null,
+        controller: null,
       };
       timelineLoadFlightRef.current = flight;
     }
@@ -4018,15 +4033,17 @@ function Timeline({
     const hasCachedSnapshot = isCodex &&
       !!timelineSnapshotOwner.peek();
     setLoadingOwnerKey(sessionId && !hasCachedSnapshot ? ownerKeyAtRequest : null);
+    flight.controller = new AbortController();
+    const signal = flight.controller.signal;
     const runBurst = async () => {
       let nextReason: string | null = reason;
       while (
-        nextReason &&
+        nextReason && !signal.aborted &&
         timelineOwnerKeyRef.current === ownerKeyAtRequest &&
         timelineLoadFlightRef.current === flight
       ) {
         flight.trailingReason = null;
-        await runTimelineLoad(nextReason);
+        await runTimelineLoad(nextReason, signal);
         nextReason = flight.trailingReason;
       }
     };
@@ -4035,6 +4052,7 @@ function Timeline({
       if (timelineLoadFlightRef.current !== flight) return;
       flight.promise = null;
       flight.trailingReason = null;
+      flight.controller = null;
       setLoadingOwnerKey((currentOwnerKey) => (
         currentOwnerKey === ownerKeyAtRequest ? null : currentOwnerKey
       ));
@@ -5101,13 +5119,13 @@ function Timeline({
       + ' uuid=' + identity.slice(-12) + ' mode=preview-body');
   };
 
-  const loadPreviewResponse = useCallback(async (preview: any): Promise<string> => {
+  const loadPreviewResponse = useCallback(async (preview: any, signal?: AbortSignal): Promise<string> => {
     const identity = timelineFinalNavigationIdentity(preview);
     if (!sessionId || !identity || !['claude', 'codex'].includes(toolType)) throw new Error('Полный ответ недоступен');
     const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
       toolType, tabId, sessionId, cwd, dehydrate: false, bounds: { aroundUuid: identity, radius: 1 },
       source: 'Timeline.preview', reason: 'expand-final', visible: true,
-    });
+    }, { signal });
     if (!result?.success) throw new Error('Не удалось прочитать полный ответ');
     const content = resolveTimelineFullResponse(result.entries, preview,
       text => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex'));
@@ -5115,13 +5133,13 @@ function Timeline({
     return content;
   }, [toolType, tabId, sessionId, cwd]);
 
-  const loadPreviewImages = useCallback(async (prompt: any) => {
+  const loadPreviewImages = useCallback(async (prompt: any, signal?: AbortSignal) => {
     const identity = prompt?.sourceIdentity || prompt?.uuid;
     if (!sessionId || !identity || !['claude', 'codex'].includes(toolType)) return [];
     const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
       toolType, tabId, sessionId, cwd, dehydrate: false, bounds: { aroundUuid: identity, radius: 1 },
       source: 'Timeline.preview', reason: 'expand-images', visible: true,
-    });
+    }, { signal });
     return result?.success ? resolveTimelinePromptImages(result.entries, prompt) : [];
   }, [toolType, tabId, sessionId, cwd]);
 

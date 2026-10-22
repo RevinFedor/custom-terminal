@@ -2,19 +2,15 @@
 'use strict';
 // build-when-idle — run from a SEPARATE terminal (NOT inside Noted Terminal).
 //
-// Polls the PRODUCTION app's local web API (GET /api/active-loaders) and waits
+// Polls the PRODUCTION app's local web API (GET /api/install-eligibility) and waits
 // until every tab across every project has gone idle — no live Claude (PTY or
 // SDK), no busy Gemini, no restart-after-owned shell process. Then it runs
 // `npm run build:install` prepares the candidate first. A second fresh idle
 // observation approves its existing control-channel gate immediately before
 // Quit, replacement and reopening.
 //
-// "Active" merges the exact main-process runtime Maps with the durable
-// orchestration store. This includes inherited child work and an exact
-// completion handoff even when the source agent itself is idle. Persisted Run
-// after / Loop promises are intentionally projected out here: an armed future
-// condition is not work that is running now. If it actually fires, its real
-// Claude/Codex turn appears as an ordinary runtime blocker on the next poll.
+// Main separates local runtime/input blockers from strictly persisted external
+// SC waits. The latter retain their original job/source and future delivery.
 // While blockers clear one by one, this prints each transition; when the last
 // goes away, the build fires.
 //
@@ -58,7 +54,7 @@ function inspectProdServer() {
 }
 
 // A dedicated sentinel for "this running build predates the feature": the old
-// app has no /api/active-loaders route → its catch-all returns 404 not-found.
+// app has no /api/install-eligibility route → its catch-all returns 404 not-found.
 // We must NOT treat that as idle (that would rebuild blindly); instead tell the
 // user to run `build:install` once so the endpoint ships.
 class EndpointMissingError extends Error {}
@@ -66,7 +62,7 @@ class EndpointMissingError extends Error {}
 function getActiveLoaders(port, token) {
   return new Promise((resolve, reject) => {
     const req = http.get({
-      host: '127.0.0.1', port, path: '/api/active-loaders',
+      host: '127.0.0.1', port, path: '/api/install-eligibility',
       headers: { Authorization: 'Bearer ' + token }, timeout: 4000,
     }, (res) => {
       let buf = '';
@@ -82,7 +78,9 @@ function getActiveLoaders(port, token) {
         // 503 is our own fail-safe ({idle:false}) — surface it as a real snap so
         // idleStreak resets and we keep waiting. Anything else with a boolean
         // `idle` is a normal answer.
-        if (typeof parsed.idle === 'boolean') return resolve(parsed);
+        if (parsed.version === 1 && parsed.known === true && typeof parsed.eligible === 'boolean' && Array.isArray(parsed.blockers)) {
+          return resolve({ ...parsed, idle: parsed.eligible, loaders: parsed.blockers, count: parsed.blockers.length });
+        }
         return reject(new Error('unexpected response (HTTP ' + res.statusCode + ')'));
       });
     });
@@ -93,15 +91,13 @@ function getActiveLoaders(port, token) {
 
 const PASSIVE_RUN_AFTER_KINDS = new Set([
   'prompt-queue',
-  'prompt-queue-state',
 ]);
 
-// `/api/active-loaders` is shared with clients that may care about durable
+// The install snapshot is distinct from general activity. Passive durable
 // promises as well as work already in flight. `build:i-obs` has the narrower
 // contract requested by the user: wait for work that is physically running,
 // not for an armed Run after condition on an inactive tab. Keep this projection
-// in the wrapper so Voice Record / mobile preflight semantics are not changed by
-// a command-specific UX decision.
+// in the wrapper as well; unknown queue storage remains a blocker.
 //
 // Do not recompute a failed/unavailable response into idle. The endpoint's 5xx
 // fail-safe has `idle:false` and no valid loader array; that state must continue
@@ -267,7 +263,7 @@ async function main() {
     if (NO_BUILD) { feed('idle confirmed (NO_BUILD=1 — not building)'); return; }
     process.exitCode = await runBuild(token, { signal: controller.signal });
   } catch (error) {
-    if (error instanceof EndpointMissingError) console.error('Installed app lacks /api/active-loaders. A one-time explicit build:install is required.');
+    if (error instanceof EndpointMissingError) console.error('Installed app lacks /api/install-eligibility. A one-time explicit build:install is required.');
     else if (error.code !== 'INSTALL_CANCELLED') console.error(String(error.stack || error));
     process.exitCode = error.code === 'INSTALL_CANCELLED' ? 130 : error.exitCode || 1;
   } finally {

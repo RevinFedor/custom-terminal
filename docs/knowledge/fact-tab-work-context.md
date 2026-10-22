@@ -119,6 +119,17 @@ payload остаётся byte-stable после restart/поздних completio
 «лечить» stale context удалением префикса из старого handoff: это изменит хеш
 неизвестной попытки. Новая отправка другого владельца получает новый handoff.
 
+Для потребителя proof есть отдельный passive `readPreparedHandoff` по exact
+`tabId + handoffId`. `prepare` для чтения вызывать нельзя: missing row запустит
+file/context IO и reservation. Reader различает missing и legacy
+`prepared_prompt=NULL`, не materialize'ит актуальный context и не меняет status.
+`base_hash` — full raw SHA256 исходного logical prompt; `payload_hash` — SHA1/16
+фактически подготовленного transport. Они не одна область identity. Producer может
+refresh'ить уже встроенный saved_prompt wrapper, поэтому strip-prefix/suffix сам
+по себе не доказывает original intent. Этот reader не удостоверяет живого owner,
+Enter или completion: install continuation отдельно сверяет immutable admission,
+exact native attempt/source и natural result. См. `fact-build-when-idle.md::AI-hop`.
+
 ## Markdown
 
 Рабочим Markdown считается существующая дочерняя file-вкладка с расширением

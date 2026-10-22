@@ -42,6 +42,61 @@ async function fixture(t, records, options = {}) {
   return f;
 }
 
+test('legacy full History preparations share the cold lane and preserve complete responses', async t => {
+  const events = [];
+  const records = Array.from({ length: 600 }, (_, i) => message('FULL-' + i + ' ' + 'контекст '.repeat(200), i));
+  const f = await fixture(t, records, { sessionId: 'full-cold-one', diagnosticReadPhases: true,
+    onDiagnostic: event => events.push(event) });
+  const secondSession = 'full-cold-two';
+  await fs.writeFile(path.join(f.directory, 'rollout-' + secondSession + '.jsonl'), encode(records));
+  const [one, two] = await Promise.all([
+    f.client.call('getHistory', { ...f.payload, dehydrate: false }),
+    f.client.call('getHistory', { ...f.payload, sessionId: secondSession, dehydrate: false }),
+  ]);
+  for (const result of [one, two]) {
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.entries.length, records.length);
+    assert.equal(result.entries.at(-1).content, records.at(-1).payload.content[0].text);
+  }
+  let active = 0, maximum = 0, completed = 0;
+  for (const event of events) {
+    if (event.side !== 'worker' || event.stage !== 'records-read') continue;
+    if (event.event === 'work-phase-begin') maximum = Math.max(maximum, ++active);
+    if (event.event === 'work-phase-end') { active--; completed++; }
+  }
+  assert.equal(completed, 2, 'both real full-read preparations completed');
+  assert.equal(active, 0);
+  assert.equal(maximum, 1, 'full raw preparations must not build concurrent transient graphs');
+});
+
+test('a ready SSD History page does not join the queued legacy full-read lane', async t => {
+  const events = [];
+  let queued;
+  const secondQueued = new Promise(resolve => { queued = resolve; });
+  const f = await fixture(t, Array.from({ length: 12 }, (_, i) => message('READY-' + i, i)), {
+    sessionId: 'ready-page', diagnosticReadPhases: true, diagnosticSlowMs: 0,
+    onDiagnostic: event => {
+      events.push(event);
+      if (event.event === 'cold-queued' && event.queueDepth >= 1) queued();
+    },
+  });
+  const reference = await f.client.call('getHistory', f.payload);
+  await f.client.call('releaseMemory');
+  events.length = 0;
+  const records = Array.from({ length: 600 }, (_, i) => message('COLD-' + i + ' контекст'.repeat(200), i));
+  const sessions = ['queued-full-one', 'queued-full-two'];
+  for (const session of sessions) await fs.writeFile(path.join(f.directory, 'rollout-' + session + '.jsonl'), encode(records));
+  const pending = sessions.map(sessionId => f.client.call('getHistory', { ...f.payload, sessionId, dehydrate: false }));
+  await secondQueued;
+  const ready = await f.client.call('getHistory', f.payload);
+  const full = await Promise.all(pending);
+  assert.deepEqual(ready.entries, reference.entries);
+  assert.ok(full.every(result => result.success && result.entries.length === records.length));
+  const warm = events.filter(event => event.session === f.sessionId);
+  assert.ok(warm.some(event => event.event === 'rpc-response' && event.source === 'ssd'));
+  assert.ok(!warm.some(event => event.event === 'cold-queued'), 'ready pages retain independent admission');
+});
+
 test('linked-file Timeline metadata survives prepared-cache reads and worker restart', async t => {
   const file = '/private/linked-work/status.md';
   const f = await fixture(t, [

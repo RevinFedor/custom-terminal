@@ -169,11 +169,31 @@ source либо готовый virtual manifest. Строгие cache/mutation r
 `fact-session-history.md::Снимок последних Codex-итераций во время busy`.
 
 25.09 SOURCE: desktop Codex больше не связывает просмотр старого участка с
-наличием полного parser graph в RAM. Read-сервис исполняется в Node worker:
+наличием полного parser graph в RAM. С22.10 SOURCE configured Codex reader
+исполняется в Electron `utilityProcess` вместо прежнего `worker_threads`:
 History/Timeline/payload, совместимые messages, поиск, копирование и экспорт.
 PTY, writer/operation proof, подписки, live delivery и мутации остаются main-owned.
 SQLite sidecars читаются прежними методами через отдельное соединение без
 startup migrations; точные binding/asset/lineage уведомления возвращаются main.
+Fatal V8 в thread не изолирует Main; отдельный процесс ограничивает этот failure
+domain. UNKNOWN/disconnect/error не доказывает exit: replacement ждёт actual exit.
+Node child injection существует только в Source tests, production fallback на
+worker_threads не используется. Это не защита всех Main SQLite/Claude/client reads.
+
+Тяжёлый read имеет отдельные demand leases, не только общий Promise: уход A
+не отменяет B, уход последнего отзывает producer, следующий C получает новую
+generation. Cold admission удаляет отменённого waiter. HTTP aborted/premature
+response-close и sender-owned IPC demand освобождают consumer; watcher subscribe
+и input/Send authority остаются другими владельцами. Renderer держит AbortSignal
+локально, поздний result/finally не очищает новый flight.
+
+Reader→Main stream использует накопленный consumed byte credit: duplicate/future
+ACK не расширяет окно, end ждёт final credit. JSON/NDJSON кодируются частями,
+без второго полного stringify/gzip buffer в Main. После частичного ответа ошибка
+закрывает wire, не запускает второй full read; UNKNOWN/source invalidation не
+маскируются consumer cleanup. Conditional/delta/freshness сохраняют свои ветки.
+Эта граница ограничивает transport-owned bytes, не canonical/pending graph,
+произвольный toJSON, full-array DTO или строки потребителя.
 
 После saved COW Rewind подготовка должна попасть именно в этот configured worker,
 а не только в Main cache: иначе тот же большой retained prefix строился дважды.
@@ -474,7 +494,7 @@ carried/changed`, `HistoryRewrite reusedRows`, `TranscriptService:WatchRebind`.
 ## Ресурсная модель большой сессии
 
 Resume не обязан создавать полную raw-проекцию ещё раз ради настроек запуска.
-После ремонта19.09 `codex-c` потоково извлекает root metadata, последний
+После ремонта19.09 default source-reader потоково извлекает root metadata, последний
 структурный model/effort и точное наличие user-turns. Общие reducers сохраняют
 pairing, Fork/compact/rollback и отказ на более новую неполную настройку;
 tool/assistant/replacement-history payload не накапливается в массиве Resume.
@@ -482,6 +502,24 @@ tool/assistant/replacement-history payload не накапливается в м
 смене path/inode/size/mtime/ctime проход повторяется: один рост файла не
 доказывает append, а произвольный хвост может не содержать последние настройки.
 Fork сохраняет полный source для точного lineage snapshot.
+
+22Oct обычный Resume отделён от этого полного пересчёта: launch-purpose reader
+сначала проверяет64КиБ header +2МиБ tail на той же физической версии. В памяти
+только bounded bytes и один canonical положительный user witness после последнего
+rollback; body/UUID/локальный индекс окна не выдаются за полную историю. Последний
+структурный settings-кандидат берётся прежним reducer; его source byte offset
+известен, полный recordIndex=null. Whole-file counts остаютсяnull, exact views
+этим результатом не заполняются. Малый файл/готовый exact cache идут прежним путём;
+при недостаточном окне прежний streaming fallback сохраняет empty/thin/Fork/
+rollback/settings capabilities. Поэтому full scan НЕ устранён для каждого файла.
+Диагностика `CodexResumeSource launch-window` разделяет sourceBytes/read bytes/
+counts unknown; `launch-fallback` называет причину. Повтор при изменившейся версии
+может прочитать несколько окон, но не возвращает устаревшую пару.
+Private Node22 discriminator: валидный33557342-byte файл с tool rows — прежний
+код прочитал33557342B, launch-window2162688B. Это I/O proof на собственной finite
+fixture, не замер установленного HH5957/CLI latency и не доказательство ремонта
+его cold Send. Проверки — `codex-resume-launch-source.test.js` и Main-prefix
+`codex-resume-source.main.test.js`; full/default parity тесты сохранены.
 
 SSD/OS file-cache ускоряют доставку bytes, но не отменяют JSON.parse, объекты
 и последующую сборку мусора. Поэтому уменьшение heap важнее обещания меньшего
@@ -700,7 +738,12 @@ native раньше обрезала до2K уже ПОСЛЕ загрузки; 
 action по-прежнему адресует большой отдельный text. Native policy не мутирует
 canonical prepared rows/desktop graph. Thinking presence остаётся структурной.
 
-Тот же getToolPayload проверяет exact row/ref/hash на bounded canonical read;
+Тот же getToolPayload проверяет exact row/ref/hash. Source22Oct direct physical
+miss при сохранённом backend binding (owner/source/row/generation/hash и точный
+origin call/line) читает и хеширует leaf частями, затем атомарно восстанавливает
+payload cache. Source replacement/cancel/hash/storage failure не стирает прежний
+committed body. Размер BLOB проверяется до bounded substr, не после native getter.
+Без proof physical equivalence сохраняется canonical fallback;
 Claude compact восстанавливается тем же branch projector, не новым extract-парсером.
 Ответ идёт страницами до4Mi UTF-16 units, без потери остатка и без разрыва
 surrogate pair. Policy участвует в conditional revision и HTTP delta-consumer;

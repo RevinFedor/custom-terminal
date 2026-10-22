@@ -53,6 +53,12 @@ adapters; v1/RAW/writers сохраняются. Полный index/search и п
 не перегруппируются по raw parent; nonleaf file не скрывает обычного потомка.
 Names/index не ждут runtime/cards, file tabs не входят в runtime producer.
 
+Это wire metadata prefix. Native Source22.10 отдельно показывает0 attached file rows,
+первый explicit tap раскрывает до5, далее до20; initial metadata5/20 и server cursor
+не меняются, старые клиенты совместимы. Full index/search/by-ID остаются полными;
+display count не становится ref/cursor/owner proof. Это не уменьшение полного index
+и не доказательство скорости публичной доставки.
+
 `GET …?projection=catalog-v2` отделяет index/tree от details/fileWindows и передаёт
 sourceEpoch/catalogClock/clocks/provenanceCounts. Нет aliases/saved SIDs/record bodies.
 Узкий SQL сохраняет hydration/read transaction/single-flight по профилю, без settled
@@ -102,6 +108,20 @@ Node22/private HTTP/SQL controls используют node:sqlite вместо n
 это не installed/native UI/actual-project-DB PASS. Guards/DTO —
 `workflow-directory-catalog.cjs`/`workflow-directory-api.js`; проверки —
 `workflow-directory-catalog.test.js`.
+
+Отдельная additive `catalogV2.windowLayout` объявляет опубликованную оконную
+read-проекцию: `columns-ltr-windows-ttb-strip-v1`, `canonical-fragments-v1`, pixelsfalse.
+`layout_json` читается с membership/publication в той же SQLite read transaction;
+windowLayout входит в read catalogClock, optional workflowPublication receipt — нет.
+Идентичность исполнения и прежний nativeDragExpected этим не заменяются. По прямому
+Fedor22.10 видимые колонки идут LTR, окна TTB, chips в strip order; затем hidden
+retained, затем shared sidebar order. Hidden positions берутся только из exact
+текущего windowDisplayKey, без геометрии остаётся опубликованный pane order.
+Dormant/legacy content сохраняется с дедупликацией после visible owners; geometry-only
+profile не создаёт tab. Groups могут иметь context fragments при одном canonical
+owner. Unknown shape возвращает полный canonical fallback и null inventories,
+не ложное пустое sidebar. Это read API, не window writer/History/runtime proof;
+старый клиент продолжает canonical Core, native должен отдельно валидировать sidecar.
 
 ### Канонические действия групп и native drag
 
@@ -331,6 +351,26 @@ receipt без setup context не backfill'ится: original D02/c057 lost crea
 остаётся unknown, ready/readSID/название/текст не восстанавливают результат и не
 разрешают resend. Voice clientAttemptId/requestId и provider attempt различны;
 новый `runId=requestId` не присваивается старому c057 задним числом.
+
+## Перенос cwd существующей Codex-вкладки
+
+SOURCE22.10: `POST /api/terminal-tabs/:tabId/working-directory-operations`
+принимает `{operationId, expectedSessionId, targetCwd, expectedCwd?, resume?}`;
+`GET .../working-directory-operations/:operationId` только читает квитанцию.
+Проверяемая capability `/api/me.capabilities.workingDirectory.version=1` отделена
+от history/settings и объявляется лишь с подключённым Main executor. Это не
+renderer bridge и не смена project/workflow. Владельцы Stop/cd/Resume прежние,
+с одним Main FIFO hold и exact cwd checkpoint, без nested lifecycle mutex.
+
+POST возвращает202 для принятой pending,200 для success,409 для сохранённой
+ошибки. GET существующей квитанции возвращает200 даже для failed/interrupted;
+`ok:true` означает успешное чтение, не успешный перенос. В ней раздельны
+cwdChanged/processStopped/launchWritten/inputReady: после cd ошибка Resume не
+возвращает cwd назад. Same ID+same request не исполняются заново; другой body
+получает conflict. После restart только interrupted/readback, без auto-replay.
+SSE `working-directory-operation` будит явное чтение, не разрешает новый POST.
+Старый Main требует обновления, не raw-shell/SQL fallback. Механика и причины
+выбора — `fact-terminal-core.md::Перенос Codex через Terminal MCP`.
 
 ## Saved-history Rewind/Delete для Timeline внешнего клиента
 
@@ -993,6 +1033,16 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
   legacy POST сохраняет intent. Partial выбор наследует доказанную вторую половину
   пары; при её неизвестности не подставлять global/default effort. Смена intent
   не меняет модель уже исполняющегося provider request задним числом.
+- **Typed standalone Codex control.** GET/POST `/api/terminal-tabs/:id/codex/settings`
+  читает прежний main params snapshot / передаёт `modelSelection` и/или `effort`
+  в тот же desktop intent. Явная catalog-пара проверяется по одному снимку
+  каталога до сохранения; target перечитывается после await. POST
+  `/api/terminal-tabs/:id/codex/fast` с `{enabled:boolean}` использует отдельный
+  absolute bridge action; старый пустой POST остаётся toggle. Неполный/чужой
+  ACK не объявляется сохранённым выбором. Capability `codexSettings` v1 отдельно
+  от Claude `agentParams`; `queued` не равно native applied. Ни один из этих
+  путей не отправляет prompt/Stop/Resume. MCP tools и recovery после потерянного
+  ACK описаны в `fact-terminal-mcp.md`; legacy `/params` не переименован.
 - **Think — одна toggle-пилюля, не on/off-пара.** Mirror десктопной Think-кнопки:
   `Think ON`/`Think OFF`, тап флипает. Для PTY каждая смена шлёт
   `claude:toggle-thinking` с абсолютным желаемым состоянием. Main проверяет
@@ -1620,6 +1670,12 @@ Layout operations для native split'ятся от runtime activity. CRUD гр�
 snapshot'ом. Если смешать эти оси и перезагружать `/tabs` ради каждого busy-edge, phone снова
 получит тяжёлые reload'ы во время навигации.
 
+Граница SOURCE20.10: нижеследующий native preflight — отдельная клиентская
+индикация. Voice Record теперь принимает окончательное решение обычного install
+по `/api/install-eligibility`, включая собственный turn/input и строго сохранённый
+внешний wait. Новый явный MCP Force не означает, что iOS получил такой control;
+его клиентская реализация этим ремонтом не менялась. См. `fact-build-when-idle.md`.
+
 Native iOS также использует `GET /api/active-loaders` как preflight перед удалённым
 `build:install`. Endpoint возвращает широкий snapshot live-состояний, но install UI блокирует
 только элементы со `status=busy|running`. Важная граница: idle-alive Claude/Codex CLI — это
@@ -1721,6 +1777,8 @@ POST /api/projects/:id/sdk-tabs                → createSDKTab (через brid
 POST /api/terminal-tabs/:tabId/send                 → sendAgentPromptScenario; project ownership, TUI draft conflict не очищается
 POST /api/terminal-tabs/:tabId/start                → fresh Claude/Codex runtime в existing PTY, когда Resume недоступен
 POST /api/terminal-tabs/:tabId/stop                 → stopAgentProcessScenario; для legacy SDK fallback query.close()
+POST /api/terminal-tabs/:tabId/working-directory-operations → exact Codex cwd operation; acceptance is not completion
+GET  /api/terminal-tabs/:tabId/working-directory-operations/:operationId → saved result only; no replay
 POST /api/terminal-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
 POST /api/terminal-tabs/:tabId/rename               → renameTab (через bridge)
 POST /api/terminal-tabs/:tabId/open-in-workspace    → exact restore/place/reveal в указанном workflow/window; явное открытие отменяет external auto-close
@@ -1745,7 +1803,7 @@ GET  /api/terminal-tabs/:tabId/queue                 → getPromptQueue (core + 
 POST /api/terminal-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
 GET  /api/terminal-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
 POST /api/terminal-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
-GET  /api/active-loaders                       → live loaders snapshot для external install preflight
+GET  /api/active-loaders                       → общая activity/client preflight; installer SOURCE20.10 читает /api/install-eligibility
 GET  /api/project-activity                     → full project activity snapshot для native project badges
 GET  /api/workspace/switcher?scope=desktop|native → exact compact Ctrl+Tab selector; native требует anchorTabId+visibleTabIds, без навигационных writes
 GET  /api/history-freshness?tabIds=<JSON array> → opt-in small read-source metadata, без History fanout; не outcome/provider status

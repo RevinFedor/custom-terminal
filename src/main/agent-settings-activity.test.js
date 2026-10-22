@@ -65,3 +65,23 @@ test('actual Codex picker request is busy during asynchronous config lookup, bef
   assert.equal(result.success, false);
   assert.equal(activity.read('T').busy, false);
 });
+
+test('only exact replaceable operations stay editable until their first control input', () => {
+  const activity = createAgentSettingsActivity();
+  const a = activity.begin({ tabId: 'T', target: 'model', replaceable: true });
+  assert.equal(activity.read('T').busy, true);
+  assert.equal(activity.read('T').replaceable, true);
+  const b = activity.begin({ tabId: 'T', target: 'effort' });
+  assert.notEqual(activity.read('T').replaceable, true, 'a real/native second operation cannot be bypassed');
+  activity.end(b);
+  const before = activity.read('T').sequence;
+  assert.equal(activity.markInputStarted(a), true);
+  assert.equal(activity.read('T').busy, true);
+  assert.notEqual(activity.read('T').replaceable, true);
+  assert.ok(activity.read('T').sequence > before);
+  const settled = activity.read('T').sequence;
+  assert.equal(activity.markInputStarted(a), false);
+  assert.equal(activity.read('T').sequence, settled);
+  activity.end(a);
+  assert.equal(activity.markInputStarted(a), false);
+});

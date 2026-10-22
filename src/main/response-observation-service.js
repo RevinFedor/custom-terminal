@@ -15,11 +15,34 @@ const childRevision = runs => JSON.stringify(runs.map(run => [run.runId, run.sta
   run.notificationStatus, run.sourceFollowupPending, run.resultComplete]).sort((a, b) => a[0].localeCompare(b[0])));
 
 function createResponseObservationService({ store, readState, readResponse, evidence,
-  subscribe, unsubscribe, onChanged, onSettled, log = console }) {
+  subscribe, unsubscribe, onChanged, onSettled, readRestartBinding = null, log = console }) {
   const inflight = new Map();
   const trailing = new Set();
   const responseReads = new Map();
   let stopped = false;
+  const evidenceKey = run => run.restartBinding?.evidenceKey || run.runId;
+  function restartFor(run) {
+    const original = evidence.readSelected(run.runId);
+    // A real original final wins, even if a restart was captured concurrently.
+    if (original?.result?.complete === true && original.result.sourceVerified === true) return null;
+    if (original?.failure && !isAbortedReason(original.failure.code)) return null;
+    return readRestartBinding?.(run) || null;
+  }
+  const restartKey = binding => binding ? JSON.stringify([binding.operationId, binding.pending,
+    binding.evidenceKey, binding.subject || null]) : null;
+  const effectiveRun = (run, binding) => binding && !binding.pending ? { ...run,
+    observationTarget: binding.target, observationSubject: binding.subject,
+    observationCurrentTurnSubject: binding.subject, restartBinding: binding } : run;
+  async function refresh(run) {
+    const current = await store.getInternal(run.runId);
+    if (!current || terminal(current)) return null;
+    const binding = restartFor(current);
+    if (current.observationRevision !== run.observationRevision
+      || restartKey(binding) !== restartKey(run.restartBinding || null)) {
+      trailing.add(run.runId); return null;
+    }
+    return effectiveRun(current, binding);
+  }
   const coordinator = createOrchestrationProofCoordinator({
     label: 'response-observation', subscribe, unsubscribe,
     onWake: runId => reconcile(runId, 'transcript'), log,
@@ -35,7 +58,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
   }
 
   async function settle(run, result, failure) {
-    const saved = failure ? evidence.freezeFailure(run.runId, failure) : evidence.readSelected(run.runId);
+    const saved = failure ? evidence.freezeFailure(evidenceKey(run), failure) : evidence.readSelected(evidenceKey(run));
     if (saved?.failure) failure = saved.failure;
     else if (saved?.result) { result = saved.result; failure = null; }
     if (!failure && result?.complete !== true) {
@@ -88,7 +111,13 @@ function createResponseObservationService({ store, readState, readResponse, evid
     let run = await store.getInternal(runId);
     if (stopped || !isResponseObservation(run)) return;
     if (terminal(run)) { await coordinator.release(runId, 'terminal'); return; }
-    const selected = evidence.readSelected(runId);
+    const binding = restartFor(run);
+    if (binding?.pending) {
+      await coordinator.release(runId, 'build-continue-pending');
+      return wait(run, [], 'build-continue:' + binding.operationId);
+    }
+    run = effectiveRun(run, binding);
+    const selected = evidence.readSelected(evidenceKey(run));
     if (selected?.failure) return settle(run, null, selected.failure);
     const target = run.observationTarget;
     if (!target?.sessionId) return settle(run, null, { code: 'response_target_unresolved', error: 'Не удалось определить наблюдаемую сессию' });
@@ -98,7 +127,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
     let subject = selected?.subject || run.observationSubject;
     const currentTurnOnly = run.waitForDescendants === false && !!run.observationCurrentTurnSubject;
     let result = selected?.result;
-    if (subject || currentTurnOnly) result = evidence.read(runId, subject || run.observationCurrentTurnSubject)?.result;
+    if (subject || currentTurnOnly) result = evidence.read(evidenceKey(run), subject || run.observationCurrentTurnSubject)?.result;
     if (!result) {
       const state = await readRuntime(run, 'admission');
       if (stopped) return;
@@ -116,7 +145,8 @@ function createResponseObservationService({ store, readState, readResponse, evid
       const ownTurnStillBusy = currentTurnOnly && state.busy === true
         && executionContextsMatch(observedExecution, liveExecution)
         && observedExecution.generation === liveExecution.generation;
-      if (ownTurnStillBusy || (!subject && !currentTurnOnly && (state.busy === true || backgroundBusy || children.length || hasPendingAgentGoalWork(state)))) {
+      if (ownTurnStillBusy || ((!subject || run.restartBinding) && !currentTurnOnly
+        && (state.busy === true || backgroundBusy || children.length || hasPendingAgentGoalWork(state)))) {
         await coordinator.release(runId, 'waiting-lifecycle');
         return wait(run, children, !state.busy && children.some(child => child.status === 'waiting_recovery' || isSourceNotificationBlocked(child))
           ? 'child-attention' : state.busy ? 'target-busy'
@@ -128,8 +158,16 @@ function createResponseObservationService({ store, readState, readResponse, evid
       const response = await readOnce({ tabId: run.targetTabId, expectedSessionId: target.sessionId,
         subject: subject || run.observationCurrentTurnSubject || null, maxChars: 250_000 }, state.revision);
       if (stopped) return;
-      run = await store.getInternal(runId);
-      if (!run || terminal(run)) return;
+      run = await refresh(run);
+      if (!run) return;
+      if (run.restartBinding && currentTurnOnly) {
+        const current = await readRuntime(run, 'after-restart-response');
+        if (current?.known !== true) return wait(run, [], 'runtime-unknown:restart-read');
+        if (current.sessionId !== target.sessionId || current.toolType !== target.toolType) {
+          return settle(run, null, { code: 'response_target_changed', error: 'Продолженная вкладка изменилась во время чтения ответа' });
+        }
+        if (current.revision !== state.revision) { trailing.add(runId); return wait(run, [], 'target-changed-during-read'); }
+      }
       if (response?.pending) return wait(run, children, response.reason || response.code || 'response-not-materialized');
       if (response?.error && !response.result) {
         return settle(run, null, { code: response.code || 'response_read_failed', error: response.error });
@@ -138,7 +176,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
         if (response?.error) return settle(run, null, { code: response.code || 'response_unavailable', error: response.error });
         return wait(run, children, 'response-subject-unavailable');
       }
-      if (!subject && !currentTurnOnly) {
+      if ((!subject || run.restartBinding) && !currentTurnOnly) {
         const current = await readRuntime(run, 'after-response');
         const currentChildren = run.waitForDescendants === false ? [] : childRuns(await store.listAll(), run.targetTabId);
         if (current?.known !== true) return wait(run, currentChildren, 'runtime-unknown:changed-during-read');
@@ -165,12 +203,15 @@ function createResponseObservationService({ store, readState, readResponse, evid
       if (subject.sessionId !== target.sessionId || subject.toolType !== target.toolType) {
         return settle(run, null, { code: 'response_subject_mismatch', error: 'Ответ принадлежит другой сессии' });
       }
-      const committed = evidence.freeze(runId, subject, result);
+      run = await refresh(run);
+      if (!run) return;
+      if (run.restartBinding) result = { ...result, restartProvenance: run.restartBinding.provenance };
+      const committed = evidence.freeze(evidenceKey(run), subject, result);
       if (committed.failure) return settle(run, null, committed.failure);
       subject = committed.subject;
       result = committed.result;
     }
-    if (!run.observationSubject) {
+    if (!run.observationSubject && !run.restartBinding) {
       await store.bindResponseObservationSubject(runId, subject || run.observationCurrentTurnSubject);
       run = await store.getInternal(runId);
       if (stopped || !run || terminal(run)) return;
@@ -180,6 +221,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
       return settle(run, result, { code: classification.code || 'response_not_completed',
         error: classification.message || 'Наблюдаемая работа завершилась без успешного ответа' });
     }
+    if (run.restartBinding && !await refresh(run)) return;
     log.log('[ResponseObservation] ready run=' + runId + ' target=' + run.targetTabId
       + ' session=' + target.sessionId.slice(0, 12) + ' reason=' + reason);
     return settle(run, result);
@@ -196,6 +238,9 @@ function createResponseObservationService({ store, readState, readResponse, evid
     })().catch(async error => {
       log.warn('[ResponseObservation] read failed run=' + runId + ' error=' + (error?.code || error?.message));
       const run = await store.getInternal(runId);
+      if (!stopped && run && !terminal(run) && String(error?.code || error?.message).startsWith('build_continue_')) {
+        await wait(run, [], 'runtime-unknown:' + (error.code || error.message)); return;
+      }
       if (!stopped && run && !terminal(run)) await settle(run, null, {
         code: error?.code || 'response_observation_read_failed',
         error: 'Не удалось прочитать ожидаемый ответ: ' + String(error?.message || error),
@@ -220,6 +265,12 @@ function createResponseObservationService({ store, readState, readResponse, evid
     const context = lifecycleExecutionContext(payload);
     const failures = [];
     for (const run of store.responseObservationsForTarget(tabId)) {
+      try {
+        if (restartFor(run)) { void reconcile(run.runId, 'restart-lifecycle'); continue; }
+      } catch (error) {
+        log.warn('[ResponseObservation] restart authority unavailable run=' + run.runId);
+        void reconcile(run.runId, 'restart-authority'); continue;
+      }
       if (!isResponseObservation(run) || terminal(run) || run.observationSubject || run.targetTabId !== tabId
         || !context || context.sessionId !== run.observationTarget?.sessionId
         || context.provider !== run.observationTarget?.toolType) continue;
@@ -243,7 +294,8 @@ function createResponseObservationService({ store, readState, readResponse, evid
       code: 'response_observation_registry_unavailable',
     });
     // Missing/unreadable metadata is not proof that old SQLite results are orphaned.
-    if (store.loadedFromDisk === true) evidence.retainRuns(runs.filter(isResponseObservation).map(run => run.runId));
+    if (store.loadedFromDisk === true) evidence.retainRuns(runs.filter(isResponseObservation)
+      .flatMap(run => [run.runId, restartFor(run)?.evidenceKey].filter(Boolean)));
     for (const run of runs) if (isResponseObservation(run) && !terminal(run)) await arm(run);
   }
 
@@ -253,6 +305,16 @@ function createResponseObservationService({ store, readState, readResponse, evid
     if (verdict.kind === 'pending') return;
     const runs = [...store.runs.values()];
     for (const run of store.responseObservationsForTarget(tabId)) {
+      try {
+        const binding = restartFor(run);
+        if (binding && !binding.pending) { void reconcile(run.runId, 'restart-provider-final'); continue; }
+        if (binding?.pending && verdict.kind === 'terminal-failure' && isAbortedReason(result.terminalOutcomeReason)) {
+          void reconcile(run.runId, 'restart-original-abort'); continue;
+        }
+      } catch (error) {
+        log.warn('[ResponseObservation] restart authority unavailable run=' + run.runId);
+        void reconcile(run.runId, 'restart-authority'); continue;
+      }
       if (!isResponseObservation(run) || terminal(run) || run.observationSubject || run.targetTabId !== tabId
         || run.observationTarget?.sessionId !== subject.sessionId || run.observationTarget?.toolType !== subject.toolType) continue;
       if (run.waitForDescendants === false) {
@@ -282,7 +344,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
   return { arm, reconcile, wakeTarget, handleLifecycle, restore,
     recordCompletion,
     handleTranscriptChanged: coordinator.handleTranscriptChanged,
-    readResult: run => run ? evidence.readSelected(run.runId)?.result || null : null,
+    readResult: run => run ? evidence.readSelected(restartFor(run)?.evidenceKey || run.runId)?.result || null : null,
     async dispose() { stopped = true; await coordinator.stop(); await Promise.allSettled([...inflight.values()]); },
   };
 }

@@ -564,6 +564,24 @@ Launch cwd для ControlBar — это `tab.cwd`, а не только `project
 
 Все app-controlled Codex launches передают этот cwd не только как shell working directory, но и явно через `codex -C <cwd>`. Это важно для restore/continue: если Codex показывает chooser между session directory и current directory, текущий рабочий root уже закреплён командой запуска, а не угадывается по shell. ProjectHome использует это как деградацию для удалённых папок: Codex history entry с отсутствующим `cwd` открывается в ближайшем существующем родителе и показывает toast, тогда как Claude/обычный terminal по-прежнему падают с `working_directory_missing`.
 
+В exact0.163.0 explicit `-C` выбирает cwd запуска без chooser и не меняет
+`[tui].resume_cwd`. `Always use current/session` сохраняет политику выбранного
+user-config для других Resume/Fork, а не путь одной вкладки; сброс — `/config →
+Resume directory → Ask`. Даже одноразовый cold Resume может сохранить новый cwd
+в thread settings. Native `/cd` — иной контракт: full-history fork с новым SID,
+не point-write папки прежнего thread. Его нельзя подменять blind Send.
+
+Для MCP-переноса22.10 одного `-C` недостаточно: уже загруженный/subscribed daemon
+thread может сохранить старую конфигурацию. После proven host cwd и обычного
+Resume новый Main executor отдельно проверяет native thread settings доказанного
+writer: SAME-source запись должна быть после prelaunch byte-boundary; direct child
+требует exact parent и destination cwd. Чтение bounded head/tail, не полный History.
+Устаревшие settings из retained истории, чужой child и совпадение Sidebar пути
+не являются подтверждением. Новые AGENTS/config выбирает upstream reload;
+native cwd proof не означает, что модель уже прочла файл новым tool-call.
+Старые инструкции остаются историческими данными. Контракт переноса и partial
+recovery — `fact-terminal-core.md::Перенос Codex через Terminal MCP`.
+
 ### Удалённый подход: приватный патченный Codex
 
 До 29.08.2026 Noted Terminal подставлял Codex-вкладкам собственную сборку CLI
@@ -906,7 +924,8 @@ frame, а не активным renderer или TTL первого запуск�
 после repaint окно осталось. Отдельный capture16:27MSK доказывает usage-меню,
 не эту же попытку Resume. Полная трасса — рабочий файл `codex-resume-usage-policy-2026-09-14.md`.
 
-System сохраняет `codexResumePausedGoal` (Resume по умолчанию, либо Leave paused)
+System сохраняет `codexResumePausedGoal` (явные Resume либо Leave paused;
+Source21Oct также допускает не задано/«Спрашивать каждый раз»)
 и отдельный `codexUsageExhaustionPolicy=continue|stop-all` (continue по умолчанию).
 Continue выбирает только доказанный пункт Luna Reserve, не Add Credits/Reset usage.
 Stop-all фиксирует текущие Codex jobs и вызывает общий serialized process Stop
@@ -987,8 +1006,39 @@ same-Goal menu после проверки даёт прежний typed manual-
 Только последующий готовый composer подтверждает сам выбор; exact current
 operational turn может снять runtime blocker без choiceConfirmed/delivery proof.
 Живой процесс сохраняется; поздний настоящий composer снимает объяснение. UI/remount и таймаут HTTP не
-запускают Resume/выбор заново. Desktop показывает статическую синюю информацию,
-не Starting-spinner; скрытие плашки не меняет main policy.
+запускают Resume/выбор заново. Desktop показывает ручной выбор информационно,
+не Starting-spinner; скрытие плашки не меняет main policy. Source21Oct различает
+информацию ручного выбора и ошибку автоматического действия, как описано ниже.
+
+По прямому Fedor21Oct при не заданной политике обе кнопки Resume Goal/Leave
+paused доступны сразу по exact Main operation; общий startupPending не прячет
+их при том же Goal blocker. Сохранённые boolean и explicit operation override
+сохраняют прежнее значение. Автоматическое действие и ручной клик показывают
+loader на выбранной кнопке, не «результат не подтверждён» и не кнопку обновления.
+Отказ или отсутствие наблюдаемого результата дают ошибку; Main один раз на
+попытку сохраняет прежний bounded preview/raw diagnostic с operation/request/
+owner/frame и временем вызова/возврата sendKey. Это не fd callback и не CLI ACK.
+Пока нет нового доказанного меню, ошибка не разрешает повтор Enter; поздний
+exact composer/operational proof снимает объяснение без второго действия.
+
+Исходный incident4196/585d77bf отличает два Send: первая Hmvha4y0e истекла без
+payload/Enter, следующая Hmvha5kzj дошла после неё до exact audit. Порядок FIFO
+не нарушился; поздняя готовность не оживляет первую попытку. Автоматический
+Goal Enter был вызван, но причина отсутствия ответа CLI по старому capture не
+установлена. Source/controlled проверки кнопок не являются installed/CLI proof.
+
+22Oct/4196 incidentf9457601 — другой дефект: явный Resume уже получил exact
+committed-composer/choiceConfirmed за~0.2s, но до окончания async process-ready
+verifier старый startup watchdog объявил no-ready после22мин ручного ожидания.
+Распознавание footer не было причиной: тот же кадр его доказал. Source22Oct
+читает current Goal operation/physical owner и новый result frame относительно
+initial frame; такой UI proof снимает только объяснение «startup UI не появлялся»
+и не допускает позднюю публикацию уже захваченного timeout. Ни process/writer/
+inputReady, ни choice/delivery, ни срок Send от этого не присваиваются. Поэтому
+ручной terminal Enter тоже может доказать появление UI, не подтверждая старый
+автоматический выбор. Partial/stale frame, смена owner/поколения и один факт
+записанной клавиши этого исключения не дают. Реальный uninitialized timeout
+остаётся. Новый helper не повторяет Goal и не касается его native lifetime.
 
 Шрам19Oct/753: auto Goal Enter → продолжающаяся synchronized redraw6.47s → старый
 3s manual отказ Send, затем current-turn-operational1.7s позже. Сохранённый старый
@@ -2536,9 +2586,27 @@ Prompt Queue / Run after использует тот же high-level слой, �
 
 Process-tree — отказоустойчивый наблюдатель, а не самостоятельный источник истины. Его контракт трёхсоставный: найденные descendants = `found`, успешно прочитанное пустое дерево = `absent`, timeout/ошибка `ps` = `unknown`. Только `absent` разрешает очистить known session, TUI readiness и turn watcher; `unknown` не кэшируется как пустой результат, сохраняет последнее подтверждённое lifecycle-состояние и запускает повторную проверку. Следующее положительное доказательство жизни возвращает running-проекцию и переармляет отсутствующий watcher по известному session id. Номер запуска защищает от обратной гонки: поздний результат delayed `D` или recheck старой команды не может погасить новый `B`/explicit launch.
 
+Успешный exit самого `ps` недостаточен: пустой глобальный stdout, неразбираемая
+строка, небезопасное числовое поле, повтор PID или отсутствие строки текущего
+Main означают `unknown` до записи нового process snapshot. Сначала проверяются
+все непустые raw rows и caller PID, затем применяется прежний Electron filter.
+Иначе caller мог исчезнуть при фильтрации, а повреждённый global read выглядел
+как доказанное отсутствие AI. Валидный снимок без descendants по-прежнему даёт
+`absent`, в том числе когда filtered Maps пусты. Предыдущий валидный cache/TTL
+сохраняет прежнюю политику; неудачный fresh capture не публикует новый cache/wake.
+Общий failure log содержит bounded `censusReason/censusRows`, без текста команд.
+Это структурный guard, не доказательство отсутствия любых пропущенных OS-строк.
+
 Прод-шрам 2026-07-15: пять одновременных снимков `ps -eo pid,ppid,command` завершились timeout, прежний helper превратил ошибку в `[]`, а exit-recheck принял это за доказанный exit. Loader исчез, вкладка кратко показывала зелёный `active`, затем новый rollout-edge вернул loader, но уже закрытый watcher не восстановился. Поэтому в диагностике важна пара `process lookup unknown action=preserve-and-retry` → последующий `found/absent`, а не один визуальный флап.
 
 ## Модели и effort
+
+Отдельный Terminal MCP выбор model/effort/Fast использует тот же desktop intent
+и прежний Main reconcile, включая busy/streaming. `queued` подтверждает сохранение
+выбора, не применение к native CLI и не смену уже выполняющегося provider request.
+Это не settings override при Send: его idle/owner/input guards остаются прежними.
+Tools, capability и отсутствие автоматического повтора при lost ACK описаны в
+`fact-terminal-mcp.md`; source/API acceptance не является installed проверкой.
 
 Строки `/model`/`/effort` в History не должны ждать тяжёлого полного refresh:
 main turn watcher публикует короткий canonical `thread_settings_applied` в
@@ -2794,6 +2862,19 @@ turn и пустом поле: последующая работа получа�
 не заменяются желаемыми значениями до proof. После разрешения control-boundary
 перепроверяется последний intent, а не повторяется старая отправка.
 
+Desktop Resume не должен превращать старую сохранённую пару в запрет нового
+выбора. До первого owned control input Main preparation помечается replaceable;
+UI может сохранить новую revision и не выдаёт её за applied. Main сравнивает
+model/effort/revision/actionSequence непосредственно у первой записи `/model`
+либо точного draft-copy. Устаревшая A до этой границы не пишет; после неё прежняя
+операция безопасно заканчивает свой picker, а old applied CAS не подтверждает B.
+Stop/owner/input/native-observation guards остаются отдельными и действуют после
+этой границы тоже. Шрам20Oct4412: прежний pending Sol/max блокировал UI Astra,
+handler до save молча возвращался. Actual Source regression отличает этот путь
+от CLI refusal; отсутствие нового intent log само по себе не доказывает отсутствие
+физического клика. Нельзя ради UI заменяемости повторять старый Send или менять
+его explicit model contract/deadline.
+
 Пустой Codex composer может показывать dim-placeholder (`Find and fix a bug in @filename`, `Explain this codebase`). Plain-text парсинг видит это как обычный текст, но xterm cell-style помечает подсказку как dim; такой кадр обязан классифицироваться как `hasDraft=false` с source вроде `cursor:*:dim-hint`. Не хардкодить конкретные фразы подсказок: они меняются версией Codex, а стиль остаётся единственным смысловым признаком «это hint, не draft». Реальный пользовательский draft содержит non-dim cells и идёт по `hasDraft=true` stash-path.
 
 Если первая строка после `›` пустая, это ещё не пустой draft. Многострочный Codex composer может начинаться со blank line или отступа, а полезный текст будет на следующей visual row; `getCodexDraftState` обязан сканировать продолжение и возвращать source вида `*:multiline-draft-row-N`. Не расширять это в «полный парсер prompt'а»: xterm-buffer подходит для yes/no перед Enter и короткого preview, но 500 строк с wrap'ами, prompt-like символами и copied Codex output проверяются только после отправки через rollout.
@@ -3012,12 +3093,21 @@ Codex0.156.1 изменил footer update picker с `Press enter to continue` н
 и историческое меню над новым composer не разрешают клавиши; обновление CLI
 и бессрочный Skip не выполняются.
 
-Большой `codex-c` больше не вызывает full/raw loader только ради доказательства
-настроек и materialization. Отдельное потоковое чтение сохраняет прежние
-семантические проверки, не удерживая tool/compact bodies; exact-version cache
-не повышает source до live writer. Новый/изменённый файл всё ещё читается,
-неизменный повтор использует компактный proof. `codex-f` сохраняет полный
-источник для своего snapshot. Точная граница, память и цена чтения —
+Обычный `codex-c` запрашивает у `loadResumeSource` отдельный `purpose:'launch'`:
+для большого изменённого файла сначала читает до64КиБ заголовка и2МиБ хвоста,
+а не пересчитывает всю историю. Первый metadata обязан точно соответствовать
+SID; последний settings-кандидат в полном suffix сохраняет прежний reducer,
+включая отказ на более новую неполную пару. Положительное наличие истории
+доказывает прежний Timeline classifier по user после последнего rollback в
+окне; окно не доказывает точное число ходов (`userTurns/userRecords=null`).
+Эти nullable counts не превращаются в0/1 при runtime publication/live user.
+Path/descriptor/dev:ino/size/mtime/ctime и повторный discovery сверяются вокруг
+чтения. Нет settings/полного metadata/положительного witness — прежний полный
+потоковый reader с причиной `launch-fallback`, не угадывание модели или SID.
+Это значит, что bounded fast path НЕ гарантирован для любого giant-tail файла.
+Default reader/cache и `codex-f` сохраняют полные exact-count/snapshot возможности;
+неизменный exact-version proof можно переиспользовать. Source не становится live
+writer, composer-ready либо разрешением ввода. Точная граница и цена чтения —
 `fact-transcript-сервис.md::Ресурсная модель большой сессии`.
 
 > Актуальный input-ready контракт: `Starting MCP servers` не блокирует

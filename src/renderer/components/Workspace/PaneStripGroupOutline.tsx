@@ -1,4 +1,4 @@
-import React,{useId,useLayoutEffect,useMemo,useRef,useState} from 'react';
+import React,{useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {readPaneTabStripChips} from '../../utils/paneTabStripGeometry.mjs';
 import {buildPaneStripGroupOutlines} from '../../utils/paneStripGroupOutline.mjs';
 import {resolveTabCardMetrics} from '../../utils/tabCardVisual.mjs';
@@ -11,13 +11,14 @@ const box=(rect:DOMRect,origin:DOMRect):Rect=>({left:rect.left-origin.left,right
 /** Shared chip geometry plus an explicit child file-chip read. Only an owned
  * layout/resize/child-list invalidation schedules one coalesced observation.
  * No pointer listener, per-move scan, catalog serialization or store geometry. */
-export default function PaneStripGroupOutline({rootRef,scrollerRef,entriesKey,layoutKey='',groups,presented=true}: {
-  rootRef:React.RefObject<HTMLDivElement|null>;scrollerRef:React.RefObject<HTMLDivElement|null>;
+export default function PaneStripGroupOutline({rootRef,scrollerRef,entriesKey,layoutKey='',groups,presented=true,onMeasured}: {
+  rootRef:React.RefObject<HTMLElement|null>;scrollerRef:React.RefObject<HTMLElement|null>;
   entriesKey:string;layoutKey?:string;groups:PaneStripColorGroup[];presented?:boolean;
+  onMeasured?:(chips:Array<{id:string;left:number;right:number;top:number;bottom:number}>)=>void;
 }) {
-  const [layout,setLayout]=useState<{chips:any[];rows:any[];entriesKey:string;layoutKey:string}>({chips:[],rows:[],entriesKey:'',layoutKey:''});
+  const [layout,setLayout]=useState<{chips:any[];entriesKey:string;layoutKey:string}>({chips:[],entriesKey:'',layoutKey:''});
   const lastSignature=useRef('');
-  const clipPrefix=useId().replace(/:/g,'');
+  const measuredCallback=useRef(onMeasured);measuredCallback.current=onMeasured;
   const configuredRadius=useUIStore(state=>state.tabGeometry.borderRadius);
   const radius=resolveTabCardMetrics({borderRadius:configuredRadius}).borderRadius;
   const enabled=presented&&groups.length>0;
@@ -36,15 +37,8 @@ export default function PaneStripGroupOutline({rootRef,scrollerRef,entriesKey,la
           card:card?box(card.getBoundingClientRect(),origin):undefined,
           files:Array.from(node?.querySelectorAll<HTMLElement>('[data-tab-linked-files]')||[],file=>box(file.getBoundingClientRect(),origin))};
       });
-      const header=root.closest('[data-split-attach-row]'),bounds=header?.getBoundingClientRect();
-      const actions=header?.querySelector<HTMLElement>('[data-split-pane-actions]')?.getBoundingClientRect();
-      // Continuation reaches the pane divider, including the header padding.
-      // The first row still stops before its reserved window actions.
-      const left=bounds?bounds.left-origin.left:0,right=bounds?bounds.right-origin.left:origin.width;
-      const rows=[...new Set(chips.map(chip=>chip.top))].map(top=>({top,left,
-        right:actions&&origin.top+top<actions.bottom&&origin.top+top>=actions.top-1?Math.min(right,actions.left-origin.left):right}));
-      const signature=JSON.stringify({chips,rows,entriesKey,layoutKey});
-      if(signature!==lastSignature.current){lastSignature.current=signature;setLayout({chips,rows,entriesKey,layoutKey});}
+      const signature=JSON.stringify({chips,entriesKey,layoutKey});
+      if(signature!==lastSignature.current){lastSignature.current=signature;setLayout({chips,entriesKey,layoutKey});measuredCallback.current?.(chips);}
     };
     const invalidate=()=>{if(!retired&&frame===null)frame=requestAnimationFrame(measure);};
     const observer=new ResizeObserver(invalidate);
@@ -53,13 +47,25 @@ export default function PaneStripGroupOutline({rootRef,scrollerRef,entriesKey,la
       const next=new Set<Element>([root,strip,...strip.querySelectorAll('[data-strip-item],[data-tab-linked-files]')]);
       for(const target of targets)if(!next.has(target)){observer.unobserve(target);targets.delete(target);}
       for(const target of next)if(!targets.has(target)){observer.observe(target);targets.add(target);}
-      invalidate();
     };
     bind();
+    // A committed layout key must get its matching contour before paint. Waiting
+    // for rAF while render rejects the previous key produces a blank frame.
+    measure();
     // File hover can scale its existing chip without a border-box resize.
     // Observe that one publication, never pointer moves or arbitrary styles.
-    const mutations=new MutationObserver(bind);mutations.observe(strip,{childList:true,subtree:true,
-      attributes:true,attributeFilter:['data-linked-files-hovered']});
+    const mutations=new MutationObserver(records=>{
+      const relevant=records.some(record=>{
+        const target=record.target as Element;
+        if(target.closest?.('[data-pane-strip-group-outlines]'))return false;
+        const group=target.closest?.('[data-pane-strip-collapsed-group]');
+        // Nested absolute groups own their contour; opening them changes no
+        // neighbouring flow box. Their SVG/hover mutations are not our layout.
+        return !group||group===strip;
+      });
+      if(relevant){bind();invalidate();}
+    });mutations.observe(strip,{childList:true,subtree:true,
+      attributes:true,attributeFilter:['data-linked-files-hovered','data-linked-files-opening']});
     window.addEventListener('resize',invalidate);
     window.addEventListener('scroll',invalidate,true);
     return()=>{retired=true;if(frame!==null)cancelAnimationFrame(frame);mutations.disconnect();observer.disconnect();
@@ -69,12 +75,8 @@ export default function PaneStripGroupOutline({rootRef,scrollerRef,entriesKey,la
   if(!enabled||layout.entriesKey!==entriesKey||layout.layoutKey!==layoutKey)return null;
   return <svg data-pane-strip-group-outlines aria-hidden="true"
     style={{position:'absolute',inset:0,width:'100%',height:'100%',overflow:'visible',pointerEvents:'none',zIndex:10}}>
-    <defs>{outlines.map((outline,index)=>outline.clip&&<clipPath key={outline.id} id={`${clipPrefix}-${index}`} clipPathUnits="userSpaceOnUse">
-      <rect x={outline.clip.left} y={outline.clip.top} width={outline.clip.right-outline.clip.left} height={outline.clip.bottom-outline.clip.top}/>
-    </clipPath>)}</defs>
-    {outlines.map((outline,index)=><g key={outline.id} data-pane-strip-color-group={outline.groupId} fill="none" stroke={outline.color} strokeWidth="1" strokeLinecap="round"
-      clipPath={outline.clip?`url(#${clipPrefix}-${index})`:undefined}>
-      <path d={outline.solid}/>{outline.dashed&&<path d={outline.dashed} strokeDasharray="3 3"/>}
+    {outlines.map(outline=><g key={outline.id} data-pane-strip-color-group={outline.groupId} fill="none" stroke={outline.color} strokeWidth="1" strokeLinecap="butt">
+      <path d={outline.solid}/>
     </g>)}
   </svg>;
 }

@@ -25,6 +25,8 @@ const sendCode = ['readScenarioDestination', 'durableRecordHasProviderQueueAccep
   assert.ok(node, name);
   return node.getText(web);
 }).join('\n');
+const completionAdmissionCode = web.statements.find(item => ts.isVariableStatement(item)
+  && item.declarationList.declarations.some(declaration => declaration.name.getText(web) === 'COMPLETION_ADMISSION')).getText(web);
 
 // Real web dispatcher, FIFO, SQLite receipts and persisted run store. Only
 // runtime/history facts and the renderer/provider boundary are controlled.
@@ -67,6 +69,7 @@ async function fixture(t) {
     receipts = createAgentSendReceiptStore(db);
     context = vm.createContext({ require, path, srcMainDir: __dirname, console: quiet,
       ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
+      ...require('./agent-send-preparation'),
       agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: receipts,
       agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
       promptAuditFingerprint, classifyAgentSendReceipt, crypto: require('node:crypto'), shortId: value => value,
@@ -96,7 +99,9 @@ async function fixture(t) {
         return { success: null, submitted: true, accepted: true, auditPending: true, status: 'audit-pending' };
       },
     });
-    vm.runInContext(sendCode, context);
+    // Current sender also fences external-completion input. This fixture sends
+    // an ordinary continuation and carries that real private symbol declaration.
+    vm.runInContext(completionAdmissionCode + '\n' + sendCode, context);
     queue = new AgentSendQueue({ store: receipts, admit: async request => {
       await controls.beforeDispatch?.(request);
       return true;

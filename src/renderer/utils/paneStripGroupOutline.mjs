@@ -64,7 +64,7 @@ export function stripRoundedPaths(edges,radius=0) {
 
 /** `chips` uses the shared strip layout receipt plus separately read card/file
  * silhouettes. Foreign chips always split a run, including noncontiguous groups. */
-export function buildPaneStripGroupOutlines({chips,groups,rows=[],radius=0}) {
+export function buildPaneStripGroupOutlines({chips,groups,radius=0}) {
   const membership=new Map();for(const group of groups||[])for(const id of group.tabIds||[])membership.set(id,group);
   const positioned=(chips||[]).filter(valid);
   const lines=[];
@@ -73,42 +73,28 @@ export function buildPaneStripGroupOutlines({chips,groups,rows=[],radius=0}) {
     if(!line){line={top:chip.top,chips:[]};lines.push(line);}line.chips.push(chip);
   }
   lines.sort((a,b)=>a.top-b.top);for(const line of lines)line.chips.sort((a,b)=>a.left-b.left);
-  const groupRows=new Map();lines.forEach((line,index)=>line.chips.forEach(chip=>{
-    const group=membership.get(chip.id);if(group){const set=groupRows.get(group.id)||new Set();set.add(index);groupRows.set(group.id,set);}
-  }));
   const outlines=[];
   lines.forEach((line,rowIndex)=>{
-    const row=rows.find(row=>Math.abs(row.top-line.top)<=1);
     for(let i=0;i<line.chips.length;){
       const group=membership.get(line.chips[i].id);if(!group){i++;continue;}
       const begin=i,run=[];
       while(i<line.chips.length&&membership.get(line.chips[i].id)?.id===group.id)run.push(line.chips[i++]);
-      const rects=run.flatMap(chip=>[expand(chip.card||chip),...(chip.files||[]).filter(valid).map(expand)]),tails=[];
+      const rects=run.flatMap(chip=>[expand(chip.card||chip),...(chip.files||[]).filter(valid).map(expand)]);
       for(let k=1;k<run.length;k++){
         const left=run[k-1].card||run[k-1],right=run[k].card||run[k];
         if(right.left>left.right)rects.push({left:left.right-.5,right:right.left+.5,top:Math.max(left.top,right.top)-.5,bottom:Math.min(left.bottom,right.bottom)+.5});
       }
-      const hasEarlier=[...(groupRows.get(group.id)||[])].some(index=>index<rowIndex);
-      const hasLater=[...(groupRows.get(group.id)||[])].some(index=>index>rowIndex);
-      const openLeft=!!row&&begin===0&&hasEarlier,openRight=!!row&&i===line.chips.length&&hasLater;
+      // A row wrap is an open continuation, not a new rounded group end.
+      // Only adjacent members across the row seam share these cuts: foreign
+      // chips still split the silhouette. Never extend into empty margins.
+      const previous=lines[rowIndex-1]?.chips.at(-1),next=lines[rowIndex+1]?.chips[0];
+      const openLeft=begin===0&&membership.get(previous?.id)?.id===group.id;
+      const openRight=i===line.chips.length&&membership.get(next?.id)?.id===group.id;
       const left=Math.min(...rects.map(r=>r.left)),right=Math.max(...rects.map(r=>r.right));
-      const top=line.top-.5,bottom=Math.max(...rects.map(r=>r.bottom));
-      const leftEnd=openLeft?Math.min(row.left-1,left):left,rightEnd=openRight?Math.max(row.right+1,right):right;
-      if(openLeft&&leftEnd<left){
-        const tail={left:leftEnd,right:left,top,bottom};rects.push(tail);if(left>row.left)tails.push(tail);
-      }
-      if(openRight&&rightEnd>right){
-        const tail={left:right,right:rightEnd,top,bottom};rects.push(tail);if(right<row.right)tails.push(tail);
-      }
-      // A wrapped row continues beyond the viewport; its artificial ends are
-      // not group corners. Keep horizontal strokes long enough to clip, and
-      // omit the vertical caps before rounding the real silhouette corners.
-      const edges=stripSilhouetteEdges(rects,tails).filter(e=>!(e.x1===e.x2&&
-        ((openLeft&&e.x1===leftEnd)||(openRight&&e.x1===rightEnd))));
-      const clip=openLeft||openRight?{left:openLeft?row.left:left-1,right:openRight?row.right:right+1,
-        top:Math.min(...rects.map(r=>r.top))-1,bottom:bottom+1}:undefined;
+      const edges=stripSilhouetteEdges(rects).filter(edge=>edge.x1!==edge.x2||
+        !(openLeft&&edge.x1===left||openRight&&edge.x1===right));
       outlines.push({id:`${group.id}:${rowIndex}:${begin}`,groupId:group.id,color:group.color,tabIds:run.map(chip=>chip.id),
-        ...stripRoundedPaths(edges,radius),edges,clip});
+        ...stripRoundedPaths(edges,radius),edges});
     }
   });return outlines;
 }

@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, writeFile, mkdir, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { installTerminalMcp, updateClaudeConfig, updateCodexTerminalSection } from './install-terminal-mcp.mjs';
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'mcp');
 const projectDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const runtimeFiles = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
+const runtimeFiles = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs', 'working-directory-operation.mjs'];
 
 test('Codex update preserves unrelated sections and installs inherited instance routing', () => {
   const before = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.terminal]\ncommand = "old"\ncustom = true\n\n[features]\nflag = true\n';
@@ -92,6 +92,8 @@ test('installer atomically mirrors repo bytes, preserves config, and is idempote
         await readFile(join(sourceDir, file)),
       );
     }
+    const relocated = await import(pathToFileURL(join(home, '.claude', 'mcp', 'working-directory-operation.mjs')).href);
+    assert.equal(typeof relocated.callWorkingDirectoryOperation, 'function', 'installed helper has no repo/Main dependency');
 
     const claudeInstalled = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8'));
     assert.equal(claudeInstalled.mcpServers.other.command, 'keep-other');

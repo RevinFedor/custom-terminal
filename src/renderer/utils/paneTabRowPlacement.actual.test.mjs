@@ -8,6 +8,9 @@ import * as rows from '../../shared/pane-strip-row-placement.cjs';
 import * as rowLayout from '../../shared/pane-strip-row-layout.cjs';
 import * as reorder from './horizontalReorder.mjs';
 import * as layout from './paneStripLayout.mjs';
+import * as collapsed from './paneStripCollapseModel.mjs';
+import * as workflowDrag from './workflowDragModel.mjs';
+import * as groupField from '../../shared/pane-strip-color-groups.cjs';
 import {TAB_STRIP_ROW_GAP} from './tabCardVisual.mjs';
 
 const ref=tabId=>({projectId:'P',tabId});
@@ -36,6 +39,8 @@ function stripFixture() {
     '../../utils/paneTabDragBridge':{paneStripKey:()=> 'pane:0',usePaneTabDragSnapshot:()=>drag,
       usePaneTabDropPresentation:()=>released},
     '../../utils/paneTabDropPresentation.mjs':{panePresentationKey:()=> 'W'},
+    '../../utils/workflowDragModel.mjs':workflowDrag,
+    '../../../shared/pane-strip-color-groups.cjs':groupField,
     '../../utils/paneTabDropCommit':{},
     '../../hooks/useHorizontalOrderPreview':{useHorizontalOrderPreview:(base,_ref,_selector,_attribute,options)=>({displayedIds:options.projectionIds||base})},
     '../../utils/uiPerformanceDiagnostics.mjs':{uiDragDiagnostic(){}},
@@ -44,6 +49,8 @@ function stripFixture() {
     './PaneTabChip':{__esModule:true,default:component},'./PaneChooserChip':{__esModule:true,default:component},
     './PaneStripSelection':{PaneStripSelectionContext:React.createContext(null),usePaneStripSelectionController:()=>({})},
     './PaneStripGroupOutline':{__esModule:true,default:component},
+    './PaneStripCollapsedGroup':{__esModule:true,default:component},
+    '../../utils/paneStripCollapseModel.mjs':collapsed,
     '../../utils/paneStripSelectionModel.mjs':{paneStripOutlineGap:x=>x+1},
     '../../utils/paneStripGroupsModel.mjs':{readPaneStripOwnerEntries:()=>state.splitPanes[0].tabs,
       readyPaneStripOutlineGroups:()=>[],readPaneStripActiveGroups:()=>[]},

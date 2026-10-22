@@ -1,4 +1,8 @@
 import { create } from 'zustand';
+import { createPaneStripInterfacePreferences, initialPaneStripInterfacePreferences } from '../utils/paneStripInterfacePreferences.mjs';
+
+export type PaneStripInterfacePreferenceKey = 'paneStripSelectedFirst' | 'paneStripCloseOnClick' | 'paneStripInstantHover';
+export type PaneStripInterfacePreferenceStatus = 'loading' | 'ready' | 'saving' | 'load-error' | 'save-error' | 'save-unknown';
 import { clampTimelinePreviewResponseLines, loadTimelinePreviewResponseLines, TIMELINE_PREVIEW_RESPONSE_LINES_KEY } from '../utils/timelinePreviewSettings.mjs';
 import {
   DISPLAY_SIZE_KEYS, DISPLAY_SIZE_LIMITS, DISPLAY_PROFILES_STORAGE_KEY,
@@ -825,6 +829,15 @@ interface UIStore {
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
+  // Default OFF; app-state SQLite owns durability. Status distinguishes RAM from ACK.
+  paneStripSelectedFirst: boolean;
+  paneStripCloseOnClick: boolean;
+  paneStripInstantHover: boolean;
+  paneStripPreferenceStatus: Record<PaneStripInterfacePreferenceKey, PaneStripInterfacePreferenceStatus>;
+  setPaneStripSelectedFirst: (enabled: boolean) => Promise<boolean>;
+  setPaneStripCloseOnClick: (enabled: boolean) => Promise<boolean>;
+  setPaneStripInstantHover: (enabled: boolean) => Promise<boolean>;
+  retryPaneStripInterfacePreference: (key: PaneStripInterfacePreferenceKey) => Promise<boolean>;
   newTabPrimarySurface: 'history' | 'terminal';
   terminalIsPrimaryTabs: Record<string, boolean>;
   setNewTabPrimarySurface: (surface: 'history' | 'terminal') => void;
@@ -858,8 +871,8 @@ interface UIStore {
   setDefaultCodexModel: (v: DefaultCodexModel) => void;
   defaultCodexEffort: DefaultCodexEffort;
   setDefaultCodexEffort: (v: DefaultCodexEffort) => void;
-  codexResumePausedGoal: boolean;
-  setCodexResumePausedGoal: (value: boolean) => void;
+  codexResumePausedGoal: boolean | null;
+  setCodexResumePausedGoal: (value: boolean | null) => void;
   codexUsageExhaustionPolicy: 'continue' | 'stop-all';
   setCodexUsageExhaustionPolicy: (value: 'continue' | 'stop-all') => void;
   // Manual display/order settings. Actual availability is still reconciled
@@ -2173,10 +2186,12 @@ const saveCodexUsageExhaustionPolicy = (value: 'continue' | 'stop-all') => {
 const LS_KEY_CODEX_RESUME_GOAL = 'noted-terminal-codex-resume-paused-goal';
 let codexResumeGoalChoiceRevision = 0;
 const initialCodexResumePausedGoal = (() => {
-  try { return localStorage.getItem(LS_KEY_CODEX_RESUME_GOAL) !== 'false'; }
-  catch { return true; }
+  try {
+    const value = localStorage.getItem(LS_KEY_CODEX_RESUME_GOAL);
+    return value === 'true' ? true : value === 'false' ? false : null;
+  } catch { return null; }
 })();
-const saveCodexResumePausedGoal = (value: boolean) => {
+const saveCodexResumePausedGoal = (value: boolean | null) => {
   codexResumeGoalChoiceRevision += 1;
   try { localStorage.setItem(LS_KEY_CODEX_RESUME_GOAL, String(value)); } catch {}
   try {
@@ -2190,7 +2205,7 @@ const saveCodexResumePausedGoal = (value: boolean) => {
   try {
     const value = await window.require('electron').ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_RESUME_GOAL);
     if (revision !== codexResumeGoalChoiceRevision) return;
-    const enabled = value !== false;
+    const enabled = typeof value === 'boolean' ? value : null;
     useUIStore.setState({ codexResumePausedGoal: enabled });
     try { localStorage.setItem(LS_KEY_CODEX_RESUME_GOAL, String(enabled)); } catch {}
   } catch {}
@@ -3651,6 +3666,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
+  ...(initialPaneStripInterfacePreferences() as Pick<UIStore, 'paneStripSelectedFirst' | 'paneStripCloseOnClick' | 'paneStripInstantHover' | 'paneStripPreferenceStatus'>),
+  setPaneStripSelectedFirst: (enabled) => paneStripInterfacePreferences.write('paneStripSelectedFirst', enabled),
+  setPaneStripCloseOnClick: (enabled) => paneStripInterfacePreferences.write('paneStripCloseOnClick', enabled),
+  setPaneStripInstantHover: (enabled) => paneStripInterfacePreferences.write('paneStripInstantHover', enabled),
+  retryPaneStripInterfacePreference: (key) => paneStripInterfacePreferences.retry(key),
   newTabPrimarySurface: initialNewTabPrimarySurface,
   terminalIsPrimaryTabs: initialTerminalPrimaryTabs,
   setNewTabPrimarySurface: (surface) => {
@@ -3976,6 +3996,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
     if (get().activeArea !== area) set({ activeArea: area });
   }
 }));
+
+// Construct after the Zustand store; even a synchronous IPC failure can safely
+// publish status. Hydration only reads and cannot replace an intervening edit.
+const paneStripInterfacePreferences = createPaneStripInterfacePreferences({
+  getState: useUIStore.getState,
+  setState: useUIStore.setState,
+  invoke: (channel: string, payload: unknown) => window.require('electron').ipcRenderer.invoke(channel, payload),
+  reportError: (key: string, status: string, error: unknown) => {
+    console.warn('[PaneStripInterfacePreferences]', key, status, error);
+    if (status !== 'load-error') useUIStore.getState().showToast(
+      'Настройка применена в этом окне, но сохранение не подтверждено. Повторите сохранение в настройках.', 'error',
+    );
+  },
+});
+void paneStripInterfacePreferences.hydrate();
 
 // Черновик поля ввода сохраняется САМ, пока человек печатает.
 //

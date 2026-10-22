@@ -82,6 +82,71 @@ function sanitizeWorkCapsule(value) {
     attribution:'whole-work-totals; no overlap scaling or parent-child sum'};
 }
 
+// SQL witness v1 is additive to causal v3. Tokens are fixed wrapper-site IDs,
+// never SQL/bindings/paths/stacks. Descriptor reads do not invoke getters.
+function sanitizeSqlWitness(value, maxSites = 16) {
+  try {
+    const sequence=own(value,'sequence'), revision=own(value,'revision');
+    const integer=v=>Number.isSafeInteger(v) && v>=0;
+    if(own(value,'version')!==1 || !integer(sequence) || !integer(revision))return null;
+    const cell = (raw, identity=false) => {
+      if(!raw || typeof raw!=='object')return null;
+      const siteId=token(own(raw,'siteId'),64), operation=own(raw,'operation');
+      if(!siteId || !['prepare','get','all','run'].includes(operation))return null;
+      if(!identity)return {siteId,operation};
+      const seq=own(raw,'sequence'), enteredAbs=number(own(raw,'enteredAbs'));
+      if(!integer(seq) || seq<1 || seq>sequence || enteredAbs===null)return null;
+      return {siteId,operation,sequence:seq,enteredAbs,
+        workId:token(own(raw,'workId')),parentSpanId:token(own(raw,'parentSpanId')),
+        parentSqlSequence:integer(own(raw,'parentSqlSequence'))?own(raw,'parentSqlSequence'):null};
+    };
+    const rawActive=own(value,'active'), active=rawActive===null?null:cell(rawActive,true);
+    if(rawActive!==null && !active)return null;
+    const rawLast=own(value,'lastCompleted');let lastCompleted=null;
+    if(rawLast!==null) {
+      const c=cell(rawLast,true),outcome=own(rawLast,'outcome');
+      if(!c || !['success','error'].includes(outcome))return null;
+      lastCompleted={...c,outcome,rows:outcome==='success' && c.operation==='all'
+        && integer(own(rawLast,'rows'))?own(rawLast,'rows'):null};
+    }
+    const totals=(raw)=>{
+      const keys=['attempted','completed','errors','allReturned','rows','maxRows'];
+      if(!keys.every(k=>integer(own(raw,k))))return null;
+      const out=Object.fromEntries(keys.map(k=>[k,own(raw,k)]));
+      return out.completed<=out.attempted && out.errors<=out.completed
+        && out.allReturned<=out.completed-out.errors?out:null;
+    };
+    const aggregate=totals(own(value,'totals'));if(!aggregate || aggregate.attempted!==sequence)return null;
+    const sites=[],supplied=own(value,'sites'),limit=Math.max(0,Math.min(16,Math.floor(maxSites)||0));
+    if(Array.isArray(supplied))for(let i=0;i<Math.min(supplied.length,16);i++) {
+      const raw=own(supplied,String(i)),siteId=token(own(raw,'siteId'),64),stats=totals(raw);
+      if(siteId && stats && sites.length<limit)sites.push({siteId,...stats});
+    }
+    const health={},rawHealth=own(value,'health');
+    for(const k of ['preCallAttempts','suppressed','settleSuppressed','transportFailures','unavailable','siteOverflow'])health[k]=count(own(rawHealth,k));
+    const mode=own(value,'collectionState');
+    return {version:1,revision,sequence,active,lastCompleted,totals:aggregate,sites,
+      collectionState:mode==='enabled'||mode==='disabled'?mode:'unknown',
+      counterScope:'named-wrappers-while-enabled',
+      omittedSites:count(own(value,'omittedSites'))+Math.max(0,(Array.isArray(supplied)?supplied.length:0)-sites.length),health,
+      coverage:'named-wrappers-only',preCallCoverage:'all-only-4-pairs-per-minute-best-effort',
+      certainty:'observation-only; current-state-UNKNOWN; not-retaining-owner'};
+  } catch {return null;}
+}
+
+// Dedicated source-side envelope allowlist: SQL metadata must be clean BEFORE
+// entering child.send, as well as again at the external receiver.
+function sanitizeSqlEnvelope(value) {
+  try {
+    const sourceBoot=token(own(value,'sourceBoot'),100),sourcePid=own(value,'sourcePid'),sourceSeq=own(value,'sourceSeq');
+    const emittedAbs=number(own(value,'emittedAbs')),sqlWitness=sanitizeSqlWitness(own(value,'sqlWitness'),0);
+    if(own(value,'kind')!=='sql-witness' || !sourceBoot || !Number.isSafeInteger(sourcePid) || sourcePid<=0
+      || !Number.isSafeInteger(sourceSeq) || sourceSeq<1 || emittedAbs===null || !sqlWitness)return null;
+    return {schema:CAUSAL_SCHEMA_VERSION,kind:'sql-witness',sourceBoot,sourcePid,sourceSeq,
+      sourceKind:'main',emittedAbs,sqlWitness};
+  } catch {return null;}
+}
+
 // Input here is already top-level allowlisted by the journal. Preserve the
 // mandatory causal explanation before optional metadata, within the SAME cap.
 // Return a fresh fitted record, or null when even its core cannot fit.
@@ -90,6 +155,7 @@ function fitCausalRecord(clean, maxBytes = 2048) {
   const record={...clean};
   if(record.workSummary)record.workSummary=sanitizeWorkSummary(record.workSummary);
   if(record.workCapsule)record.workCapsule=sanitizeWorkCapsule(record.workCapsule);
+  if(record.sqlWitness)record.sqlWitness=sanitizeSqlWitness(record.sqlWitness,0);
   const fits=()=>Buffer.byteLength(JSON.stringify(record))<=maxBytes;
   if(fits())return record;
   let omitted=count(record.omittedFields);
@@ -102,7 +168,7 @@ function fitCausalRecord(clean, maxBytes = 2048) {
   const core=new Set(['schema','sourcePid','sourceKind','sourceBoot','sourceSeq','emittedAbs',
     'watchdogReceivedAbs','kind','summaryId','revision','workSummary','workCapsule',
     'startAbs','durationMs','threadCpuMs','enteredRecordMissing','omittedFields',
-    'spanId','parentSpanId','name','phase','enteredAbs','settledAbs','state','outcome']);
+    'spanId','parentSpanId','name','phase','enteredAbs','settledAbs','state','outcome','sqlWitness']);
   for(const key of Object.keys(record)) {
     if(fits())break;
     if(!core.has(key)){delete record[key];record.omittedFields=++omitted;}
@@ -118,4 +184,4 @@ function fitCausalRecord(clean, maxBytes = 2048) {
 }
 
 module.exports={CAUSAL_SCHEMA_VERSION,sanitizeWorkSummary,compactWorkSummary,
-  sanitizeWorkCapsule,fitCausalRecord};
+  sanitizeWorkCapsule,fitCausalRecord,sanitizeSqlWitness,sanitizeSqlEnvelope};

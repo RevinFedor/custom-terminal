@@ -11,4 +11,6 @@ function writeWithSendEnterTiming(write, publish, now = Date.now) {
   }
 }
 
-module.exports = { writeWithSendEnterTiming };
+// Same observation-only call boundary, used separately for authored payload.
+// Enter timing remains legacy telemetry and is not an input-start substitute.
+module.exports = { writeWithSendEnterTiming, writeWithSendPayloadTiming: writeWithSendEnterTiming };

@@ -243,6 +243,7 @@ async function httpFixture(t, h, options = {}) {
       assert.equal(name, './external-research-browser'); return require(name);
     },
     WORKSPACE_SWITCHER_CAPABILITY: require('./workspace-switcher-api').WORKSPACE_SWITCHER_CAPABILITY,
+    CODEX_SETTINGS_CAPABILITY: require('./codex-settings-control').CODEX_SETTINGS_CAPABILITY,
     RUN_AFTER_CAPABILITY: require('../shared/run-after-api.cjs').RUN_AFTER_CAPABILITY,
     getRunAfterApi: () => ({ journal: { epoch: 'params-fixture-main' } }),
     completionNotificationCapability: require('./tab-completion-notification-api').completionNotificationCapability,

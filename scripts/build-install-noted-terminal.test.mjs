@@ -8,7 +8,7 @@ import asar from '@electron/asar';
 import { writePackagedNodePtyFixture } from './node-pty-test-fixture.mjs';
 import {
   acquireInstallLock, buildInstallNotedTerminal, INSTALL_READY_PREFIX,
-  isProcessAlive, PREPARE_SCRIPTS, pruneInstallStaging, releaseInstallLock,
+  isProcessAlive, main, PREPARE_SCRIPTS, pruneInstallStaging, releaseInstallLock,
   validateAppBundle, waitForInstallAck,
 } from './build-install-noted-terminal.mjs';
 
@@ -70,7 +70,10 @@ async function fixture(t, options = {}) {
     await options.beforeQuit?.(data);
   };
   return { root, applicationsDir, installedApp, releaseApp, events, readVersion,
-    execute: extra => buildInstallNotedTerminal({ projectDir: root, applicationsDir, releaseApp, run, fileSystem, validate, beforeQuit, log() {}, aliveCheck: () => true, ...extra }),
+    execute: extra => {
+      validation = 0;
+      return buildInstallNotedTerminal({ projectDir: root, applicationsDir, releaseApp, run, fileSystem, validate, beforeQuit, log() {}, aliveCheck: () => true, ...extra });
+    },
   };
 }
 
@@ -87,6 +90,47 @@ test('prepare/sign/integrations and staged validation precede quit; old app is r
   assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
   assert.equal(await f.readVersion(result.previousApp), 'old installed bytes');
   await assert.rejects(fs.stat(path.join(f.applicationsDir, '.noted-terminal-install-lock')), { code: 'ENOENT' });
+});
+
+test('explicit continue mode commits its cut and quits before any compiler, with one quiet operation', async t => {
+  const f = await fixture(t), operationId = 'install:continue:one';
+  const result = await f.execute({ quitBeforePrepare: true, earlyQuitSource: { status: 'found', server: { pid: 42 } }, maintenance: { operationId,
+    begin: async () => { f.events.push({ label: 'quiet-begin' }); return { operationId }; },
+    launchArguments: () => ['--args', '--research-maintenance-operation=' + operationId],
+    complete: async () => { f.events.push({ label: 'quiet-complete' }); return { operationId, complete: true }; },
+  } });
+  assert.equal(result.ok, true);
+  const labels = f.events.map(event => event.label);
+  assert(labels.indexOf('quiet-begin') < labels.indexOf('idle-ack'));
+  assert(labels.indexOf('idle-ack') < labels.indexOf('quit'));
+  assert(labels.indexOf('quit') < labels.indexOf(PREPARE_SCRIPTS[0]));
+  assert.equal(labels.filter(label => label === 'quit').length, 1);
+  assert.equal(labels.filter(label => label === 'idle-ack').length, 1);
+  assert.deepEqual(f.events.find(event => event.label === 'quit').args, ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only', '42']);
+  assert(labels.indexOf('quiet-complete') > labels.indexOf('open'));
+});
+
+test('early-quit preparation failure reopens the unchanged app under the same maintenance identity', async t => {
+  const f = await fixture(t, { fail: 'build' }), operationId = 'install:continue:rollback';
+  const result = await f.execute({ quitBeforePrepare: true, earlyQuitSource: { status: 'found', server: { pid: 42 } }, maintenance: { operationId,
+    begin: async () => ({ operationId }),
+    launchArguments: () => ['--args', '--research-maintenance-operation=' + operationId],
+    complete: async options => { assert.equal(options.reopenedPrevious, true); return { operationId, complete: true }; },
+  } });
+  assert.equal(result.ok, false); assert.equal(result.recovery.status, 'previous-app-reopened');
+  assert.equal(await f.readVersion(f.installedApp), 'old installed bytes');
+  assert.deepEqual(f.events.find(event => event.label === 'open').args,
+    [f.installedApp, '--args', '--research-maintenance-operation=' + operationId]);
+  assert.equal(f.events.some(event => event.label === 'replace'), false);
+});
+
+test('cancel after acknowledged early Quit still waits for exact old Main before reopening old app', async t => {
+  const controller = new AbortController();
+  const f = await fixture(t, { beforeQuit: async () => { controller.abort(Error('user cancel')); } });
+  const result = await f.execute({ quitBeforePrepare: true, earlyQuitSource: { status: 'found', server: { pid: 42 } }, signal: controller.signal });
+  const labels = f.events.map(e => e.label);
+  assert.equal(result.ok, false); assert.equal(result.recovery.status, 'previous-app-reopened');
+  assert(labels.indexOf('quit') < labels.indexOf('open')); assert.equal(labels.includes('build'), false);
 });
 
 test('portable ad-hoc output is signed for the existing install identity before validation', async t => {
@@ -122,15 +166,71 @@ test('same maintenance operation is a launch argument before replacement startup
   assert.equal(result.ok, true); assert.equal(result.maintenance.operationId, operationId);
 });
 
-test('explicit frozen candidate excludes every CURRENT build/integration script', async t => {
-  const f = await fixture(t), proof = [];
-  const result = await f.execute({ preparedCut: { candidateApp: f.releaseApp,
-    verify: async app => { assert.equal(app, f.installedApp); proof.push('baseline'); },
-    claim: async () => proof.push('claimed'), verifyCandidate: async app => proof.push(app === f.installedApp ? 'installed-bytes' : 'staged-bytes'),
+test('manual and Voice Record entrypoints rebuild source despite any leftover prepared intent', async t => {
+  const previousNonce = process.env.NOTED_INSTALL_IDLE_ACK_ID;
+  const previousExitCode = process.exitCode;
+  try {
+    for (const owner of ['manual', 'voice-record']) {
+      for (const state of ['pending', 'claimed', 'failed', 'malformed']) {
+        await t.test(owner + ': ' + state, async t => {
+          const f = await fixture(t);
+          const intentPath = path.join(f.root, 'release', 'prepared-install-intent.json');
+          const obsolete = state === 'malformed' ? '{invalid json' : JSON.stringify({ version: 1, state,
+            candidateApp: '/must-not-use/Noted Terminal.app', claimedBy: 'old-cancelled-job' });
+          await fs.writeFile(intentPath, obsolete);
+          if (owner === 'voice-record') process.env.NOTED_INSTALL_IDLE_ACK_ID = 'new-install-job';
+          else delete process.env.NOTED_INSTALL_IDLE_ACK_ID;
+          let result;
+          await main({ projectDir: f.root, install: async ({ signal, projectDir }) => {
+            // Real entrypoint and installer; only OS build/quit/open and the
+            // external idle-ACK/API are replaced by the private fixture.
+            result = await f.execute({ signal, projectDir });
+            return result;
+          } });
+          assert.equal(result.ok, true);
+          assert.deepEqual(f.events.filter(x => PREPARE_SCRIPTS.includes(x.label)).map(x => x.label), PREPARE_SCRIPTS);
+          assert.equal(await fs.readFile(intentPath, 'utf8'), obsolete, 'obsolete metadata is neither consumed nor rewritten');
+        });
+      }
+    }
+  } finally {
+    if (previousNonce === undefined) delete process.env.NOTED_INSTALL_IDLE_ACK_ID;
+    else process.env.NOTED_INSTALL_IDLE_ACK_ID = previousNonce;
+    process.exitCode = previousExitCode;
+  }
+});
+
+test('cancel before quit releases the installer and a new invocation rebuilds from source', async t => {
+  const previousExitCode = process.exitCode;
+  const previousNonce = process.env.NOTED_INSTALL_IDLE_ACK_ID;
+  delete process.env.NOTED_INSTALL_IDLE_ACK_ID;
+  let cancelFirst = true;
+  const f = await fixture(t, { beforeQuit: () => {
+    if (cancelFirst) { cancelFirst = false; process.emit('SIGTERM'); }
   } });
-  assert.equal(result.ok, true); assert.deepEqual(proof, ['baseline', 'claimed', 'staged-bytes', 'staged-bytes', 'installed-bytes']);
-  assert(!f.events.some(x => PREPARE_SCRIPTS.includes(x.label)), 'no WIP compiler or integrations');
-  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
+  const invoke = async () => {
+    let result;
+    await main({ projectDir: f.root, install: async ({ signal, projectDir }) => {
+      result = await f.execute({ signal, projectDir });
+      return result;
+    } });
+    return result;
+  };
+  try {
+    const cancelled = await invoke();
+    assert.equal(cancelled.ok, false);
+    assert.equal(cancelled.error, 'install cancelled');
+    assert.equal(await f.readVersion(f.installedApp), 'old installed bytes');
+    assert(!f.events.some(x => x.label === 'quit'));
+    await assert.rejects(fs.stat(path.join(f.applicationsDir, '.noted-terminal-install-lock')), { code: 'ENOENT' });
+    f.events.length = 0;
+    assert.equal((await invoke()).ok, true);
+    assert.deepEqual(f.events.filter(x => PREPARE_SCRIPTS.includes(x.label)).map(x => x.label), PREPARE_SCRIPTS);
+  } finally {
+    if (previousNonce === undefined) delete process.env.NOTED_INSTALL_IDLE_ACK_ID;
+    else process.env.NOTED_INSTALL_IDLE_ACK_ID = previousNonce;
+    process.exitCode = previousExitCode;
+  }
 });
 
 test('ambiguous quiet begin ACK forbids Quit and does not complete an unknown operation', async t => {

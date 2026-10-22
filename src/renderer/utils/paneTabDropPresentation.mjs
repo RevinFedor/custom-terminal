@@ -5,6 +5,7 @@ import {dragPlacement,dragRelation,dragFamily} from '../../shared/workflow-drag.
 import {stableJson,layoutReferences} from '../../shared/workflow-organization.cjs';
 import {normalizePaneStripRowPlacement,samePaneStripRowPlacement} from '../../shared/pane-strip-row-placement.cjs';
 import {readPaneStripRowPlacement} from '../../shared/pane-strip-row-layout.cjs';
+import {paneStripColorGroupsBasis} from '../../shared/pane-strip-color-groups.cjs';
 
 // These are read proofs for a released chip presentation, never write guards,
 // a second layout store, or permission to resend an immutable drag request.
@@ -34,8 +35,20 @@ export function createPaneDropPresentation(request,receipt,state) {
   if(receipt.windowId && (!before || before.displayHidden || !after || after.displayHidden))return null;
   const beforeEntries=receipt.windowId ? paneTabs(before):centerEntries(change.beforeLayout,receipt.centerKey);
   const afterEntries=receipt.windowId ? paneTabs(after):centerEntries(change.layout,receipt.centerKey);
+  const rawRows=rowsOf(change.layout,receipt.windowId,receipt.centerKey,afterEntries);
+  const measuredWidth=typeof receipt.stripWidth==='number' && Number.isFinite(receipt.stripWidth) && receipt.stripWidth>0;
+  // React consumes the width-normalized rows, while Main keeps the captured
+  // raw descriptor. An unmeasured explicit break supplies no layout proof.
+  const effectiveRows=rawRows && !measuredWidth ? undefined : normalizePaneStripRowPlacement(
+    rawRows,{order:afterEntries.map(entry=>entry.tabId),width:measuredWidth ? receipt.stripWidth:undefined});
   if(!samePaneEntries(beforeEntries,receipt.baseEntries) || !samePaneEntries(afterEntries,receipt.entries)
-    || !samePaneStripRowPlacement(rowsOf(change.layout,receipt.windowId,receipt.centerKey,afterEntries),receipt.rowPlacement))return null;
+    || effectiveRows===undefined || !samePaneStripRowPlacement(effectiveRows,receipt.rowPlacement))return null;
+  const release=request.stripGroupReleases?.find(value=>value.workflowId===receipt.workflowId);
+  const groupAfterBasis=release?paneStripColorGroupsBasis(release.nextState):null;
+  // Order and membership must have been shown by the SAME committed React
+  // receipt. A painted order alone never proves an IN/OUT membership preview.
+  if(release&&(paneStripColorGroupsBasis(receipt.baseGroupState)!==release.basis
+    ||paneStripColorGroupsBasis(receipt.groupState)!==groupAfterBasis))return null;
   const strips=[];
   for(const pane of change.beforeLayout.splitPanes || []) {
     if(!pane.windowId || pane.displayHidden)continue;
@@ -55,10 +68,14 @@ export function createPaneDropPresentation(request,receipt,state) {
       strips.push({key:panePresentationKey(receipt.workflowId,null,receipt.centerKey),base,entries,rowPlacement});
   }
   const targetKey=panePresentationKey(receipt.workflowId,receipt.windowId,receipt.centerKey);
+  if(release&&release.basis!==groupAfterBasis&&!strips.some(strip=>strip.key===targetKey))
+    strips.push({key:targetKey,base:beforeEntries,entries:afterEntries,rowPlacement:rawRows});
+  if(release)for(const strip of strips)strip.groupState=release.nextState;
   // A no-op needs no owner beyond the existing canonical strip.
   if(!strips.some(strip=>strip.key===targetKey))return null;
   const presentation={request,strips,targetKey,targetOwner:receipt.owner,
     workflowId:receipt.workflowId,navigationRevision:state.navigationRevision,
+    groupBeforeBasis:release?.basis||null,groupAfterBasis,
     phase:'pending'};
   return paneDropPresentationValid(presentation,state) ? presentation:null;
 }
@@ -69,6 +86,10 @@ export function createPaneDropPresentation(request,receipt,state) {
 export function paneDropPresentationValid(presentation,state,{applying=false}={}) {
   if(state.view!=='workspace' || state.activeSpaceId!==presentation.workflowId
     || !applying && state.navigationRevision!==presentation.navigationRevision)return false;
+  if(presentation.groupAfterBasis) {
+    const basis=paneStripColorGroupsBasis(state.spaces.find(space=>space.id===presentation.workflowId)?.stripColorGroups);
+    if(basis!==presentation.groupBeforeBasis&&basis!==presentation.groupAfterBasis)return false;
+  }
   return paneDropScopeCurrent(presentation.request,state);
 }
 
@@ -126,6 +147,8 @@ export function paneDropScopeCurrent(request,state) {
 export function paneDropPresentationCaughtUp(presentation,state) {
   const layout=layoutOf(state,presentation.workflowId);
   if(!layout)return false;
+  if(presentation.groupAfterBasis&&paneStripColorGroupsBasis(
+    state.spaces.find(space=>space.id===presentation.workflowId)?.stripColorGroups)!==presentation.groupAfterBasis)return false;
   return presentation.strips.every(strip=>{
     const [,kind,id]=JSON.parse(strip.key);
     const entries=kind==='window' ? paneTabs(layout.splitPanes?.find(pane=>pane.windowId===id)) : centerEntries(layout,id);
@@ -134,10 +157,11 @@ export function paneDropPresentationCaughtUp(presentation,state) {
   });
 }
 
-/** A new drag from a released chip recaptures its actual canonical address.
- * The displayed destination grants neither placement nor execution authority. */
+/** A new drag recaptures the Store's current logical address, including an
+ * already released pair awaiting ACK. Visual props alone grant no authority. */
 export function canonicalPaneDragAddress(state,projectId,tabId) {
-  const workflowId=state.tabWorkflowMembership?.[tabId]?.workflowId || state.activeSpaceId;
+  const workflowId=state.pendingTabWorkflowMembership?.[tabId]?.workflowId
+    || state.tabWorkflowMembership?.[tabId]?.workflowId || state.activeSpaceId;
   const layout=layoutOf(state,workflowId);
   if(!layout)return {sourceSpaceId:workflowId,sourcePaneKey:null};
   const index=(layout.splitPanes || []).findIndex(pane=>!pane.displayHidden

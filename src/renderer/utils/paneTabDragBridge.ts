@@ -6,8 +6,10 @@ import {
   createHorizontalDragGeometryCache,
 } from './horizontalDragGeometry.mjs';
 import {readPaneTabStripChips} from './paneTabStripGeometry.mjs';
+import {paneStripVisibleInsertion,paneStripOpenGroupGeometry} from './paneStripCollapseModel.mjs';
 import {clampPaneStripGroupInsertion} from './paneStripSelectionModel.mjs';
-import {samePaneStripRowPlacement} from '../../shared/pane-strip-row-placement.cjs';
+import {normalizePaneStripRowPlacement,samePaneStripRowPlacement} from '../../shared/pane-strip-row-placement.cjs';
+import {paneStripColorGroupsBasis} from '../../shared/pane-strip-color-groups.cjs';
 
 export const PANE_TAB_DND_TYPE = 'PANE_TAB_CHIP_V2';
 
@@ -16,7 +18,7 @@ export type PaneStripKey = 'center' | `pane:${number}`;
 
 export type PaneTabDragSource = {
   /** Renderer-only captured color-group scope, not a durable writer grant. */
-  groupDrag?: { boundary: any; isCurrent: () => boolean };
+  groupDrag?: { boundary: any; internalScope?: boolean; isCurrent: (releasedRequest?: any) => boolean };
   /** UI-only original sidebar grab; never part of durable workflow admission. */
   sourceGrabOffsetY?: number;
   owner: 'pane' | 'sidebar';
@@ -73,16 +75,19 @@ const stripGeometry = createHorizontalDragGeometryCache();
 let dragSession = 0;
 let claimedDropSession = -1;
 
-export function paneTabGroupDragIsCurrent(source: PaneTabDragSource) {
+export function paneTabGroupDragIsCurrent(source: PaneTabDragSource,releasedRequest?:any) {
   const lease=source.groupDrag;
   if(!lease)return true;
-  try {return (lease.boundary?.kind==='group' || lease.boundary?.kind==='free') && lease.isCurrent()===true;} catch {return false;}
+  try {return (lease.boundary?.kind==='group' || lease.boundary?.kind==='free') && lease.isCurrent(releasedRequest)===true;} catch {return false;}
 }
 
-/** Clamp the semantic POST-removal index before it becomes a shown target.
- * A color-group member cannot be adopted by another pane/workflow/sidebar. */
+/** Only a collapsed member-origin peek owns an internal POST-removal range.
+ * Ordinary roots/subsets may leave; the release compiler owns their exact
+ * order+membership change through the existing Main transaction. */
 export function constrainPaneTabGroupTarget(source:PaneTabDragSource,target:PaneTabDropTarget|null) {
   if(!target || !source.groupDrag || source.groupDrag.boundary?.kind==='free')return target;
+  if(source.groupDrag.boundary?.kind!=='group')return null;
+  if(!source.groupDrag.internalScope)return target;
   const boundary=source.groupDrag.boundary;
   if(boundary?.kind!=='group' || target.paneKey!==source.sourcePaneKey
     || target.spaceId!==source.sourceSpaceId)return null;
@@ -118,7 +123,10 @@ export function beginPaneTabDrag(source: PaneTabDragSource) {
     && snapshot.source?.sourceSpaceId === source.sourceSpaceId
     && snapshot.source.entries.map((entry) => entry.tabId).join('\u0000') === entries.map((entry) => entry.tabId).join('\u0000');
   if (sameSource) return snapshot.source;
-  retirePaneTabDropPresentation('new-gesture');
+  // A released Store pair is the next pickup's logical baseline even while
+  // retained parent props lag behind it. Keep only its presentation handoff;
+  // the new gesture owns target/reveal and will replace it at its release.
+  if(presentationOwner?.plan.phase==='pending')retirePaneTabDropPresentation('new-gesture');
   paintedStrip = null;
   stripGeometry.clear();
   dragSession += 1;
@@ -169,7 +177,11 @@ export function claimPaneTabDragDrop(rootTabId?: string) {
   if(!paneTabGroupDragIsCurrent(snapshot.source))return null;
   if (claimedDropSession === dragSession) return null;
   claimedDropSession = dragSession;
-  return { source: snapshot.source, target: snapshot.target, session: dragSession };
+  const session=dragSession;
+  // UI reveal only: physical end keeps this intent, a new gesture revokes it.
+  // It never authorizes or cancels the already admitted durable command.
+  return { source: snapshot.source, target: snapshot.target, session,
+    isRevealCurrent:()=>dragSession===session };
 }
 
 export function endPaneTabDrag(rootTabId?: string, gestureId?: string) {
@@ -194,9 +206,18 @@ export function usePaneTabDragSnapshot() {
 // particular it never makes snapshot.active true or supplies a drop target.
 type StripSurface = {workflowId:string;windowId?:string|null;centerKey?:string|null;
   paneKey:PaneStripKey;baseEntries:PaneTabDragEntry[];entries:PaneTabDragEntry[];
-  baseRowPlacement?:any;rowPlacement?:any;stripWidth?:number};
+  canonicalEntries?:PaneTabDragEntry[];
+  baseGroupState?:any;groupState?:any;
+  baseRowPlacement?:any;rowPlacement?:any;stripWidth?:number;layoutKey?:string};
 const stripSurfaces = new Map<object,StripSurface>();
 const presentationListeners = new Set<()=>void>();
+const groupBasisMatches=(field:any,basis:string)=>{
+  try{return paneStripColorGroupsBasis(field)===basis;}catch{return false;}
+};
+const samePresentedGroupState=(left:any,right:any)=>{
+  if(left===right)return true;
+  try{return paneStripColorGroupsBasis(left)===paneStripColorGroupsBasis(right);}catch{return false;}
+};
 let paintedStrip:any = null;
 let presentationOwner:any = null;
 let presentationSnapshot:any = null;
@@ -216,23 +237,23 @@ function retirePaneTabDropPresentation(reason:string,owner=presentationOwner) {
   publishPresentation();
 }
 function retirePaintedCanonical(owner:any) {
-  if(presentationOwner!==owner || owner.plan.phase!=='applied')return;
+  if(presentationOwner!==owner || !['released','applied'].includes(owner.plan.phase))return;
   const target=stripSurfaces.get(owner.plan.targetOwner);
   if(!target || panePresentationKey(target.workflowId,target.windowId,target.centerKey)!==owner.plan.targetKey) {
     retirePaneTabDropPresentation('target-unmounted',owner);return;
-  }
-  const targetStrip=owner.plan.strips.find((strip:any)=>strip.key===owner.plan.targetKey);
-  if(targetStrip?.rowPlacement && target.stripWidth!==undefined
-    && Math.abs(targetStrip.rowPlacement.width-target.stripWidth)>0.5) {
-    retirePaneTabDropPresentation('target-width-changed',owner);return;
   }
   for(const [surfaceId,key] of owner.surfaces) {
     const surface=stripSurfaces.get(surfaceId);
     if(!surface)continue; // A removed source host cannot own another surface.
     const strip=owner.plan.strips.find((strip:any)=>strip.key===key);
+    const measuredWidth=typeof surface.stripWidth==='number' && Number.isFinite(surface.stripWidth) && surface.stripWidth>0;
+    if(strip.rowPlacement && !measuredWidth)return;
+    const effectiveRows=normalizePaneStripRowPlacement(strip.rowPlacement,
+      {order:strip.entries.map((entry:PaneTabDragEntry)=>entry.tabId),width:measuredWidth ? surface.stripWidth:undefined});
     if(panePresentationKey(surface.workflowId,surface.windowId,surface.centerKey)!==key
-      || !samePaneEntries(surface.baseEntries,strip.entries)
-      || !samePaneStripRowPlacement(surface.baseRowPlacement,strip.rowPlacement))return;
+      || !samePaneEntries(surface.canonicalEntries||surface.baseEntries,strip.entries)
+      || owner.plan.groupAfterBasis&&!groupBasisMatches(surface.baseGroupState,owner.plan.groupAfterBasis)
+      || !samePaneStripRowPlacement(surface.baseRowPlacement,effectiveRows))return;
   }
   retirePaneTabDropPresentation('canonical-react-layout',owner);
 }
@@ -249,7 +270,10 @@ export function observePaneTabStrip(owner:object,surface:StripSurface) {
     // create per-move layout work instead of following the shown order.
     if(!previous || !samePaneEntries(previous.entries,surface.entries)
       || !samePaneStripRowPlacement(previous.rowPlacement,surface.rowPlacement)
-      || previous.stripWidth!==surface.stripWidth) {
+      // Membership can change a closed block's visible coverage without any
+      // order change. Reuse the existing measured receipt/cache boundary.
+      || !samePresentedGroupState(previous.groupState,surface.groupState)
+      || previous.stripWidth!==surface.stripWidth || previous.layoutKey!==surface.layoutKey) {
       stripGeometry.clear(`${surface.workflowId}:${surface.paneKey}`);
       uiDragDiagnostic('geometry-invalidated',{gestureId:source.gestureId,
         revision:snapshot.revision,workflowId:surface.workflowId,paneKey:surface.paneKey,
@@ -289,6 +313,11 @@ export function beginPaneTabDropPresentation(request:any,store:{getState:()=>any
     try {
       if(!isCurrent() || !paneDropPresentationValid(plan,state,{applying:owner.applying}))
         retirePaneTabDropPresentation('current-scope-changed',owner);
+      else if(plan.phase==='pending'&&paneDropPresentationCaughtUp(plan,state)) {
+        // Local release has reached Store. This says nothing about durability;
+        // Store's existing writer owns the immutable command until its receipt.
+        plan.phase='released';publishPresentation();retirePaintedCanonical(owner);
+      }
     } catch {retirePaneTabDropPresentation('scope-unavailable',owner);}
   };
   owner.unsubscribe=store.subscribe(check);
@@ -352,6 +381,9 @@ export function paneTabDropTargetContainsPoint(
     && (!target.spaceId || target.spaceId === spaceId);
 }
 
+// Paired with stripGeometry's own read boundary. Weak keys do not keep retired
+// strips alive; this contains IDs only, no second rectangle cache/observer.
+const collapsedOrdinalMaps=new WeakMap<HTMLElement,{layoutKey:string;fullIds:string[];blocks:any[]}>();
 export function resolvePaneTabDropTarget(
   pointed: Element | null,
   clientX: number,
@@ -392,15 +424,72 @@ export function resolvePaneTabDropTarget(
     includeRowPlacement: true,
     // Reuse this geometry between pointer moves. A committed, non-animated
     // strip order expires it in observePaneTabStrip; requested state does not.
-    readChips: () => readPaneTabStripChips(strip),
+    readChips: () => {
+      const chips=readPaneTabStripChips(strip);
+      if(strip.dataset.stripCanonicalIds) {
+        try {
+          const fullIds=JSON.parse(strip.dataset.stripCanonicalIds);
+          const nodes=new Map(Array.from(strip.querySelectorAll<HTMLElement>('[data-strip-item]'),node=>[node.dataset.stripTabId,node]));
+          // Orientation belongs to this SAME measured receipt. Validate once
+          // here, not from live attributes/rectangles on every pointer sample.
+          // This temporary map adds no retained geometry owner or observer.
+          const openGroups=new Map<string,{node:HTMLElement;ids:string[];seen:string[];direction:string;last:any}>();
+          const blocks=chips.map(chip=>{
+            const group=nodes.get(chip.id)?.closest<HTMLElement>('[data-pane-strip-collapsed-group]');
+            if(group?.dataset.groupOpen==='1') {
+              const id=group.dataset.paneStripCollapsedGroup;
+              if(!id)throw Error('unknown open group scope');
+              let scope=openGroups.get(id);
+              if(!scope) {
+                const ids=JSON.parse(group.dataset.groupMemberIds||'null'),direction=group.dataset.groupDirection===undefined?'right':group.dataset.groupDirection;
+                if(!Array.isArray(ids)||!ids.length||ids.some(id=>typeof id!=='string'||!id)
+                  ||new Set(ids).size!==ids.length||direction!=='right'&&direction!=='left')throw Error('unknown open group orientation');
+                scope={node:group,ids,seen:[],direction,last:null};openGroups.set(id,scope);
+              }
+              if(scope.node!==group||![chip.left,chip.right,chip.top,chip.bottom].every(Number.isFinite))
+                throw Error('unknown open group geometry');
+              const previous=scope.last;
+              if(previous&&(chip.top>=previous.bottom-.5||previous.top>=chip.bottom-.5
+                ||(scope.direction==='left'?chip.right>previous.left+.5:chip.left<previous.right-.5)))
+                throw Error('unknown open group physical order');
+              scope.seen.push(chip.id);scope.last=chip;
+              return {visibleId:chip.id,ids:[chip.id],openGroupId:id,openGroupDirection:scope.direction};
+            }
+            return {visibleId:chip.id,ids:group&&group.dataset.groupOpen!=='1'?JSON.parse(group.dataset.groupMemberIds||'null'):[chip.id],
+              openGroupId:undefined};
+          });
+          if(!Array.isArray(fullIds)||fullIds.some(id=>typeof id!=='string'||!id)||new Set(fullIds).size!==fullIds.length
+            ||blocks.some(block=>!Array.isArray(block.ids)))throw Error('unknown collapsed coverage');
+          for(const scope of openGroups.values())if(JSON.stringify(scope.ids)!==JSON.stringify(scope.seen))
+            throw Error('incomplete open group coverage');
+          collapsedOrdinalMaps.set(strip,{layoutKey:strip.dataset.stripLayoutKey||'',fullIds,blocks});
+        }catch{collapsedOrdinalMaps.delete(strip);}
+      }else collapsedOrdinalMaps.delete(strip);
+      return chips;
+    },
+    selectChips:strip.dataset.stripCanonicalIds?(chips:any[],point:{x:number;y:number})=>{
+      const map=collapsedOrdinalMaps.get(strip);
+      if(!map||map.layoutKey!==(strip.dataset.stripLayoutKey||''))return null;
+      const pointedGroup=pointed?.closest<HTMLElement>('[data-pane-strip-collapsed-group]');
+      return paneStripOpenGroupGeometry({chips,blocks:map.blocks,clientX:point.x,clientY:point.y,
+        preferredGroupId:pointedGroup?.dataset.groupOpen==='1'?pointedGroup.dataset.paneStripCollapsedGroup:undefined});
+    }:undefined,
   });
+  if(!slot)return null;
+  let insertion=slot;
+  if(strip.dataset.stripCanonicalIds) {
+    const map=collapsedOrdinalMaps.get(strip);
+    if(!map||map.layoutKey!==(strip.dataset.stripLayoutKey||''))return null;
+    const full=paneStripVisibleInsertion({...map,excludedIds:excludedTabIds,at:slot.at,rowStartId:slot.rowStartId,scopeId:slot.scopeId});
+    if(!full)return null;insertion={...slot,...full};
+  }
   return {
     zone: 'strip',
     paneKey,
     paneIndex,
     spaceId,
-    at: slot.at,
-    rowStartId: slot.rowStartId,
+    at: insertion.at,
+    rowStartId: insertion.rowStartId,
     stripWidth: stripRect.width,
     debug: {
       dragCenterX,

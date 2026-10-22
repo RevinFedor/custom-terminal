@@ -6,6 +6,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { errorMonitor } = require('node:events');
 const { randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
+const { parse: parseUrl } = require('node:url');
 const { directoryReadRoute } = require('../shared/workflow-directory-catalog.cjs');
 const context = new AsyncLocalStorage();
 const ID = /^[a-z0-9-]{1,90}$/;
@@ -19,7 +20,7 @@ function httpReadCorrelation(value = currentHttpReadContext()) {
   return result;
 }
 function readRoute(req) {
-  const pathname = String(req.url || '').split('?', 1)[0];
+  const pathname = parseUrl(String(req.url || '')).pathname || '';
   // Only the exact v2 routes whose handler has read effect. Never all POSTs.
   const directoryRead = directoryReadRoute(req.method, pathname);
   if (directoryRead) return directoryRead;

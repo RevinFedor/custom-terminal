@@ -31,6 +31,9 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
 import { isOrchestrationResultProofPending, mergeOrchestrationRuns } from '../../utils/orchestrationRunProjection.mjs';
 import { orchestrationRequestTime, orchestrationDetailRows, orchestrationLinkedName } from '../../utils/orchestrationDetails.mjs';
+import { useBuildInstallStatus } from '../../hooks/useBuildInstallStatus';
+import { buildInstallVisibleInDock } from '../../utils/buildInstallPresentation.mjs';
+import { BuildInstallTracker } from './BuildInstallTracker';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -184,6 +187,16 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       spinning: false,
     };
   }
+  if (run.runKind === 'external-research' && ACTIVE.has(run.status)) {
+    const ui = run.externalResearchUiState;
+    if (ui?.attention || ui?.parked || ['waiting_retry', 'preparing', 'awaiting_confirmation', 'unknown', 'blocked', 'exhausted'].includes(ui?.recoveryStatus || '')) {
+      return { color: '#fbbf24', icon: 'recovery', spinning: false,
+        label: ui?.sendState === 'not_attempted' ? 'Подготовка остановлена — не отправлено'
+          : ui?.recoveryStatus === 'waiting_retry' ? 'Ждёт кнопку «Повторить»'
+            : ['preparing', 'awaiting_confirmation'].includes(ui?.recoveryStatus || '') ? 'Восстановление ответа'
+              : 'Требуется восстановление' };
+    }
+  }
   if (hasPendingSourceHandoff(run, tabId)) {
     return {
       color: run.notificationStatus === 'sent' ? '#4ade80' : run.notificationStatus === 'sending' ? '#60a5fa' : '#a1a1aa',
@@ -315,6 +328,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const [openingLinkedRunIds, setOpeningLinkedRunIds] = useState<Set<string>>(() => new Set());
   const messagePreviewRef = useRef<HTMLElement>(null);
   const messages = useTabMessages(tabId);
+  const installs = useBuildInstallStatus(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
   const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
   const closeMessage = useCallback(() => setSelectedMessage(null), []);
@@ -402,10 +416,12 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     ...orderedRuns.map(run => ({ kind: 'run' as const, run, at: run.createdAt || 0, id: 'run:' + run.runId })),
     ...messages.threads.map(thread => ({ kind: 'message' as const, thread,
       at: tabMessageTimestamp(thread.question.createdAt), id: 'message:' + thread.question.messageId })),
-  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads]);
+    ...installs.jobs.map(job => ({ kind: 'install' as const, job, at: job.startedAt, id: 'install:' + job.id })),
+  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs]);
   const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
   const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
-  const hasDockEntries = statusRuns.length > 0 || hasVisibleMessages || Boolean(messages.listError);
+  const statusInstalls = installs.jobs.filter(buildInstallVisibleInDock);
+  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || hasVisibleMessages || Boolean(messages.listError);
   const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
     hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null);
 
@@ -648,6 +664,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         {messages.listError && <div role="alert" style={{ padding: 8, fontSize: 10, color: '#fbbf24' }}>Сообщения недоступны: {messages.listError}</div>}
         {!historyEntries.length && !messages.listError && <div style={{ padding: 10, fontSize: 11, color: '#888' }}>Запросов пока нет</div>}
         {historyEntries.map((entry) => {
+          if (entry.kind === 'install') return <BuildInstallTracker key={entry.id} job={entry.job} stale={installs.stale}
+            error={installs.error} history onCancel={installs.cancel} />;
           if (entry.kind === 'message') return <TabMessageRow key={entry.id} thread={entry.thread} tabId={tabId}
             history selected={selectedMessage?.messageId === entry.thread.question.messageId}
             onOpen={openMessage} onDismiss={cancelMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
@@ -804,6 +822,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
           overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
       <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} />
+      {statusInstalls.map(job => <BuildInstallTracker key={job.id} job={job} stale={installs.stale} error={installs.error} onCancel={installs.cancel} />)}
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list

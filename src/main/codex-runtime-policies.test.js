@@ -21,7 +21,7 @@ function fixture(options = {}) {
   let locked = Promise.resolve();
   const controller = createCodexRuntimePolicyController({
     capture: () => ({ ...owner }), readFrame: async () => options.readFrame ? options.readFrame(frame) : frame,
-    readPolicy: () => options.policy || {},
+    readPolicy: () => options.policy || { resumeGoal: true },
     isComposer: value => !!parseCodexVerifiedComposerFooter(value.text),
     withWriteLock: async (_term, work) => { await locked; return work({ active: true }); },
     sendKey: async (_tab, key, { guard }) => {
@@ -62,7 +62,7 @@ test('usage grammar: exact current bounded menu, wrapped fallback, no credits/re
 });
 
 for (const [label, policy, expected] of [
-  ['default Resume', {}, ['\r']], ['Leave paused', { resumeGoal: false }, ['\x1b[B', '\r']],
+  ['saved Resume', { resumeGoal: true }, ['\r']], ['Leave paused', { resumeGoal: false }, ['\x1b[B', '\r']],
   ['explicit override', { resumeGoal: false, resumeOverride: true }, ['\r']],
 ]) test('Goal policy ' + label + ': one action and committed result, not key write', async () => {
   const h = fixture({ policy }); h.paint(); h.paint(); await tick();

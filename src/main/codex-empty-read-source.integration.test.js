@@ -15,6 +15,7 @@ const { createCodexRuntimeProjectionStore } = require('./codex-runtime-projectio
 const { SessionTranscriptService } = require('./session-transcript-service');
 const { PublicHistoryRevisions } = require('./public-history-read');
 const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
+const { beginHttpReadDependency, createHttpReadDiagnostics } = require('./http-read-diagnostics');
 const api = require('./ipc/codex-data')._api;
 const quiet = { log() {}, warn() {}, error() {} };
 function functions(file, names) {
@@ -90,6 +91,9 @@ async function fixture(t) {
   } } });
   const sendJson = (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
   const web = vm.createContext({ url, crypto, console: quiet, require: () => ({}), token: 'fixture', path,
+    beginHttpReadDependency, httpReadDiagnostics: createHttpReadDiagnostics({ serviceId: 'empty-read-fixture', log() {} }),
+    handleDictationClipboardHttp: async () => false, workflowOrganizationHttp: async () => false,
+    handleStorageMaintenance: async () => false, storageMaintenance: null,
     handleSystemPromptApi: async () => false, systemPromptService: null, readBody: async () => ({}),
     decId: decodeURIComponent, sendJson, historyReadSession, historyReadOwnerFromProjection, transcriptService: service,
     conversationOwners: null, finishConversationOwnerRead: () => ({}), publishTabTiming() {},

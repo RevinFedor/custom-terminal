@@ -23,6 +23,7 @@ import { draftTransferResultFields, readAgentDraftTransfer } from './agentDraftT
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 import manualActionContract from '../../shared/agent-manual-action.cjs';
 import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
+import agentSendReadTiming from '../../shared/agent-send-read-timing.cjs';
 
 const { createAgentSendTargetExpectation, resolveReadyAgentSendTarget } = sendTargetContract;
 
@@ -108,27 +109,35 @@ export function createAgentReadyWait(
   runtime: HistoryAgentRuntime,
   timeoutMs = 30000,
   purpose = 'ready',
+  observe?: (phase: string, fields?: Record<string, unknown>) => void,
 ) {
   let cleanup = () => {};
+  const note = (phase: string, fields: Record<string, unknown> = {}) => {
+    try { observe?.(phase, fields); } catch {}
+  };
   const promise = new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
       cleanup();
+      note('ready-resolve');
       resolve();
     };
     // Both callers own an absolute deadline and re-read presence on every
     // wake. The deadline must wake that last read too: an event can be lost
     // while the composer has already become ready. This wake grants nothing.
-    const timer = setTimeout(finish, timeoutMs);
+    const timer = setTimeout(() => { note('wait-timer', {wakeSource:'deadline'}); finish(); }, timeoutMs);
     const handler = (_event: any, data: { tabId?: string } = {}) => {
       if (data?.tabId !== tabId) return;
+      note('ready-handler', {eventTs:(data as any)?.ts, wakeSource:'runtime-ready'});
       finish();
     };
     const readinessChanged = (_event: any, data: { tabId?: string; toolType?: string } = {}) => {
       if (data?.toolType !== runtime.toolType) return;
-      handler(_event, data);
+      if (data?.tabId !== tabId) return;
+      note('ready-handler', {eventTs:(data as any)?.ts, wakeSource:'readiness-changed'});
+      finish();
     };
     let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
     cleanup = () => {
@@ -139,7 +148,7 @@ export function createAgentReadyWait(
     };
     ipcRenderer.on('agent:readiness-changed', readinessChanged);
     if (!runtime.readyEvent) {
-      fallbackTimer = setTimeout(finish, Math.min(500, timeoutMs));
+      fallbackTimer = setTimeout(() => { note('wait-timer', {wakeSource:'fallback'}); finish(); }, Math.min(500, timeoutMs));
     } else {
       ipcRenderer.on(runtime.readyEvent, handler);
     }
@@ -159,6 +168,7 @@ export async function prepareAgentRuntimeForSend({
   requireLive = false,
   sendOperationKey,
   sendAttemptId,
+  handoffId,
   expectedTarget: pinnedTarget,
   admissionSignal,
   launchAdmission: suppliedLaunchAdmission,
@@ -176,12 +186,29 @@ export async function prepareAgentRuntimeForSend({
   requireLive?: boolean;
   sendOperationKey?: string | null;
   sendAttemptId?: string | null;
+  handoffId?: string;
   expectedTarget?: AgentSendTarget;
   admissionSignal?: AbortSignal;
   launchAdmission?: ReturnType<typeof createAgentLaunchAdmission>;
   assertAdmissionCurrent?: () => void;
   acceptPreparedSession?: (sessionId: string) => void;
 }) {
+  const readTrace = agentSendReadTiming.createAgentSendReadTiming({
+    tabId, operationKey:runtime.toolType === 'codex' ? sendOperationKey : null,
+    attemptId:sendAttemptId, handoffId,
+    emit:(record: unknown) => console.log('[AgentSendReadTiming] ' + JSON.stringify(record)),
+    now:() => performance.timeOrigin + performance.now(),
+  });
+  const getPresence = (stage: string) => {
+    const context=readTrace.start(stage);
+    const pending=context
+      ? runtime.getPresence(tabId,undefined,{consumer:'send-preparation',readTiming:context})
+      : runtime.getPresence(tabId);
+    if(context)try { pending.then(
+      value => { readTrace.end(context,value); },
+      () => { readTrace.end(context,null,true); }); } catch {}
+    return pending;
+  };
   const launchController = new AbortController();
   const abortLaunch = () => {
     launchController.abort();
@@ -242,7 +269,7 @@ export async function prepareAgentRuntimeForSend({
     await providerContract.waitForStartupGate(tabId, 'agent-send');
     assertSendNotCancelled();
   };
-  let presence = await runtime.getPresence(tabId).catch((err: any) => {
+  let presence = await getPresence('initial-presence').catch((err: any) => {
     console.warn('[AgentScenario:send] presence failed before send tool=' + runtime.toolType
       + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
     return null;
@@ -252,15 +279,21 @@ export async function prepareAgentRuntimeForSend({
     if (!runtime.prepareMainComposerForSend || !presence
       || !['active', 'busy', 'starting'].includes(presence.status)) return;
     observePhysicalTarget();
-    const prepared = await runtime.prepareMainComposerForSend(tabId, {
+    const context=readTrace.start('composer-prepare');
+    const pending=runtime.prepareMainComposerForSend(tabId, {
       expectedTarget, sendOperationKey, sendAttemptId,
+      ...(context ? {readTiming:context} : {}),
     });
+    if(context)try { pending.then(
+      value => { readTrace.end(context,value); },
+      () => { readTrace.end(context,null,true); }); } catch {}
+    const prepared = await pending;
     assertSendNotCancelled();
     if (prepared?.success !== true) throw Object.assign(
       new Error(prepared?.error || 'Main composer could not be confirmed'), prepared,
       { submitted: false, pasteWritten: false, enterWritten: false });
     if (prepared.inputWritten) {
-      presence = await runtime.getPresence(tabId).catch(() => null);
+      presence = await getPresence('after-composer-presence').catch(() => null);
       assertSendNotCancelled();
       if (presence && ['active', 'busy', 'starting'].includes(presence.status)) observePhysicalTarget();
     }
@@ -291,7 +324,7 @@ export async function prepareAgentRuntimeForSend({
   if (submitCapability() === 'queue') return resolved('busy', 'queue');
   if (submitCapability() === 'direct') {
     await waitStartupGate();
-    presence = await runtime.getPresence(tabId).catch(() => null);
+    presence = await getPresence('launch-presence').catch(() => null);
     assertSendNotCancelled();
     if (presence?.status === 'stopping') {
       throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
@@ -349,7 +382,7 @@ export async function prepareAgentRuntimeForSend({
       // a fresh authoritative read still proves the process inactive. Unknown
       // waits for the already-armed readiness path; it never authorizes a
       // second lifecycle mutation.
-      const afterRejectedLaunch = await runtime.getPresence(tabId).catch(() => null);
+      const afterRejectedLaunch = await getPresence('rejected-launch-presence').catch(() => null);
       assertSendNotCancelled();
       if (afterRejectedLaunch?.status === 'inactive') {
         // Preserve Main's exact no-launch/lookup/owner refusal across the
@@ -409,7 +442,8 @@ export async function prepareAgentRuntimeForSend({
     assertSendNotCancelled();
     followStartupDeadline();
     const remainingMs = deadline - Date.now();
-    const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
+    const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send',
+      (phase,fields) => readTrace.event(phase,fields));
     let removeAdmissionAbort = () => {};
     const admissionAbort = new Promise<void>(resolve => {
       if (!admissionSignal) return;
@@ -423,7 +457,7 @@ export async function prepareAgentRuntimeForSend({
       ? createCoordinatedAgentSendCancellationWait(tabId, coordinatedSendToken)
       : null;
     try {
-      presence = await runtime.getPresence(tabId).catch(() => null);
+      presence = await getPresence('wait-presence').catch(() => null);
       assertSendNotCancelled();
       const previousDeadline = deadline;
       followStartupDeadline();
@@ -443,7 +477,7 @@ export async function prepareAgentRuntimeForSend({
       }
       if (providerContract.startupGateOwnsComposer(presence)) {
         await waitStartupGate();
-        presence = await runtime.getPresence(tabId).catch(() => null);
+        presence = await getPresence('gate-presence').catch(() => null);
         assertSendNotCancelled();
         if (presence?.status === 'stopping') {
           throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
@@ -473,7 +507,7 @@ export async function prepareAgentRuntimeForSend({
         // would await a cancelled, permanently unresolved promise. Finally
         // retires the observation on every return/error/next pass.
         await waitStartupGate();
-        presence = await runtime.getPresence(tabId).catch(() => null);
+        presence = await getPresence('final-presence').catch(() => null);
         assertSendNotCancelled();
         if (presence?.status === 'stopping') {
           throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
@@ -500,6 +534,7 @@ export async function prepareAgentRuntimeForSend({
       } else {
         await readyOrRevoked;
       }
+      readTrace.event('loop-resume', {pass});
     } finally {
       readyWait.cancel();
       removeAdmissionAbort();
@@ -507,6 +542,7 @@ export async function prepareAgentRuntimeForSend({
     }
   }
   } finally {
+    readTrace.close();
     admissionSignal?.removeEventListener('abort', abortLaunch);
     launchCancellation?.cancel();
     if (!suppliedLaunchAdmission) void launchAdmission.finish();

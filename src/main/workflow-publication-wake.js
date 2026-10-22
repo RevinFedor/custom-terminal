@@ -36,6 +36,14 @@ function createWorkflowPublicationWake({ onError = () => {} } = {}) {
       try { return observe(options.readPublication()); }
       catch { report('publication-unavailable'); return false; }
     },
+    forPublication(publication) {
+      // Join the captured SQL publication to this exact Main owner/clock.
+      // A directory cursor epoch is not a publication epoch; reads never
+      // observe, advance or repair the retained wake on behalf of a capture.
+      return current() && latest && publication?.version === 1
+        && publication.generation === latest.generation && publication.revision === latest.revision
+        ? { ...latest } : null;
+    },
     snapshot() { return current() && latest ? { ...latest } : null; },
   };
 }

@@ -2,6 +2,9 @@ import { create } from 'zustand';
 import { queuedRewindLabel, rewindIteration } from '../utils/queuedRewindLabel.mjs';
 import { usePromptsStore, RUN_AFTER_LOOP_PROMPT_ID } from './usePromptsStore';
 import { DEFAULT_LOOP_PROMPT, parsePersistedSharedLoopPrompt } from '../../shared/prompt-loop.mjs';
+import loopPolicy from '../../shared/loop-dependencies.cjs';
+export const { loopPromptMode } = loopPolicy;
+export type LoopPromptMode = 'all-work' | 'own-turn';
 export { parsePersistedSharedLoopPrompt };
 import {
   buildPromptImagePayload,
@@ -161,7 +164,7 @@ function markPromptQueueStoreHydrated(): void {
 
 type PersistedTabQueueSnapshot = Pick<TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds'
-  | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt'
+  | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt' | 'loopPromptEpoch' | 'loopPromptMode'
   | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId' | 'firstDelayCountdownAt'
   | 'workflowRestartPending' | 'loopRestartPending' | 'workflowOutcomeFloorAt'
   | 'pendingDelivery'
@@ -183,6 +186,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       !q.postPromptEnabled &&
       !q.postPromptText &&
       !q.loopPromptEnabled &&
+      loopPromptMode(q) === 'all-work' &&
       !q.runAfterTabId &&
       // NOT `!q.panelCollapsed`: the panel now defaults to collapsed, so the
       // deliberate choice worth keeping is the OPPOSITE one. Both sides of this
@@ -203,6 +207,8 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       postPromptText: q.postPromptText,
       loopPromptEnabled: q.loopPromptEnabled,
       loopPromptArmedAt: q.loopPromptArmedAt,
+      loopPromptEpoch: q.loopPromptEpoch,
+      loopPromptMode: loopPromptMode(q),
       runAfterTabId: q.runAfterTabId,
       workflowArmedAt: q.workflowArmedAt,
       workflowOutcomeFloorAt: q.workflowOutcomeFloorAt,
@@ -544,6 +550,10 @@ export type PromptQueuePendingDelivery = {
   triggerKey: string;
   conditionKey: string;
   causeKey: string | null;
+  loopCause?: { provider: string; sessionId: string; turnId: string };
+  loopEpoch?: string;
+  loopPromptMode?: LoopPromptMode;
+  loopWaitId?: string;
   createdAt: number;
 };
 
@@ -597,8 +607,12 @@ export type TabQueue = {
   // disabled. The separate arm timestamp prevents a newly edited Loop from
   // consuming an older completion restored from disk.
   loopPromptEnabled: boolean;
+  // Explicit opt-in: ordinary waits for all work; own-turn can review external waits.
+  loopPromptMode?: LoopPromptMode;
   loopPromptText: string;
   loopPromptArmedAt: number | null;
+  // Identity of an explicit arm/text edit; restart and outcome floors keep it.
+  loopPromptEpoch?: string | null;
 
   // ── Overlay collapsed/expanded state ─────────────────────────────────────
   // Per-tab UI state for the Run-after panel. Default is COLLAPSED (see
@@ -773,7 +787,7 @@ interface PromptQueueStore {
   // setPostPromptText writes the body. Both are persisted.
   setPostPromptEnabled: (tabId: string, value: boolean) => void;
   setPostPromptText: (tabId: string, text: string) => void;
-  setLoopPromptEnabled: (tabId: string, value: boolean) => void;
+  setLoopPromptEnabled: (tabId: string, value: boolean, mode?: LoopPromptMode) => void;
   setLoopPromptText: (tabId: string, text: string) => void;
   setPanelCollapsed: (tabId: string, value: boolean) => void;
 
@@ -805,6 +819,7 @@ interface PromptQueueStore {
   ) => string[];
   suspendWorkflowsForRestart: () => void;
   resumeWorkflowsForTrigger: (triggerTabId: string, rendererStartedAt: number) => void;
+  applyBuildInstallContinuationFloor: (tabId: string, floorAt: number) => void;
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
   // pointed at it. Called from workspace closeTab.
@@ -826,8 +841,10 @@ const EMPTY: TabQueue = {
   postPromptEnabled: false,
   postPromptText: '',
   loopPromptEnabled: false,
+  loopPromptMode: 'all-work',
   loopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
   loopPromptArmedAt: null,
+  loopPromptEpoch: null,
   panelCollapsed: DEFAULT_RUN_AFTER_PANEL_COLLAPSED,
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
@@ -859,8 +876,10 @@ type PreHydrateQueueField =
   | 'postPromptEnabled'
   | 'postPromptText'
   | 'loopPromptEnabled'
+  | 'loopPromptMode'
   | 'loopPromptText'
   | 'loopPromptArmedAt'
+  | 'loopPromptEpoch'
   | 'runAfterTabId'
   | 'workflowArmedAt'
   | 'workflowOutcomeFloorAt'
@@ -909,8 +928,10 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.postPromptEnabled !== current.postPromptEnabled) changed.add('postPromptEnabled');
     if (baseline.postPromptText !== current.postPromptText) changed.add('postPromptText');
     if (baseline.loopPromptEnabled !== current.loopPromptEnabled) changed.add('loopPromptEnabled');
+    if (baseline.loopPromptMode !== current.loopPromptMode) changed.add('loopPromptMode');
     if (baseline.loopPromptText !== current.loopPromptText) changed.add('loopPromptText');
     if (baseline.loopPromptArmedAt !== current.loopPromptArmedAt) changed.add('loopPromptArmedAt');
+    if (baseline.loopPromptEpoch !== current.loopPromptEpoch) changed.add('loopPromptEpoch');
     if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
     if (baseline.workflowArmedAt !== current.workflowArmedAt) changed.add('workflowArmedAt');
     if (baseline.workflowOutcomeFloorAt !== current.workflowOutcomeFloorAt) changed.add('workflowOutcomeFloorAt');
@@ -957,8 +978,10 @@ function mergeHydratedQueue(
   if (changed?.has('postPromptEnabled')) merged.postPromptEnabled = current.postPromptEnabled;
   if (changed?.has('postPromptText')) merged.postPromptText = current.postPromptText;
   if (changed?.has('loopPromptEnabled')) merged.loopPromptEnabled = current.loopPromptEnabled;
+  if (changed?.has('loopPromptMode')) merged.loopPromptMode = current.loopPromptMode;
   if (changed?.has('loopPromptText')) merged.loopPromptText = current.loopPromptText;
   if (changed?.has('loopPromptArmedAt')) merged.loopPromptArmedAt = current.loopPromptArmedAt;
+  if (changed?.has('loopPromptEpoch')) merged.loopPromptEpoch = current.loopPromptEpoch;
   if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
   if (changed?.has('workflowArmedAt')) merged.workflowArmedAt = current.workflowArmedAt;
   if (changed?.has('workflowOutcomeFloorAt')) merged.workflowOutcomeFloorAt = current.workflowOutcomeFloorAt;
@@ -1002,7 +1025,7 @@ export type PromptQueueCore = Pick<
   TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'runAfterTabId'
   | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'
-  | 'loopPromptEnabled' | 'loopPromptText'
+  | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptMode'
 >;
 
 export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
@@ -1016,6 +1039,7 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
     postPromptEnabled: q.postPromptEnabled,
     postPromptText: q.postPromptText,
     loopPromptEnabled: q.loopPromptEnabled,
+    loopPromptMode: loopPromptMode(q),
     loopPromptText: q.loopPromptText,
   };
 }
@@ -1178,12 +1202,16 @@ function queuedPromptMatchesExpected(
   return true;
 }
 
+let loopPromptEpochSequence = 0;
+function newLoopPromptEpoch() { return Date.now() + ':' + (++loopPromptEpochSequence) + ':' + Math.random().toString(36).slice(2); }
+
 function projectSystemLoopPrompt(state: PromptQueueStore, text: string) {
   if (state.sharedLoopPromptText === text) return state;
   const next = new Map(state.queues);
   const editedAt = Date.now();
   for (const [ownerTabId, queue] of next) {
     next.set(ownerTabId, { ...queue, loopPromptText: text,
+      loopPromptEpoch: queue.loopPromptEnabled ? newLoopPromptEpoch() : queue.loopPromptEpoch,
       loopPromptArmedAt: queue.loopPromptEnabled ? editedAt : queue.loopPromptArmedAt });
   }
   trackPreHydrateQueueChanges(state.queues, next);
@@ -1931,15 +1959,18 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
-    setLoopPromptEnabled: (tabId, value) => {
+    setLoopPromptEnabled: (tabId, value, mode) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        if (cur.loopPromptEnabled === value) return state;
+        const nextMode = mode ?? (value ? 'all-work' : loopPromptMode(cur));
+        if (cur.loopPromptEnabled === value && loopPromptMode(cur) === nextMode) return state;
         next.set(tabId, {
           ...cur,
           loopPromptText: state.sharedLoopPromptText,
           loopPromptEnabled: value,
+          loopPromptMode: nextMode,
+          loopPromptEpoch: value ? newLoopPromptEpoch() : null,
           loopRestartPending: false,
           loopPromptArmedAt: value ? Date.now() : null,
         });
@@ -2040,6 +2071,22 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             ...cur, workflowRestartPending: cur.autoRun, loopRestartPending: cur.loopPromptEnabled,
           });
         }
+        return { queues: next };
+      });
+    },
+
+    applyBuildInstallContinuationFloor: (tabId, floorAt) => {
+      if (!Number.isFinite(floorAt) || floorAt <= 0) return;
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        const loopFloor = cur.loopPromptEnabled ? Math.max(cur.loopPromptArmedAt || 0, floorAt) : cur.loopPromptArmedAt;
+        const workflowFloor = Math.max(cur.workflowOutcomeFloorAt || 0, floorAt);
+        if (loopFloor === cur.loopPromptArmedAt && workflowFloor === cur.workflowOutcomeFloorAt
+          && !cur.loopRestartPending) return state;
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, loopPromptArmedAt: loopFloor, workflowOutcomeFloorAt: workflowFloor,
+          loopRestartPending: false });
         return { queues: next };
       });
     },
@@ -2352,8 +2399,10 @@ type PersistedTabQueue = {
   postPromptEnabled?: boolean;
   postPromptText?: string;
   loopPromptEnabled?: boolean;
+  loopPromptMode?: LoopPromptMode;
   loopPromptText?: string;
   loopPromptArmedAt?: number | null;
+  loopPromptEpoch?: string | null;
   runAfterTabId?: string | null;
   workflowArmedAt?: number | null;
   workflowOutcomeFloorAt?: number | null;
@@ -2373,7 +2422,12 @@ function normalizePendingDelivery(value: unknown): PromptQueuePendingDelivery | 
     || typeof v.createdAt !== 'number' || !Number.isFinite(v.createdAt)) return null;
   return { version: 1, kind: v.kind, itemId: v.itemId, handoffId: v.handoffId,
     baseHandoffId: v.baseHandoffId, operationKey: v.operationKey, triggerTabId: v.triggerTabId,
-    triggerKey: v.triggerKey, conditionKey: v.conditionKey, causeKey: v.causeKey, createdAt: v.createdAt };
+    triggerKey: v.triggerKey, conditionKey: v.conditionKey, causeKey: v.causeKey, createdAt: v.createdAt,
+    ...(v.kind === 'loop' && v.loopCause && ['provider', 'sessionId', 'turnId'].every(key =>
+      typeof (v.loopCause as any)[key] === 'string' && (v.loopCause as any)[key]) ? { loopCause: v.loopCause } : {}),
+    ...(v.kind === 'loop' && typeof v.loopEpoch === 'string' ? { loopEpoch: v.loopEpoch } : {}),
+    ...(v.kind === 'loop' ? { loopPromptMode: loopPromptMode(v) } : {}),
+    ...(v.kind === 'loop' && typeof v.loopWaitId === 'string' ? { loopWaitId: v.loopWaitId } : {}) };
 }
 
 function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
@@ -2537,10 +2591,13 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     postPromptEnabled: !!entry.postPromptEnabled,
     postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
     loopPromptEnabled: !!entry.loopPromptEnabled,
+    loopPromptMode: loopPromptMode(entry),
     loopPromptText: typeof entry.loopPromptText === 'string' ? entry.loopPromptText : '',
     loopPromptArmedAt: typeof entry.loopPromptArmedAt === 'number' && Number.isFinite(entry.loopPromptArmedAt)
       ? Number(entry.loopPromptArmedAt)
       : null,
+    loopPromptEpoch: typeof entry.loopPromptEpoch === 'string' ? entry.loopPromptEpoch
+      : entry.loopPromptEnabled && Number.isFinite(entry.loopPromptArmedAt) ? 'legacy:' + entry.loopPromptArmedAt : null,
     // Not `!!entry.panelCollapsed`: a row saved before this field existed has
     // no flag, and coercing "absent" to false would expand every restored tab.
     panelCollapsed: resolvePersistedPanelCollapsed(entry.panelCollapsed),

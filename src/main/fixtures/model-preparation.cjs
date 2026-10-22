@@ -7,6 +7,7 @@ const Module = require('node:module'), ts = require('typescript');
 const { fixture: base, tick } = require('./compact-preparation.cjs');
 const preparation = require('../agent-send-preparation');
 const settings = require('../codex-settings-send');
+const { createAgentSettingsActivity } = require('../agent-settings-activity');
 const repoMain = path.join(__dirname, '..', 'main.js');
 const source = fs.readFileSync(process.env.MODEL_MAIN_SOURCE || repoMain, 'utf8');
 const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
@@ -37,6 +38,7 @@ function fixture(t, options = {}) {
   let current = options.samePair ? { ...requested } : { model: 'gpt-5.6-luna', effort: 'medium' };
   let writerId = 'S', targetCurrent = true, screen = '', serviceEnters = 0, promptCalls = 0;
   let runtime;
+  const settingsActivity = createAgentSettingsActivity();
   const emit = text => { screen = text; for (const onData of [...raw]) onData(text); };
   term.onData = onData => { raw.add(onData); captures.push({ at: clock.now() });
     return { dispose: () => raw.delete(onData) }; };
@@ -79,8 +81,9 @@ function fixture(t, options = {}) {
       if (options.configTime) clock.advance(options.configTime);
       return { success: !options.configFailure, source: 'controlled-config' };
     },
-    beginAgentSettingsActivity: () => { events.push({ kind: 'activity-begin' }); return { id: 1 }; },
-    agentSettingsActivity: { end: () => events.push({ kind: 'activity-end' }) },
+    beginAgentSettingsActivity: (tabId, toolType, target, options) => { events.push({ kind: 'activity-begin' });
+      return settingsActivity.begin({ tabId, toolType, target, ...options }); },
+    agentSettingsActivity: { ...settingsActivity, end: token => { events.push({ kind: 'activity-end' }); return settingsActivity.end(token); } },
     attachCodexSettingsProofOwner: (result, sessionId) => ({ ...result, codexSettingsProofSessionId: sessionId }),
     closeCodexPickerToComposer: async () => { events.push({ kind: 'close-picker' }); return { success: true }; },
     emitAgentReadinessChanged: () => h.notifyFrame(),

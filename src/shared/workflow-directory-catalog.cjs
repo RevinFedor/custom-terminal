@@ -4,6 +4,7 @@
 // projector's output; window coverage is not an organization mutation.
 const crypto = require('node:crypto');
 const { stableJson } = require('./workflow-organization.cjs');
+const { WINDOW_LAYOUT_CAPABILITY } = require('./workflow-window-presentation.cjs');
 const FIRST_FILES = 5, FILE_PAGE_SIZE = 20, MAX_SUMMARY_ROWS = 256;
 const CAPABILITY = Object.freeze({ version: 2, treeVersion: 1, inventory: 'active-membership',
   endpoint: '/api/workflow-organization?projection=catalog-v2', indexComplete: true,
@@ -12,6 +13,8 @@ const CAPABILITY = Object.freeze({ version: 2, treeVersion: 1, inventory: 'activ
   filePreview: '/api/tab-catalog/:tabId/file-preview', runtime: '/api/workflow-organization/runtime-summary',
   cards: '/api/workflow-organization/card-signals', sourceBindings: 'tab',
   presentation: 'canonical-tree-v1', windowPresentation: false,
+  // Additive read sidecar. Clients without this capability keep the full tree.
+  windowLayout: WINDOW_LAYOUT_CAPABILITY,
   failurePolicy: 'unavailable-retain-readable-cache', automaticLegacyFallback: false });
 const READ_POSTS = Object.freeze([
   ['/api/workflow-organization/file-page', '/api/workflow-organization/file-page'],
@@ -99,7 +102,8 @@ function prepareDirectoryCatalog(core, codec) {
     descriptors: { kind: 'content-hash', value: hash({ rows: core.rows, refs }) },
     tree: { kind: 'content-hash', value: hash(core.workflows) } };
   const catalogClock = hash({ index, refs, rows: core.rows, workflows: core.workflows,
-    groups: core.groups, provenanceCounts: core.provenanceCounts, clocks });
+    groups: core.groups, provenanceCounts: core.provenanceCounts, clocks,
+    ...(core.windowLayout ? { windowLayout: core.windowLayout } : {}) });
   // Compatibility witness for the UNCHANGED nativeDrag v1 admission. This is
   // exactly full readCapture's tree hash, not the v2 directory content clock.
   // Main still captures all execution refs itself; no hidden ref is invented.
@@ -124,9 +128,12 @@ function prepareDirectoryCatalog(core, codec) {
   const hidden = new Set(buckets.flatMap(bucket => bucket.nodeIds.slice(FIRST_FILES).map(id => byNode.get(id).tabId)));
   const initial = () => ({ version: 2, projection: 'catalog-v2', inventory: 'active-membership', ...basis,
     index, workflows: core.workflows, groups: core.groups,
+    ...(core.windowLayout ? { windowLayout: { ...core.windowLayout, ...basis } } : {}),
     details: Object.fromEntries(Object.keys(index).filter(id => !hidden.has(id)).map(id => [id, publicDetail(id)])),
     fileWindows: buckets.map(bucket => window(bucket, FIRST_FILES)), provenanceCounts: core.provenanceCounts, clocks, nativeDragExpected,
-    initialFileCount: FIRST_FILES, filePageSize: FILE_PAGE_SIZE, excludedSignals: core.excludedSignals, sourceBindings: 'tab' });
+    initialFileCount: FIRST_FILES, filePageSize: FILE_PAGE_SIZE, excludedSignals: core.excludedSignals, sourceBindings: 'tab',
+    // Initial read sidecar only: excluded from content clocks, cursors and drag.
+    ...(core.workflowPublication ? { workflowPublication: { ...core.workflowPublication } } : {}) });
   const page = requestCursor => {
     const cursor = codec.decode(requestCursor); assertBasis(basis, cursor);
     const bucket = buckets.find(b => b.workflowId === cursor.workflowId && b.parentNodeId === cursor.parentNodeId);

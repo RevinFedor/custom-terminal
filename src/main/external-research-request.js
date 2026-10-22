@@ -86,7 +86,7 @@ function externalResearchTargetLabel(request) {
   return model ? `${provider} · ${model}` : provider;
 }
 
-function continuationRequest(previous, body = {}, { validateMode = true } = {}) {
+function continuationRequest(previous, body = {}, { validateMode = true, existingRequest = null } = {}) {
   if (previous?.runKind !== 'external-research') throw new Error('previousRunId is not an external research run');
   if (previous.status !== 'completed' || previous.resultComplete !== true) {
     throw new Error('previous external research result is not complete');
@@ -103,7 +103,14 @@ function continuationRequest(previous, body = {}, { validateMode = true } = {}) 
   }
   const nextOptions = body.options && typeof body.options === 'object' && !Array.isArray(body.options)
     ? { ...(previousIntent.options || {}), ...body.options }
-    : previousIntent.options;
+    : { ...(previousIntent.options || {}) };
+  const operationOptions = ['readOnlyImport', 'composeOnly', 'importWaitForFinal', 'importTimeoutMs', 'importIncludeActivity'];
+  // A follow-up is an author operation, even when the previous result arrived
+  // through a read-only import. Only presentation/model preferences inherit.
+  // Preserve normalization of already frozen legacy operations for SAME-ID
+  // replay: never silently rewrite an accepted observer into a new Send.
+  const legacyReplay = existingRequest && operationOptions.some(key => Object.hasOwn(existingRequest.options || {}, key));
+  if (!legacyReplay) for (const key of operationOptions) delete nextOptions[key];
   return normalizeExternalResearchRequest({
     provider: previousIntent.provider || previous.externalResearchProvider,
     prompt: body.prompt ?? body.text,

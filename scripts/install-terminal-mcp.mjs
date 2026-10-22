@@ -13,7 +13,7 @@ const REQUIRED_ENV_VARS = [
   'NOTED_DISCOVERY_DIR',
   'NOTED_MCP_INSTANCE_ROUTE',
 ];
-const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
+const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs', 'working-directory-operation.mjs'];
 
 function quoteToml(value) {
   return JSON.stringify(String(value));

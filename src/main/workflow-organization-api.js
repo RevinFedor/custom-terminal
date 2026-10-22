@@ -15,10 +15,11 @@ const { WorkflowDrag } = require('./workflow-drag');
 const { projectWorkflowCatalog } = require('../shared/workflow-catalog-projection.cjs');
 const {WorkflowNativeDrag}=require('./workflow-native-drag');
 const { createWorkflowDirectoryApi } = require('./workflow-directory-api');
+const { projectWorkflowWindowLayout } = require('../shared/workflow-window-presentation.cjs');
 
 /** One Main publication serves the renderer, automation and external readers. */
 function createWorkflowOrganizationApi({ database, publish = () => {}, validateDirectory = cwd => fs.statSync(cwd).isDirectory(),captureExecution,
-  readDirectoryRuntime, readDirectoryCards, directoryOptions = {} }) {
+  readDirectoryRuntime, readDirectoryCards, readDirectoryPublication, directoryOptions = {} }) {
   let migrationSource = null;
   const roots = new WorkflowRootRegistry(database);
   const groups = new WorkflowGroups({database});
@@ -143,7 +144,15 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
           WHERE a.key='workspace-session' ORDER BY CAST(j.key AS INTEGER)`).all().map(row => row.projectId);
         const legacyNamespaces = legacyNamespaceIds();
         const namespaceOrder = [...savedOrder, ...namespaceIds(snapshot.tabs, legacyNamespaces)];
-        return projectWorkflowCatalog({ snapshot, namespaceOrder, legacyNamespaces, directory: true });
+        const core = projectWorkflowCatalog({ snapshot, namespaceOrder, legacyNamespaces, directory: true });
+        // Read the last durable layout from the same SQL capture as membership.
+        // workspace-session supplies only hydration order; no renderer overlay.
+        const windowLayout = projectWorkflowWindowLayout({ snapshot, core });
+        // Capture the optional Main wake receipt inside THIS synchronous SQL
+        // read, not when an awaited/held response is eventually returned.
+        const workflowPublication = typeof readDirectoryPublication === 'function'
+          ? readDirectoryPublication(snapshot.publication) : null;
+        return { ...core, windowLayout, ...(workflowPublication ? { workflowPublication } : {}) };
       })); } catch (error) { reject(error); }
       finally { end(); if (directoryFlight === flight) directoryFlight = null; }
     }));

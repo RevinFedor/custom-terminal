@@ -1,4 +1,5 @@
 import { captureSpaceLayout } from './workspaceSpacesModel.mjs';
+import {readPaneStripReleasedPairs} from './paneStripReleasePair.mjs';
 
 // What "the saved session" IS — one definition, used by BOTH ways it is written.
 //
@@ -76,6 +77,7 @@ export function buildSessionSnapshot(state) {
     tabLastWorkflowIds: state.tabLastWorkflowIds || {},
     runAfterWorkflowScopeVersions:state.runAfterWorkflowScopeVersions || {},
     workflowSidebarState:state.workflowSidebarState || {},
+    paneStripReleasedPairs:readPaneStripReleasedPairs(state.paneStripReleasedPairs),
     ...(state.organizationReady ? {organizationVersion:1,organizationRevision:state.organizationRevision,
       organizationGeneration:state.organizationGeneration} : {}),
   };
@@ -107,4 +109,5 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'tabLastWorkflowIds',
   'runAfterWorkflowScopeVersions',
   'workflowSidebarState',
+  'paneStripReleasedPairs',
 ]);

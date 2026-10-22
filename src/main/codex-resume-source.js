@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const { performance } = require('node:perf_hooks');
 const { createCodexSourceSettingsReducer } = require('./codex-source-settings');
+const { readCodexResumeLaunchWindow } = require('./codex-resume-launch-source');
 const { codexUserMessageAuditText, codexUserMessagePresentationText,
   isCodexEnvironmentContextUserText, isCodexProjectInstructionsUserText } = require('./codex-prompt-audit');
 
@@ -249,10 +250,50 @@ function createCodexResumeSourceReader({ findSessionFile, readJsonlRange,
       return { success: false, error: error?.message || String(error) };
     } finally { finish?.(); }
   }
+  async function loadForLaunch(sessionId, cwd, options) {
+    const key = JSON.stringify([sessionId, cwd || '', options.sessionsDir || '']);
+    const started = performance.now();
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const found = await findSessionFile(sessionId, cwd, options);
+        if (!found?.filePath) return await loadInner(sessionId, cwd, options);
+        const filePath = found.filePath, stat = await fs.promises.stat(filePath);
+        if (views.get(key)?.version === filePath + ':' + statKey(stat) || stat.size <= SMALL_SOURCE_BYTES) {
+          return await loadInner(sessionId, cwd, options);
+        }
+        views.delete(key);
+        stats.reads++;
+        const proof = await readCodexResumeLaunchWindow(filePath, stat, sessionId, {
+          createTimelineProjector, onBytes: bytes => { stats.bytesRead += bytes; },
+        });
+        const latest = await findSessionFile(sessionId, cwd, options);
+        if (statKey(await fs.promises.stat(filePath)) !== statKey(stat) || latest?.filePath !== filePath
+          || proof.reason === 'source-changed') continue;
+        if (!proof.matched) {
+          log.log?.('[CodexResumeSource] launch-fallback session=' + String(sessionId).slice(0, 8)
+            + ' reason=' + proof.reason + ' windowBytes=' + proof.bytesRead);
+          return await loadInner(sessionId, cwd, options);
+        }
+        const { matched, bytesRead, ...fields } = proof;
+        log.log?.('[CodexResumeSource] launch-window session=' + String(sessionId).slice(0, 8)
+          + ' bytes=' + bytesRead + ' sourceBytes=' + stat.size
+          + ' counts=unknown ms=' + (performance.now() - started).toFixed(1));
+        return { success: true, filePath, ...fields, mode: 'launch-window', sourceSnapshot: {
+          filePath, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+          fileIdentity: stat.dev + ':' + stat.ino, sessionId, linkKind: 'end',
+        } };
+      }
+      return { success: false, error: 'codex-resume-source-changed-during-read' };
+    } catch (error) {
+      views.delete(key);
+      return { success: false, error: error?.message || String(error) };
+    }
+  }
   function load(sessionId, cwd, options = {}) {
     const key = JSON.stringify([sessionId, cwd || '', options.sessionsDir || '']);
     const previous = flights.get(key) || Promise.resolve();
-    const next = previous.catch(() => {}).then(() => loadInner(sessionId, cwd, options));
+    const next = previous.catch(() => {}).then(() => options.purpose === 'launch'
+      ? loadForLaunch(sessionId, cwd, options) : loadInner(sessionId, cwd, options));
     flights.set(key, next);
     next.finally(() => { if (flights.get(key) === next) flights.delete(key); }).catch(() => {});
     return next;

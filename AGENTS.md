@@ -96,6 +96,10 @@
 ## Обзор
 Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Claude Code — PTY + Agent SDK, Codex CLI) и организацией вкладок в workflow. Единый Terminal MCP управляет полноценными вкладками и даёт cross-session доступ к истории Claude/Codex поверх тех же JSONL-парсеров, что Timeline.
 
+Configured Codex History reader в SOURCE изолирован Electron utilityProcess;
+его demand cancellation и byte-credit wire не заменяют Main-owned PTY/writers
+и не являются пределом всей памяти canonical graph, Main SQLite или клиентов.
+
 Persistent Browser maintenance hold не обходится restart/spawn нового child.
 SOURCE host protocol сохраняет exact generation/child/helper receipt; parent/child
 связаны canonical ingress path, directory pin и digest независимо от child HOME.
@@ -162,6 +166,20 @@ Cmd+click в оконной полосе меняет локальное выд�
 через переносы; middle-click остаётся снятием placement. Цветные strip-группы
 не являются sidebar/global groups: CREATE собирает выбранные рядом у первого
 участника вместе с цветом в одном organization CAS, recolor порядок не меняет.
+Обычный drop внутрь одной непрерывной strip-группы присоединяет только moving
+roots; drop наружу исключает только их, без захвата промежуточных вкладок.
+Release синхронно задаёт следующую local пару order+membership до async ACK;
+Main повторно проверяет basis/owner/activity и сохраняет пару атомарно. Поздняя
+публикация не смешивает старый состав с новым порядком; UNKNOWN восстанавливается
+тем же request/key. Internal drag раскрытого collapsed peek сохраняет свой scope.
+Сворачивание strip-группы сохраняет её membership/placement: один representative
+и `+N`, раскрытие absolute на той же строке без копии текущей карточки/History.
+По умолчанию OPEN-fit может разово переставить только representative при нехватке места,
+через прежний exact field/order CAS; order-only preview не подтверждает membership.
+Три независимых SQLite interface prefs управляют selected-first order, close-only
+и instant badge-hover. Direction absolute-ряда не меняет durable IDs или physical
+anchor; recovery прежнего accepted arrange предшествует новому no-op. Outside-left
+очищает локальное strip selection, сохраняя captured menu и прежние batch guards.
 Новый общий Stop/Full нельзя подменять whole-workflow или global-group executor.
 Оконный multi-menu использует `workflow:selection-*` Main admission и прежний
 action journal: local lease только до admission, затем frozen targets/receipts;
@@ -212,6 +230,13 @@ settings/physical lock; renderer несёт только Main-issued scope ID. F
 proof выполняется после последнего pre-paste await. Ready не равно empty; Stop,
 смена owner/mirror и late negative после durable Enter arm не разрешают повтор Send.
 
+Desktop Codex Model/Effort/Quick различают pending intent и native input:
+ожидающий либо replaceable preparation можно заменить до первой управляющей
+записи. Optional settings-activity.replaceable — только presentation, не ready/
+writer authority. У первой записи Main сверяет exact revision/actionSequence;
+начатый picker заканчивается под прежними guards, old proof не подтверждает новый
+intent. Общая очередь, explicit Send identity/deadline и UNKNOWN не ослабляются.
+
 Принятый Codex Send получает один60s preparation scope при входе ACTIVE HEAD,
 не при enqueue; cold ограничен также original startup deadline.
 Новый warm HEAD не наследует остаток прежнего startup clock даже до его expiry;
@@ -222,6 +247,13 @@ Public startupWait не выдаёт этот ID заново для initialized
 После Goal Enter отсутствие нового committed результата через3s не является
 доказанным manual-action: тот же Send ждёт existing events в исходном scope,
 без повторного Enter/renew; новый current same-menu proof сохраняет ручной выбор.
+Source Goal UI различает незаданную/manual политику и explicit Resume/Leave:
+две доступные кнопки либо loader выбранного действия. Отсутствие результата —
+ошибка+bounded снимок, не refresh и не разрешение повтор Enter. Сохранённые
+boolean/explicit override, первоначальный Send deadline и UNKNOWN прежние.
+Exact current Goal handled + новый committed composer снимает лишь старый
+startup-no-state timeout до async process-ready commit; не выдаёт input/writer/
+choice authority и не продлевает Send. Старый owner/частичный frame не подходят.
 Поздний кадр продолжает тот же H/O/A вне PTY/settings locks. Standalone Compact сохраняет
 единственную вставку до exact-owned proof; отмена/expiry не становятся replay.
 Подробности — `fact-terminal-mcp.md::Main FIFO принятых Send` и `fact-codex.md`.
@@ -263,6 +295,8 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Desktop sidebar не дублирует непоказанного участника иерархии подписью `↳ родитель`.** Технический `contextParent` сохраняет отношения проекции/drag и не является разрешением добавить отдельную строку или ссылку. Пользовательская DnD-иерархия и происхождение MCP/Fork — разные сведения.
 - **O(n²) Restore Cascade:** При восстановлении сессии (множественное создание табов) обязательно используй флаг `isRestoring`. `createTab` не должен триггерить `set()` и `saveTabs()` внутри цикла восстановления.
 - **Async Large File I/O:** Никогда не читай большие файлы (>1MB) синхронно в main process. Для JSONL-логов Claude используй асинхронный Incremental Reader. См. [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md).
+- **Resume metadata ≠ полный пересчёт History.** Обычный Codex launch запрашивает `loadResumeSource(...,{purpose:'launch'})`: bounded header/tail с exact source/settings proof, иначе прежний streaming fallback. Не подменять неизвестный полный count нулём/суффиксом и не выдавать metadata за composer/writer-ready. Default exact reader, empty и Fork/snapshot возможности сохраняются; см. `fact-codex.md::Interrupted recovery и AutoResume`.
+- **Тяжёлая диагностика не должна ронять рабочий Noted.** Не запускай ради расследования полные History/Timeline, заведомо большие `last`, массовые `copy-range`/export и stress на гигантских пользовательских JSONL. Это относится к Terminal MCP, HTTP API, Node/JS и curl одинаково: другой вход всё равно может материализовать данные в общем Main/renderer. Сначала используй пассивные metadata, точные receipts и существующие ограниченные логи; даже маленький response window не доказывает ограниченную память серверной подготовки. Проверяй ремонт на собственных конечных synthetic fixtures в согласованной среде, production read — только в явно согласованном scope с известной стоимостью. Не воспроизводи OOM на рабочем приложении и не закрывай чужие вкладки по временному соседству со сбоем. Постоянная защита принадлежит общему backend: порционное чтение/передача, отмена работы без потребителя, admission тяжёлых reads и отдельный reader process. Лимит Codex или общий JS catch не защищает Main от native V8 fatal OOM/SIGABRT; предупреждение агентам не заменяет этот ремонт. Пользовательские History/Copy возможности при диагностике сохраняются. Дополнительно: маленькие `limit`/`maxChars` у `get_session_progress`, `list_turns`, evidence/search и `/overseer/session/*` не гарантируют маленькую подготовку — сначала может строиться полная модель turn-ов. Для гигантской живой сессии не вызывай их ради статуса, ожидания или подтверждения доставки; используй current_context/get_tab_context и точные message/run/send receipts. После `CODEX_SOURCE_READ_INVALIDATED`, UNKNOWN или потерянного ACK не запускай повтор чтения/отправки циклом; сохраняй исходный ID и передавай владельцу конкретное свидетельство. Не делай массовый History/Timeline fanout по всем вкладкам при восстановлении; предупреждение агента не выдаёт такой допуск.
 - **Пауза фоновых анимаций — только точные цели.** Не используй descendant `[style*=...]`/`[class*=...]` для поиска индикаторов внутри retained windows: изменение opacity/class владельца инвалидирует тысячи обычных узлов. Inline infinite-индикатор помечай `noted-infinite-animation` на самом animated DOM/SVG; CSS-классы перечисляй точно. Сохраняй visible-unfocused движение, hidden pause/resume и finite animationend; coverage проверяет `presentationAnimations.actual.test.mjs`. Непрерывное вращение SVG проверяй по native Layerize: даже14px SVG может перестраивать слои всех окон; HTML carrier того же glyph сохраняет feedback без этой работы, но требует проверки геометрии/фаз.
 - **Не используй `activeProjectId` для фоновых задач:** При создании суб-агентов или обновлении данных в фоне (через MCP), всегда ищи целевой проект по `tabId` в `openProjects`. `activeProjectId` отражает только то, что пользователь видит в UI в данный момент, и может не совпадать с проектом, где работает агент.
 - **Не переизобретай — переиспользуй существующий код проекта.** Перед написанием новой логики для feature, которая уже есть в проекте под другим углом (Timeline backtrace, parseTimelineEntries, paste middleware, провайдер-роутер), сначала grep'ни по domain-words и прочти найденные модули. Юзер: *«у тебя есть таймлайн, в документации полностью расписано алгоритм backtrace... ты какого хуя это не переиспользуешь»*. Документация в `docs/knowledge/` существует именно для этого — `docs_search` находит фактическое поведение существующих подсистем по симптомам. Переписывать parser/algorithm с нуля = удваивать поверхность багов и расходиться в shape данных.
@@ -355,10 +389,10 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **External Terminal API + legacy mobile-web:** `src/main/web-server.js` — активный HTTP/SSE API для native iOS Terminal Control, Inbox и внешних клиентов. Старое имя `Mobile WebServer` историческое: `mobile-web/` SPA из `mobile-web/dist/` почти не используется и правится только по явному запросу про legacy web/mobile-web/browser UI. Bearer token в `~/.noted-terminal/web-token.txt`, копируется на телефон через WebChip в StatusBar (right-click). Sibling-модули в main грузить через `path.join(srcMainDir, '<name>')`, не relative — иначе production не найдёт файл. См. [`fact-mobile-web.md`](docs/knowledge/fact-mobile-web.md). Переносимые принципы мобильного UX — [`methodology/переносимый-дизайн-mobile.md`](docs/methodology/переносимый-дизайн-mobile.md).
 - **Обновление markdown-editor:** Noted собирает `vendor/markdown-editor` через npm workspace. Изменения соседнего GT source автоматически не переносятся; host API и vendored source должны быть согласованы. После изменения редактора собирай `npm run build:markdown`; для dev отдельно проверяй старый Vite prebundle. Проверочный build использует отдельную копию source/package/output, чтобы не удалять декларации пользовательской сборки. См. [`fact-file-preview-markdown.md`](docs/knowledge/fact-file-preview-markdown.md) и [`fix-vite-prebundle-cache.md`](docs/knowledge/fix-vite-prebundle-cache.md).
 - **Быстрый codesign для persistent TCC (Accessibility / Microphone / Screen Recording):** стандартная подпись `electron-builder` намеренно отключена (`CSC_IDENTITY_AUTO_DISCOVERY=false`, `build.mac.identity=null`), потому что `@electron/osx-sign` последовательно подписывает сотни data-файлов с сетевым timestamp и добавляет минуты. Сразу после упаковки `npm run sign:local-fast` одним локальным `codesign --deep --timestamp=none` подписывает готовый bundle self-signed cert'ом «Noted Terminal Dev» и делает strict-verify; измеренная цена около 2 секунд, без notarization и hardened runtime. Нельзя убирать post-sign или менять cert на adhoc `-`: тогда TCC снова получает нестабильную identity. Cert настраивается один раз через `bash scripts/codesign/setup-dev-cert.sh` + Keychain Access → Trust → Code Signing = Always Trust. См. [`fact-codesign-tcc.md`](docs/knowledge/fact-codesign-tcc.md).
-- **`build_install_noted_terminal`:** явно передай текущие `returnToTabId` и `projectId`; Voice Record исключает инициатора, ждёт остальные активные ходы/запросы, устанавливает Noted и возвращает результат в ту же сессию — после ACK закончи ход, не отменяй штатное ожидание; при согласованной установке другим вкладкам достаточно сохранить checkpoint и освободить текущий ход, не завершать всю задачу.
+- **`build_install_noted_terminal`:** явно передай текущие `returnToTabId` и `projectId`; обычный Voice Record hook ждёт локальные ходы/input, включая исходный, и сохраняет внешнее SC ожидание; requestId и returnTo неизменны через restart. После ACK закончи ход, не отменяй штатное ожидание; Force только явным force:true для одной операции с отчётом исходному returnTo, не fallback; при согласованной установке другим вкладкам достаточно сохранить checkpoint и освободить текущий ход, не завершать всю задачу.
 - **Плановое обслуживание без research-промптов:** штатный Noted installer ведёт same-ID operational maintenance автоматически; SOURCE bootstrap передаёт тот же ID новому Main до operational restore и требует strict startup receipt, не поздний begin. Перед отдельным SC build/install используй `node scripts/research-maintenance.cjs begin <operationId>`, после проверки связи — `complete <тот-же-ID>`; FULL не отключать, UNKNOWN/Send не replay, отсутствие installed API не выдавать за quiet ACK.
 - **Research Telegram и model wake независимы:** SOURCE default-off для автоматических Research Telegram включает operational-delivery failure, browser-offline и старый backlog этих producers; ручной `notify_user` и completion bell сохраняются. Отключение Telegram не должно отключать штатное восстановление и доставку полного результата исходному агенту.
-- **Запрещён desktop reinstall изнутри Noted Terminal:** если агент работает в установленном Noted Terminal, не запускай через `exec_command` или PTY `npm run build:install`, `npm run build:i`, `bash scripts/graceful-quit.sh`, `rm -rf /Applications/Noted\ Terminal.app`, `cp -R release/mac-arm64/Noted\ Terminal.app /Applications/`, `open /Applications/Noted\ Terminal.app` и любые эквивалентные install-цепочки. Даже если команда не называется `build:install`, первый `graceful-quit` закрывает хост-приложение и обрывает текущие AI-вкладки. Для установки из AI-сессии используй только `build_install_noted_terminal` / AI-hop с `returnToTabId` и ожиданием idle; если пользователь сам запустил ручной build install, не дублируй его параллельным reinstall.
+- **Запрещён desktop reinstall изнутри Noted Terminal:** если агент работает в установленном Noted Terminal, не запускай через `exec_command` или PTY `npm run build:install`, `npm run build:i`, `npm run build:i-c`, `bash scripts/graceful-quit.sh`, `rm -rf /Applications/Noted\ Terminal.app`, `cp -R release/mac-arm64/Noted\ Terminal.app /Applications/`, `open /Applications/Noted\ Terminal.app` и любые эквивалентные install-цепочки. Даже если команда не называется `build:install`, первый `graceful-quit` закрывает хост-приложение и обрывает текущие AI-вкладки. Для установки из AI-сессии используй только `build_install_noted_terminal` / AI-hop с точным returnTo/requestId и выбранным обычным либо явно запрошенным Force режимом; если пользователь сам запустил ручной build install, не дублируй его параллельным reinstall.
 
 ## Логирование (обязательно к соблюдению)
 

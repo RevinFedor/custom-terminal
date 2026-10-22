@@ -184,7 +184,8 @@ append после eviction восстанавливает состояние и 
 Cold fallback остаётся при miss/corruption/смене схемы или источника. Его
 чтение сразу кормит оба проектора без raw-array, а первая
 классификация stubs выполняется короткими порциями до синхронной выдачи окна.
-Read/preparation перенесены в worker; configured RAM делится, не удваивается.
+Read/preparation перенесены в reader; с22.10 SOURCE configured Codex owner —
+отдельный Electron utilityProcess, configured RAM делится, не удваивается.
 Это не обещание нулевой цены обновления: запись/codec continuation и поиск
 изменённых rows остаются работой по размеру состояния. Row-write уступает worker
 между порциями внутри atomic cache transaction. Обход cold queue не прерывает
@@ -194,6 +195,12 @@ elapsed rebuild, `CodexHistoryMetadata maxSliceMs`, `HistoryPrepare elapsedMs`
 (syncMs только в прежнем синхронном пути) и
 input→paint: малиновый значок показывает работу, а не разрешение заморозить UI.
 Доказательство/ограничения — `fact-transcript-сервис.md::Ресурсная модель большой сессии`.
+
+Byte-credit/порционный HTTP codec ограничивают дополнительную память передачи,
+а last-consumer cancellation прекращает уже ненужную работу. Они не ограничивают
+сам canonical graph, pending calls, большую selected строку и массивы/строки
+renderer. Маленькое окно ответа или virtualized DOM не доказывает bounded peak;
+реальные transport/reader/caller границы разделены в `fact-transcript-сервис.md`.
 
 05.10 установленный cold-start показал границу этого reuse: общий2GiB SSD prune
 удаляет whole SQLite family вместе с continuation/payload, base/view rows и

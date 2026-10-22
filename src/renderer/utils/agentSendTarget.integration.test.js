@@ -97,6 +97,7 @@ async function harness({ toolType = 'codex', status = 'active', sessionId = 'A',
   rememberAgentLaunchFence('tab', fence);
   const context = vm.createContext({
     manualActionContract: require('../../shared/agent-manual-action.cjs'),
+    agentSendReadTiming: require('../../shared/agent-send-read-timing.cjs'),
     console: { log() {}, warn() {} }, setTimeout, clearTimeout,
     ipcRenderer, AbortController,
     ...(await import('./agentLaunchAdmission.mjs')),

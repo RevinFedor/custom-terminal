@@ -82,7 +82,7 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
     return work;
   };
   const scope = lease => {
-    const now = capture?.(lease.tabId);
+    const now = capture?.(lease.tabId, lease.purpose);
     const ownWriter = lease.resuming && lease.launchId && now?.inputOwnerLaunchId === lease.launchId
       && now.runSeq === lease.launchRunSeq;
     if (!now?.terminalToken || now.terminalToken !== lease.scope.terminalToken
@@ -91,7 +91,9 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
       || lease.launchId && (now.runSeq !== lease.launchRunSeq || now.inputOwnerLaunchId !== lease.launchId)
       || !lease.resuming && (now.runSeq !== lease.scope.runSeq
         || now.lifecycleGeneration !== lease.scope.lifecycleGeneration)
-      || !lease.launchId && now.inputRevision !== lease.scope.inputRevision) {
+      || !lease.launchId && now.inputRevision !== lease.scope.inputRevision
+      || lease.purpose === 'working-directory' && (now.nativeRewindPending
+        || now.subjectId !== lease.scope.subjectId)) {
       refuse('history_input_owner_changed');
     }
     return now;
@@ -111,21 +113,22 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
   };
   const proofOf = lease => ({ version: 1, tabId: lease.tabId, operationId: lease.operationId, token: lease.token });
   return {
-    reserve({ tabId, operationId, toolType, sessionId, owner = null }) {
+    reserve({ tabId, operationId, toolType, sessionId, owner = null, purpose = 'history' }) {
       if (!tabId || !operationId || !['claude', 'codex'].includes(toolType) || !sessionId) refuse('history_input_identity_required');
+      if (!['history', 'working-directory'].includes(purpose)) refuse('history_input_purpose_invalid');
       const old = mutations.get(tabId);
       if (old) {
-        if (old.operationId !== operationId || old.owner !== owner || old.closing) refuse('history_input_mutation_pending');
+        if (old.operationId !== operationId || old.owner !== owner || old.purpose !== purpose || old.closing) refuse('history_input_mutation_pending');
         scope(old);
         return proofOf(old);
       }
       // An executing Send or unresolved physical slot is not no-write proof.
       // Refuse BEFORE Stop, without cancelling/releasing its existing receipt.
       if (sends.has(tabId) || readSendBusy(tabId) !== false) refuse('history_input_send_pending');
-      const initial = capture?.(tabId);
+      const initial = capture?.(tabId, purpose);
       if (!initial?.terminalToken || initial.toolType !== toolType || initial.sessionId !== sessionId
         || !initial.projectId || !initial.cwd || initial.stopping) refuse('history_input_owner_changed');
-      const lease = { tabId, operationId, toolType, sessionId, owner, scope: initial,
+      const lease = { tabId, operationId, toolType, sessionId, owner, purpose, scope: initial,
         token: randomUUID(), pending: 0, closing: false };
       persist([...mutations.values(), lease]);
       mutations.set(tabId, lease); // Synchronous, durable before the first read/Stop await.
@@ -133,6 +136,8 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
       return proofOf(lease);
     },
     held: tabId => mutations.has(tabId),
+    installBlockers: () => [...new Set([...mutations.keys(), ...sends.keys()])]
+      .map(tabId => ({ tabId, kind: 'input', status: 'history-input-reservation' })),
     notify,
     read(tabId) {
       const lease = mutations.get(tabId);
@@ -164,6 +169,11 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
       const lease = match(proof);
       if (tabId !== lease.tabId || lease.closing) refuse('history_input_reservation_changed');
       scope(lease);
+      if (action === 'directory') {
+        if (toolType !== 'cwd-change' || lease.purpose !== 'working-directory'
+          || !lease.directoryWrite || lease.directoryWrite.claimed) refuse('history_input_directory_unavailable');
+        return;
+      }
       if (toolType && toolType !== lease.toolType) refuse('history_input_owner_changed');
       if (action === 'send' || action === 'resume' && sessionId !== lease.sessionId) refuse('history_input_resume_target_changed');
     },
@@ -173,6 +183,46 @@ function createHistoryMutationInputGate({ capture, readSendBusy = () => false, w
       // Called only inside the existing successful binding CAS callback.
       lease.sessionId = sessionId || null;
       scope(lease);
+    },
+    beginDirectoryWrite(proof, { operationId, targetCwd } = {}) {
+      const lease = match(proof);
+      if (lease.closing || lease.resuming || lease.purpose !== 'working-directory'
+        || lease.directoryWrite || !operationId || typeof targetCwd !== 'string' || !targetCwd.startsWith('/')) {
+        refuse('history_input_directory_unavailable');
+      }
+      const before = scope(lease);
+      if (before.isRunning !== false || before.processLookupUnknown === true || before.stopping) {
+        refuse('history_input_directory_shell_unproven');
+      }
+      lease.directoryWrite = { operationId, targetCwd, before, claimed: false };
+    },
+    claimDirectoryWrite(proof, operationId) {
+      const lease = match(proof);
+      if (lease.closing || lease.purpose !== 'working-directory' || !lease.directoryWrite
+        || lease.directoryWrite.operationId !== operationId || lease.directoryWrite.claimed) {
+        refuse('history_input_directory_unavailable');
+      }
+      scope(lease);
+      lease.directoryWrite.claimed = true; // Immediately before the one shell write, never a Resume claim.
+    },
+    commitDirectoryWrite(proof, result) {
+      const lease = match(proof), write = lease.directoryWrite;
+      const now = capture?.(lease.tabId, lease.purpose), before = write?.before;
+      if (lease.closing || lease.purpose !== 'working-directory' || !write?.claimed
+        || result?.success !== true || result.accepted !== true || result.persisted !== true
+        || result.proof !== 'live-process-osc7' || result.operationId !== write.operationId
+        || result.cwd !== write.targetCwd || !before || !now?.terminalToken
+        || now.terminalToken !== before.terminalToken || now.projectId !== before.projectId
+        || now.subjectId !== before.subjectId || now.toolType !== lease.toolType
+        || now.sessionId !== lease.sessionId || now.cwd !== write.targetCwd
+        || now.inputRevision !== before.inputRevision || now.runSeq !== before.runSeq + 1
+        || now.isRunning !== false || now.processLookupUnknown === true || now.stopping) {
+        refuse('history_input_directory_checkpoint_changed');
+      }
+      // ONLY the exact persisted OSC7 result of our one claimed cd can advance
+      // cwd/run. No release/reserve gap, inherited token or generic SID rebase.
+      lease.scope = now;
+      lease.directoryWrite = null;
     },
     authorizeResume(proof, request = {}) {
       if (!proof) return;

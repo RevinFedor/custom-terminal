@@ -3,6 +3,9 @@ import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {prunePaneStripSelection,selectPaneStripTab,paneStripSelectionEntries} from '../../utils/paneStripSelectionModel.mjs';
 import type {StripEntry} from './PaneTabStrip';
 import {readPaneStripOwnerEntries,capturePaneStripGroupDrag} from '../../utils/paneStripGroupsModel.mjs';
+import {registerPaneStripOutsideSelection} from '../../utils/paneStripOutsideSelection.mjs';
+import {getPaneTabDragSnapshot,subscribePaneTabDrag} from '../../utils/paneTabDragBridge';
+import {getPaneTabPointerSnapshot,subscribePaneTabPointer} from '../../utils/paneTabPointerBridge';
 
 export type PaneStripSelectionLease={
   version:1;workflowId:string;windowId:string|null;paneIndex:number|null;
@@ -12,15 +15,15 @@ type Controller={
   selected:(tabId:string)=>boolean;
   click:(tabId:string,event:{metaKey?:boolean;shiftKey?:boolean})=>boolean;
   dragEntries:(tabId:string)=>StripEntry[];
-  captureGroupDrag:(tabId:string)=>ReturnType<typeof capturePaneStripGroupDrag>|undefined;
+  captureGroupDrag:(tabId:string,options?:{internalScope?:boolean})=>ReturnType<typeof capturePaneStripGroupDrag>|undefined;
   menu:(tabId:string)=>PaneStripSelectionLease|null;
 };
 export const PaneStripSelectionContext=createContext<Controller|null>(null);
 export const usePaneStripSelection=()=>useContext(PaneStripSelectionContext);
 
 /** Local to a retained window. No whole-catalog subscription or sidebar write. */
-export function usePaneStripSelectionController({workflowId,windowId,paneIndex,entries,presented=true}: {
-  workflowId:string;windowId:string|null;paneIndex:number|null;entries:StripEntry[];presented?:boolean;
+export function usePaneStripSelectionController({workflowId,windowId,paneIndex,entries,presented=true,rootRef}: {
+  workflowId:string;windowId:string|null;paneIndex:number|null;entries:StripEntry[];presented?:boolean;rootRef?:React.RefObject<HTMLElement|null>;
 }):Controller {
   const ownerKey=JSON.stringify([workflowId,windowId ?? paneIndex]);
   const orderKey=entries.map(e=>JSON.stringify([e.projectId,e.tabId])).join('|');
@@ -36,6 +39,15 @@ export function usePaneStripSelectionController({workflowId,windowId,paneIndex,e
   }
   useEffect(()=>{setSelection(prior=>({ownerKey,...prunePaneStripSelection(prior.ownerKey===ownerKey?prior:null,entries)}));},[ownerKey,orderKey]);
   useEffect(()=>()=>{latest.current.generation++;},[]);
+  const hasSelection=latest.current.selection.tabIds.length>0;
+  useEffect(()=>{
+    if(!hasSelection)return;
+    return registerPaneStripOutsideSelection({target:window,ownerKey,containsChip:chip=>!!rootRef?.current?.contains(chip),
+      isDragging:()=>getPaneTabDragSnapshot().active||getPaneTabPointerSnapshot().active,
+      subscribeDrag:listener=>{const pane=subscribePaneTabDrag(listener),reserve=subscribePaneTabPointer(listener);return()=>{pane();reserve();};},
+      clear:()=>{if(!latest.current.selection.tabIds.length)return;latest.current.selection={tabIds:[],anchor:null};latest.current.generation++;
+        setSelection({ownerKey:latest.current.ownerKey,tabIds:[],anchor:null});}});
+  },[ownerKey,hasSelection,rootRef]);
   return useMemo(()=>({
     selected:(id:string)=>latest.current.selection.tabIds.includes(id),
     click:(id:string,event:{metaKey?:boolean;shiftKey?:boolean})=>{
@@ -44,9 +56,10 @@ export function usePaneStripSelectionController({workflowId,windowId,paneIndex,e
       setSelection({ownerKey,...value.selection});return !value.activate;
     },
     dragEntries:(id:string)=>paneStripSelectionEntries(latest.current.selection,latest.current.entries,id),
-    captureGroupDrag:(id:string)=>{
+    captureGroupDrag:(id:string,options?:{internalScope?:boolean})=>{
       const captured=capturePaneStripGroupDrag({getState:useWorkspaceStore.getState,owner:{workflowId,windowId,paneIndex},
-        sourceIds:paneStripSelectionEntries(latest.current.selection,latest.current.entries,id).map(entry=>entry.tabId)});
+        sourceIds:paneStripSelectionEntries(latest.current.selection,latest.current.entries,id).map(entry=>entry.tabId),
+        internalScope:options?.internalScope===true});
       return captured;
     },
     menu:(id:string)=>{

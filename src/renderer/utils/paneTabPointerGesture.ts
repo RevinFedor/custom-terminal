@@ -55,7 +55,8 @@ function finish(cancelled: boolean, reason: string) {
       if(drag.source.workflowDrag) {
         const claimed=claimPaneTabDragDrop(drag.source.rootTabId);
         const request=claimed && workflowDragRequest(drag.source.workflowDrag,{workflowId:target.spaceId || useWorkspaceStore.getState().activeSpaceId,target});
-        if(request)void useWorkspaceStore.getState().commitWorkflowDrag(request,{isSourceCurrent:()=>paneTabGroupDragIsCurrent(drag.source)}).then(accepted=>
+        if(request && claimed)void useWorkspaceStore.getState().commitWorkflowDrag(request,{isSourceCurrent:()=>paneTabGroupDragIsCurrent(drag.source,request),
+          isRevealCurrent:claimed.isRevealCurrent}).then(accepted=>
           console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed='+Number(accepted)));
       } else result=commitPaintedPaneTabDrop(drag.source.rootTabId);
     }
@@ -115,7 +116,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
     const projectId = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]')?.dataset.projectId;
     if (workflowId || projectId) {
       setPaneTabDragTarget(null);
-      if(drag.source.groupDrag?.boundary.kind==='group') {
+      if(drag.source.groupDrag?.internalScope) {
         clearTabDragNavigationTarget('pane');return;
       }
       setTabDragNavigationTarget('pane', {

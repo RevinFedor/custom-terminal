@@ -1,5 +1,5 @@
 import React from 'react';
-import { RefreshCw, X } from 'lucide-react';
+import { RefreshCw, Loader2, X } from 'lucide-react';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 
 // Controls share the caption's baseline and colour, without nested warning
@@ -13,25 +13,24 @@ export default function AgentLifecycleActions({ lifecycle }: { lifecycle: AgentL
     cursor: 'pointer', pointerEvents: 'auto',
   };
   return <>
-    {lifecycle.goalActions && (['resume', 'leave-paused'] as const).map(action => {
+    {lifecycle.goalActions && (lifecycle.goalActions.pendingAction || lifecycle.goalActions.availableActions.length > 0)
+      && (['resume', 'leave-paused'] as const).map(action => {
       const goal = lifecycle.goalActions!;
       const allowed = !!goal.onChoose && goal.availableActions.includes(action);
-      const label = action === 'resume' ? 'Resume Goal' : 'Leave paused';
+      const pending = goal.pendingAction === action;
+      const label = pending ? action === 'resume' ? 'Resuming goal…' : 'Leaving paused…'
+        : action === 'resume' ? 'Resume Goal' : 'Leave paused';
       return <button key={action} type="button" data-codex-goal-action={action}
-        disabled={!allowed} aria-label={label}
-        title={allowed ? label : 'Main пока не разрешает этот выбор'}
+        disabled={!allowed} aria-label={label} aria-busy={pending || undefined}
+        title={pending ? label : allowed ? label : 'Выполняется выбранное действие'}
         style={{ ...style, width: 'auto', padding: '0 3px', lineHeight: 'inherit',
-          font: 'inherit', whiteSpace: 'nowrap', opacity: allowed ? 1 : 0.5,
+          font: 'inherit', gap: 3, whiteSpace: 'nowrap', opacity: allowed || pending ? 1 : 0.5,
           cursor: allowed ? 'pointer' : 'default' }}
         onMouseDown={event => { event.preventDefault(); event.stopPropagation(); }}
         onClick={event => { event.preventDefault(); event.stopPropagation(); if (allowed) goal.onChoose?.(action); }}
-      >{label}</button>;
+      >{label}{pending && <span data-codex-goal-progress className="noted-infinite-animation animate-spin"
+        style={{ display: 'inline-flex' }}><Loader2 size={12} aria-hidden /></span>}</button>;
     })}
-    {lifecycle.goalActions?.onRefresh && <button type="button" data-codex-goal-read
-      aria-label="Проверить статус Goal" title="Проверить статус Goal" style={style}
-      onMouseDown={event => { event.preventDefault(); event.stopPropagation(); }}
-      onClick={event => { event.preventDefault(); event.stopPropagation(); lifecycle.goalActions?.onRefresh?.(); }}
-    ><RefreshCw size={12} aria-hidden style={{ display: 'block' }} /></button>}
     {lifecycle.kind === 'error' && lifecycle.onRetry && <button
       type="button" data-agent-lifecycle-retry
       aria-label={lifecycle.retryLabel || 'Retry settings'}

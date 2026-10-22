@@ -422,6 +422,7 @@ export function TabStatusMarkerButton({
         <div
           ref={menuRef}
           data-tab-status-marker-menu
+          data-tab-menu-owner-id={tabId}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
           style={{

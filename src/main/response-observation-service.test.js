@@ -476,7 +476,9 @@ test('a read failure or a missing registry never deletes saved SQLite evidence',
       subscribe: () => { throw Error('No subscription from an unknown catalog'); }, unsubscribe: async () => {},
       onChanged: () => {}, onSettled: () => {}, log: { log() {}, warn() {} },
     });
-    if (file === brokenFile) await assert.rejects(service.restore(), { code: 'response_observation_registry_unavailable' });
+    // The strict authoritative RunStore reader now rejects before the legacy
+    // activityReadError wrapper. Evidence preservation below is still required.
+    if (file === brokenFile) await assert.rejects(service.restore(), { code: 'orchestration_store_unavailable' });
     else await service.restore();
     assert.equal(h.evidence.readSelected('saved-old-run').result.assistantText, 'PRESERVE');
     await service.dispose(); await store.flush();

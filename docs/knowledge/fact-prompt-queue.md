@@ -823,6 +823,19 @@ intent, не переписывает его новыми подсказками
 
 В UI Loop — вторая border-mounted split-кнопка рядом с Post. На счётчике панели Post сохраняет маленькую оранжевую точку, а Loop с09.10 SOURCE отмечается статичным фиолетовым SVG `RefreshCw`8px справа внизу, не spinner. При Loop число поднято на3px внутри прежней кнопки26×26: даже `99` не пересекается с иконкой; Post+Loop видны вместе. Это только индикация toggle, не доказательство отправки или busy. Глобальная политика остаётся заметной без отдельной полноразмерной строки.
 
+Уточнение Fedor21Oct для SOURCE-кандидата: split имеет три части — слева `GitBranch`
+включает Loop после собственного ответа при внешнем MCP/Research ожидании, середина
+`Loop` включает обычное ожидание завершения всей связанной работы, справа карандаш
+редактирует общий текст. Это взаимоисключающие режимы одного Loop. Обычный — default,
+в том числе для старой сохранённой настройки; внешнее ожидание требует явного выбора
+слева. Повтор выбранной части выключает Loop, другая часть переключает режим с новым
+arm, отзывающим прежнюю ещё не отправленную подготовку. ON и выбор переживают restart.
+Новый режим использует отдельный `await_dependencies`; обычный не зависит от его
+журнала. Ни один режим не снимает input/FIFO/UNKNOWN, Goal или install hold.
+Граница SOURCE/private и оставшиеся проверки внешнего ожидания — в
+[рабочем плане](../tmp/loop-ожидание-mcp-план-20261021.md); installed приёмка этим
+описанием не заявляется.
+
 Обычный успешный конец хода не означает, что задача готова: пока Loop включён, он отправляет следующую проверку. Ручной interrupt не является таким концом и не меняет toggle: после продолжения Loop снова сработает на следующем natural completion. Неизменяемый app-owned протокол добавляется даже к пользовательскому Loop-тексту: готовая задача вызывает self-only `complete_task` (completed по умолчанию); внешняя блокировка — тот же метод со `status:"blocked"` и обязательной конкретной `reason`. Агент должен в финале назвать невыполненный остаток и нужное внешнее действие. Самостоятельно исправимая ошибка и ожидание уже запущенной операции/дочернего run не являются blocked. Готовность и прогресс не угадываются по словам ответа, таймеру или отсутствию правок файлов: read-only проверка тоже может быть настоящей работой.
 
 `complete_task` регистрирует намерение только для точного текущего busy-turn, который доказан одновременно app-owned источником `prompt-loop` и принятым provider user-prompt с `terminal_task_completion_protocol`. Само наличие инструмента, глобальная инструкция, обычный запрос при включённом toggle или текст из старой истории права не дают; backend отвечает `completion_protocol_not_active`. Идентичный повтор идемпотентен; смена исхода/причины уже принятого intent конфликтует. Активные исходящие Terminal MCP-run блокируют оба исхода, interrupt/ошибка/manual stop/выход процесса отменяют намерение. Только авторитетный natural final того же хода публикует `explicitTaskComplete` либо отдельный `explicitTaskBlocked` с причиной. Runner выключает Loop до остальных продолжений, blocked объясняется toast и финальным ответом, но не получает completed-флаг. Обычные queued prompts/autoRun, runtime success-allowlist и результаты orchestration этим сигналом не меняются. Старый intent не переносится на новый ход. После устранения внешней блокировки пользователь осознанно включает Loop снова; unlock сам не армит его.
@@ -846,6 +859,33 @@ History-бабл и Timeline-preview такой tagged записи по уто�
 raw body/Copy/audit/identity остаются прежними. Loop сохраняет user carrier и
 не превращается в Terminal MCP. Доказанный native ответ на вопрос имеет более
 точное синее оформление; новый toggle не перекрашивает старую историю.
+
+### Build Install удерживает текущую Loop-итерацию (SOURCE20.10)
+
+До передачи job Voice Record Main сохраняет install continuation в app_state,
+привязанную к requestId и исходным tab/provider/session. Loop остаётся ON, queue и
+`autoRun` сохраняются. ACK installer, конец исходного хода, shutdown и callback
+receipt сами по себе не разрешают следующую проверку. После restart Main сначала
+восстанавливает эту границу, затем сверяет frozen callback с native send receipt
+и реальным результатом именно его user UUID/сессии через прежний result reader.
+Только natural final этого продолжения возвращается обычному runner один раз.
+
+Release не синтезирует completion: renderer применяет обе границы Loop/workflow,
+не расходует отложенный старый outcome до решения gate и сохраняет Manual Stop,
+Pause, Goal/`complete_task`, owner и UNKNOWN guards. Подтверждённый отказ/отмена без
+callback закрывает install hold с новой нижней границей; старый final не оживает,
+но последующий настоящий ход может снова запустить включённый Loop. Потерянный,
+дублированный или чужой callback не даёт второго prompt. Install inherited loader
+остаётся видимой работой; он не подменяет own runtime busy и не блокирует собственный
+installer через отдельный `/api/install-eligibility`. Подробности —
+`fact-build-when-idle.md::AI-hop изнутри Noted Terminal`.
+
+Post-live20.10: если приложение добавило working context, callback logical hash
+и native transport audit hash различаются. Install hold связывает их через
+app-owned preparation/immutable request/exact attempt, а не выключает hashes или
+context. Только exact natural result снимает hold; binding сохраняется до final
+и переживает restart. Исторический callback receipt не переписывается новой
+краткой формой отчёта. Подробности — `fact-build-when-idle.md::AI-hop`.
 
 ## First-chip armed hint: красный blink + приглушённый pending-state
 

@@ -1,6 +1,8 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { collectTabLinkedFileTree } from './tabLinkedFiles.mjs';
 
 const path = window.require('path');
+const MAX_LINKED_FILES_PER_AI = 10;
 
 export type LinkFileTabResult = {
   projectId: string;
@@ -42,10 +44,21 @@ export async function linkFileTab(filePath: string, targetTabId: string): Promis
   }
   if (targetTab.aiClosing) throw new Error('target tab is closing');
 
+  let publicationError = 'target tab changed before file link committed';
   const canPublish = () => {
-    const current = useWorkspaceStore.getState().openProjects.get(targetProjectId!);
+    publicationError = 'target tab changed before file link committed';
+    const openProjects = useWorkspaceStore.getState().openProjects;
+    const current = openProjects.get(targetProjectId!);
     const owner = current?.tabs.get(targetTabId);
-    return current === targetWorkspace && isAiSessionTab(owner) && !owner?.aiClosing;
+    if (current !== targetWorkspace || !isAiSessionTab(owner) || owner?.aiClosing) return false;
+    // Count the current file-only family, including nested files, but stop at
+    // independent AI children. The creation queue repeats this before persist
+    // and publish, so concurrent links cannot both take the last free place.
+    if (collectTabLinkedFileTree(openProjects, targetTabId).length >= MAX_LINKED_FILES_PER_AI) {
+      publicationError = `You can link up to ${MAX_LINKED_FILES_PER_AI} files to an AI tab. Unlink a file before adding another (the file stays on disk).`;
+      return false;
+    }
+    return true;
   };
 
   for (const tab of targetWorkspace.tabs.values()) {
@@ -59,6 +72,9 @@ export async function linkFileTab(filePath: string, targetTabId: string): Promis
       reused: true,
     };
   }
+
+  // Existing exact links above remain reusable even for an over-limit owner.
+  if (!canPublish()) throw new Error(publicationError);
 
   const fileTabId = await state.createTabAfterCurrent(
     targetProjectId,
@@ -76,7 +92,7 @@ export async function linkFileTab(filePath: string, targetTabId: string): Promis
       canPublish,
     },
   );
-  if (!fileTabId) throw new Error('target tab changed before file link committed');
+  if (!fileTabId) throw new Error(publicationError);
 
   return {
     projectId: targetProjectId,

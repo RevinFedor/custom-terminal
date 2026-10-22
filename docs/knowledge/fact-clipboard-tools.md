@@ -120,7 +120,15 @@ Popup рендерит один provider-neutral `CopySessionFilterPanel`: trans
 
 Codex Copy Session строится из rollout JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), а не из Claude backtrace. User turns берутся из `event_msg.user_message`, ответы — из `response_item.message`, thinking — из `response_item.reasoning`, compact — из top-level `type: "compacted"`. `thread_rolled_back` удаляет последние turns из уже собранного export'а, потому что Codex rollback физически оставляет старые записи в файле.
 
-Служебные `role=user` carriers не становятся USER-блоками clean copy: целый `environment_context`, автоматически приложенные `# AGENTS.md/CLAUDE.md instructions for …` и subagent notifications отбрасываются. В History AGENTS/CLAUDE instructions могут оставаться отдельным открываемым chip — это другая presentation-задача. Если Timeline сохраняет такой chip как адресуемый turn, clean projector обязан увеличить структурный `turnIndex`, не добавляя текста: удаление одновременно текста **и координаты** сдвигает все следующие selected turns, а последняя точка даёт `Selected range has no copyable content`.
+Служебные `role=user` carriers не становятся USER-блоками clean copy: целый `environment_context`, автоматически приложенные `# AGENTS.md/CLAUDE.md instructions for …`, `turn_aborted` и subagent notifications не создают пользовательский ход. В History AGENTS/CLAUDE instructions и прерывание могут оставаться отдельными служебными строками — это другая presentation-задача. Чистая копия использует тот же canonical presentation text при объединении response/event carriers, включая provider image markup; после adoption точный event UUID должен обновиться в реально сохранённой export-записи, а не только в её временной копии.
+
+### Выбранная точка не равна номеру в другом массиве
+
+Шрам21.10: файл копии имел правильный SID вкладки4929 и четыре USER-блока, но они были на16 позиций раньше выбранных, последний ответ отсутствовал. Timeline и clean export независимо считали turns; служебный `turn_aborted` в одном счётчике становился новым user, а в другом пропускался. Поэтому равные `turnIndex` не доказывают принадлежность ответа выбранной точке. Диапазон сначала связывает каждый выбранный canonical UUID с его user/Goal owner в clean projection и только затем берёт ответы/действия по локальному turn этого owner. Не найденный или неоднозначный UUID даёт явный отказ, не fallback на совпавший номер. Тот же join используется для `assistantOnly`/контекста отдельной итерации.
+
+Фильтр User OFF применяется после carrier adoption/rollback: пользовательский ход без ответа всё ещё обязан существовать структурно, иначе rollback удалит предыдущий ответ. Compact отбирается отдельно по собственному UUID, а не по turn-счётчику: single compact не прихватывает текст соседнего хода. Одинаковые prompts остаются разными UUID; смена направления диапазона не меняет состав. Это исправление чтения/форматирования, не запись rollout, receipt, lifecycle или буфера обмена из теста.
+
+Конкретный сдвиг файла и наличие полного последнего ответа подтверждены раздельными Application API reads. Локальные регрессии воспроизводят дефект на заданных carriers; восстановленная текстовая копия через API не заменяет raw-rollout replay, installed Copy или E2E. Новый crash/OOM не является доказанным следствием этого index bug.
 
 Codex compact — структурная Timeline-точка и остаётся выбираемой в single/range действиях, но encrypted body никогда не является копируемым текстом. Любой clean/range/single export пишет ровно одну строку: `Context compacted (encrypted)`. Если есть authoritative postTokens — добавляется размер результата; если известны одновременно pre и post — строка показывает `664k → 11k tokens, −653k (encrypted)`. Один preTokens без post не выдаётся за размер результата. `replacement_history`, retained user messages и `[encrypted compaction state]` не разворачиваются ни при каком виде Copy.
 
@@ -135,7 +143,7 @@ Codex raw names не образуют собственную taxonomy. `apply_pa
 ## Unified Formatting (main.js)
 Для обеспечения консистентности действий Claude и Codex используют `copy-action-format.js`; transport normalization остаётся у provider parser, а family/headline берутся из shared History grammar.
 - **Claude Range Copy:** При двойном клике в Timeline система теперь не просто копирует префикс, а выполняет полноценный Backtrace для поиска `tool_result` и вставляет полное содержание файлов/диффов, если это включено в глобальных настройках.
-- **Codex Range Copy:** тот же жест в Timeline открывает popup с `Копировать`, но backend идёт через `codex:copy-range` и режет уже собранный Codex timeline по выбранным `turnIndex` / compact UUID.
+- **Codex Range Copy:** тот же жест в Timeline открывает popup с `Копировать`; `codex:copy-range` связывает выбранные user/Goal UUID с clean projection, compact отбирает по собственному UUID. Составной transcript сохраняет прежние `entryRef`/revision guards перед этим formatter.
 - **Actions Block:** Форматирование списка действий (`**Actions:**`) унифицировано для всех видов экспорта.
 
 ## Quick filters в `Copy Settings`

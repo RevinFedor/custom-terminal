@@ -25,7 +25,7 @@ const component=name=>props=>React.createElement('test-'+name,null,props.childre
 
 function fixture({kind='empty',focused=true,area='terminal',side=false,hidden=false}={}) {
   const calls=[],slots=[];let cursor=0,tree;
-  const state={activeSpaceId:'W',activeProjectId:'P',spaces:[{id:'W',name:'Here'},{id:'OTHER',name:'Other'}],
+  const state={view:'workspace',activeSpaceId:'W',activeProjectId:'P',spaces:[{id:'W',name:'Here'},{id:'OTHER',name:'Other'}],
     openProjects:new Map([['P',{tabs:new Map([['AI',{id:'AI',commandType:'codex'}],['FILE',{id:'FILE',tabType:'file'}]])}]]),
     splitPanes:[],centerStrips:{},
     closeWindowPane:index=>calls.push(['close-window',index]),closeTab:(...args)=>calls.push(['close-tab',...args]),
@@ -98,10 +98,13 @@ test('actual empty/file/AI/chooser header has no vacancy label or X; action layo
     for(const kind of ['empty','file','ai','chooser','ai','empty'])for(const side of [false,true])for(const area of ['terminal','sidebar'])for(const focused of [false,true]){
       f.setKind(kind);f.ui.sideTerminalOpenTabs.AI=side;f.ui.activeArea=area;f.props.focused=focused;f.render();
       const html=f.html();assert.ok(!html.includes('Нет вкладки'));assert.equal(f.by('data-vacant-pane-close').length,0);
-      assert.equal(f.by('data-split-strip-menu-button').length,1);assert.equal(f.by('data-split-pane-terminal-slot').length,1);
+      assert.equal(f.by('data-split-strip-menu-button').length,1);assert.equal(f.by('data-split-pane-terminal-slot').length,0);
+      assert.equal(f.by('data-terminal-full-view-open').length,0,'terminal action must not reserve any header slot');
       baseline??=actionLayout(f);assert.deepEqual(actionLayout(f),baseline);
-      const focus=f.by('data-split-pane-focus-actions')[0];assert.equal(focus.props.inert,!focused||area==='sidebar');
+      assert.equal(f.by('data-split-pane-focus-actions').length,0,'there must be no hidden header action reservation');
+      const split=f.by('data-split-button')[0];assert.ok(split);assert.notEqual(split.props.style.visibility,'hidden');
       const frame=f.by('data-split-attach-row')[0].props.style;assert.ok(frame.minHeight>0);assert.equal(frame.height,undefined);
+      assert.equal(frame.padding,'2px 8px 0','first-row group stroke must clear the pane focus frame');
     }
   }
 });
@@ -134,13 +137,44 @@ test('legacy id-less vacancy closes only while the exact pane object remains cur
   }
 });
 
-test('terminal slot reserves width but cannot activate an absent control; valid AI keeps its existing executor',()=>{
+test('terminal full view exists only in the ellipsis menu and keeps its existing executor',()=>{
   for(const kind of ['empty','file','ai'])for(const side of [false,true]){
-    const f=fixture({kind,side}),button=f.by('data-split-pane-terminal-slot')[0];
+    const f=fixture({kind,side});
+    assert.equal(f.by('data-split-pane-terminal-slot').length,0);
+    assert.equal(f.by('data-split-strip-menu-item','terminal-full-view').length,0);
+    f.openMenu();const button=f.by('data-split-strip-menu-item','terminal-full-view')[0];
     const available=kind==='ai'&&side;
-    assert.equal(button.props.disabled,!available);assert.equal(button.props.style.width,22);
-    f.click('data-split-pane-terminal-slot');
+    assert.equal(button.props.disabled,!available);
+    assert.equal(button.props['data-terminal-full-view-open'],available?'AI':undefined);
+    f.click('data-split-strip-menu-item','terminal-full-view');
     assert.deepEqual(f.calls,available?[['activate','P','AI'],['full-view','AI']]:[]);
+    assert.equal(f.by('data-split-strip-menu').length,available?0:1);
+  }
+});
+
+test('stale terminal menu cannot focus a changed workflow, window, tab or side-terminal state',()=>{
+  for(const change of ['workflow','replacement','shown-tab','side-closed','primary','tab-removed','dashboard']){
+    const f=fixture({kind:'ai',side:true});f.openMenu();
+    const action=f.by('data-split-strip-menu-item','terminal-full-view')[0];
+    if(change==='workflow')f.state.activeSpaceId='OTHER';
+    else if(change==='replacement')f.state.splitPanes=[{...f.state.splitPanes[0],windowId:'window-B'}];
+    else if(change==='shown-tab')f.state.splitPanes=[{...f.state.splitPanes[0],tabId:'FILE'}];
+    else if(change==='side-closed')f.ui.sideTerminalOpenTabs.AI=false;
+    else if(change==='primary')f.ui.terminalPrimaryTabs.AI=true;
+    else if(change==='tab-removed')f.state.openProjects.get('P').tabs.delete('AI');
+    else f.state.view='dashboard';
+    action.props.onClick({stopPropagation(){}});assert.deepEqual(f.calls,[],change);
+  }
+});
+
+test('terminal menu supports the exact center owner without adding a header button',()=>{
+  for(const legacy of [false,true]){
+    const f=fixture({kind:'ai',side:true});f.props.paneIndex=null;f.props.paneLayout=[];
+    f.state.splitPanes=[];f.state.activeSpaceTab=legacy?null:{projectId:'P',tabId:'AI'};
+    f.state.openProjects.get('P').activeTabId='AI';f.render();
+    assert.equal(f.by('data-split-pane-terminal-slot').length,0);f.openMenu();
+    f.click('data-split-strip-menu-item','terminal-full-view');
+    assert.deepEqual(f.calls,[['activate','P','AI'],['full-view','AI']]);
   }
 });
 

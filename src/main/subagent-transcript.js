@@ -328,19 +328,30 @@ function extractCodexProviderInstruction(text) {
   };
 }
 
-function codexProviderInstructionStep(state, record, payload, text) {
-  if (state.codexBootstrapInstructionSeen) return null;
+// null means ordinary child input; an empty array means consumed bootstrap.
+// Before the first own output, only recognised context may be suppressed:
+// a real user clarification can legally arrive immediately after NEW_TASK.
+function codexProviderBootstrapSteps(state, record, payload, text) {
   const instruction = extractCodexProviderInstruction(text);
-  if (!instruction) return null;
+  if (!instruction) {
+    const value = String(text || '').trim();
+    const plugins = /^<recommended_plugins>[\s\S]*?<\/recommended_plugins>\s*/.exec(value);
+    if (plugins) {
+      const remainder = value.slice(plugins[0].length).trim();
+      if (!remainder || isCodexEnvironmentContextUserText(remainder)) return [];
+    }
+    return null;
+  }
+  if (state.codexBootstrapInstructionSeen) return [];
   state.codexBootstrapInstructionSeen = true;
-  return {
+  return [{
     id: stableCodexMessageStepId(state, record, 'context', payload),
     kind: 'instruction',
     role: 'user',
     ...instruction,
     timestamp: record?.timestamp || payload?.timestamp || '',
     sessionId: String(state.codexSessionId || state.codexExpectedSessionId || ''),
-  };
+  }];
 }
 
 function flushCodexPendingResponseUsers(state) {
@@ -1198,8 +1209,8 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     const text = codexUserMessagePresentationText(record);
     if (!text.trim()) return [];
     if (state.codexAwaitingFirstVisibleOutput) {
-      const instruction = codexProviderInstructionStep(state, record, payload, text);
-      return instruction ? [instruction] : [];
+      const bootstrap = codexProviderBootstrapSteps(state, record, payload, text);
+      if (bootstrap) return bootstrap;
     }
     if (
       isCodexEnvironmentContextUserText(text)
@@ -1222,8 +1233,8 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     const text = codexUserMessagePresentationText(record);
     if (!text.trim()) return [];
     if (state.codexAwaitingFirstVisibleOutput) {
-      const instruction = codexProviderInstructionStep(state, record, payload, text);
-      return instruction ? [instruction] : [];
+      const bootstrap = codexProviderBootstrapSteps(state, record, payload, text);
+      if (bootstrap) return bootstrap;
     }
     if (
       isCodexEnvironmentContextUserText(text)
@@ -1300,6 +1311,7 @@ function consumeAgentStepChunk({
   size,
   reset,
   codexDecodeCall,
+  retainedState = true,
 }) {
   const bytesRead = chunk.length;
   const steps = Array.isArray(state.prefaceSteps) ? state.prefaceSteps.splice(0) : [];
@@ -1407,7 +1419,12 @@ function consumeAgentStepChunk({
     if (!state.pendingLineSkip) state.pendingLineParts.push(tail);
     state.pendingLineBytes = (Number(state.pendingLineBytes) || 0) + tail.length;
   }
-  const nextOffset = from + bytesRead;
+  // Main retains the parser state and can advance across a partial record.
+  // A legacy/stateless caller cannot keep its tail: leave that record's bytes
+  // unconsumed so the next call reads the complete appended line instead.
+  const nextOffset = !retainedState && state.pendingLineBytes > 0
+    ? Math.max(from, Number(state.pendingLineStartOffset) || 0)
+    : from + bytesRead;
   if (toolType === 'codex') {
     const shape = codexRecordShapeFromPrefix(state.pendingLinePrefix);
     state.launchTierDiagnostics.partial = shape.recordType === 'event_msg'
@@ -1449,7 +1466,7 @@ function readAgentSteps({
   if (prepared.from >= stat.size) {
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from, chunk: Buffer.alloc(0),
-      size: stat.size, reset: prepared.reset, codexDecodeCall,
+      size: stat.size, reset: prepared.reset, codexDecodeCall, retainedState: !!projectionState,
     });
   }
   let fd;
@@ -1461,7 +1478,7 @@ function readAgentSteps({
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from,
       chunk: buffer.subarray(0, bytesRead), size: stat.size,
-      reset: prepared.reset, codexDecodeCall,
+      reset: prepared.reset, codexDecodeCall, retainedState: !!projectionState,
     });
   } catch (error) {
     return { success: false, error: String(error.message || error), steps: [], offset: prepared.from, size: stat.size };
@@ -1489,7 +1506,7 @@ async function readAgentStepsAsync({
   if (prepared.from >= stat.size) {
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from, chunk: Buffer.alloc(0),
-      size: stat.size, reset: prepared.reset, codexDecodeCall,
+      size: stat.size, reset: prepared.reset, codexDecodeCall, retainedState: !!projectionState,
     });
   }
   let handle;
@@ -1501,7 +1518,7 @@ async function readAgentStepsAsync({
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from,
       chunk: buffer.subarray(0, read.bytesRead), size: stat.size,
-      reset: prepared.reset, codexDecodeCall,
+      reset: prepared.reset, codexDecodeCall, retainedState: !!projectionState,
     });
   } catch (error) {
     return { success: false, error: String(error.message || error), steps: [], offset: prepared.from, size: stat.size };

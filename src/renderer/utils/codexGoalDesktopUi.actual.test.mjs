@@ -36,13 +36,13 @@ test('actual Goal UI renders compact explicit choices and invokes the actual cli
   assert.deepEqual(calls, ['resume', 'leave-paused']);
 });
 
-test('no availableActions means disabled choices, including programmatic stale click; X only dismisses', () => {
+test('no availableActions means no dead choices; X only dismisses', () => {
   const calls = [];
   const summary = { ...lifecycle({ availableActions: [], onChoose: action => calls.push(action) }),
     onDismiss: () => calls.push('hide') };
   const rendered = buttons({ lifecycle: summary });
   const choices = rendered.filter(button => button.props['data-codex-goal-action']);
-  assert.equal(choices.length, 2);
+  assert.equal(choices.length, 0);
   for (const button of choices) {
     assert.equal(button.props.disabled, true);
     button.props.onClick(event());
@@ -51,11 +51,10 @@ test('no availableActions means disabled choices, including programmatic stale c
   assert.deepEqual(calls, ['hide']);
 });
 
-test('Check status invokes only a read callback, never either choice', () => {
+test('Goal never adds a refresh button, even if an older caller supplies the callback', () => {
   const calls = [];
   const summary = lifecycle({ availableActions: [], onChoose: action => calls.push(action), onRefresh: () => calls.push('read') });
   const readButton = buttons({ lifecycle: summary }).find(button => 'data-codex-goal-read' in button.props);
-  assert.ok(readButton, 'Unknown Goal exposes a read-only status control');
-  readButton.props.onClick(event());
-  assert.deepEqual(calls, ['read']);
+  assert.equal(readButton, undefined);
+  assert.deepEqual(calls, []);
 });

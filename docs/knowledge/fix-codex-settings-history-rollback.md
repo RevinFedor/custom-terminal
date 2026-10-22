@@ -52,8 +52,12 @@ it does not become success. External API settings still use the common queue.
 
 This supersedes the previous "always clickable while applying" model/effort UI
 contract per the user's explicit request. Busy replies/paste alone do not disable
-choosing a setting. Once chosen, Model/Effort/Quick are disabled until the setting
-operation settles; empty input and the save/Enter reply are not completion proof.
+choosing a setting. Desktop Codex SOURCE20Oct refines the queued phase: a desired
+pair waiting for Resume/readiness or Main preparation can be replaced until its
+first controlled input. Main's optional replaceable activity projection is not
+writer authority; missing metadata retains the old lock. After control input
+starts, Model/Effort/Quick stay disabled until settlement. Empty input and the
+save/Enter reply are not completion proof.
 Manual Codex picker presentation requires a committed composer footer naming
 model and effort before its activity ends; it does not label Escape as success.
 

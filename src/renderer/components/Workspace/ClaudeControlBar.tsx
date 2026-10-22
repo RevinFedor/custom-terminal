@@ -1511,9 +1511,15 @@ function ClaudeControlBar({
     console.log('[ControlBarAction] end tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason);
   };
   const beginModelEffortAction = (reason: string) => {
-    // This is the UI admission guard, not the shared PTY queue. API callers
-    // still serialize normally; a second physical click cannot race the first.
-    if (settingsWriteBusy || claudeSettingActionsRef.current.pending > 0) return false;
+    // This is UI admission, not the PTY queue. A queued desired Codex choice
+    // can be replaced; its local save and owned native input cannot overlap.
+    if (settingsWriteBusy || claudeSettingActionsRef.current.pending > 0) {
+      console.warn('[ControlBarAction] blocked settings intent tab=' + tabId.slice(-12)
+        + ' reason=' + reason + ' settingsBusy=' + settingsWriteBusy
+        + ' localPending=' + claudeSettingActionsRef.current.pending);
+      useUIStore.getState().showToast('Предыдущая настройка ещё применяется. Дождитесь подтверждения.', 'info');
+      return false;
+    }
     if (!isCodex && !canQueueClaudeSettings) return beginControlAction(reason);
     claudeSettingActionsRef.current.seq += 1;
     claudeSettingActionsRef.current.pending += 1;
@@ -1829,6 +1835,7 @@ function ClaudeControlBar({
     reason: string,
   ) => {
     console.warn('[CodexControlBar] live picker rejected tab=' + tabId.slice(-12) + ' reason=' + reason + ' requestedState=' + JSON.stringify(state) + ' currentState=' + JSON.stringify({ codexModel, codexEffort }) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    useUIStore.getState().showToast('Выбор Codex не подтверждён: ' + reason, 'error', 6000);
     focusTerminal();
   };
   const codexRunPayload = (base: { tabId: string; command: string; sessionId?: string; cwd?: string }) => {
@@ -2138,7 +2145,7 @@ function ClaudeControlBar({
     return confirmedClaudeEffort;
   })();
 
-  const codexSettingsIntentPending = isCodex && !isCommandRunning
+  const codexSettingsIntentPending = isCodex
     && Number(providerState.codexSettingsIntentRevision || 0)
       > Number(providerState.codexSettingsIntentAppliedRevision || 0);
   const claudeModelProofNeedsAttention = (isCodex && (codexSettingsIntentPending || !!providerState.codexSettingsIntentError)) || (isAnthropicPTY && settingProofNeedsAttention({
@@ -2891,6 +2898,10 @@ function ClaudeControlBar({
         return { success: false, model, effort: null };
       }
       return { success: true, model: appliedPlan.model, effort: appliedPlan.effort || null };
+    } catch (error: any) {
+      if (claudeSettingActionIsCurrent(actionSeq)) rejectCodexLivePickerWithoutStateChange(requestedState,
+        `intent-request-failed:${source}:${error?.message || String(error)}`);
+      return { success: false, model, effort: null };
     } finally {
       if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
@@ -3357,6 +3368,7 @@ function ClaudeControlBar({
     localBusy: isLocalBusy && ['model', 'effort', 'quick'].includes(controlBarBusyTarget(localBusyReason) || ''),
     localTarget: controlBarBusyTarget(localBusyReason), activity: settingsActivity,
     intentWaiting: codexIntentWaiting, intentTarget: providerState.codexSettingsIntentControl,
+    replaceQueuedIntent: isCodex,
   });
   const settingsWriteBusy = settingsWritePresentation.busy;
   const busyTarget = settingsWriteBusy ? settingsWritePresentation.target : controlBarBusyTarget(localBusyReason);
@@ -4832,6 +4844,8 @@ function ClaudeControlBar({
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : modelBlocked
                   ? 'Идёт применение другой настройки'
+                : isCodex && codexIntentWaiting
+                  ? 'Выбор сохранён и ждёт готовности Codex. До начала применения его можно заменить'
                 : !isCommandRunning && (pendingClaudeModel || codexSettingsIntentPending)
                   ? 'Выбор сохранён для следующего запуска; применение ещё не подтверждено'
                 : claudeModelProofNeedsAttention
@@ -4974,7 +4988,7 @@ function ClaudeControlBar({
                 })}
               </div>
             ))}
-            {supportsModelEffortPair && openPopup === 'model' && hoveredModelMenuAnchor && (() => {
+            {supportsModelEffortPair && openPopup === 'model' && !settingsWriteBusy && hoveredModelMenuAnchor && (() => {
               const hoveredCodexModel = codexModels.find((model) => model.id === hoveredModelMenuModel);
               const hoveredClaudeModel = claudeCodeModels.find((model) => model.id === hoveredModelMenuModel);
               const hoveredModel = isCodex ? hoveredCodexModel : hoveredClaudeModel;
@@ -5132,6 +5146,8 @@ function ClaudeControlBar({
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : effortBlocked
                   ? 'Идёт применение другой настройки'
+                : isCodex && codexIntentWaiting
+                  ? 'Выбор сохранён и ждёт готовности Codex. До начала применения его можно заменить'
                 : !isCommandRunning && (pendingClaudeEffort || codexSettingsIntentPending)
                   ? 'Выбор сохранён для следующего запуска; применение ещё не подтверждено'
                 : claudeEffortProofNeedsAttention

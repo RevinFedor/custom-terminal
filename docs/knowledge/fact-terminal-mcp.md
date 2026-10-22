@@ -45,6 +45,27 @@ tab-scoped startup intent до запуска. Отсутствующее пол
 намеренный custom ID; catalog id `opus` сервер превращает в текущий точный
 runtime ID из Settings.
 
+Для выбора Codex без сообщения доступны `set_codex_model_effort` и
+`set_codex_fast`; `get_codex_settings` читает наблюдённые и requested/pending
+значения раздельно. В первом tool передаются `tabId`, typed `modelSelection`
+и/или `effort`; неуказанная половина пары наследуется только через прежний
+desktop settings planner. При неизвестной паре нужно указать обе половины,
+не подставлять глобальное значение. Fast принимает абсолютный `enabled:boolean`,
+не toggle. Эти операции принимают intent при busy/streaming, не отправляют
+user prompt, не запускают и не останавливают Codex.
+
+```text
+MCP выбор -> Project API -> desktop intent -> Main safe native apply
+                           queued           отдельный application proof
+```
+
+Требуется live `codexSettings:{version:1,standalone:true,busy:true,fast:'absolute'}`.
+Старое приложение получает update-required до мутации, не fallback на Send.
+После потерянного ACK читать `get_codex_settings`, не повторять выбор автоматически:
+это текущий intent, не Codex requestId-журнал и не proof исхода конкретной команды.
+Настройки, прикреплённые к Send, сохраняют прежний idle guard; новый standalone
+контракт его не снимает. Source/private tests не подтверждают installed поддержку.
+
 Отказ readiness/settings до provider-paste имеет `submitted:false` и сохраняет
 возвращённый draft. Полученный отрицательный renderer receipt не является
 bridge timeout. Если ответ потерян после возможного Enter, состояние остаётся
@@ -85,7 +106,7 @@ source; нельзя повторять весь audit. При явном рас
 проверяется durable run и один раз читается result, без polling transcript.
 `/terminal/tabs` использует один общий runtime batch, не N последовательных
 process lookups. Установка из собственной сессии — только
-`build_install_noted_terminal`: внешний Voice Record ждёт driver-ready/idle,
+`build_install_noted_terminal`: внешний Voice Record проверяет candidate и отдельный install-допуск (либо явно выбранный Force),
 возвращает в точные tab/session, не в sibling с похожим именем.
 
 Тесты: `agent-send-target-routing`, `agent-send-preflight-receipt`,
@@ -307,6 +328,12 @@ committed кадру того же интерактивного меню пос�
 unknown не является доказанным manual-action: исходный unwritten Send продолжает
 existing event-driven ожидание в своём прежнем preparation scope. Только свежий
 same-menu proof разрешает прежний explicit recovery; GET ничего не нажимает.
+Desktop Source21Oct больше не предлагает пользователю «проверить статус»:
+неизвестный результат там виден как ошибка и сохраняет bounded diagnostic.
+Это не изменение API unknown/recoveryAvailable: MCP GET по requestId остаётся
+безопасным read-only recovery, а не повторной командой. Незаполненная System
+политика оставляет availableActions для ручного выбора; wire action при этом
+null, а не выдуманное третье действие.
 Отменённый/истёкший/failed Send от поздней готовности не возобновляется.
 Квитанции runtime-scoped:1024 без вытеснения, затем явный capacity error;
 после restart namespace новый, старый operationId не может нажать новое меню.
@@ -542,6 +569,12 @@ UUID target-prompt; текстовый hash используется тольк�
 `/terminal/ai-prompt` с `submit=true` для Claude **и Codex** не пишет в PTY напрямую: main пересылает запрос в renderer scenario layer (`sendAgentPromptScenario`) — тот же путь, что History Enter / Project API / Inbox. Это даёт MCP-отправке готовность/queue/audit-проверки и статус-паритет: `submitted_unverified` возвращается как HTTP 202 (доставлено в TUI, durable-подтверждение ещё не пришло), а не теряется. Прямой `safePasteAndSubmit` остался только для paste-без-submit (`submit=false`) и Gemini, у которого нет scenario runtime. Следствие: если renderer недоступен (окно перезагружается), Claude/Codex submit вернёт ошибку bridge, а не молча вставит байты в PTY.
 
 ### Одна квитанция для Project API, Inbox, Terminal MCP и orchestration
+
+History input elapsed — отдельная read-only метрика той же exact H/O/A:
+ACTIVE HEAD→первый вызов payload write. `sendInputTiming` в receipt не меняет
+delivery/state/input slot, payload, audit или preparation deadline; старый
+`enterAttemptAt` остаётся отдельной телеметрией. CONFIRMING/запуск CLI не
+заменяют наблюдение payload. UX-границы — `fact-история-как-основная-поверхность.md`.
 
 Если нижний слой вернул `submitted:false`, Enter не пересечён: HTTP 409 разрешает
 осмысленный retry. Если `submitted:true`, но exact JSONL/rollout audit ещё не
@@ -1134,18 +1167,17 @@ Portable image marker является намерением вложить фа�
 
 Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery-unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
 
-`build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
-handoff в Voice Record, а не команда в текущей PTY. Использовать его, когда агент внутри
-Noted Terminal должен инициировать `npm run build:install` самого Noted Terminal. Tool
-передаёт `returnTo` исходного tab/session в Voice Record и сразу возвращает job id. Перед
-самой сборкой Voice Record ждёт, пока все соседние сессии (вкладки/проекты с живым turn'ом
-или running-процессом) уйдут в idle — **вызвавшую вкладку исключает**, иначе дедлок; прогресс
-в `job.phase`/`job.wait` (см. `fact-build-when-idle.md::Observe-фаза`). После рестарта callback
-в Voice Record ждёт восстановления именно этой вкладки/сессии и сам
-отправляет completion prompt через `/terminal/ai-prompt`. Нельзя заменять это на
-`run_command("npm run build:install")` или чтение terminal output: управляющая вкладка будет
-убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,
-не через таймаут.
+`build_install_noted_terminal` передаёт установку sibling Voice Record, который
+переживает закрытие Noted. До POST Main сохраняет точный source continuation;
+MCP возвращает requestId/jobId. Обычный observer ждёт и исходный реальный ход,
+не исключает вкладку целиком. Сохранённый внешний SC wait допускается только по
+строгому app-owned proof, без смены общей busy-индикации. Явный `force:true` одной
+операции пропускает activity waits и возвращает отчёт исходному returnTo;
+старый endpoint без capability не получает скрытого fallback. После restart
+callback использует общий auth Project API send с immutable target и native
+receipt, а Loop ждёт реальный natural final callback-turn. Полный контракт и
+bootstrap — `fact-build-when-idle.md::AI-hop изнутри Noted Terminal`.
+Нельзя заменять sibling hook на `run_command("npm run build:install")` в своей PTY.
 
 SOURCE20.10 штатный внешний installer отдельно включает/завершает same-ID
 operational maintenance (`orchestrationMaintenance.version:1`). Это не prompt
@@ -1158,10 +1190,46 @@ Noted API; без capability нельзя выдавать Source/CLI налич
 #### Completion prompt после rebuild — одноразовая доставка.
 
 Если Voice Record уже нашёл
-исходную tab/session и `/terminal/ai-prompt` начал handoff, дальнейший `submitted_unverified`
+исходную tab/session и общий Project API send начал handoff, дальнейший `submitted_unverified`
 или timeout не является разрешением повторить тот же prompt: целевая Codex/Claude TUI могла
 уже получить ввод, а доказательство могло сорваться на audit/readiness edge. Повтор здесь хуже
 ошибки статуса — пользователь получает несколько одинаковых команд в живой AI-сессии.
+
+### Перенос существующей Codex-вкладки в другой каталог
+
+SOURCE22.10 добавляет `change_working_directory` и read-only
+`get_working_directory_operation`. Пользователь хочет продолжить тот же разговор
+с AGENTS/config другой папки, не менять workflow и не выбирать глобальный Always.
+Вызов требует заранее выбранных `operationId`, exact `expectedSessionId` и
+абсолютного `targetCwd`; optional `expectedCwd` защищает исходный путь. `resume`
+по умолчанию true, false оставляет процесс остановленным. `projectId` служит
+только маршрутизации. `cwd` discovery другого инструмента не является переносом.
+
+Перед POST проверяется `/api/me.capabilities.workingDirectory` v1 с receipts,
+Codex, expectedSessionId, physicalCwdProof и globalPolicyUnchanged. При старом
+приложении нет fallback к SQL, raw cd/Resume, native `/cd` или Always. Историю
+удерживает прежний source Resume; если CLI материализовал законного child,
+принимается только прежний exact writer proof, не обещание неизменного SID.
+
+```text
+change(tab, operationId, expectedSessionId, targetCwd)
+  → Main reservation → wait turn/Goal/background → guarded Stop
+  → exact persisted OSC7 cwd → Resume -C → owned writer + native cwd + inputReady
+                         └─ failure: partial receipt, no rollback/replay
+```
+
+202 — приём операции, не завершение. После потери ACK или для явной проверки
+результата читается тот же tab/operationId, без polling или нового ID.
+`cwdChanged`, `processStopped`, `launchWritten`, `inputReady`, `partial` различны;
+null означает неподтверждённый исход начатого этапа. GET сохраняет failed receipt
+как `ok:true, operation.success:false`; optional `includeStatus:true` читает
+текущий runtime отдельно от исторической квитанции. Ошибка status не стирает её.
+После restart interrupted не повторяет Stop/cd/Resume. Ввод и UNKNOWN Send не
+отменяются; waiting FIFO сохраняет исходный адрес и не переносится в новую cwd.
+
+Это SOURCE-контракт: нужны согласованные App и Terminal MCP runtime files.
+Обновление только MCP не добавляет executor в уже запущенный Main. Предыдущие
+разовые перенесения через свободный shell не являются приёмкой нового API.
 
 ### Граница live-действий и истории
 
@@ -1417,6 +1485,12 @@ editable draft не должен неявно материализовать м�
 Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.
 
 `link_file` не создаёт новую иерархию. Он вызывает тот же renderer-сценарий, что desktop Link File/DnD: `tabType='file'`, `visualParentTabId=<AI tab>`, inherited `groupId`, background creation. Путь сначала canonicalize/проверяется сервером; повтор той же пары canonical file + parent возвращает существующий file-tab. Без `tabId` файл прикрепляется к родительской полноценной сессии, с явным `tabId` — к другой открытой AI-вкладке, в том числе другого проекта.
+
+Общий Link File допускает до10 активных файлов на AI-владельца; повтор старой
+связи остаётся идемпотентным. Считается вся file-family, не только Markdown из
+`get_tab_context`. Для освобождения места `close_tab` получает exact file-tab ID:
+это снимает связь, сохраняя дисковый файл, а не закрывает AI-владельца. Детали
+лимита и независимых AI-child — `fact-tabs.md::Файловые вкладки как visual-child`.
 
 Сохранённый на диске документ ещё не подтверждает прикрепление: связь проверяется
 через `get_tab_context`. Шрам13.10: `link_file` у507 получал409

@@ -156,6 +156,7 @@ if (!app.isPackaged) {
   require(path.join(srcMainDir, 'e2e-cli-isolation')).assertE2ECliIsolation(process.env);
 }
 const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
+const agentSendReadTiming = require(path.join(srcSharedDir, 'agent-send-read-timing.cjs'));
 const { resolveWorkingDirectory } = require(path.join(srcSharedDir, 'working-directory.cjs'));
 const {
   AgentInputCaptureProtocol,
@@ -605,6 +606,7 @@ let workflowSelectionRuntime = null;
 const workflowOrganization = createWorkflowOrganizationApi({ database: projectManager.db,
   readDirectoryRuntime: entries => captureWorkflowDirectoryRuntime(entries),
   readDirectoryCards: entries => captureWorkflowDirectoryCards(entries),
+  readDirectoryPublication: publication => workflowPublicationWake.forPublication(publication),
   captureExecution: tabId => ({...captureConversationOwner(tabId),inputRevision:getTerminalInputRevision(tabId),
     lifecycleGeneration:getTerminalLifecycleGeneration(tabId)}),
   publish: publication => {
@@ -904,17 +906,44 @@ const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:
 const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
-const { writeWithSendEnterTiming } = require(path.join(srcMainDir, 'agent-send-enter-timing'));
+const { writeWithSendEnterTiming, writeWithSendPayloadTiming } = require(path.join(srcMainDir, 'agent-send-enter-timing'));
 const { historySendReturnControl } = require(path.join(srcMainDir, 'history-send-return'));
 
 function publishHistorySendReturn(control) {
   if (!control) return;
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:history-send-return', control);
 }
-function writeHistorySendPayload(term, data, tabId, handoffId) {
+function writeHistorySendPayload(term, data, tabId, handoffId, timingIdentity = null) {
   const control = historySendReturnControl(agentSendReceiptStore).beforeWrite(tabId, handoffId);
   try { if (control?.newlyStarted) publishHistorySendReturn(control); } catch { /* publication cannot change the write fence */ }
-  return term.write(data);
+  if (!timingIdentity?.sendOperationKey || !timingIdentity?.sendAttemptId) return term.write(data);
+  return writeWithSendPayloadTiming(() => term.write(data), payloadStartedAt => {
+    // Timestamp the actual call (even if write then throws), never an armed
+    // intention. The receipt/event is metadata, not composer/CLI acceptance.
+    const publish = sendInputTiming => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:send-input-attempt', {
+        tabId, handoffId, sendOperationKey: timingIdentity.sendOperationKey,
+        sendAttemptId: timingIdentity.sendAttemptId, sendInputTiming,
+      });
+    };
+    // The ordinary message caller already holds the exact Main-issued clock.
+    // Keep the live observation independent of fallible telemetry persistence.
+    const liveTiming = !timingIdentity.authoredCommand && Number.isFinite(timingIdentity.preparationStartedAt)
+      ? { version: 1, preparationStartedAt: timingIdentity.preparationStartedAt, payloadStartedAt } : null;
+    if (liveTiming) try { publish(liveTiming); } catch { /* receipt can recover a missed event */ }
+    queueMicrotask(() => {
+      try {
+        const timing = agentSendReceiptStore.recordPayloadAttempt({ tabId, handoffId,
+          operationKey: timingIdentity.sendOperationKey, attemptId: timingIdentity.sendAttemptId,
+          payloadStartedAt, authoredCommand: timingIdentity.authoredCommand });
+        if (!timing?.newlyStarted) return;
+        const { newlyStarted, ...sendInputTiming } = timing;
+        if (!liveTiming) publish(sendInputTiming);
+        console.log('[AgentSendTiming] Payload attempt tab=' + tabId + ' handoff=' + handoffId
+          + ' attempt=' + timingIdentity.sendAttemptId + ' at=' + payloadStartedAt);
+      } catch (error) { console.warn('[AgentSendTiming] payload timing unavailable:', error?.message || error); }
+    });
+  }, Date.now);
 }
 
 function writeHistorySendEnter(term, data, { tabId, handoffId, sendOperationKey, sendAttemptId } = {}) {
@@ -2498,6 +2527,7 @@ function publishTabBackgroundWork(tabId, reason = 'changed') {
     + ' reason=' + reason);
   // A child may finish after the parent's last turn, without another busy edge.
   idleSessionStopService?.refresh();
+  if (workingDirectoryOperations?.waiting(tabId)) queueMicrotask(() => workingDirectoryOperations?.notify(tabId));
 }
 
 function clearClaudeBackgroundSidecarTimer(tabId) {
@@ -3113,7 +3143,8 @@ const terminalCommandAdmission = createTerminalCommandAdmission(tabId => termina
 const terminalCommandStops = new Map();
 const terminalProjects = new Map(); // tabId -> cwd path
 const historyMutationInput = require(path.join(srcMainDir, 'history-mutation-input')).createHistoryMutationInputGate({
-  capture: tabId => ({ ...captureSavedHistoryRuntime(tabId),
+  capture: (tabId, purpose) => ({ ...(purpose === 'working-directory'
+    ? captureWorkingDirectoryOperationScope(tabId) : captureSavedHistoryRuntime(tabId)),
     inputOwnerLaunchId: resolveAiToolTypeForTab(tabId) === 'codex'
       ? codexLastRunCommandPayload.get(tabId)?.launchId || getCodexWriterProofSnapshot(tabId)?.launchId || null
       : claudeLaunchGenerationByTab.get(tabId)?.generation || null }),
@@ -3146,6 +3177,109 @@ ipcMain.handle('history-mutation:finish', (event, proof) => {
   return { success: true };
 });
 const terminalCwdChangeProofs = new TerminalCwdChangeProofRegistry();
+var workingDirectoryOperations = null; // Early metadata publication has no operation to wake.
+function captureWorkingDirectoryOperationScope(tabId) {
+  const scope = captureSavedHistoryRuntime(tabId);
+  const owner = captureConversationOwner(tabId);
+  return { ...scope, subjectId: owner?.executionScope?.subjectId || null,
+    nativeRewindPending: !!readPendingCodexNativeRewindHandoff(tabId) };
+}
+function inspectWorkingDirectoryInput(tabId) {
+  const draft = getHeadlessCodexDraftState(tabId, 'working-directory-change');
+  if (draft?.success !== true || draft.hasDraft !== false) return draft;
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'working-directory-change', { preferCommitted: false });
+  if (snapshot?.success !== true || snapshot.authoritativeFrameCommitted !== true
+    || snapshot.synchronizedOutputOpen || snapshot.liveSynchronizedOutputOpen
+    || snapshot.writeSeq !== snapshot.flushedSeq) return { success: false, hasDraft: null };
+  const queued = require(path.join(srcMainDir, 'terminal-history-preview')).extractCodexQueuedMessageProofs([
+    ...(snapshot.preViewportLines || []), ...(snapshot.lines || []),
+  ]);
+  return queued.length ? { success: false, hasDraft: false, code: 'cwd_operation_native_queue_pending' } : draft;
+}
+function getWorkingDirectoryOperations() {
+  if (!workingDirectoryOperations) {
+    const { WorkingDirectoryOperations } = require(path.join(srcMainDir, 'working-directory-operation'));
+    workingDirectoryOperations = new WorkingDirectoryOperations({
+      db: projectManager.db,
+      broadcast: (tabId, event) => _webBroadcast(tabId, event),
+      runtime: {
+        capture: captureWorkingDirectoryOperationScope,
+        reserveInput: request => historyMutationInput.reserve({ ...request, owner: 'cwd-operation:' + request.operationId }),
+        assertInput: proof => historyMutationInput.assert(proof.tabId, proof, { toolType: 'codex', action: 'mutation' }),
+        finishInput: proof => historyMutationInput.finish(proof),
+        resolveTarget: async target => {
+          if (!(await fs.promises.stat(target)).isDirectory()) throw Error('working_directory_not_directory');
+          return fs.promises.realpath(target);
+        },
+        readCurrent: async tabId => ({ ...await readMainPublicRuntimeSnapshot(tabId),
+          backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId) }),
+        inspectDraft: inspectWorkingDirectoryInput,
+        stop: (tabId, proof, guard) => {
+          let admitted = false;
+          return historyMutationInput.run(proof, () => stopAgentProcessScenarioInMain({
+            tabId, toolType: 'codex', reason: 'working-directory-change', historyInput: proof,
+          }, { onStopAdmitted: () => { admitted = true; }, preSignalGuard: () => {
+            guard();
+            if (admitted) return { allowed: true }; // Own Stop output is not a new draft; owner/input still checked above.
+            const turn = codexTurnWatchers.get(tabId), draft = inspectWorkingDirectoryInput(tabId);
+            if (turn?.busy === true || turn?.catchUpPending === true
+              || getCodexPublicRuntimeProjection(tabId)?.goalWork?.pending === true
+              || getCombinedTabBackgroundWorkCount(tabId) > 0) throw Error('cwd_operation_turn_changed');
+            const writer = getCodexWriterProofSnapshot(tabId);
+            if (!writer || writer.sessionId !== captureWorkingDirectoryOperationScope(tabId).sessionId) {
+              throw Error('cwd_operation_live_session_changed');
+            }
+            if (draft?.success !== true || draft.hasDraft !== false) throw Error(draft?.code || 'cwd_operation_draft_changed');
+            return { allowed: true };
+          } }));
+        },
+        changeCwd: request => historyMutationInput.run(request.historyInput, () => changeTerminalWorkingDirectory(request)),
+        resume: request => runCodexCommandFromPayload(mainWindow?.webContents, {
+          tabId: request.tabId, command: 'codex-c', sessionId: request.sessionId, cwd: request.cwd,
+          historyInput: request.historyInput, launchSource: 'explicit',
+          workingDirectoryOperation: { tabId: request.tabId, operationId: request.operationId },
+        }),
+        waitReady: (tabId, launch) => require(path.join(srcMainDir, 'agent-ready-wait')).waitForAgentReadyTransition({
+          tabId, expectedOwner: launch, eventBus: ipcMain, timeoutMs: 120_000, requireWriter: true,
+          readStatus: () => readMainPublicRuntimeSnapshot(tabId),
+        }),
+        verifyExistingCwd: async (tabId, ready, cwd) => {
+          const writer = getCodexWriterProofSnapshot(tabId);
+          if (!writer?.filePath || writer.sessionId !== ready.sessionId || ready.writerConfirmed !== true) {
+            return { known: false, reason: 'cwd_operation_existing_writer_unknown' };
+          }
+          const stat = await fs.promises.stat(writer.filePath);
+          return require(path.join(srcMainDir, 'codex-working-directory-proof')).readCodexWorkingDirectoryProof({
+            findSessionFile: codexDataModule._api.findSessionFile, sessionId: ready.sessionId,
+            sourceSessionId: ready.sessionId, cwd,
+            before: { filePath: writer.filePath, fileIdentity: stat.dev + ':' + stat.ino, size: 0, sessionId: ready.sessionId },
+          });
+        },
+        verifyNativeCwd: async (tabId, ready, record) => {
+          const reader = require(path.join(srcMainDir, 'codex-working-directory-proof')).readCodexWorkingDirectoryProof;
+          const request = { findSessionFile: codexDataModule._api.findSessionFile,
+            sessionId: ready.sessionId, sourceSessionId: record.expectedSessionId, cwd: record.resolvedTargetCwd,
+            before: workingDirectoryOperations.resumeSource(tabId, record.operationId) };
+          const started = Date.now();
+          let proof = await reader(request), bytes = proof.bytesRead || 0;
+          // One changed-observation catch-up, NOT timer/poll or another launch.
+          if (!proof.known && proof.reason === 'cwd_operation_native_source_changed') {
+            proof = await reader(request); bytes += proof.bytesRead || 0;
+          }
+          console.log('[WorkingDirectoryCwdProof] tab=' + tabId + ' operation=' + record.operationId
+            + ' known=' + proof.known + ' reason=' + (proof.reason || proof.source)
+            + ' bytes=' + bytes + ' elapsedMs=' + (Date.now() - started));
+          return proof;
+        },
+      },
+    });
+    for (const event of ['agent:input-owner-changed-internal', 'agent:tui-ready-internal',
+      'agent:readiness-changed-internal', 'terminal:command-boundary-internal', CODEX_SETTINGS_WRITER_ADOPTED_EVENT]) {
+      ipcMain.on(event, (_event, payload) => workingDirectoryOperations.notify(typeof payload === 'string' ? payload : payload?.tabId));
+    }
+  }
+  return workingDirectoryOperations;
+}
 const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
 let processTreeSnapshotCache = null;
 const processTreeSnapshotSingleFlight = createProcessTreeSnapshotSingleFlight({
@@ -4257,7 +4391,7 @@ function terminalHistoryPreviewDiagnosticCommandState(tabId) {
   };
 }
 
-async function captureTerminalHistoryPreviewDiagnostic(payload = {}, continuationWindow = null) {
+async function captureTerminalHistoryPreviewDiagnostic(payload = {}, continuationWindow = null, completionControl = null) {
   const tabId = String(payload?.tabId || '');
   const toolType = payload?.toolType === 'claude' || payload?.toolType === 'codex'
     ? payload.toolType
@@ -4275,18 +4409,34 @@ async function captureTerminalHistoryPreviewDiagnostic(payload = {}, continuatio
   // Pin before renderer/disk awaits. The error packet keeps a stable reference
   // while its independently bounded tail continues observing this physical PTY.
   let rawWindow = continuationWindow || { available: false, reason: 'raw-observer-unavailable' };
+  let ownedControlTrace = null;
   try {
+    const rawOwner = readTerminalInputDiagnosticOwner(tabId);
+    const candidate = toolType === 'codex' && terminal
+      ? continuationWindow && payload.context?.source === 'owned-short-control-completion'
+        ? completionControl?.receipt
+        : !continuationWindow && payload.context?.source === 'owned-short-control-frame'
+          ? codexSettingsMutationQueue.getUnsubmittedInput(terminal) : null
+      : null;
+    const exact = candidate?.diagnostic?.traceId === payload.context?.traceId
+      && candidate?.identity?.terminalToken === terminal && candidate.identity.tabId === tabId
+      && candidate.identity.mirrorGeneration === mirror?.generation
+      && candidate.identity.terminalLifecycleGeneration === rawOwner.lifecycleGeneration
+      && candidate.identity.terminalRunSeq === rawOwner.runSeq
+      && candidate.identity.terminalStopRevision === rawOwner.stopRevision
+      && candidate.identity.inputRevision === rawOwner.inputRevision;
+    if (exact) {
+      try {
+        const snapshot = continuationWindow ? completionControl?.snapshot : candidate.diagnostic.snapshot?.();
+        if (snapshot?.traceId === candidate.diagnostic.traceId && snapshot.tabId === tabId) {
+          // The scalar producer is bounded and excludes text. Detach before any
+          // renderer/disk await; a later trace must not rewrite this boundary.
+          ownedControlTrace = { available: true, boundary: continuationWindow ? 'pre-release' : 'failure',
+            snapshot: JSON.parse(JSON.stringify(snapshot)) };
+        }
+      } catch { /* Scalar failure must not suppress the original raw pin. */ }
+    }
     if (!continuationWindow) {
-      const rawOwner = readTerminalInputDiagnosticOwner(tabId);
-      const candidate = toolType === 'codex' && terminal && payload.context?.source === 'owned-short-control-frame'
-        ? codexSettingsMutationQueue.getUnsubmittedInput(terminal) : null;
-      const exact = candidate?.diagnostic?.traceId === payload.context?.traceId
-        && candidate?.identity?.terminalToken === terminal && candidate.identity.tabId === tabId
-        && candidate.identity.mirrorGeneration === mirror?.generation
-        && candidate.identity.terminalLifecycleGeneration === rawOwner.lifecycleGeneration
-        && candidate.identity.terminalRunSeq === rawOwner.runSeq
-        && candidate.identity.terminalStopRevision === rawOwner.stopRevision
-        && candidate.identity.inputRevision === rawOwner.inputRevision;
       const completionKey = exact ? candidate.diagnostic.traceId : null;
       rawWindow = observeTerminalRaw(terminalRawWindow, 'pin', terminal, {
         incidentId, sendIdentity: { ...payload.sendIdentity,
@@ -4413,6 +4563,7 @@ async function captureTerminalHistoryPreviewDiagnostic(payload = {}, continuatio
       toolType,
     ) || null,
     liveSnapshot,
+    ...(ownedControlTrace ? { ownedControlTrace } : {}),
     redrawTrace: snapshotTerminalRedrawTrace(mirror?.redrawTrace, 48),
     composerTrace,
     replayJournal: mirror?.replayJournal?.snapshot() || null,
@@ -5357,7 +5508,8 @@ function assertAgentSendLaunchCurrent(tabId, toolType, request = {}, {
   };
   try {
     historyMutationInput.assert(tabId, request?.historyInput, {
-      toolType, sessionId: request?.sessionId || null, action: isSend ? 'send' : 'resume',
+      toolType, sessionId: request?.sessionId || null,
+      action: toolType === 'cwd-change' ? 'directory' : isSend ? 'send' : 'resume',
     });
   } catch (error) { refuse(error.code || error.message); }
   const intent = request?.launchIntent;
@@ -5531,7 +5683,10 @@ function writeAgentLaunchCommandToIdleShell(term, {
     sendLaunchRequest.launchIntent.token, sendLaunchRequest.launchAttempt, false, launchId)) {
     throw Object.assign(new Error('agent_launch_attempt_unresolved'), { code: 'agent_launch_attempt_unresolved' });
   }
-  if (sendLaunchRequest?.historyInput) historyMutationInput.claimLaunch(sendLaunchRequest.historyInput, launchId, proof.runSeq);
+  if (sendLaunchRequest?.historyInput) {
+    if (toolType === 'cwd-change') historyMutationInput.claimDirectoryWrite(sendLaunchRequest.historyInput, launchId);
+    else historyMutationInput.claimLaunch(sendLaunchRequest.historyInput, launchId, proof.runSeq);
+  }
   term.write(input);
   if (sendLaunchRequest?.launchIntent !== undefined) agentLaunchPreparations.markIntentWrite(
     sendLaunchRequest.launchIntent.token, sendLaunchRequest.launchAttempt, true);
@@ -8337,8 +8492,9 @@ const agentSettingsActivity = require(path.join(srcMainDir, 'agent-settings-acti
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:settings-activity', state);
     },
   });
-function beginAgentSettingsActivity(tabId, toolType, target) {
+function beginAgentSettingsActivity(tabId, toolType, target, { replaceable = false } = {}) {
   return agentSettingsActivity.begin({ tabId, toolType, target,
+    replaceable,
     runtime: { term: terminals.get(tabId), lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
       runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) } });
 }
@@ -9207,6 +9363,44 @@ function resolveActivityIdentity(tabId, engine) {
 // a rebuild waits until every Claude / Gemini / SDK / restart-after process across
 // the app has gone idle. Runs in main (not via the renderer bridge) so it still
 // answers correctly while the renderer is mid-reload or unfocused.
+async function computeInstallInputBlockers() {
+  const blockers = historyMutationInput.installBlockers();
+  const cohort = new Map(terminals);
+  const tabs = [...cohort.keys()];
+  await Promise.all(tabs.map(async tabId => {
+    const term = cohort.get(tabId);
+    if (pasteInflight.has(term) || historyMutationInput.held(tabId)) {
+      blockers.push({ tabId, kind: 'input', status: 'physical-input' });
+    }
+    if (!['claude', 'codex'].includes(resolveAiToolTypeForTab(tabId))) return;
+    try {
+      const snapshot = await readMainPublicRuntimeSnapshot(tabId);
+      if (terminals.get(tabId) !== term || snapshot.coherent !== true
+        || !['inactive', 'active', 'starting', 'stopping', 'busy'].includes(snapshot.status || snapshot.sessionStatus)
+        || !['found', 'absent'].includes(snapshot.processStatus)) {
+        blockers.push({ tabId, kind: 'input', status: 'runtime-unknown' });
+      } else if (['starting', 'stopping', 'busy'].includes(snapshot.status || snapshot.sessionStatus)) {
+        blockers.push({ tabId, kind: 'input', status: snapshot.status || snapshot.sessionStatus });
+      } else if (snapshot.processStatus === 'found' && snapshot.inputReady !== true) {
+        blockers.push({ tabId, kind: 'input', status: 'input-not-ready' });
+      }
+    } catch {
+      blockers.push({ tabId, kind: 'input', status: 'runtime-unknown' });
+    }
+  }));
+  // Every physical slot must be rechecked after ALL runtime awaits. A shell
+  // paste or replacement can begin after that tab's own reader has returned.
+  for (const tabId of tabs) {
+    if (pasteInflight.has(terminals.get(tabId)) || historyMutationInput.held(tabId)) {
+      blockers.push({ tabId, kind: 'input', status: 'physical-input' });
+    }
+  }
+  if (tabs.length !== terminals.size || tabs.some(tabId => terminals.get(tabId) !== cohort.get(tabId))) {
+    blockers.push({ kind: 'input', status: 'runtime-membership-changed' });
+  }
+  return blockers;
+}
+
 function computeActiveLoaders() {
   const loaders = [];
   const seen = new Set(); // tabId — one tab contributes at most one loader
@@ -15713,8 +15907,8 @@ function projectCodexRuntimeSnapshotFromEvents(
     transcriptStatus,
     timelineCount: lineageSourceSessionId
       ? null
-      : Number.isFinite(Number(visibleMaterialization?.userTurns))
-        ? Number(visibleMaterialization.userTurns)
+      : Number.isFinite(visibleMaterialization?.userTurns)
+        ? visibleMaterialization.userTurns
         : null,
     materializationReason: visibleMaterialization?.reason || 'history-read-unavailable',
     hasWatcher: turnState.hasWatcher === true,
@@ -15794,6 +15988,7 @@ function broadcastCodexPublicRuntimeSnapshot(tabId, reason = 'runtime-snapshot')
     reason,
     ...getCodexPublicWriterFields(tabId),
   });
+  if (workingDirectoryOperations?.waiting(tabId)) queueMicrotask(() => workingDirectoryOperations?.notify(tabId));
 }
 
 function getLiveAiRuntimeOwners(tabId) {
@@ -15904,8 +16099,8 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtim
       canCopySessionId: sessionStatus === 'inactive'
         ? !!savedSessionId
         : writerUsableForMutation,
-      timelineCount: cachedMaterialization
-        ? Number(cachedMaterialization.userTurns || 0)
+      timelineCount: Number.isFinite(cachedMaterialization?.userTurns)
+        ? cachedMaterialization.userTurns
         : null,
       materializationReason: cachedMaterialization?.reason
         || (conversationMaterialized ? 'codex-session-id' : 'no-session-id'),
@@ -20330,6 +20525,9 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
         }
         if (oscAgentTool === 'codex') {
           rearmCodexProcessActionBoundary(tabId, 'osc-command-started');
+        }
+        if (oscAgentTool === 'codex' || codexRuntimeProjectionStore.read(tabId)) {
+          publishCodexRuntimeProjection(tabId, 'shell-command-generation-started');
         }
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:command-started', {
@@ -25942,6 +26140,8 @@ app.whenReady().then(async () => {
       tabWorkContext,
       userNotificationOutbox,
       computeActiveLoaders,
+      computeInstallInputBlockers,
+      readInstallMcpStatus: () => mcpHubStatus(800),
       computeProjectActivity,
       readWorkflowPublication: () => workflowPublicationWake.snapshot(),
       readTabActivityState: readPublicTabActivityState,
@@ -25969,6 +26169,7 @@ app.whenReady().then(async () => {
         bindInput: (proof, sessionId) => historyMutationInput.bound(proof, sessionId),
       },
       historyMutationInput,
+      workingDirectoryOperations: getWorkingDirectoryOperations(),
       recoverCodexRewindPostEnter: recoverCodexRewindPostEnterOperation,
       readCodexRewindPostEnterResult,
       readCodexNativeRewindState: (tabId) => {
@@ -26122,6 +26323,9 @@ app.whenReady().then(async () => {
     ipcMain.handle('orchestration:list-active', async () => {
       return webServer.listActiveOrchestrationRuns();
     });
+    ipcMain.handle('build-install:list-continuations', async () => webServer.readBuildInstallContinuations());
+    ipcMain.handle('build-install:status-for-tab', (_event, tabId) => webServer.readBuildInstallStatus(tabId));
+    ipcMain.handle('build-install:cancel', (_event, request) => webServer.cancelBuildInstallFromDock(request));
     ipcMain.handle('orchestration:acknowledge', async (_event, payload = {}) => {
       if (!payload.runId || !payload.tabId) return { ok: false, error: 'runId+tabId required' };
       const run = await webServer.acknowledgeOrchestrationRun(payload.runId, payload.tabId);
@@ -30382,6 +30586,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
   const hasPromptQueueOrigin = isPromptQueueSource(source);
   const isPromptQueueAutomation = isPromptQueueAutomationSource(source, { promptQueueAction });
+  if (isPromptQueueAutomation && broadcastTabId
+    && require(path.join(srcMainDir, 'web-server')).buildInstallAutomationBlocked(broadcastTabId)) {
+    return { success: false, accepted: false, deferred: true, submitted: false,
+      error: isCodexPasteSource ? 'codex_input_not_ready' : 'claude_input_not_ready', detail: 'build-install-continuation' };
+  }
   const isHistoryComposerSource = typeof source === 'string'
     && (source === 'history-panel' || source === 'codex-history-panel');
   const shouldStageClaudeAudit = shouldStageClaudeUserPromptAudit({
@@ -31446,7 +31655,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     try {
       emitBusy(true, 'sending');
-      writeHistorySendPayload(term, payload, broadcastTabId, handoffId);
+      writeHistorySendPayload(term, payload, broadcastTabId, handoffId,
+        i === 0 ? { sendOperationKey, sendAttemptId,
+          preparationStartedAt: destinationRecord?.attemptId === sendAttemptId
+            ? destinationRecord?.receipt?.sendInputTiming?.preparationStartedAt : undefined } : null);
       if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markWritten(options.claudeSettingEvidenceToken, 'paste');
     } catch (error) {
       if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markUncertain(options.claudeSettingEvidenceToken, 'paste');
@@ -35459,12 +35671,20 @@ async function captureProcessTreeSnapshot({ forceFresh, getWaiterCount, generati
     const parseStartedAt = nodePerformance.now();
     const children = new Map();
     const processesByPid = new Map();
-    const lines = (psOut || '').split('\n').filter(Boolean);
+    const lines = (psOut || '').split('\n').filter(line => line.trim().length > 0);
+    const rawProcesses = [];
+    const rawPids = new Set();
+    const invalidCensus = reason => Object.assign(
+      new Error('process_census_invalid reason=' + reason + ' rows=' + lines.length),
+      { code: 'ERR_PROCESS_CENSUS_INVALID', reason, rowCount: lines.length },
+    );
+    if (lines.length === 0) throw invalidCensus('empty');
+    // A successful ps exit is not proof of a complete census. Validate every
+    // raw row, including Electron/the caller, before filtering or caching it.
     for (const line of lines) {
       const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(.+)$/);
-      if (!m) continue;
+      if (!m) throw invalidCensus('malformed-row');
       const [, pid, ppid, pgid, tpgid, cmd] = m;
-      if (cmd.includes('Electron') || cmd.includes('electron')) continue;
       const child = {
         pid: Number(pid),
         ppid: Number(ppid),
@@ -35472,6 +35692,18 @@ async function captureProcessTreeSnapshot({ forceFresh, getWaiterCount, generati
         tpgid: Number(tpgid),
         cmd,
       };
+      if (![child.pid, child.ppid, child.pgid, child.tpgid].every(Number.isSafeInteger)) {
+        throw invalidCensus('unsafe-integer');
+      }
+      if (child.pid <= 0) throw invalidCensus('nonpositive-pid');
+      if (rawPids.has(child.pid)) throw invalidCensus('duplicate-pid');
+      rawPids.add(child.pid);
+      rawProcesses.push(child);
+    }
+    if (!rawPids.has(process.pid)) throw invalidCensus('caller-missing');
+    for (const child of rawProcesses) {
+      const { cmd } = child;
+      if (cmd.includes('Electron') || cmd.includes('electron')) continue;
       processesByPid.set(child.pid, child);
       if (!children.has(child.ppid)) children.set(child.ppid, []);
       children.get(child.ppid).push(child);
@@ -35514,6 +35746,8 @@ async function captureProcessTreeSnapshot({ forceFresh, getWaiterCount, generati
       forceFresh: forceFresh === true, waiters: getWaiterCount(),
       code: typeof error?.code === 'number' ? error.code
         : typeof error?.code === 'string' ? error.code.slice(0, 80) : null,
+      ...(error?.code === 'ERR_PROCESS_CENSUS_INVALID'
+        ? { censusReason: error.reason, censusRows: error.rowCount } : {}),
       signal: typeof error?.signal === 'string' ? error.signal.slice(0, 24) : null,
       killed: error?.killed === true,
     }));
@@ -36902,6 +37136,10 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
     : 'send-command';
   const handoffId = typeof sendOptions.handoffId === 'string' ? sendOptions.handoffId : null;
   const isPromptQueueSend = isPromptQueueAutomationSource(source, sendOptions);
+  if (isPromptQueueSend && require(path.join(srcMainDir, 'web-server')).buildInstallAutomationBlocked(tabId)) {
+    return { success: false, accepted: false, deferred: true, error: 'claude_input_not_ready',
+      detail: 'build-install-continuation', submitted: false };
+  }
   const hasPromptQueueOrigin = isPromptQueueSource(source);
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
@@ -37684,6 +37922,26 @@ function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit'
   };
 }
 
+function createCodexModelEffortIntentWriteGuard(tabId, intent) {
+  const expected = { model: intent.model, effort: intent.effort, revision: intent.revision, actionSequence: intent.actionSequence };
+  let inputStarted = false;
+  return phase => {
+    // A newer queued UI choice wins before the first native control mutation.
+    // Once we own a draft capture/slash input, finish THAT operation under its
+    // existing writer/input guards; do not abandon it or replay Enter for B.
+    if (inputStarted) return { allowed: true };
+    const current = getCodexModelEffortIntentRecord(tabId);
+    if (!current || current.revision !== expected.revision || current.actionSequence !== expected.actionSequence
+      || current.model !== expected.model || current.effort !== expected.effort) {
+      console.log('[CodexSettingsIntent] superseded before input tab=' + String(tabId).slice(-12)
+        + ' revision=' + expected.revision + ' current=' + (current?.revision ?? '-') + ' phase=' + phase);
+      return { allowed: false, reason: 'codex_settings_intent_superseded' };
+    }
+    if (phase === 'slash-command-paste' || phase === 'draft-exact-copy') inputStarted = true;
+    return { allowed: true };
+  };
+}
+
 function markCodexModelEffortIntentApplied(tabId, intent, ownerId, source = 'picker', { publish = true } = {}) {
   const current = getCodexModelEffortIntentRecord(tabId);
   if (!current
@@ -37833,6 +38091,7 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
         visualHasDraft: false,
         visualSource: 'settings-intent-reconcile',
         settingsControl: intent.providerState.codexSettingsIntentControl,
+        settingsWriteGuard: createCodexModelEffortIntentWriteGuard(tabId, intent),
       });
       if (!codexModelEffortIntentApplicationProven(intent, result)) {
         updateCodexSettingsIntentError(tabId, intent.revision, result?.error || 'settings-application-unconfirmed', intent.actionSequence);
@@ -38172,6 +38431,15 @@ function scheduleCodexFastIntentReconcile(tabId, reason = 'scheduled') {
   codexFastIntentReconcileInflight.set(tabId, work);
   return work;
 }
+
+ipcMain.handle('codex:set-fast-intent', async (_event, { tabId, enabled } = {}) => {
+  if (!tabId || typeof enabled !== 'boolean') return { success: false, error: 'invalid_codex_fast_request' };
+  if (!terminals.has(tabId)) return { success: false, error: 'terminal not found' };
+  if (resolveAiToolTypeForTab(tabId) !== 'codex') return { success: false, error: 'codex_settings_provider_mismatch' };
+  const saved = persistCodexFastIntentValue(tabId, enabled, 'external-selection');
+  void scheduleCodexFastIntentReconcile(tabId, 'external-selection');
+  return { success: true, queued: true, ...saved };
+});
 
 ipcMain.handle('codex:toggle-fast-intent', async (_event, { tabId } = {}) => {
   if (!tabId) return { success: false, error: 'tabId required' };
@@ -42713,7 +42981,8 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
 // proven-idle shell boundary as an AI launch, then completion is tied to the
 // exact OSC 7 value that main validates against the live PTY process. A timer
 // can surface missing observability, but it never commits cwd by itself.
-ipcMain.handle('terminal:change-working-directory', async (_event, request = {}) => {
+ipcMain.handle('terminal:change-working-directory', (_event, request = {}) => changeTerminalWorkingDirectory(request));
+async function changeTerminalWorkingDirectory(request = {}) {
   const tabId = String(request?.tabId || '');
   const requestedTarget = normalizeDirectoryTarget(request?.targetCwd);
   if (!tabId || !requestedTarget) {
@@ -42737,6 +43006,7 @@ ipcMain.handle('terminal:change-working-directory', async (_event, request = {})
   }
 
   return runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+    if (request.historyInput) historyMutationInput.assert(tabId, request.historyInput, { toolType: 'codex', action: 'mutation' });
     const term = terminals.get(tabId);
     if (!term) {
       return { success: false, accepted: false, error: 'terminal_not_found' };
@@ -42787,12 +43057,16 @@ ipcMain.handle('terminal:change-working-directory', async (_event, request = {})
     if (!pending.success) return pending;
 
     try {
+      if (request.historyInput) historyMutationInput.beginDirectoryWrite(request.historyInput, {
+        operationId: pending.operationId, targetCwd,
+      });
       writeAgentLaunchCommandToIdleShell(term, {
         tabId,
         toolType: 'cwd-change',
         command: `cd -- ${shellQuote(targetCwd)}`,
         launchId: pending.operationId,
         admission,
+        sendLaunchRequest: request.historyInput ? { historyInput: request.historyInput } : null,
       });
     } catch (error) {
       terminalCwdChangeProofs.cancel(
@@ -42803,6 +43077,7 @@ ipcMain.handle('terminal:change-working-directory', async (_event, request = {})
     }
 
     const proof = await pending.promise;
+    if (request.historyInput && proof.success === true) historyMutationInput.commitDirectoryWrite(request.historyInput, proof);
     console.log('[TerminalCwdChange] settled ' + JSON.stringify({
       tabId,
       operationId: pending.operationId,
@@ -42814,7 +43089,7 @@ ipcMain.handle('terminal:change-working-directory', async (_event, request = {})
     }));
     return proof;
   });
-});
+}
 
 // Renderer components can mount after the shell already emitted its first
 // OSC 133;A. Return the retained main-owned boundary for the exact live PTY so
@@ -49668,6 +49943,22 @@ function getCodexRuntimePolicies() {
       if (policy.phase === 'detected' && policy.type === 'usage-exhaustion') rememberCodexReserveReturnPreference(tabId);
       if (policy.phase === 'detected') resetCodexTuiReadyDetection(tabId, 'provider-dialog:' + policy.type);
       if (policy.phase === 'handled') void markCodexTuiReadyAfterVerifiedComposer(tabId, 'runtime-policy-result').catch(() => {});
+      if (policy.type === 'resume-goal' && policy.captureDiagnostic === true) {
+        // Capture the failure boundary now, before renderer/disk awaits and
+        // before a later manual input/composer replaces this exact operation.
+        // This is observation only: never retry a key or change Send authority.
+        void captureTerminalHistoryPreviewDiagnostic({ tabId, toolType: 'codex',
+          incidentReason: 'codex-goal-choice-failed', context: { source: 'codex-goal-choice',
+            operationId: policy.operationId, requestId: policy.requestId, policy: policy.policy,
+            phase: policy.phase, reason: policy.reason, frameSeq: policy.frameSeq,
+            actionWritten: policy.actionWritten, actionAttempted: policy.actionAttempted,
+            actionFrameSeq: policy.actionFrameSeq,
+            writeAttemptAt: policy.writeAttemptAt, writeReturnedAt: policy.writeReturnedAt,
+            writeCoverage: 'sendKey call/return; not fd callback or CLI acceptance',
+            owner: { ...policy.owner } } }).catch(error => console.warn(
+          '[CodexGoalAction] diagnostic failed tab=' + tabId + ' operation=' + policy.operationId
+          + ' reason=' + String(error?.message || error)));
+      }
       publishCodexObservedRuntime(tabId, 'runtime-policy:' + policy.phase);
       emitAgentReadinessChanged(tabId, { toolType: 'codex', source: 'runtime-policy', reason: policy.reason });
       scheduleProjectActivityBroadcast('codex-runtime-policy');
@@ -50469,8 +50760,24 @@ function normalizeCodexMcpStartupInspection(
   return normalized;
 }
 
+function hasCodexPolicyInitializedComposer(tabId) {
+  const goal = codexRuntimePolicies?.readGoalAction?.(tabId);
+  // Closing the exact native dialog publishes its committed composer before
+  // the async process/settings readiness verifier can settle. At that point
+  // "no startup UI ever arrived" is false, even after a long manual wait.
+  // This retires only that explanation; it grants no input/writer authority,
+  // choice confirmation, renewed deadline or permission to repeat a key.
+  return goal?.currentOperation === true && goal.runtimeLive === true
+    && goal.phase === 'handled'
+    && (goal.reason === 'committed-composer' || goal.reason === 'composer-already-ready')
+    && Number.isSafeInteger(goal.initialFrameSeq) && Number.isSafeInteger(goal.resultFrameSeq)
+    && goal.resultFrameSeq > goal.initialFrameSeq
+    && Number.isSafeInteger(goal.frameSeq) && goal.frameSeq >= goal.resultFrameSeq;
+}
+
 function getCodexStartupNoStateTimeout(tabId) {
   if (codexRuntimePolicies?.read(tabId)) return null; // This dialog has its own finite, typed outcome.
+  if (hasCodexPolicyInitializedComposer(tabId)) return null;
   if (getCodexLiveInputControl(tabId)) return null;
   const payload = codexLastRunCommandPayload.get(tabId) || null;
   const startedAt = Number(payload?.startedAt || 0);
@@ -50568,6 +50875,7 @@ function armCodexStartupNoStateTimeout(tabId, launchId, startedAt) {
 function maybeSurfaceCodexStartupNoStateTimeout(tabId, status) {
   if (!tabId || !status) return;
   if (codexRuntimePolicies?.read(tabId)) return;
+  if (hasCodexPolicyInitializedComposer(tabId)) return;
   codexTuiReadyLastNotReady.set(tabId, status);
   const launchId = status.launchId || codexLastRunCommandPayload.get(tabId)?.launchId || null;
   if (codexStartupNoStateTimeoutTabs.has(tabId)) {
@@ -52273,6 +52581,8 @@ function emitCodexTurnStateResolved(tabId, source) {
 
 function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
   if (!tabId) return;
+  // Publication wakes the same Main scenario; it never grants Stop authority.
+  if (workingDirectoryOperations?.waiting(tabId)) queueMicrotask(() => workingDirectoryOperations?.notify(tabId));
   const state = codexTurnWatchers.get(tabId);
   if (outcomeDetails?.outcome) {
     applyCodexWatcherOutcome(
@@ -52593,6 +52903,11 @@ ipcMain.handle('codex:get-runtime-projection', (_event, request) => {
     ? request
     : { tabId: request, projectId: null };
   if (!tabId) return { success: false, error: 'tabId required' };
+  if (request?.readTiming) return agentSendReadTiming.observeAgentSendReadTiming(
+    request.readTiming,tabId,()=>publishCodexRuntimeProjection(tabId,'renderer-presence-query',projectId),{
+      emit:record=>console.log('[AgentSendReadTiming] '+JSON.stringify(record)),
+      now:()=>nodePerformance.timeOrigin+nodePerformance.now(),
+    });
   return publishCodexRuntimeProjection(tabId, 'renderer-presence-query', projectId);
 });
 
@@ -53107,12 +53422,18 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
     + ' pids=' + matches.map(m => m.pid).join(','));
   const provisionalSettings = getCodexProvisionalSettingsSnapshot(tabId);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('codex:tui-ready', {
+    const readyPayload = {
       tabId,
       ts: Date.now(),
       reason,
       ...(provisionalSettings || {}),
-    });
+    };
+    const publicationTiming={tabId,launchId:expectedLaunchId,eventTs:readyPayload.ts};
+    const timingOptions={emit:record=>console.log('[AgentSendReadTiming] '+JSON.stringify(record)),
+      now:()=>nodePerformance.timeOrigin+nodePerformance.now()};
+    agentSendReadTiming.recordAgentReadyPublication(publicationTiming,'ready-publication-before',timingOptions);
+    mainWindow.webContents.send('codex:tui-ready', readyPayload);
+    agentSendReadTiming.recordAgentReadyPublication(publicationTiming,'ready-publication-after',timingOptions);
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
   broadcastCodexReadySnapshot(tabId, reason);
@@ -54934,8 +55255,12 @@ function resolveCodexLiveAgentThreadId(tabId, callId) {
     const prefix = wanted.split(':')[0];
     const byPrefix = agents.get(prefix) || known?.get(prefix);
     if (byPrefix?.threadId) return byPrefix.threadId;
+    // A requested card is not interchangeable with the tab's sole live child.
+    // Its missing identity may arrive later; returning B here binds A's pane
+    // to B permanently because the renderer only resolves an empty thread id.
+    return '';
   }
-  // Single live agent on this tab — unambiguous.
+  // Legacy caller without a requested card: a sole live child is unambiguous.
   if (live?.size === 1) {
     const [only] = [...live.values()];
     if (only?.threadId) return only.threadId;
@@ -55555,8 +55880,10 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
       codexConversationMaterializationCache.set(materializedSessionId, {
         materialized: true,
         metadataOnly: false,
-        userRecords: Math.max(1, Number(previousMaterialization?.userRecords || 0)),
-        userTurns: Math.max(1, Number(previousMaterialization?.userTurns || 0)),
+        userRecords: previousMaterialization?.userRecords === null
+          ? null : Math.max(1, Number(previousMaterialization?.userRecords || 0)),
+        userTurns: previousMaterialization?.userTurns === null
+          ? null : Math.max(1, Number(previousMaterialization?.userTurns || 0)),
         reason: 'user-history-present',
       });
       publishCodexRuntimeProjection(state.tabId, 'rollout-user-message');
@@ -60436,7 +60763,8 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     metadataOnlySession: conversationMaterialization.metadataOnly === true,
     writerMetadataOnlySession: conversationMaterialization.writerMetadataOnly === true,
     historyLineageSourceSessionId,
-    timelineCount: Number(conversationMaterialization.userTurns || 0),
+    timelineCount: Number.isFinite(conversationMaterialization.userTurns)
+      ? conversationMaterialization.userTurns : null,
     materializationReason: conversationMaterialization.reason || null,
     writerSourceMatch: writerConfirmed ? proof.sourceMatch : null,
     writerSourceSessionId: writerConfirmed ? proof.sourceSessionId : null,
@@ -64786,6 +65114,15 @@ function validateCodexOwnedSlashDraftIdentity(identity, term) {
 }
 
 function releaseCodexOwnedModelInput(term, receipt, reason) {
+  let completionControl = null;
+  try {
+    if (receipt?.rawCompletion && codexSettingsMutationQueue.getUnsubmittedInput(term) === receipt) {
+      const snapshot = receipt.diagnostic?.snapshot?.();
+      if (snapshot?.traceId === receipt.diagnostic.traceId) completionControl = {
+        receipt, snapshot: JSON.parse(JSON.stringify(snapshot)),
+      };
+    }
+  } catch { /* A missing forensic snapshot cannot prevent owned cleanup. */ }
   if (!codexSettingsMutationQueue.releaseUnsubmittedInput(term, receipt)) return false;
   receipt.unsubscribe?.();
   receipt.diagnostic?.record('released', { reason });
@@ -64807,7 +65144,7 @@ function releaseCodexOwnedModelInput(term, receipt, reason) {
           tabId, toolType: 'codex', incidentReason: 'owned-control-diagnostic-completion',
           context: { source: 'owned-short-control-completion', traceId: completion.completionKey,
             originalIncidentId: completion.incidentId, completionReason: reason },
-        }, { ...completion.rawWindow, continuation: true }).then(result => {
+        }, { ...completion.rawWindow, continuation: true }, completionControl).then(result => {
           console.log('[TerminalIncident] owned-control-completion tab=' + String(tabId).slice(-12)
             + ' raw=' + completion.id + ' reason=' + reason + ' path=' + result.artifactPath);
           return result;
@@ -65604,7 +65941,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   }
   modelInputReceipt?.diagnostic?.record('paste-attempt');
   try {
-    const write = () => writeHistorySendPayload(term, clearPrefix + PASTE_START + text + PASTE_END, tabId, handoffId);
+    const write = () => writeHistorySendPayload(term, clearPrefix + PASTE_START + text + PASTE_END, tabId, handoffId, {
+      sendOperationKey: preparation?.scope?.operationKey,
+      sendAttemptId: sendAttemptId || preparation?.scope?.attemptId, authoredCommand: text,
+    });
     if (modelInputReceipt?.diagnostic) modelInputReceipt.diagnostic.withWrite(term, 'paste', 1, write);
     else write();
     modelInputReceipt?.diagnostic?.record('paste-returned');
@@ -68181,7 +68521,9 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}, assertCurre
       // the full source because capture below freezes its exact raw lineage.
       let loaded = null;
       if (normalizedCommand === 'codex-c') {
-        const source = await codexDataModule._api.loadResumeSource(sessionId, termCwd, { tabId });
+        const source = await codexDataModule._api.loadResumeSource(sessionId, termCwd, { tabId, purpose: 'launch' });
+        if (payload.workingDirectoryOperation) getWorkingDirectoryOperations().noteResumeSource(
+          payload.workingDirectoryOperation, payload.historyInput, source?.sourceSnapshot);
         sourceMetadataForLaunch = source?.success ? source.sourceMetadata : null;
         sourceSettingsProof = source?.success ? source.sourceSettingsProof : {
           status: 'absent', sourceKind: null, reason: source?.error || 'source-session-load-failed',
@@ -68955,6 +69297,11 @@ const codexSettingsSendRuntime = createCodexSettingsSendRuntime({
 });
 
 ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
+  if (isPromptQueueAutomationSource(options.source, options)
+    && require(path.join(srcMainDir, 'web-server')).buildInstallAutomationBlocked(tabId)) {
+    return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready',
+      detail: 'build-install-continuation', submitted: false };
+  }
   const requestReceivedAt = nodePerformance.now();
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
   // `shouldQueue` is a UI/API handoff state: the prompt was submitted while
@@ -69128,6 +69475,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
   visualPreview = '',
   settingsControl = 'model',
   preparation = null,
+  settingsWriteGuard = null,
 } = {}, ptyWriteOwner = null) {
   const expectedSettingsWriterSessionId = typeof expectedWriterSessionId === 'string'
     ? (expectedWriterSessionId.trim() || null)
@@ -69142,7 +69490,8 @@ async function executeCodexSelectModelEffortRequest(sender, {
     return { success: false, error: 'pty_write_owner_expired' };
   }
   if (!model) return { success: false, error: 'model is required' };
-  const activity = beginAgentSettingsActivity(tabId, 'codex', settingsControl);
+  const activity = beginAgentSettingsActivity(tabId, 'codex', settingsControl,
+    { replaceable: typeof settingsWriteGuard === 'function' });
   let activityDeferred = false;
   const requestStartedAt = Date.now();
   let latencyPhase = 'config';
@@ -69320,9 +69669,11 @@ async function executeCodexSelectModelEffortRequest(sender, {
             currentWriterSessionId,
           };
         };
-        const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+        const readAdmission = (freshHasDraft, expectedInputRevision = null, phase = 'admission') => {
           const expired = typeof preparation?.failure === 'function' ? preparation.failure() : null;
           if (expired) return { allowed: false, reason: expired.code };
+          const settingsCheck = typeof settingsWriteGuard === 'function' ? settingsWriteGuard(phase) : null;
+          if (settingsCheck && settingsCheck.allowed !== true) return settingsCheck;
           const currentState = terminalCommandState.get(tabId) || null;
           const writerTransition = readWriterTransition();
           if (writerTransition.allowed !== true) {
@@ -69450,11 +69801,15 @@ async function executeCodexSelectModelEffortRequest(sender, {
         const writeGuard = (phase) => {
           pickerOperation.phase = phase;
           pickerOperation.manualEnterSubmitsPrompt = false;
-          let admission = readAdmission(freshHasDraft, expectedInputRevision);
+          let admission = readAdmission(freshHasDraft, expectedInputRevision, phase);
           if (admission.allowed && !codexSettingsObservationCurrent(
             { settingsObservationKey: settingsObservationBeforePicker }, readCodexSettingsSendScope(tabId),
             model, effort, resolveConfiguredCodexSettingsModelIdentity,
           )) admission = { allowed: false, reason: 'codex_settings_observation_changed' };
+          if (admission.allowed && typeof settingsWriteGuard === 'function'
+            && (phase === 'slash-command-paste' || phase === 'draft-exact-copy')) {
+            agentSettingsActivity.markInputStarted(activity);
+          }
           if (!admission.allowed) {
             console.warn('[codex:select-model-effort] write boundary rejected tab='
               + String(tabId).slice(-12)
@@ -72619,8 +72974,14 @@ ipcMain.handle('codex:get-native-question', (_event, { tabId } = {}) => ({ succe
 ipcMain.handle('codex:list-native-questions', () => ({ success: true,
   states: codexNativeQuestionMirror.list(), revision: codexQuestionPublicationRevision }));
 ipcMain.handle('codex:control-native-question', (_event, { tabId, ...args } = {}) => codexNativeQuestionMirror.control(tabId, args));
-ipcMain.handle('codex:prepare-main-composer-for-send', (_event, { tabId, ...request } = {}) =>
-  prepareCodexMainComposerForSend(tabId, request));
+ipcMain.handle('codex:prepare-main-composer-for-send', (_event, { tabId, readTiming, ...request } = {}) => {
+  if(!readTiming)return prepareCodexMainComposerForSend(tabId,request);
+  return agentSendReadTiming.observeAgentSendReadTiming(readTiming,tabId,
+    ()=>prepareCodexMainComposerForSend(tabId,request),{
+      emit:record=>console.log('[AgentSendReadTiming] '+JSON.stringify(record)),
+      now:()=>nodePerformance.timeOrigin+nodePerformance.now(),
+    });
+});
 
 ipcMain.handle('claude:get-pending-question', async (_event, { tabId } = {}) => {
   if (!tabId) return { success: false, error: 'tabId required', pendingQuestion: null };
@@ -72983,6 +73344,22 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
   if (!readerLease) {
     return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
   }
+  const pendingRead = (reason, size = 0) => {
+    // Explain the existing wait once per phase on this reader's own lease.
+    // No transcript/prompt/path, new reader, timer or global diagnostic map.
+    if (readerId && readerLease.pendingReason !== reason) {
+      readerLease.pendingReason = reason;
+      console.log('[SubagentSteps] pending ' + JSON.stringify({
+        readerId: String(readerId).slice(0, 256),
+        tabId: String(tabId || '').slice(0, 256),
+        chipKey: String(chipKey || '').slice(0, 256),
+        parentSessionId: String(parentSessionId || '').slice(0, 128),
+        childSessionId: String(agentSessionId || agentId || '').slice(0, 128),
+        reason,
+      }));
+    }
+    return { success: true, steps: [], offset: 0, size, pending: true, reason };
+  };
   try {
     if (readerLease.released) {
       return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
@@ -73011,7 +73388,8 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
     }
     if (!filePath) {
       // Not an error: a just-spawned agent may not have flushed its file yet.
-      return { success: true, steps: [], offset: 0, size: 0, pending: true };
+      return pendingRead(toolType === 'codex' && !(agentSessionId || agentId)
+        ? 'child-thread-unresolved' : 'transcript-not-found');
     }
     const requestedOffset = Math.max(0, Number(offset) || 0);
     const cacheKey = String(readerId || chipKey || `${toolType}:${filePath}`);
@@ -73036,17 +73414,18 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
       if (codexBoundary?.rootMetaSeen !== true) {
         let size = 0;
         try { size = fs.statSync(filePath).size; } catch {}
-        return { success: true, steps: [], offset: 0, size, pending: true };
+        return pendingRead('root-meta-pending', size);
       }
       if (codexBoundary?.requiresBoundary === true && codexBoundary?.found !== true) {
         let size = 0;
         try { size = fs.statSync(filePath).size; } catch {}
-        return { success: true, steps: [], offset: 0, size, pending: true };
+        return pendingRead('new-task-boundary-pending', size);
       }
       if (codexBoundary?.found === true) {
         initialReadOffset = Math.max(0, Number(codexBoundary.offset) || 0);
       }
     }
+    readerLease.pendingReason = null;
     const createProjectionState = () => createSubagentStepProjectionState({
       codexSessionId: toolType === 'codex' ? (agentSessionId || agentId) : '',
       codexRootMetaSeen: codexBoundary?.found === true,

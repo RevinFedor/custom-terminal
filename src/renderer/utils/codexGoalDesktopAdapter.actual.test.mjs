@@ -65,6 +65,23 @@ test('event read in flight is coalesced and cannot publish an older available op
   assert.equal(seen.some(state => state?.operationId === 'old'), false);
 });
 
+test('known pre-action rejection does not permanently mask a fresh Main-authorized manual choice', async () => {
+  const calls = []; let receipt = null;
+  const adapter = createCodexGoalDesktopAdapter({ createRequestId: () => 'rejected-request', invoke: async (channel, request) => {
+    calls.push({ channel, request });
+    if (channel === 'codex:apply-goal-action') {
+      receipt = { ...request, status: 'rejected', accepted: false, reason: 'stale-current-frame', availableActions: [] };
+      return receipt;
+    }
+    return request.requestId ? receipt : available();
+  } });
+  await adapter.refresh('T'); await adapter.choose('T', 'S', 'op', 'resume'); await tick();
+  await adapter.refresh('T');
+  assert.deepEqual(adapter.snapshot('T', 'S').availableActions, ['resume', 'leave-paused']);
+  assert.equal(adapter.receipt('T', 'rejected-request').status, 'rejected');
+  assert.equal(calls.filter(x => x.channel === 'codex:apply-goal-action').length, 1, 'a read never replays the choice');
+});
+
 test('lifecycle wakes and remount are read-only; dismiss survives busy/session wakes and all listeners unsubscribe', async () => {
   const h = fixture(), ipc = new EventEmitter(), seen = [];
   let cleanup = watchCodexGoalDesktop(h.adapter, ipc, 'T', 'S', state => seen.push(state));
@@ -94,7 +111,8 @@ test('Goal projection is compact, honest on failure/unknown and preserves other 
     assert.deepEqual(result.goalActions.availableActions, []);
   }
   const unknown = projectCodexGoalLifecycle(null, { ...goal, status: 'unknown', availableActions: [], error: 'offline' }, actions);
-  assert.match(unknown.detail, /offline/); assert.equal(unknown.goalActions.onRefresh, actions.onRefresh);
+  assert.match(unknown.detail, /offline/); assert.equal(unknown.goalActions.onRefresh, undefined);
+  assert.equal(unknown.kind, 'error');
   for (const base of [
     { tabId: 'other', engine: 'codex', kind: 'info' }, { tabId: 'T', engine: 'claude', kind: 'info' },
     ...['stopping', 'error', 'warning'].map(kind => ({ tabId: 'T', engine: 'codex', kind })),

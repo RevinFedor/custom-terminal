@@ -6,7 +6,9 @@ const RESUME_GOAL_FIRST_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*1\.[\t ]*Resume\s
 const RESUME_GOAL_SECOND_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*2\.[\t ]*Leave\s+paused\b/im;
 
 function resolveCodexResumeGoalPreference(override, configured) {
-  return typeof override === 'boolean' ? override : configured !== false;
+  // Absence is a manual choice, not an implicit authorization to resume a
+  // persisted native Goal. Existing explicit booleans retain their meaning.
+  return typeof override === 'boolean' ? override : typeof configured === 'boolean' ? configured : null;
 }
 
 function normalizeCodexResumeGoalText(value) {

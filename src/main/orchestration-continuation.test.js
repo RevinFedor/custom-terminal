@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const vm = require('node:vm');
 const ts = require('typescript');
 const Database = require('better-sqlite3');
-const { OrchestrationRunStore, buildOrchestrationResultLookup } = require('./orchestration-runs');
+const { OrchestrationRunStore, buildOrchestrationResultLookup, isExternalResearchRun } = require('./orchestration-runs');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { AgentSendQueue } = require('./agent-send-queue');
 const registry = require('./agent-send-receipt-registry');
@@ -341,7 +341,7 @@ test('actual /cancel fences the pending Continue and persists closure before ACK
   const helper = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'cancelPendingOrchestrationContinuation').getText(ast);
   const route = text.slice(text.indexOf('  const orchestrationCancelMatch ='), text.indexOf('  const orchestrationActionMatch ='));
   const env = vm.createContext({ getOrchestrationRunStore: () => h.store, agentSendReceiptStore: h.receipts, agentSendQueue: null,
-    isResponseObservation: () => false, decId: decodeURIComponent, readBody: async () => ({ interrupt: false }),
+    isResponseObservation: () => false, isExternalResearchRun, decId: decodeURIComponent, readBody: async () => ({ interrupt: false }),
     emitOrchestrationChanges() {}, finalizeSettledOrchestrations: async () => {}, withOrchestrationUrls: value => value,
     sendJson: (_res, status, value) => ({ status, value }) });
   vm.runInContext(helper, env);
@@ -403,13 +403,14 @@ test('actual Claude original adapter keeps parser verification and original iden
   assert.equal((await env.readAgentContinuationOriginalProof(request)).sourceVerified, false);
 });
 
-test('actual action -> common FIFO -> actual Main canonical publisher -> exact continuation, with one physical bridge call', async t => {
+test('actual action -> common FIFO -> actual Main canonical publisher -> exact continuation, with one physical bridge call', { timeout: 5000 }, async t => {
   const h = await fixture(t);
   const web = ts.createSourceFile('web.js', fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8'), ts.ScriptTarget.Latest, true);
   const main = ts.createSourceFile('main.js', fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8'), ts.ScriptTarget.Latest, true);
   const extract = (tree, name) => { const fn = tree.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name); assert.ok(fn, name); return fn.getText(tree); };
   let physical = 0, routed;
   const env = vm.createContext({ require, path, srcMainDir: __dirname, ...registry,
+    ...require('./agent-send-preparation'),
     agentSendReceiptStore: h.receipts, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000, readAgentRuntimeSnapshot: null,
     AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES, AGENT_SEND_DURABLE_STATES: require('./agent-send-receipt-store').STORE_STATES,
@@ -430,10 +431,16 @@ test('actual action -> common FIFO -> actual Main canonical publisher -> exact c
   });
   vm.runInContext(['isOrchestrationPromptAudit', 'compatiblePromptAuditExecutionContext', 'publishAgentPromptAuditResult']
     .map(name => extract(main, name)).join('\n'), env);
+  vm.runInContext(web.statements.filter(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(d => ['COMPLETION_ADMISSION', 'OPERATIONAL_ADMISSION'].includes(d.name.getText(web))))
+    .map(node => node.getText(web)).join('\n'), env);
   vm.runInContext(['durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay', 'publicAgentSendReceipt',
     'durableAgentSendFailure', 'runPreparedAgentSendScenario', 'runAgentSendScenario', 'readScenarioDestination',
     'notifyAgentPromptAuditResult', 'performOrchestrationAction'].map(name => extract(web, name)).join('\n'), env);
-  const queue = new AgentSendQueue({ store: h.receipts, execute: request => env.runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true }) });
+  const queue = new AgentSendQueue({ store: h.receipts, execute: (request, scope) => env.runPreparedAgentSendScenario({
+    ...request, applicationQueueExecution: true, sendRequestFingerprint: scope.requestFingerprint,
+    ...(scope.expectedTarget ? { expectedTarget: scope.expectedTarget } : {}),
+  }) });
   env.agentSendQueue = queue;
   t.after(() => queue.dispose());
   env.bridgeRequest = async (action, request) => {

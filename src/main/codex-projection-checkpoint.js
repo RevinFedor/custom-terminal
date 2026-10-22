@@ -27,12 +27,48 @@ function cloneProjectionGraph(value, transform = (_key, item) => item) {
 
 const { createProjectionIdentityMap } = require('../shared/codex-rewrite-identities.cjs');
 
-// Count container items as well as objects: a single huge primitive array/Map
-// also has to yield. Object.keys and one transform remain indivisible; this is
-// a work-unit budget, not a hard slice-time guarantee. Strings stay shared.
-async function cloneProjectionGraphAsync(value, transform = (_key, item) => item) {
+// Traverse one child at a time. The old breadth-first queue retained every
+// visited object until EOF; measuring one wide array also pushed every child
+// before consuming the first. This removes that *additional* width-sized
+// frontier. The source graph, cloned result and identity table are still full
+// graphs: cooperative traversal is deliberately not advertised as a heap cap.
+function* projectionChildren(item) {
+  if (item instanceof Map) {
+    for (const [key, value] of item) yield { key, value, map: true };
+  } else if (item instanceof Set) {
+    for (const value of item) yield { value, set: true };
+  } else {
+    for (const key in item) if (Object.hasOwn(item, key)) yield { key, value: item[key] };
+  }
+}
+
+function traversalControl(options, defaultUnits) {
+  const assertCurrent = options.assertCurrent || (() => {});
+  const schedule = options.schedule || (() => new Promise(resolve => setImmediate(resolve)));
+  const maxUnits = Math.max(1, Number(options.maxUnits) || defaultUnits);
+  let units = 0;
+  const metrics = options.metrics;
+  if (metrics) Object.assign(metrics, { units: 0, yields: 0, maxFrontier: 0, complete: false });
+  return {
+    assertCurrent,
+    observe(frontier) { if (metrics) metrics.maxFrontier = Math.max(metrics.maxFrontier, frontier); },
+    step() { if (metrics) metrics.units++; return ++units >= maxUnits; },
+    async checkpoint() {
+      assertCurrent();
+      await schedule();
+      assertCurrent();
+      units = 0;
+      if (metrics) metrics.yields++;
+    },
+    finish() { assertCurrent(); if (metrics) metrics.complete = true; },
+  };
+}
+
+async function cloneProjectionGraphAsync(value, transform = (_key, item) => item, options = {}) {
   const seen = new Map();
-  const queue = [];
+  const stack = [];
+  const control = traversalControl(options, 1000);
+  control.assertCurrent();
   let approxBytes = 0;
   const copy = (item, key = '', opaque = false) => {
     if (!opaque) item = transform(key, item);
@@ -45,69 +81,57 @@ async function cloneProjectionGraphAsync(value, transform = (_key, item) => item
       : Array.isArray(item) ? [] : {};
     approxBytes += 48;
     seen.set(item, result);
-    queue.push({ item, result, key, opaque });
+    stack.push({ result, key, opaque, children: projectionChildren(item) });
+    control.observe(stack.length);
     return result;
   };
   const result = copy(value);
-  let units = 0;
-  const pause = () => new Promise(resolve => setImmediate(resolve));
-  for (let index = 0; index < queue.length; index += 1) {
-    const { item, result, key, opaque } = queue[index];
-    if (item instanceof Map) {
-      for (const [k, v] of item) {
-        result.set(copy(k, key, opaque), copy(v, key, opaque));
-        if (++units % 1000 === 0) await pause();
-      }
-    } else if (item instanceof Set) {
-      for (const v of item) {
-        result.add(copy(v, key, opaque));
-        if (++units % 1000 === 0) await pause();
-      }
-    } else {
-      for (const k of Object.keys(item)) {
-        result[k] = copy(item[k], Array.isArray(item) ? key : k,
-          opaque || ['args', 'payload', 'diffHunks'].includes(k));
-        if (++units % 1000 === 0) await pause();
-      }
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const next = frame.children.next();
+    if (next.done) stack.pop();
+    else {
+      const child = next.value;
+      if (child.map) frame.result.set(copy(child.key, frame.key, frame.opaque), copy(child.value, frame.key, frame.opaque));
+      else if (child.set) frame.result.add(copy(child.value, frame.key, frame.opaque));
+      else frame.result[child.key] = copy(child.value, Array.isArray(frame.result) ? frame.key : child.key,
+        frame.opaque || ['args', 'payload', 'diffHunks'].includes(child.key));
     }
-    if (++units % 1000 === 0) await pause();
+    if (control.step()) await control.checkpoint();
   }
+  control.finish();
   return { value: result, approxBytes };
 }
 
-async function measureProjectionGraphBytes(value) {
+async function measureProjectionGraphBytes(value, options = {}) {
   const seen = new Set();
-  const pending = [value];
-  let bytes = 0, units = 0;
-  const pause = () => new Promise(resolve => setImmediate(resolve));
-  while (pending.length) {
-    const item = pending.pop();
+  const stack = [];
+  const control = traversalControl(options, 4000);
+  control.assertCurrent();
+  let bytes = 0;
+  const visit = item => {
     if (!item || typeof item !== 'object') bytes += typeof item === 'string' ? 16 + item.length * 2 : 8;
     else if (!seen.has(item)) {
       seen.add(item);
       bytes += 48;
-      // Expanding ONE giant container is work too. The byte cost and graph
-      // identity semantics are unchanged; optional checkpoint retention is not
-      // weakened just because the graph is expensive to measure.
-      if (item instanceof Map) {
-        for (const [key, value] of item) {
-          pending.push(key, value);
-          if (++units % 4000 === 0) await pause();
-        }
-      } else if (item instanceof Set) {
-        for (const value of item) {
-          pending.push(value);
-          if (++units % 4000 === 0) await pause();
-        }
-      } else {
-        for (const key of Object.keys(item)) {
-          pending.push(item[key]);
-          if (++units % 4000 === 0) await pause();
-        }
-      }
+      stack.push(projectionChildren(item));
+      control.observe(stack.length);
     }
-    if (++units % 4000 === 0) await pause();
+  };
+  visit(value);
+  while (stack.length) {
+    // Only optional checkpoint admission uses early exit. Default callers
+    // still receive the exact original conservative graph accounting.
+    if (Number.isFinite(options.stopAfterBytes) && bytes > options.stopAfterBytes) return bytes;
+    const next = stack[stack.length - 1].next();
+    if (next.done) stack.pop();
+    else {
+      if (next.value.map) visit(next.value.key);
+      visit(next.value.value);
+    }
+    if (control.step()) await control.checkpoint();
   }
+  control.finish();
   return bytes;
 }
 

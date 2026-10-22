@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Run from an external owner (Voice Record AI-hop or the user's terminal).
-// Never quit the installed host until a fully validated replacement is ready.
+// Normal install prepares before Quit. Explicit build:i-c captures/quits first
+// and reopens the unchanged installed app if preparation fails.
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
@@ -8,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { validateAsarArchive } from './validate-app-asar.mjs';
 import maintenanceApi from './research-maintenance.cjs';
-import { readPreparedInstall } from './prepared-noted-install.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_NAME = 'Noted Terminal.app';
@@ -292,8 +292,11 @@ export async function buildInstallNotedTerminal({
   stagingKeep = STAGING_KEEP_DEFAULT,
   prune = pruneInstallStaging,
   beforeQuit = async () => {},
+  quitBeforePrepare = false,
+  earlyQuitSource = null,
+  beforeReplace = async () => {},
+  onPhase = () => {},
   maintenance = null,
-  preparedCut = null,
   signal,
   log = message => console.log('[NotedInstall] ' + message),
 } = {}) {
@@ -306,6 +309,7 @@ export async function buildInstallNotedTerminal({
   let previousMoved = false;
   let replacementInstalled = false;
   let quitAttempted = false;
+  let earlyQuitConfirmed = false;
   let launchAttempted = false;
   let step = 'lock';
   let recovery = null;
@@ -322,19 +326,37 @@ export async function buildInstallNotedTerminal({
     // with the exact release command, never guessed away or removed recursively.
     await acquireInstallLock({ lockDir, fileSystem, aliveCheck, log });
     lockOwned = true;
-    if (preparedCut) {
-      step = 'prepared-cut-admission';
-      await preparedCut.verify(installedApp);
-      await preparedCut.claim();
-      releaseApp = preparedCut.candidateApp;
-      log('using explicit prepared cut; CURRENT build/integration scripts are excluded');
+    if (quitBeforePrepare) {
+      if (!['found', 'absent'].includes(earlyQuitSource?.status)
+        || earlyQuitSource.status === 'found' && !(Number.isInteger(earlyQuitSource.server?.pid) && earlyQuitSource.server.pid > 0)) {
+        throw new Error('explicit early quit requires an authoritative source process');
+      }
+      const prior = await exists(installedApp, fileSystem);
+      if (prior && (!prior.isDirectory() || prior.isSymbolicLink())) throw new Error('refusing to close an invalid installed app');
+      if (maintenance) {
+        maintenanceReceipt = { ...await maintenance.begin(), beginConfirmed: true };
+        maintenanceBegun = true;
+      }
+      step = 'capture-and-quit';
+      onPhase({ stage: 'quitting', step });
+      quitAttempted = earlyQuitSource.status === 'found';
+      try { await beforeQuit({ installedApp, signal }); }
+      catch (error) { if (error.quitRequested === false) quitAttempted = false; throw error; }
+      // The app-owned API already requested Quit after its durable cut. Wait
+      // for that shutdown; this explicit mode never kills past a missing ACK.
+      if (quitAttempted) await run('bash', ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only',
+        String(earlyQuitSource.server.pid)], { cwd: projectDir });
+      earlyQuitConfirmed = true;
+      checkAbort(signal);
     }
-    for (const script of preparedCut ? [] : PREPARE_SCRIPTS) {
+    for (const script of PREPARE_SCRIPTS) {
       step = script;
-      log('prepare ' + script + ' (installed app remains available)');
+      onPhase({ stage: 'preparing', step });
+      log('prepare ' + script + (quitBeforePrepare ? ' (captured app is closed)' : ' (installed app remains available)'));
       await runStep('npm', ['run', script]);
     }
     step = 'validate-release';
+    onPhase({ stage: 'validating', step });
     await validate(releaseApp, { run, fileSystem, signal });
     const prior = await exists(installedApp, fileSystem);
     if (prior && (!prior.isDirectory() || prior.isSymbolicLink())) throw new Error('refusing to replace a non-directory/symlink installed app');
@@ -347,20 +369,21 @@ export async function buildInstallNotedTerminal({
     await runStep('/usr/bin/ditto', [releaseApp, stagedApp]);
     step = 'validate-stage';
     await validate(stagedApp, { run, fileSystem, signal });
-    if (preparedCut) await preparedCut.verifyCandidate(stagedApp);
+    await beforeReplace({ stagedApp, installedApp, signal });
     step = 'owner-idle-ack';
-    if (maintenance) {
+    onPhase({ stage: 'awaiting-owner', step });
+    if (maintenance && !maintenanceBegun) {
       maintenanceReceipt = { ...await maintenance.begin(), beginConfirmed: true };
       maintenanceBegun = true;
     }
-    await beforeQuit({ stagingRoot, installedApp, signal });
+    if (!quitBeforePrepare) await beforeQuit({ stagingRoot, installedApp, signal });
     checkAbort(signal);
-    if (preparedCut) await preparedCut.verifyCandidate(stagedApp);
     step = 'quit';
+    onPhase({ stage: 'quitting', step });
     quitAttempted = true;
     // Do not abort the shutdown helper halfway through and race its remaining
     // cleanup with reopening the old app. Cancellation is checked just after.
-    await runStep('bash', ['scripts/graceful-quit.sh', '20'], { signal: undefined });
+    if (!quitBeforePrepare) await runStep('bash', ['scripts/graceful-quit.sh', '20'], { signal: undefined });
     checkAbort(signal);
     if (prior) {
       step = 'preserve-previous';
@@ -368,17 +391,19 @@ export async function buildInstallNotedTerminal({
       previousMoved = true;
     }
     step = 'install';
+    onPhase({ stage: 'installing', step });
     await fileSystem.rename(stagedApp, installedApp);
     replacementInstalled = true;
     checkAbort(signal);
     step = 'validate-installed';
     await validate(installedApp, { run, fileSystem, signal });
-    if (preparedCut) await preparedCut.verifyCandidate(installedApp);
     step = 'launch';
     launchAttempted = true;
+    onPhase({ stage: 'launching', step });
     await runStep('/usr/bin/open', [installedApp, ...(maintenance?.launchArguments?.() || [])]);
     if (maintenance) {
       step = 'maintenance-complete';
+      onPhase({ stage: 'verifying', step });
       try { maintenanceReceipt = await maintenance.complete(); }
       catch (error) {
         // A verified installed app is not rolled back just because its API
@@ -400,7 +425,14 @@ export async function buildInstallNotedTerminal({
       ...(maintenanceReceipt ? { maintenance: maintenanceReceipt } : {}) };
   } catch (error) {
     log('failed step=' + step + ' error=' + error.message);
-    if (quitAttempted) {
+    if (quitBeforePrepare && quitAttempted && !earlyQuitConfirmed) {
+      try {
+        await run('bash', ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only',
+          String(earlyQuitSource.server.pid)], { cwd: projectDir });
+        earlyQuitConfirmed = true;
+      } catch { recovery = { status: 'shutdown-unconfirmed', path: installedApp }; }
+    }
+    if (quitAttempted && !recovery) {
       try {
         // If launch itself failed, stop any partially launched new app before
         // moving bundles. Recovery deliberately ignores the cancelled signal.
@@ -414,7 +446,7 @@ export async function buildInstallNotedTerminal({
           previousMoved = false;
         }
         if (await exists(installedApp, fileSystem)) {
-          await run('/usr/bin/open', [installedApp], { cwd: projectDir });
+          await run('/usr/bin/open', [installedApp, ...(quitBeforePrepare ? maintenance?.launchArguments?.() || [] : [])], { cwd: projectDir });
           recovery = { status: 'previous-app-reopened', path: installedApp };
           log('reopened previous installed app at ' + installedApp);
         } else recovery = { status: 'no-previous-app', path: null };
@@ -422,7 +454,7 @@ export async function buildInstallNotedTerminal({
         recovery = { status: 'failed', error: recoveryError.message, previousApp: previousMoved ? previousApp : installedApp };
         log('recovery failed; preserved artifacts at ' + (stagingRoot || installedApp) + ': ' + recoveryError.message);
       }
-    } else recovery = { status: 'installed-app-untouched', path: installedApp };
+    } else if (!recovery) recovery = { status: 'installed-app-untouched', path: installedApp };
     if (maintenanceBegun && (!quitAttempted || recovery?.status === 'previous-app-reopened')) {
       try { maintenanceReceipt = await maintenance.complete({ reopenedPrevious: true }); }
       catch (endError) { log('same maintenance operation retained: ' + endError.message); }
@@ -439,7 +471,7 @@ export async function buildInstallNotedTerminal({
   }
 }
 
-async function main() {
+export async function main({ projectDir = projectRoot, install = buildInstallNotedTerminal } = {}) {
   if (process.platform !== 'darwin') throw new Error('Noted Terminal installation requires macOS');
   const controller = new AbortController();
   const cancel = () => controller.abort(new Error('install cancelled'));
@@ -464,10 +496,10 @@ async function main() {
     process.stdin.once('error', onControlEnd);
   }
   try {
-    const preparedCut = await readPreparedInstall(projectRoot, nonce);
-    const result = await buildInstallNotedTerminal({
+    const result = await install({
+      projectDir,
       signal: controller.signal,
-      preparedCut,
+      onPhase: phase => console.log('[NotedInstall:phase] ' + JSON.stringify({ protocol: 1, nonce, ...phase })),
       maintenance: maintenanceApi.createClient().installScope('install:noted:' + (nonce || randomUUID()), {
         log: message => console.log('[NotedInstall] ' + message),
       }),
@@ -476,10 +508,8 @@ async function main() {
         process.stdin.resume(); // keep cancellation observable after the ACK
       } : async () => {},
     });
-    // Exact intent stays claimed if this receipt write itself fails; another
-    // install must diagnose that same job, not replay an uncertain swap.
-    await preparedCut?.finish(result);
-    console.log(INSTALL_RESULT_PREFIX + JSON.stringify({ protocol: 1, nonce: nonce || null, ...result }));
+    console.log(INSTALL_RESULT_PREFIX + JSON.stringify({ protocol: 1, nonce: nonce || null,
+      ...(process.env.NOTED_INSTALL_FORCE === '1' ? { force: true } : {}), ...result }));
     process.exitCode = result.ok ? 0 : 1;
   } finally {
     process.stdin.off('data', onControlData);

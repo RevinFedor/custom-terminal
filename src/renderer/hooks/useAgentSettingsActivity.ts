@@ -1,7 +1,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 const { ipcRenderer } = window.require('electron');
 
-type Activity = { tabId: string; sequence: number; busy: boolean; target: string | null; toolType?: string | null };
+type Activity = { tabId: string; sequence: number; busy: boolean; target: string | null; toolType?: string | null; replaceable?: boolean };
 
 // A projection cache, not an operation owner. Listen even when a particular
 // ControlBar is unmounted, so A→B→A does not first display an empty busy state.
@@ -15,7 +15,8 @@ function accept(next: Activity) {
   if (!next?.tabId || !Number.isFinite(next.sequence)) return;
   const previous = snapshot(next.tabId);
   if (previous.sequence > next.sequence) return;
-  if (previous.sequence === next.sequence && previous.busy === next.busy && previous.target === next.target) return;
+  if (previous.sequence === next.sequence && previous.busy === next.busy && previous.target === next.target
+    && previous.replaceable === next.replaceable) return;
   snapshots.set(next.tabId, next);
   listeners.get(next.tabId)?.forEach(listener => listener());
 }

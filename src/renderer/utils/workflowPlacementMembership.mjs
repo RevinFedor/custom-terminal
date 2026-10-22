@@ -32,7 +32,11 @@ export function organizationPlacementIntent(previous, next) {
     while (added) {
       added = false;
       for (const workspace of previous.openProjects.values()) for (const tab of workspace.tabs.values()) {
-        if (family.has(tab.id) || !(family.has(tab.parentTabId)
+        // Legacy namespace hydration need not materialize the physical parent
+        // on the live Tab. Use the same canonical fallback as drag pickup;
+        // otherwise a following ordinary move strands that child behind.
+        const physicalParent=tab.parentTabId || previous.tabCatalog?.[tab.id]?.physicalParentTabId;
+        if (family.has(tab.id) || !(family.has(physicalParent)
           || tab.tabType === 'file' && family.has(tab.visualParentTabId))) continue;
         family.add(tab.id);added = true;
         const member = previous.tabWorkflowMembership[tab.id];

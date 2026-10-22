@@ -120,6 +120,23 @@ class AgentSendQueue {
       .some(item => sendInputSlot(this.store.get(item.operation_key), item).state === 'held');
   }
 
+  installBlockers() {
+    const blockers = [...this.running].map(tabId => ({ tabId, kind: 'input', status: 'preparing' }));
+    // Read only control columns, never every historical prompt/attachment.
+    const rows = this.db.prepare(`SELECT r.operation_key, r.tab_id, r.state, r.handoff_id, r.attempt_id, r.provider, r.session_id,
+      q.slot_release_json, q.release_json FROM agent_send_receipts r
+      LEFT JOIN agent_send_queue q ON q.operation_key=r.operation_key
+      WHERE q.state IN ('dispatching','awaiting-receipt') OR
+        (r.attempt_id IS NOT NULL AND r.state IN
+          ('preparing','in-flight','enter-armed','audit-pending','delivery-unknown','evicted-unknown'))`).all();
+    for (const row of rows) {
+      if (sendInputSlot(null, row).state === 'retired') continue;
+      blockers.push({ tabId: row.tab_id, kind: 'input', status: row.state, operationKey: row.operation_key,
+        handoffId: row.handoff_id, attemptId: row.attempt_id, provider: row.provider, sessionId: row.session_id });
+    }
+    return blockers;
+  }
+
   receipt(operationKey) {
     return applicationQueueReceipt(this.store.get(operationKey), this.item(operationKey));
   }

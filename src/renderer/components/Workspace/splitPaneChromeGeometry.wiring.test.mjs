@@ -23,20 +23,14 @@ const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const resizeFreeze = fs.readFileSync(path.join(here, '../../utils/splitResizeFreeze.mjs'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('действия окна сохраняют геометрию wrap, Git находится в общей шапке', () => {
-  assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
-  assert.match(chrome, /data-wrap-reserved="1"/);
-  assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
-  // Скрытый блок всегда остаётся в потоке; focus не меняет перенос строк.
+test('видимые действия окна сохраняют wrap, скрытый terminal-slot находится только в меню', () => {
+  assert.doesNotMatch(chrome, /data-split-pane-focus-actions|data-split-pane-terminal-slot|focusActionsVisible/);
+  assert.match(chrome, /data-split-strip-menu-item="terminal-full-view"/);
   assert.match(chrome, /position: 'relative'/);
-  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
   assert.doesNotMatch(chrome, /endInsetPx|focusActionsWidth/);
-  assert.match(chrome, /inert=\{!focusActionsVisible\}/);
-  // Git has one focused owner in the application toolbar. Window switching
-  // remains reachable in every pane, outside the focus-only action block.
+  // Split and window switching remain in the header for every pane.
   const block = chrome.slice(
-    chrome.indexOf('data-split-pane-focus-actions'),
+    chrome.indexOf('data-split-pane-actions'),
     chrome.indexOf('data-split-strip-menu-button'),
   );
   assert.doesNotMatch(block, /<PersistentPaneGitStatus/);

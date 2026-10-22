@@ -115,6 +115,17 @@ function synchronizeRevocations(run, revoke, now = Date.now()) {
   return failure;
 }
 function noticeBody(run, attention, execution, origin, rearm) {
+  const recovery = execution.uiRecovery;
+  if (recovery?.reportedAt && ['exhausted', 'blocked', 'unknown'].includes(recovery.status)) {
+    const exhausted = recovery.outcome === 'ui_recovery_exhausted';
+    return '[External Research: восстановление UI завершено]\n'
+      + JSON.stringify({ runId: run.runId, jobId: run.externalResearchJobId, controlEpoch: attention.controlEpoch,
+        conversationId: execution.turn?.conversationId, userMessageId: execution.turn?.userMessageId,
+        outcome: recovery.outcome, attempts: recovery.attempts?.length || 0, providerOutcome: 'unresolved' }) + '\n'
+      + (exhausted ? 'Лимит двух попыток автоматического восстановления исчерпан. Полного ответа пока нет. Рекомендуется новый чат с полным контекстом; это отдельное решение, новая отправка не выполнена. '
+        : 'Автоматическое восстановление остановлено: действие или его результат не подтверждены. Не повторяй неизвестную отправку. ')
+      + 'Сохрани исходные квитанции. Это не экспертное заключение. Уже существующий поздний полный ответ остаётся доступен под исходным job; не закрывай его единственную копию. Сообщи известному владельцу SC только при необходимости адресного восстановления, без повторных опросов.';
+  }
   return '[External Research: требуется восстановление]\n'
     + 'Это нетерминальное служебное событие существующей задачи, не новый запрос пользователя и не готовый ответ.\n'
     + JSON.stringify({ origin, runId: run.runId, jobId: run.externalResearchJobId, controlEpoch: attention.controlEpoch,

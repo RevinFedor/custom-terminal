@@ -10,8 +10,9 @@ import TabLinkedFileTree from './TabLinkedFileTree';
 import { TAB_CARD_LINE_HEIGHT } from '../../utils/tabCardVisual.mjs';
 import { useWorkspaceOverlayTarget } from '../../hooks/useWorkspaceOverlayTarget';
 import './TabLinkedFiles.css';
+import {CHIP_HOVER_MS,CHIP_HOVER_STYLE} from '../../utils/chipHoverIntent.mjs';
 
-const LINKED_FILE_HOVER_MS = 100;
+const LINKED_FILE_HOVER_MS = CHIP_HOVER_MS;
 const LINKED_FILE_HOVER_ANIMATION = 'tab-linked-file-hover-intent';
 
 export type LinkedFile = { projectId: string; id: string; ownerTabId: string; path: string; name: string; parentTabId?:string;depth?:number };
@@ -138,6 +139,7 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
     contextMenuActive.current = true;
     window.dispatchEvent(new CustomEvent('tab-context-menu:open', { detail: {
       projectId: file.projectId, tabId: file.id, x: event.clientX, y: event.clientY,
+       hoverOwnerTabId:ownerTabId,
       singleTarget: true, isCurrent: () => !!trigger.current &&
         useWorkspaceStore.getState().openProjects.get(file.projectId)?.tabs.get(file.id)?.filePath===file.path,
       onClose: () => { contextMenuActive.current = false; if (!pinned) close(); },
@@ -146,7 +148,7 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
   return <>
     <span ref={trigger} className="tab-linked-files-chip" data-tab-linked-files={ownerTabId} data-linked-files-mode={mode}
       data-linked-files-hovered={hovered ? '1' : undefined}
-      style={{ left: insetLeft, maxWidth: `calc(100% - ${insetLeft + 6}px)` }}
+      style={{ ...CHIP_HOVER_STYLE,left: insetLeft, maxWidth: `calc(100% - ${insetLeft + 6}px)` }}
       data-file-selected={selected ? '1' : undefined} aria-label={`Linked files (${files.length})`}
       title={chosen.name}
       aria-expanded={mode==='menu' ? open : undefined} aria-haspopup={mode==='menu' ? 'menu' : undefined}

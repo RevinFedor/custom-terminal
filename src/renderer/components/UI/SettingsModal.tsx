@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
-import { useUIStore, type DisplayContext, type DisplaySizeKey } from '../../store/useUIStore';
+import { useUIStore, type DisplayContext, type DisplaySizeKey, type PaneStripInterfacePreferenceKey } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID, RUN_AFTER_LOOP_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS, legacyGeminiModelLabel } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -808,6 +808,23 @@ function LineNumbersToggle({
       </label>
   );
   return tooltip ? <Tooltip content={tooltip}>{control}</Tooltip> : control;
+}
+
+function InterfacePreferenceStatus({ preference }: { preference: PaneStripInterfacePreferenceKey }) {
+  const status = useUIStore(s => s.paneStripPreferenceStatus[preference]);
+  const retry = useUIStore(s => s.retryPaneStripInterfacePreference);
+  if (status === 'ready') return null;
+  const failed = status === 'load-error' || status === 'save-error' || status === 'save-unknown';
+  const text = status === 'loading' ? 'Загрузка…' : status === 'saving' ? 'Сохраняется…'
+    : status === 'load-error' ? 'Не удалось загрузить настройку.'
+      : status === 'save-error' ? 'Изменение не сохранено.' : 'Сохранение не подтверждено.';
+  return <div role="status" aria-live="polite" data-interface-preference-status={status}
+    style={{ marginLeft: 44, fontSize: 11, color: failed ? '#fca5a5' : '#8a8a8d' }}>
+    {text}{failed && <button type="button" onClick={() => { void retry(preference); }}
+      style={{ marginLeft: 6, padding: 0, border: 0, background: 'transparent', color: '#93c5fd', cursor: 'pointer' }}>
+      {status === 'load-error' ? 'Загрузить снова' : 'Сохранить снова'}
+    </button>}
+  </div>;
 }
 
 // Общий hex-normalizer для всех color input'ов. Принимает 'fff' / '#fff' / 'ffffff' /
@@ -1636,6 +1653,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setSemanticAutoIndexIterations = useUIStore((s) => s.setSemanticAutoIndexIterations);
   const newTabPrimarySurface = useUIStore((s) => s.newTabPrimarySurface);
   const setNewTabPrimarySurface = useUIStore((s) => s.setNewTabPrimarySurface);
+  const paneStripSelectedFirst = useUIStore((s) => s.paneStripSelectedFirst);
+  const setPaneStripSelectedFirst = useUIStore((s) => s.setPaneStripSelectedFirst);
+  const paneStripCloseOnClick = useUIStore((s) => s.paneStripCloseOnClick);
+  const setPaneStripCloseOnClick = useUIStore((s) => s.setPaneStripCloseOnClick);
+  const paneStripInstantHover = useUIStore((s) => s.paneStripInstantHover);
+  const setPaneStripInstantHover = useUIStore((s) => s.setPaneStripInstantHover);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
@@ -4506,11 +4529,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     <span style={{ color: '#888', fontSize: 11 }}>При восстановлении сессии</span>
                     <select
                       data-testid="codex-resume-goal-policy"
-                      value={codexResumePausedGoal ? 'resume' : 'paused'}
-                      onChange={(e) => setCodexResumePausedGoal(e.currentTarget.value === 'resume')}
+                      value={codexResumePausedGoal === null ? 'manual' : codexResumePausedGoal ? 'resume' : 'paused'}
+                      onChange={(e) => setCodexResumePausedGoal(e.currentTarget.value === 'manual' ? null : e.currentTarget.value === 'resume')}
                       title="Что автоматически выбрать, если Codex покажет «Resume paused goal?»"
                       style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
                     >
+                      <option value="manual">Спрашивать каждый раз</option>
                       <option value="resume">Возобновлять Goal</option>
                       <option value="paused">Оставлять Goal на паузе</option>
                     </select>
@@ -4572,7 +4596,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '8px', textTransform: 'uppercase' }}>
-                  Режим новых вкладок
+                  Режимы интерфейса
                 </div>
                 <div style={{ fontSize: '12px', color: '#999', lineHeight: 1.5, marginBottom: 12 }}>
                   В каком виде открывается центр новой AI-вкладки: транскрипт (History) или терминал. Уже открытые вкладки не меняются — у каждой свой режим, кнопка Reverse переключает его для конкретной вкладки.
@@ -4599,6 +4623,35 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                       </button>
                     );
                   })}
+                </div>
+                <div style={{ display: 'grid', gap: 10, marginTop: 12 }}>
+                  <div>
+                    <LineNumbersToggle
+                      checked={paneStripSelectedFirst}
+                      onChange={enabled => { void setPaneStripSelectedFirst(enabled); }}
+                      label="Выбранная вкладка — первая в группе"
+                      description="В свёрнутой группе выбранная вкладка перемещается в начало; порядок остальных сохраняется. Выключено — прежнее размещение при раскрытии."
+                    />
+                    <InterfacePreferenceStatus preference="paneStripSelectedFirst" />
+                  </div>
+                  <div>
+                    <LineNumbersToggle
+                      checked={paneStripCloseOnClick}
+                      onChange={enabled => { void setPaneStripCloseOnClick(enabled); }}
+                      label="Закрывать группы только по клику"
+                      description="Включено: наведение, Cmd и клик закрепляют раскрытие до клика снаружи. Выключено: наведение и Cmd закрываются при уходе, клик — только снаружи."
+                    />
+                    <InterfacePreferenceStatus preference="paneStripCloseOnClick" />
+                  </div>
+                  <div>
+                    <LineNumbersToggle
+                      checked={paneStripInstantHover}
+                      onChange={enabled => { void setPaneStripInstantHover(enabled); }}
+                      label="Раскрывать группу сразу при наведении"
+                      description="Наведение на +N раскрывает группу без ожидания. Правило закрытия задаётся отдельным переключателем выше."
+                    />
+                    <InterfacePreferenceStatus preference="paneStripInstantHover" />
+                  </div>
                 </div>
               </div>
             </div>

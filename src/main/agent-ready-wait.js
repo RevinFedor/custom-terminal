@@ -7,6 +7,7 @@ const {
 const READY_EVENT = 'agent:tui-ready-internal';
 const READINESS_CHANGED_EVENT = 'agent:readiness-changed-internal';
 const { describeAgentManualAction } = require('../shared/agent-manual-action.cjs');
+const { CODEX_SETTINGS_WRITER_ADOPTED_EVENT } = require('./codex-settings-writer-transition');
 
 function startupFailureFromStatus(status) {
   if (!status || typeof status !== 'object') return null;
@@ -84,6 +85,7 @@ function waitForAgentReadyTransition({
   readStatus,
   eventBus,
   expectedOwner = null,
+  requireWriter = false,
   log = () => {},
 } = {}) {
   if (!tabId) return Promise.reject(new Error('tabId required'));
@@ -111,12 +113,13 @@ function waitForAgentReadyTransition({
   let timer = null;
   let checkInflight = false;
   let checkAgain = false;
+  const events = [READY_EVENT, READINESS_CHANGED_EVENT, ...(requireWriter
+    ? [CODEX_SETTINGS_WRITER_ADOPTED_EVENT, 'agent:input-owner-changed-internal'] : [])];
 
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       if (timer) clearTimeout(timer);
-      eventBus.removeListener(READY_EVENT, onWake);
-      eventBus.removeListener(READINESS_CHANGED_EVENT, onWake);
+      for (const event of events) eventBus.removeListener(event, onWake);
     };
     const finish = (error, status) => {
       if (settled) return;
@@ -187,7 +190,7 @@ function waitForAgentReadyTransition({
             finish(startupFailure);
             return;
           }
-          if (isAgentInputReady(last)) {
+          if (isAgentInputReady(last) && (!requireWriter || last.writerConfirmed === true)) {
             finish(null, last);
             return;
           }
@@ -205,8 +208,7 @@ function waitForAgentReadyTransition({
       void check();
     }
 
-    eventBus.on(READY_EVENT, onWake);
-    eventBus.on(READINESS_CHANGED_EVENT, onWake);
+    for (const event of events) eventBus.on(event, onWake);
     timer = setTimeout(() => {
       const error = new Error('agent did not become ready');
       error.code = 'agent_ready_timeout';

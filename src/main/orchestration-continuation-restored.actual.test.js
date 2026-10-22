@@ -161,6 +161,9 @@ async function fixture(t) {
     resolveAgentSessionInfo: async id => ({ sessionId: tabs.get(id).sessionId, lifecycleGeneration: tabs.get(id).generation }),
     reconcileAgentSendReceiptForApi: async () => {},
     readAgentContinuationOriginalProof: null,
+    // This pre-existing continuation fixture has no build:i-c operation.
+    // Restart-specific interval/receipt admission has its own actual cohort.
+    getBuildContinueOperations: () => ({ restartHistoryForRun: async () => null }),
     getAgentTurnResult: async () => {
       controls.originalReads++; await controls.beforeOriginal?.(controls.originalReads);
       return { found: true, sourceVerified: true, complete: controls.originalComplete, userUuid: 'original-user',

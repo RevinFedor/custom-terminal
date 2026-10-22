@@ -46,7 +46,7 @@ function harness(count = 43) {
   }]));
   const context = {
     ...shutdown, ...liveness, captureShutdownProcessProof, resolveCodexReadIdentity,
-    Map, Set, path, Date: { now: () => state.time },
+    Map, Set, path, process: { pid: 77 }, Date: { now: () => state.time },
     console: { log: (...args) => state.events.push(args.join(' ')), warn: (...args) => state.events.push(args.join(' ')) },
     terminals, claudeStartupIntents: new Map(), claudeLaunchGenerationByTab: new Map(),
     terminalCommandState: new Map(ids.map(id => [id, { runSeq: 7, isRunning: true }])),
@@ -76,7 +76,7 @@ function harness(count = 43) {
       state.time += state.psDelay;
       if (state.runMutation) await state.runMutation();
       if (state.psFailure) throw state.psFailure;
-      const lines = [];
+      const lines = [`${context.process.pid} 1 ${context.process.pid} -1 Electron`];
       for (const [id, term] of terminals) {
         lines.push(`${term.pid} 1 ${term.pid} ${term.pid} /bin/zsh`);
         for (const [index, provider] of (state.providers.get(id) || []).entries()) {
@@ -256,3 +256,146 @@ test('a pre-existing normal capture settles then ONE fresh shutdown observation;
   await h.context.inspectAiDescendantProcessesByTab('saved-0', null);
   assert.equal(h.state.psCalls, 3, 'shutdown unknown is not installed in the ordinary cache');
 });
+
+// Global census validity: reuse the complete actual Main/shutdown harness.
+{
+const caller = '77 1 77 -1 Electron';
+const shell = '1000 1 1000 1000 /bin/zsh';
+const provider = '10000 1000 10000 10000 /bin/codex';
+const secret = 'DO_NOT_LOG_SECRET_ARGV';
+function make(rows, count = 1) {
+  const h = harness(count);
+  h.state.rows = rows;
+  h.state.wakes = 0;
+  h.context.wakeClaudePresenceAfterProcessSnapshot = () => h.state.wakes++;
+  h.context.execAsync = async (command, timeout) => {
+    assert.equal(command, 'ps -eo pid=,ppid=,pgid=,tpgid=,command=');
+    assert.equal(timeout, 2000);
+    h.state.psCalls++;
+    h.state.time += 10;
+    return h.state.rows;
+  };
+  return h;
+}
+const invalid = [
+  ['empty', '', 'empty'],
+  ['whitespace-only', ' \n\t\n', 'empty'],
+  ['malformed', secret, 'malformed-row'],
+  ['mixed-outside-provider-subtree', [caller, shell, provider, secret].join('\n'), 'malformed-row'],
+  ['caller-missing', [shell, provider].join('\n'), 'caller-missing'],
+  ['duplicate-caller-before-filter', [caller, caller, shell].join('\n'), 'duplicate-pid'],
+  ['duplicate-other-electron-before-filter', [caller, shell, '88 1 88 -1 electron', '88 1 88 -1 electron'].join('\n'), 'duplicate-pid'],
+  ['duplicate-provider', [caller, shell, provider, provider].join('\n'), 'duplicate-pid'],
+  ['numeric-duplicate-padded-pid', [caller, shell, '01000 1 1000 1000 /bin/zsh'].join('\n'), 'duplicate-pid'],
+  ['zero-pid', [caller, '0 0 0 -1 ' + secret].join('\n'), 'nonpositive-pid'],
+  ['negative-pid', [caller, '-2 1 2 -1 ' + secret].join('\n'), 'malformed-row'],
+  ['negative-ppid', [caller, '88 -1 88 -1 ' + secret].join('\n'), 'malformed-row'],
+  ['negative-pgid', [caller, '88 1 -88 -1 ' + secret].join('\n'), 'malformed-row'],
+  ['missing-command', [caller, '88 1 88 -1'].join('\n'), 'malformed-row'],
+  ['fractional-field', [caller, '88 1.5 88 -1 ' + secret].join('\n'), 'malformed-row'],
+  ['exponent-field', [caller, '88 1 88 1e3 ' + secret].join('\n'), 'malformed-row'],
+];
+for (let field = 0; field < 4; field++) {
+  const fields = ['88', '1', '88', '-1'];
+  fields[field] = '9007199254740992';
+  invalid.push(['unsafe-integer-field-' + field, [caller, fields.join(' ') + ' ' + secret].join('\n'), 'unsafe-integer']);
+}
+invalid.push(['unsafe-negative-tpgid', [caller, '88 1 88 -9007199254740992 ' + secret].join('\n'), 'unsafe-integer']);
+invalid.push(['unsafe-electron-caller-before-filter', '77 9007199254740992 77 -1 Electron ' + secret, 'unsafe-integer']);
+for (const [name, rows, reason] of invalid) {
+  test('actual census rejects ' + name + ' through typed unknown without cache/wake', async () => {
+    const h = make(rows);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const value = await h.context.inspectAiDescendantProcessesByTab('saved-0', 'codex');
+      assert.equal(value.status, 'unknown');
+      assert.equal(value.error.code, 'AI_PROCESS_LOOKUP_FAILED');
+      assert.equal(value.error.cause.code, 'ERR_PROCESS_CENSUS_INVALID');
+      assert.equal(value.error.cause.reason, reason);
+      assert.equal(value.error.cause.rowCount, rows.split('\n').filter(line => line.trim()).length);
+      assert.ok(value.error.message.length < 120);
+      assert.equal(value.matches.length, 0);
+      assert.equal(h.context.processTreeSnapshotCache, null);
+    }
+    assert.equal(h.state.psCalls, 2);
+    assert.equal(h.state.wakes, 0);
+    assert.ok(h.state.events.some(event => event.includes('ERR_PROCESS_CENSUS_INVALID')));
+    const failure = h.state.events.find(event => event.startsWith('[Perf:ProcessTreeSnapshotFailure] '));
+    const diagnostic = JSON.parse(failure.slice(failure.indexOf('{')));
+    assert.equal(diagnostic.censusReason, reason);
+    assert.equal(diagnostic.censusRows, rows.split('\n').filter(line => line.trim()).length);
+    assert.ok(h.state.events.every(event => !event.includes(secret)));
+    await assert.rejects(h.context.getProcessTreeSnapshot({ forceFresh: true }), error =>
+      error.code === 'ERR_PROCESS_CENSUS_INVALID' && error.reason === reason);
+  });
+}
+test('actual valid full census filters Electron exactly as before and caches an empty provider subtree', async () => {
+  const rows = [caller, shell, '10001 1000 10001 -1 Electron /bin/codex', '10002 1000 10002 -1 electron /bin/codex'];
+  const h = make(rows.join('\n'));
+  const snap = await h.context.getProcessTreeSnapshot();
+  assert.equal(snap.source, 'spawn');
+  assert.equal(snap.linesCount, 4);
+  assert.deepEqual([...snap.processesByPid.keys()], [1000]);
+  assert.equal((await h.context.inspectAiDescendantProcessesByTab('saved-0', 'codex')).status, 'absent');
+  assert.equal(h.state.psCalls, 1);
+  assert.equal(h.state.wakes, 1);
+});
+test('actual caller-only full census validates before Electron filtering and yields a valid empty snapshot', async () => {
+  const h = make(caller);
+  const snap = await h.context.getProcessTreeSnapshot();
+  assert.equal(snap.processesByPid.size, 0);
+  assert.equal(snap.linesCount, 1);
+  assert.equal((await h.context.inspectAiDescendantProcessesByTab('saved-0', null)).status, 'absent');
+  assert.equal(h.state.psCalls, 1);
+});
+test('actual valid full census keeps found provider, raw line count, whitespace, signed tpgid and safe integer bounds', async () => {
+  const rows = ['  ' + caller, '', '  \t', shell + '  ', provider, '9007199254740991 0 0 -9007199254740991 /bin/other'];
+  const h = make(rows.join('\n'));
+  const result = await h.context.inspectAiDescendantProcessesByTab('saved-0', 'codex');
+  assert.equal(result.status, 'found');
+  assert.equal(result.matches[0].pid, 10000);
+  assert.equal(h.context.processTreeSnapshotCache.linesCount, 4);
+  assert.equal(h.context.processTreeSnapshotCache.processesByPid.get(Number.MAX_SAFE_INTEGER).tpgid, -Number.MAX_SAFE_INTEGER);
+  h.state.time += 750;
+  assert.equal((await h.context.getProcessTreeSnapshot()).source, 'spawn');
+  assert.equal(h.state.psCalls, 2, 'existing TTL remains 750 ms');
+});
+test('actual failed force-fresh census cannot overwrite prior valid cache or publish a wake; ordinary retry after TTL succeeds', async () => {
+  const h = make([caller, shell, provider].join('\n'));
+  const prior = await h.context.getProcessTreeSnapshot();
+  const cache = h.context.processTreeSnapshotCache;
+  h.state.rows = secret;
+  await assert.rejects(h.context.getProcessTreeSnapshot({ forceFresh: true }), { code: 'ERR_PROCESS_CENSUS_INVALID' });
+  assert.equal(h.context.processTreeSnapshotCache, cache);
+  assert.equal(h.state.wakes, 1);
+  assert.equal((await h.context.getProcessTreeSnapshot()).source, 'cache', 'existing valid-cache policy is unchanged');
+  h.state.time = prior.createdAt + 750;
+  h.state.rows = [caller, shell].join('\n');
+  assert.equal((await h.context.inspectAiDescendantProcessesByTab('saved-0', 'codex')).status, 'absent');
+  assert.equal(h.state.psCalls, 3);
+});
+test('actual concurrent invalid census is one rejected flight; next ordinary caller gets a fresh attempt', async () => {
+  const h = make(secret);
+  const results = await Promise.all(Array.from({ length: 43 }, () => h.context.inspectAiDescendantProcessesByTab('saved-0', null)));
+  assert.ok(results.every(result => result.status === 'unknown'));
+  assert.equal(h.state.psCalls, 1);
+  h.state.rows = [caller, shell, provider].join('\n');
+  assert.equal((await h.context.inspectAiDescendantProcessesByTab('saved-0', 'codex')).status, 'found');
+  assert.equal(h.state.psCalls, 2);
+});
+test('actual malformed/empty/mixed/caller-missing/duplicate census preserves all 43 shutdown recovery seeds and marks unknown', async () => {
+  for (const rows of ['', secret, [caller, shell, secret].join('\n'), shell, [caller, caller, shell].join('\n')]) {
+    const h = make(rows, 43);
+    const seeds = new Map(h.ids.map((id, i) => [id, { engine: i % 2 ? 'claude' : 'codex', sessionId: 'seed-' + id }]));
+    const result = await h.run(seeds, new Set(h.ids));
+    assert.deepEqual(JSON.parse(JSON.stringify([...result.recoverableEntries])), [...seeds]);
+    assert.deepEqual([...result.liveTabIds], [...h.ids]);
+    assert.equal(h.state.psCalls, 1);
+    assert.equal(h.state.reconcileCalls, 0);
+    assert.equal(h.state.writes, 0);
+    assert.equal(h.state.wakes, 0);
+    assert.ok(h.state.events.some(event => event.includes('"unknown":43') && event.includes('"absent":0')));
+    assert.equal(h.context.processTreeSnapshotCache, null);
+  }
+});
+
+}

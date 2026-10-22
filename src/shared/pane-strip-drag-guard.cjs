@@ -20,7 +20,7 @@ function strips(layout={}) {
 /** Inside the existing Main transaction, after its typed family proofs. Group
  * authority comes from CURRENT metadata, including groups created after pickup.
  * This does not publish metadata or supply a new writer/replay authority. */
-function assertPaneStripGroupDrag(currentWorkflows,changes,request,isActive=()=>undefined) {
+function assertPaneStripGroupDrag(currentWorkflows,changes,request,isActive=()=>undefined,releasedRoots=new Map()) {
   const moving=new Set(request.destinationKind==='window'?request.paneFamilyIds:request.sourceFamilyIds);
   const roots=new Set(request.destinationKind==='window'?request.paneRootTabIds:request.sourceRootTabIds);
   const changed=new Map(changes.map(({old,layout})=>[old.id,layout]));
@@ -33,6 +33,17 @@ function assertPaneStripGroupDrag(currentWorkflows,changes,request,isActive=()=>
       const owners=before.filter(strip=>group.tabIds.every(id=>strip.ids.includes(id)));
       if(owners.length!==1)fail();
       const source=owners[0],target=after.find(strip=>strip.key===source.key);
+      const released=releasedRoots.get(workflow.id);
+      if(released&&group.tabIds.some(id=>roots.has(id)&&released.has(id))) {
+        // Only an exact recomputed released pair can take ordinary roots out.
+        // Unselected members and physical descendants retain their old owner.
+        const retained=group.tabIds.filter(id=>!roots.has(id)||!released.has(id));
+        if(!target||retained.some(id=>!target.ids.includes(id))
+          ||retained.some(id=>request.tabs.find(tab=>tab.tabId===id)?.workflowId
+            &&request.tabs.find(tab=>tab.tabId===id).workflowId!==workflow.id))fail();
+        if(!same(source.ids.filter(id=>retained.includes(id)),target.ids.filter(id=>retained.includes(id))))fail();
+        continue;
+      }
       if(!target||group.tabIds.some(id=>!target.ids.includes(id)))fail();
       if(group.tabIds.some(id=>request.tabs.find(tab=>tab.tabId===id)?.workflowId
         &&request.tabs.find(tab=>tab.tabId===id).workflowId!==workflow.id))fail();

@@ -836,13 +836,15 @@ function publicRun(run) {
 
 class OrchestrationRunStore {
   constructor(filePath, { onActivityChanged = () => {}, onOperationalRevoked = null, onCompletionRevoked = null,
-    startupMaintenance = null, beforeStartupMaintenance = null } = {}) {
+    startupMaintenance = null, beforeStartupMaintenance = null, readRecoveryHold = null, readRestartSourceFollowup = null } = {}) {
     this.filePath = filePath;
     this.onActivityChanged = onActivityChanged;
     this.onOperationalRevoked = onOperationalRevoked;
     this.onCompletionRevoked = onCompletionRevoked;
     this.startupMaintenance = startupMaintenance;
     this.beforeStartupMaintenance = beforeStartupMaintenance;
+    this.readRecoveryHold = readRecoveryHold;
+    this.readRestartSourceFollowup = readRestartSourceFollowup;
     this.startupMaintenanceApplied = !startupMaintenance;
     this.startupMaintenancePromise = null;
     this.startupMaintenanceReceipt = null;
@@ -1569,6 +1571,17 @@ class OrchestrationRunStore {
 
     run.externalResearchStatus = externalStatus || run.externalResearchStatus || null;
     run.externalResearchStage = snapshot.stage || run.externalResearchStage || null;
+    const scExecution = snapshot.execution;
+    const previousUi = run.externalResearchUiState;
+    if (scExecution?.version === 1 && (!previousUi || previousUi.epoch !== scExecution.controlEpoch
+      || Number(scExecution.controlRevision) >= Number(previousUi.revision || 0))) {
+      run.externalResearchUiState = { epoch: scExecution.controlEpoch, revision: scExecution.controlRevision,
+        sendState: scExecution.send?.state || 'unknown', phase: scExecution.operation?.phase || null,
+        attention: scExecution.attention?.state === 'open',
+        parked: !!scExecution.authorPark && scExecution.authorPark.state !== 'resumed',
+        recoveryStatus: scExecution.uiRecovery?.status || null };
+    }
+    if (result?.continuation_hint === 'new_chat_required') run.externalResearchContinuationHint = 'new_chat_required';
     run.externalResearchTabId = Number.isInteger(snapshot.tabId)
       ? snapshot.tabId
       : (run.externalResearchTabId ?? null);
@@ -2634,7 +2647,25 @@ class OrchestrationRunStore {
       && !isPausedRun(parent)
       ? parent
       : null;
-    const followupContext = causalParent
+    let restartBinding = null;
+    if (causalParent && this.readRestartSourceFollowup) {
+      const checkpoint = () => JSON.stringify([run.updatedAt, run.status, run.sourceFollowupStartedAt, run.notificationStatus,
+        run.notificationSuppressed, run.notificationCancelRequestedAt, run.notificationPromptHash, run.notificationPromptAuditHash,
+        causalParent.updatedAt, causalParent.status, causalParent.outcome, causalParent.targetExecutionContext,
+        causalParent.continuationIntent?.operationId, causalParent.continuationIntent?.state]);
+      const before = checkpoint();
+      restartBinding = await this.readRestartSourceFollowup(JSON.parse(JSON.stringify({ run, parent: causalParent, proof })));
+      if (checkpoint() !== before || this.runs.get(runId) !== run || this.runs.get(causalParent.runId) !== causalParent) {
+        return { confirmed: false, reason: 'restart-source-followup-changed', run: publicRun(run), changed, settled };
+      }
+      const hold = this.readRecoveryHold?.(causalParent);
+      if (hold && (!restartBinding || restartBinding.operationId !== hold.operationId)) {
+        return { confirmed: false, reason: 'restart-source-followup-unproven', run: publicRun(run), changed, settled };
+      }
+    }
+    const followupContext = restartBinding?.preserveParent === true
+      ? { context: restartBinding.context, reason: null, disposition: 'captured-restart-callback' }
+      : causalParent
       ? sourceFollowupExecutionContext(run, causalParent, proof)
       : { context: null, reason: null };
     if (causalParent && !followupContext.context) {
@@ -2668,6 +2699,7 @@ class OrchestrationRunStore {
     run.sourceFollowupUserUuid = proof.userUuid || null;
     run.sourceFollowupSourceIdentity = proof.sourceIdentity || null;
     run.sourceFollowupAuditHash = proof.actualHash || null;
+    if (restartBinding?.preserveParent) run.sourceFollowupRestartOperationId = restartBinding.operationId;
     // A causal prompt audit or transcript match proves that the notification
     // has materialized in the source session. `queued` describes only the
     // earlier Enter transport; after exact proof the durable delivery state is
@@ -2685,7 +2717,7 @@ class OrchestrationRunStore {
       run.parentFollowupPending = false;
       const sameParentTurn = followupContext.disposition === 'same-active-turn'
         || followupContext.disposition === 'same-settled-turn';
-      if (causalParent && !sameParentTurn) {
+      if (causalParent && !sameParentTurn && !restartBinding?.preserveParent) {
         parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
         parent.resultPromptProofUserUuid = proof.userUuid || parent.resultPromptProofUserUuid || null;
         parent.resultPromptProofSourceIdentity = proof.sourceIdentity
@@ -2696,7 +2728,7 @@ class OrchestrationRunStore {
           || run.notificationDeliveredAt
           || now;
       }
-      if (causalParent && !sameParentTurn) {
+      if (causalParent && !sameParentTurn && !restartBinding?.preserveParent) {
         parent.outcome = null;
         parent.ownCompletedAt = null;
         parent.completedAt = null;
@@ -3455,6 +3487,29 @@ class OrchestrationRunStore {
   } = {}) {
     await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
+    // A committed provider final is not a committed source input. Cancel must
+    // revoke the downstream authority even after the result became terminal,
+    // without deleting that result or relabelling an earlier Enter as undone.
+    if (isExternalResearchRun(run) && suppressNotification
+      && isTerminalStatus(run.status) && !isResultProofPending(run)) {
+      const changed = [], settled = [], now = Date.now();
+      const first = !run.notificationSuppressed || !run.notificationCancelRequestedAt;
+      run.notificationCancelRequestedAt ||= now;
+      run.notificationSuppressed = true;
+      run.notificationStatus = 'suppressed';
+      run.sourceFollowupPending = false;
+      run.parentFollowupPending = false;
+      run.parentConsumedAt ||= now;
+      if (first) {
+        run.updatedAt = now;
+        this._pushChanged(changed, run);
+        this._refreshAncestors(run.parentRunId, changed, settled, now);
+      }
+      // synchronizeRevocation fences the live FIFO and persists its cancellation
+      // receipt; retrying after an unknown/failed write must cross this again.
+      await this.persistStrict();
+      return { run: publicRun(run), changed, settled };
+    }
     if (!run || (isTerminalStatus(run.status) && !isResultProofPending(run))) {
       if ((isResponseObservation(run) || isExternalResearchRun(run))
         && (run.status === 'cancelled' || run.notificationSuppressed === true)) {
@@ -3490,8 +3545,9 @@ class OrchestrationRunStore {
     await this.initialize({ requireAuthority: true });
     const changed = [];
     const settled = [];
-    for (const run of this.runs.values()) {
-      if (run.status !== 'waiting_recovery' || !run.recoveryDeadlineAt || run.recoveryDeadlineAt > now) continue;
+    const due = [...this.runs.values()].filter(run => run.status === 'waiting_recovery'
+      && run.recoveryDeadlineAt && run.recoveryDeadlineAt <= now && !this.readRecoveryHold?.(run));
+    for (const run of due) {
       run.status = 'failed';
       run.completedAt = now;
       run.recoveryDeadlineAt = null;
@@ -3510,6 +3566,7 @@ class OrchestrationRunStore {
     let next = null;
     for (const run of this.runs.values()) {
       if (run.status !== 'waiting_recovery' || !run.recoveryDeadlineAt) continue;
+      if (this.readRecoveryHold?.(run)) continue;
       if (next === null || run.recoveryDeadlineAt < next) next = run.recoveryDeadlineAt;
     }
     return next;
@@ -3601,6 +3658,24 @@ class OrchestrationRunStore {
       .filter(isTrackedOrchestrationRun)
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
       .map(publicRun);
+  }
+
+  async installSnapshot() {
+    await this.initialize({ requireAuthority: true });
+    const capture = () => JSON.stringify([...this.runs.values()].filter(isTrackedOrchestrationRun));
+    const snapshot = capture();
+    // A successful initial load is not proof that the most recent result or
+    // future-delivery intent reached disk. Lost write ACKs must be retried.
+    const receipt = this.installPersistReceipt;
+    if (!receipt || receipt.epoch !== this.installPersistEpoch || receipt.tracked !== snapshot) {
+      let write;
+      this.installProofCaptureRequested = true;
+      try { write = this.persistStrict(); }
+      finally { this.installProofCaptureRequested = false; }
+      await write;
+    }
+    if (capture() !== snapshot) throw Object.assign(new Error('install_run_state_changed'), { statusCode: 503 });
+    return JSON.parse(snapshot);
   }
 
   // Uses the initialized registry; a metadata GET never initializes/migrates it.
@@ -3790,6 +3865,9 @@ class OrchestrationRunStore {
         || run.outcome !== 'interrupted'
         || !run.deliveryAcceptedAt
         || run.deliveryIntent || run.continuationIntent && ['prepared', 'sending', 'unconfirmed', 'blocked'].includes(run.continuationIntent.state)) return false;
+      // A captured restart task is bound by its own canonical continuation.
+      // An earlier result/reply in the FIFO must not be adopted as that task.
+      if (this.readRecoveryHold?.(run)) return false;
       if (run.targetToolType && run.targetToolType !== exactContext.provider) return false;
       const previousContext = normalizeExecutionContext(run.targetExecutionContext);
       if (previousContext && executionContextsMatch(previousContext, exactContext)) return false;
@@ -4040,6 +4118,7 @@ class OrchestrationRunStore {
   }
 
   _enqueuePersist(strict, { startupMaintenanceCommit = false } = {}) {
+    const installEpoch = this.installPersistEpoch = (this.installPersistEpoch || 0) + 1;
     // Check at admission, before serializing, pruning or revoking anything.
     // A later successful load must not authorize a snapshot captured earlier.
     // Keep the raw rejecting promise separate from the logged/caught chain;
@@ -4069,6 +4148,8 @@ class OrchestrationRunStore {
       targetActivityByTab: Object.fromEntries(this.targetActivityByTab),
       runs: Array.from(this.runs.values()),
     }, null, 2);
+    const installTracked = this.installProofCaptureRequested
+      ? JSON.stringify([...this.runs.values()].filter(isTrackedOrchestrationRun)) : null;
     const write = this.persistChain
       .catch(() => {})
       .then(async () => {
@@ -4077,6 +4158,7 @@ class OrchestrationRunStore {
         await fs.promises.writeFile(tempPath, snapshot, 'utf8');
         await fs.promises.rename(tempPath, this.filePath);
         if (operationalCancellationError) throw operationalCancellationError;
+        if (installTracked !== null && this.installPersistEpoch === installEpoch) this.installPersistReceipt = { epoch: installEpoch, tracked: installTracked };
       });
     this.persistChain = write.catch((error) => {
         console.warn('[OrchestrationRuns] persist failed:', error?.message || error);

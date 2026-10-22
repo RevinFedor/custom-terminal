@@ -1843,6 +1843,16 @@ class TabWorkContext {
     return causal.hasWork() ? work() : causal.syncWork('tabContext.hasHandoff', {}, work);
   }
 
+  readPreparedHandoff(tabId, handoffId) {
+    // Passive proof of the original preparation. Missing and legacy NULL full
+    // payloads stay distinct; never call prepare()/refresh links from a reader.
+    const work = () => sqlStatement('tabContext.readPreparedHandoff.tab_context_handoffs', 'get',
+      () => this.db.prepare(`SELECT tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,status
+        FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?`),
+      statement => statement.get(tabId, handoffId)) || null;
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.readPreparedHandoff', { tabId }, work);
+  }
+
   rebindPreparedHandoff(sourceTabId, targetTabId, handoffId, prompt) {
     const work = () => {
       if(sourceTabId===targetTabId)return;

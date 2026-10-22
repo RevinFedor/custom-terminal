@@ -6,6 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { createCausalContext } = require('./perf-causal-context');
+const { createCausalTransport } = require('./perf-causal-transport');
 
 function fixture() {
   const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -53,18 +54,43 @@ test('actual wrapped on/removeListener and hot event return semantics survive di
   assert.match(f.state.summarizeIpcAgg(), /terminal:resize:n=1/);
 });
 
-test('actual Main causal sender counts asynchronous channel errors instead of treating enqueue as delivery', () => {
+function causalSenderFixture(causal) {
   const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
   const from = source.indexOf('const { causal: perfCausal, boundedCallerToken:');
   const end = source.indexOf('const perfActiveOps = ', from);
-  let sink, failures = 0; const callbacks = [];
   const context = vm.createContext({ process: { env: { NOTED_E2E_TEST: 'true' } }, path, srcMainDir: __dirname,
-    app: { once() {} }, require: name => name.endsWith('perf-causal-context')
-      ? { causal: { configure: options => { sink = options.sink; }, transportFailed: () => { failures++; } } }
-      : { createThreadMetrics: () => null } });
+    app: { once() {} }, require: name => {
+      if(name.endsWith('perf-causal-context'))return {causal};
+      if(name.endsWith('perf-causal-transport'))return {createCausalTransport};
+      assert.ok(name.endsWith('perf-thread-metrics'),'uncontrolled Main dependency '+name);
+      return {createThreadMetrics:()=>null};
+    } });
   vm.runInContext(source.slice(from, end) + '\nthis.connect=(sender)=>{perfWatchdog=sender;};', context);
+  return context;
+}
+
+test('actual Main causal sender counts asynchronous channel errors instead of treating enqueue as delivery', () => {
+  let sink, failures = 0; const callbacks = [];
+  const context=causalSenderFixture({configure:options=>{sink=options.sink;},transportFailed:()=>{failures++;}});
   context.connect({ connected: true, send(_value, callback) { callbacks.push(callback); } });
   assert.equal(sink({}), true); assert.equal(sink({}), true);
   callbacks.forEach(callback => callback(Error('channel closed')));
   assert.equal(failures, 2);
+});
+
+test('actual Main sender publishes a sanitized SQL identity before its callback without changing the returned rows',()=>{
+  const causal=createCausalContext({boot:'main-sql-source',pid:71,now:()=>1000}),packets=[];
+  const context=causalSenderFixture(causal);
+  context.connect({connected:true,send(packet,callback){packets.push(packet);callback();return true;}});
+  causal.configure({enabled:true});
+  const rows=[{value:'SECRET_ROW'}];
+  assert.equal(causal.sql('db.actual-main','all',()=>{
+    assert.equal(packets.length,1);
+    const witness=packets[0].record.sqlWitness;
+    assert.equal(witness.collectionState,'enabled');assert.equal(witness.active.siteId,'db.actual-main');
+    assert.equal(witness.totals.attempted,1);assert.equal(witness.totals.completed,0);
+    return rows;
+  }),rows);
+  assert.equal(packets.length,2);assert.equal(packets[1].record.sqlWitness.totals.completed,1);
+  assert.doesNotMatch(JSON.stringify(packets),/SECRET_ROW/);
 });

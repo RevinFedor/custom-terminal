@@ -39,6 +39,27 @@ function fixture(t,{hole=false}={}) {
 }
 const first=()=>({version:1,revision:1,groups:[{id:'g',revision:1,color:'#123456',tabIds:['a','b']}]});
 const recolor=(source,color)=>({...clone(source),revision:source.revision+1,groups:source.groups.map(group=>({...clone(group),color,revision:group.revision+1}))});
+test('actual SQL: release identity proof leaves unrelated large record bodies in SQLite',t=>{
+  const f=fixture(t,{hole:true}),create=f.write(first()),space=create.spaces.find(value=>value.id==='W');
+  const before=clone(space.layout.splitPanes[0].tabs);
+  create.stripColorGroupEdits[0].gather={owner:{windowId:'win',paneIndex:0,centerKey:null},beforeSlots:before};
+  space.layout.splitPanes[0].tabs=gatherPaneStripSlots(before,['a','b']);f.service.commitWorkspace(create);
+  const workflow=f.service.getWorkflow('W'),next=clone(workflow.layout),pane=next.splitPanes[0];
+  const moving=pane.tabs.find(entry=>entry.tabId==='x');pane.tabs=pane.tabs.filter(entry=>entry.tabId!=='x');pane.tabs.splice(1,0,moving);
+  const {preparePaneStripGroupRelease}=require('../shared/pane-strip-group-admission.cjs');
+  const prepared=preparePaneStripGroupRelease({workflowId:'W',field:f.state(),beforeLayout:workflow.layout,layout:next,
+    rootTabIds:['x'],targetOwner:{paneIndex:0,windowId:'win',centerKey:null},isActive:id=>f.service.stripActivity(id)});
+  const saved=JSON.parse(f.db.prepare('SELECT record_json FROM workflow_org_tabs WHERE tab_id=?').get('x').record_json);
+  saved.ownedSyntheticBody='x'.repeat(256*1024);f.db.prepare('UPDATE workflow_org_tabs SET record_json=? WHERE tab_id=?').run(JSON.stringify(saved),'x');
+  const original=f.db.prepare;let bodyBytes=0;
+  const measure=rows=>{for(const row of Array.isArray(rows)?rows:[rows])if(row&&typeof row.record_json==='string')bodyBytes+=Buffer.byteLength(row.record_json);return rows;};
+  f.db.prepare=function(...args){const stmt=original.apply(this,args);return new Proxy(stmt,{get(target,key){const value=Reflect.get(target,key,target);
+    if(key==='get'||key==='all')return(...parameters)=>measure(value.apply(target,parameters));
+    return typeof value==='function'?value.bind(target):value;}});};
+  let actual;try{actual=f.service.releaseStripGroups(workflow,next,prepared.intent);}finally{f.db.prepare=original;}
+  assert.deepEqual(actual,prepared.nextState,'identity/activity projection preserves the exact admission result');
+  assert.equal(bodyBytes,0,'unrelated record bodies are not an input to group admission');
+});
 test('actual SQL: create/recolor/known clear keep execution rows, memberships, unknown metadata and publication journal ownership',t=>{
   const f=fixture(t),before=f.db.prepare('SELECT * FROM tabs ORDER BY id').all(),members=f.service.listGlobalTabs().map(tab=>tab.membership);
   f.service.commitWorkspace(f.write(first()));assert.deepEqual(f.state(),first());

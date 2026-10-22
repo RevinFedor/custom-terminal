@@ -212,7 +212,7 @@ function createBrowserHost({ hostId, port, definitions, configurationDigest, ing
       ingressAuthority: value.ingressAuthority, ingressEpoch: value.ingressEpoch, ingressBasis: value.ingressBasis,
       held: ingress.fences.some(f => f.state === 'held') || p.hostHeld(value, ingressFile),
       heldBarrierIds: [...new Set([...ingress.fences.filter(f => f.state === 'held').map(f => f.barrierId),
-        ...value.holds.filter(h => h.state !== 'released').map(h => h.barrierId)])] }; }
+        ...value.holds.filter(h => p.hostHeld({ ...value, holds: [h] }, ingressFile)).map(h => h.barrierId)])] }; }
     catch (error) { return { version: 1, hostId, held: true, code: error.code || 'research_host_unavailable' }; }
   }
   return { assertEntry, beforeSpawn, afterSpawn, prepare, cut, release, handle, status, file, current, close: journal.close };

@@ -14,7 +14,7 @@ const LIST_COLUMNS = `messageId, kind, replyTo,
   targetTabId, targetTabName, targetProjectId, targetProjectName, targetProvider, targetSessionId,
   createdAt, updatedAt, deliveryState, error, code, replyMessageId, answeredAt,
   sourceDismissedAt, targetDismissedAt, cancelledAt, cancelledByTabId,
-  operationKey, handoffId, requestId, sourceAddressJson, targetAddressJson`;
+  operationKey, handoffId, requestId, sourceAddressJson, targetAddressJson, sourceRestartBindingId`;
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 const now = () => new Date().toISOString();
 const updatedAfter = (previous) => new Date(Math.max(Date.now(), Date.parse(previous) + 1)).toISOString();
@@ -181,11 +181,11 @@ function receiptOutcome(record, message) {
  */
 class TabMessageService {
   constructor({ db, resolveTab, send, getReceipt = () => null, onChanged = () => {}, log = () => {},
-    receiptRequiredBeforeSend = false, releaseReceipt = null, cancelDelivery = null }) {
+    receiptRequiredBeforeSend = false, releaseReceipt = null, cancelDelivery = null, readRestartBinding = null }) {
     if (!db?.prepare || !db?.transaction) throw new TypeError('A raw better-sqlite3 database is required');
     if (typeof resolveTab !== 'function' || typeof send !== 'function') throw new TypeError('resolveTab and send are required');
     if (releaseReceipt != null && typeof releaseReceipt !== 'function') throw new TypeError('releaseReceipt must be a function');
-    Object.assign(this, { db, resolveTab, send, getReceipt, onChanged, log, releaseReceipt, cancelDelivery });
+    Object.assign(this, { db, resolveTab, send, getReceipt, onChanged, log, releaseReceipt, cancelDelivery, readRestartBinding });
     // Only opt in when every physical send reserves a durable receipt and
     // unresolved messages keep that receipt. Absence then proves no input.
     this.receiptRequiredBeforeSend = receiptRequiredBeforeSend === true;
@@ -224,7 +224,7 @@ class TabMessageService {
     CREATE INDEX IF NOT EXISTS tab_messages_source ON ${TABLE_NAME}(sourceTabId, createdAt);`);
     this.db.transaction(() => {
       const columns = new Set(this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((column) => column.name));
-      for (const column of ['sourceDismissedAt', 'targetDismissedAt', 'sourceAddressJson', 'targetAddressJson', 'cancelledAt', 'cancelledByTabId']) {
+      for (const column of ['sourceDismissedAt', 'targetDismissedAt', 'sourceAddressJson', 'targetAddressJson', 'cancelledAt', 'cancelledByTabId', 'sourceRestartBindingId']) {
         if (!columns.has(column)) this.db.exec(`ALTER TABLE ${TABLE_NAME} ADD COLUMN ${column} TEXT`);
       }
     })();
@@ -279,6 +279,22 @@ class TabMessageService {
       length(text) AS textChars FROM ${TABLE_NAME} WHERE sourceTabId = ? OR targetTabId = ?
       ORDER BY createdAt DESC, rowid DESC LIMIT ?`).all(id, id, limit)
       .map((message) => ({ ...publicMessage(message), textPreview: message.textPreview.slice(0, 200) }));
+  }
+
+  restartReferences() {
+    this._assertReady();
+    // Exact outstanding owner inventory, not the retention-limited UI history.
+    return this.db.prepare(`SELECT messageId,kind,replyTo,sourceTabId,sourceProjectId,sourceProvider,sourceSessionId,
+      targetTabId,targetProjectId,targetProvider,targetSessionId,deliveryState,deliverySessionId,attemptCount,
+      replyMessageId,requestFingerprint,operationKey,handoffId,sourceRestartBindingId FROM ${TABLE_NAME}
+      WHERE cancelledAt IS NULL AND ((kind='question' AND replyMessageId IS NULL) OR deliveryState!='sent')`).all();
+  }
+
+  restartReference(messageId) {
+    this._assertReady();
+    return this.db.prepare(`SELECT messageId,kind,replyTo,sourceTabId,sourceProjectId,sourceProvider,sourceSessionId,
+      targetTabId,targetProjectId,targetProvider,targetSessionId,deliveryState,deliverySessionId,attemptCount,
+      replyMessageId,requestFingerprint,operationKey,handoffId,cancelledAt FROM ${TABLE_NAME} WHERE messageId=?`).get(messageId) || null;
   }
 
   // Dismissal is per-tab presentation on the question, including for reply IDs.
@@ -465,13 +481,22 @@ class TabMessageService {
     // return address. Only that persisted delivery binding can answer as well.
     const deliveredResponder = question.deliverySessionId && question.attemptCount > 0
       && from.sessionId === question.deliverySessionId;
+    let restartBinding = null;
     if (JSON.stringify(identity(from)) !== JSON.stringify(identity({
       ...addressed, sessionId: deliveredResponder ? question.deliverySessionId : provisionalResponder ? from.sessionId : addressed.sessionId,
     }))) {
-      throw new TabMessageError('tab_message_foreign_responder', 'Only the original addressed tab and session may answer this question', 403);
+      restartBinding = await this.readRestartBinding?.({ phase: 'reply', role: 'target', message: question, expected: addressed, live: from });
+      const current = await this._resolve(responder);
+      if (!restartBinding?.bindingId || restartBinding.sessionId !== from.sessionId
+        || JSON.stringify(identity(current)) !== JSON.stringify(identity(from)) || restartBinding.isCurrent?.() !== true) {
+        throw new TabMessageError('tab_message_foreign_responder', 'Only the original addressed tab and session may answer this question', 403);
+      }
     }
     const fingerprint = hash(JSON.stringify(['reply', sourceId, messageId, text]));
     const result = this.db.transaction(() => {
+      if (restartBinding && restartBinding.isCurrent?.() !== true) {
+        throw new TabMessageError('tab_message_address_changed', 'The proved restart participant changed before reservation');
+      }
       const existing = this._existing(from.tabId, requestId, payload);
       if (existing) return existing;
       if (this._row(messageId).replyMessageId) {
@@ -481,6 +506,7 @@ class TabMessageService {
         kind: 'reply', source: { ...addressed, provider: from.provider, sessionId: from.sessionId,
           sendTarget: from.sendTarget, runtimeTarget: from.runtimeTarget }, target: endpoint(question, 'source'),
         text, requestId, fingerprint, question: this._row(messageId),
+        sourceRestartBindingId: restartBinding?.bindingId || null,
       });
       this.db.prepare(`UPDATE ${TABLE_NAME} SET replyMessageId = ?, answeredAt = ?, updatedAt = ? WHERE messageId = ?`)
         .run(reserved.message.messageId, reserved.message.createdAt, updatedAfter(this._row(messageId).updatedAt), messageId);
@@ -491,7 +517,7 @@ class TabMessageService {
     return result;
   }
 
-  _reserve({ kind, source, target, text, requestId, fingerprint, question = null }) {
+  _reserve({ kind, source, target, text, requestId, fingerprint, question = null, sourceRestartBindingId = null }) {
     const messageId = randomUUID();
     const timestamp = now();
     const row = {
@@ -502,6 +528,7 @@ class TabMessageService {
       cancelledAt: question?.cancelledAt || null, cancelledByTabId: question?.cancelledByTabId || null,
       operationKey: `tab-message:${messageId}`, handoffId: `tab-message:${messageId}`,
       requestId, requestFingerprint: fingerprint,
+      sourceRestartBindingId,
     };
     if (row.cancelledAt) Object.assign(row, { deliveryState: 'failed', code: 'tab_message_cancelled',
       error: 'The request was cancelled; this reply is saved without delivery.' });
@@ -752,10 +779,24 @@ class TabMessageService {
       await this._reconcileOne(row, 'retry-reconcile');
       if (this.disposed || !this._row(row.messageId).retryAllowed) return;
     }
-    let target;
+    let target, deliveryRestartBinding = null;
     try {
-      const source = await this._resolve(endpoint(row, 'source'));
+      let source;
+      try { source = await this._resolve(endpoint(row, 'source')); }
+      catch (error) {
+        if (error?.code !== 'tab_message_address_changed' || !this.readRestartBinding) throw error;
+        const live = await this._resolve(row.sourceTabId);
+        const binding = await this.readRestartBinding({ phase: 'delivery', role: 'source', message: row,
+          expected: endpoint(row, 'source'), live });
+        if (!binding?.bindingId || binding.sessionId !== live.sessionId || binding.isCurrent?.() !== true) throw error;
+        deliveryRestartBinding = binding;
+        source = live;
+        this._transition(row.messageId, { sourceRestartBindingId: binding.bindingId }, 'restart-source-proof');
+      }
       target = await this._resolve(endpoint(row, 'target'), true);
+      if (deliveryRestartBinding && deliveryRestartBinding.isCurrent?.() !== true) {
+        throw new TabMessageError('tab_message_address_changed', 'The proved restart source changed during delivery');
+      }
       for (const [side, live] of [['source', source], ['target', target]]) {
         if (!row[side + 'SessionId'] && live.sessionId) {
           this.db.prepare(`UPDATE ${TABLE_NAME} SET ${side}SessionId = ?, ${side}AddressJson = NULL

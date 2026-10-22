@@ -1,13 +1,13 @@
 import React,{useCallback,useEffect,useRef,useState} from 'react';
 import {createPortal} from 'react-dom';
-import {ChevronRight,Copy,Palette,RotateCw,Square} from 'lucide-react';
+import {ChevronRight,Copy,Palette,RotateCw,Square,PanelLeftClose} from 'lucide-react';
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {useUIStore} from '../../store/useUIStore';
 import {requireCodexSurfaceSessionId} from '../../utils/codexWriterIdentity';
 import {resolvePtyAgentOwner} from '../../utils/ptyAgentOwner.mjs';
 import {refreshGeneratedTabTitle} from '../../utils/generateTabTitle';
 import {classifyPaneStripColorSelection} from '../../utils/paneStripSelectionModel.mjs';
-import {readPaneStripActiveGroups,paneStripGroupActivityFingerprint} from '../../utils/paneStripGroupsModel.mjs';
+import {readPaneStripActiveGroups,readPaneStripOwnerEntries,paneStripGroupActivityFingerprint} from '../../utils/paneStripGroupsModel.mjs';
 import {notifyPaneStripSelection,openPaneStripSelectionBeside,removePaneStripSelection,
   paneStripSelectionTargets,tabSessionUuid,tabUuidPathText} from '../../utils/paneStripSelectionActions.mjs';
 import {CONTEXT_MENU_COMPACT_ROW_STYLE,CONTEXT_MENU_ROW_STYLE,CONTEXT_MENU_TOP_DIVIDER_STYLE,CONTEXT_MENU_PANEL_STYLE} from '../UI/contextMenuMetrics.mjs';
@@ -52,8 +52,20 @@ export default function PaneStripSelectionMenu({lease,onClose,runtimePort,colorO
   const getAnchorRect=useCallback(()=>anchor.current?.getBoundingClientRect() || null,[]);
   let groups:any[]=[],colorError=false;
   try {groups=readPaneStripActiveGroups(useWorkspaceStore.getState(),lease.workflowId);}catch{colorError=true;}
-  const choice=classifyPaneStripColorSelection(groups,lease.entries.map(entry=>entry.tabId));
-  const colorDisabled=!organizationReady||colorError||choice.kind==='disabled'||busy;
+  // A collapsed representative exposes GROUP SETTINGS without silently making
+  // its single-tab Full/Stop command target all the hidden members.
+  const represented=lease.entries.length===1?groups.find(group=>group.collapsed&&group.tabIds.includes(lease.entries[0].tabId)):null;
+  const ownerEntries=represented?readPaneStripOwnerEntries(useWorkspaceStore.getState(),lease):null;
+  const colorEntries=represented&&represented.tabIds.every(id=>ownerEntries?.some(entry=>entry.tabId===id))
+    ?ownerEntries!.filter(entry=>represented.tabIds.includes(entry.tabId)):lease.entries;
+  const colorLease=colorEntries===lease.entries?lease:{...lease,entries:colorEntries,isCurrent:()=>{
+    if(!lease.isCurrent())return false;
+    const current=readPaneStripOwnerEntries(useWorkspaceStore.getState(),lease);
+    return !!current&&colorEntries.every(entry=>current.some(value=>value.tabId===entry.tabId&&value.projectId===entry.projectId));
+  }};
+  const choice=classifyPaneStripColorSelection(groups,colorEntries.map(entry=>entry.tabId));
+  const colorUnavailable=!organizationReady||colorError||choice.kind==='disabled';
+  const colorDisabled=colorUnavailable||busy;
   const color=choice.kind==='recolor'?choice.group.color:'#a855f7';
   const targets=lease.entries.flatMap(entry=>{
     const state=useWorkspaceStore.getState(),tab=state.openProjects.get(entry.projectId)?.tabs.get(entry.tabId);
@@ -76,12 +88,13 @@ export default function PaneStripSelectionMenu({lease,onClose,runtimePort,colorO
   };
   const saveColor=async (next:string)=>{
     await act(async()=>{
-      const result=await useWorkspaceStore.getState().commitPaneStripGroupColor(lease,next);
+      const result=await useWorkspaceStore.getState().commitPaneStripGroupColor(colorLease,next);
       if(!result||!Number.isSafeInteger(result.revision))throw Error('strip_group_save_unconfirmed');
       useWorkspaceStore.getState().saveSession();
     },false);
   };
-  return <div data-pane-strip-selection-menu data-selection-count={lease.entries.length}>
+  return <div data-pane-strip-selection-menu data-selection-count={lease.entries.length}
+    data-pane-strip-selection-owner={JSON.stringify([lease.workflowId,lease.windowId??lease.paneIndex])}>
     {!colorOnly&&<>
     <div className="flex items-stretch w-full">
       <button type="button" className={button+' flex-1'} style={CONTEXT_MENU_COMPACT_ROW_STYLE} disabled={busy}
@@ -100,14 +113,27 @@ export default function PaneStripSelectionMenu({lease,onClose,runtimePort,colorO
       onOnce={enabled=>{void act(()=>notifyPaneStripSelection(useWorkspaceStore.getState,lease,'once',enabled));}}
       onPersistent={enabled=>{void act(()=>notifyPaneStripSelection(useWorkspaceStore.getState,lease,'persistent',enabled));}} onAction={()=>{}}/>}
     </>}
-    <button ref={anchor} type="button" data-tab-context-action="group-color" className={button+' w-full justify-between'}
-      disabled={colorDisabled} style={{...CONTEXT_MENU_ROW_STYLE,...CONTEXT_MENU_TOP_DIVIDER_STYLE}}
+    <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
+    <button type="button" className={button+' border-r border-[#444]'} style={{...CONTEXT_MENU_COMPACT_ROW_STYLE,minWidth:28}}
+      data-tab-context-action="group-collapse" disabled={busy||colorUnavailable||choice.kind!=='recolor'}
+      aria-label="Свернуть группу в одну вкладку" aria-pressed={choice.kind==='recolor'&&!!choice.group.collapsed}
+      title={choice.kind==='recolor'&&choice.group.collapsed?'Показывать все вкладки':'Свернуть группу в одну вкладку'}
+      onClick={()=>{if(choice.kind==='recolor')void act(async()=>{
+        const result=await useWorkspaceStore.getState().commitPaneStripGroupPresentation(colorLease,choice.group.id,{collapsed:!choice.group.collapsed});
+        if(!result||!Number.isSafeInteger(result.revision))throw Error('strip_group_save_unconfirmed');
+        useWorkspaceStore.getState().saveSession();
+      });}}><PanelLeftClose size={13}/></button>
+    <button ref={anchor} type="button" data-tab-context-action="group-color" className={button+' flex-1 justify-between'}
+      disabled={colorDisabled} style={CONTEXT_MENU_ROW_STYLE}
       title={colorDisabled?'Выберите свободные вкладки или всю одну цветную группу':undefined}
       onMouseEnter={()=>{if(!colorDisabled)setColorOpen(true);}} onClick={()=>{if(!colorDisabled)setColorOpen(open=>!open);}}>
       <span className="flex items-center gap-2"><Palette size={12} style={{color}}/>Цвет группы</span><ChevronRight size={12}/>
     </button>
-    {colorOpen&&!colorDisabled&&createPortal(<SideFlyout ref={flyout} getAnchorRect={getAnchorRect} zIndex={100040}
+    </div>
+    {colorOpen&&!colorUnavailable&&createPortal(<SideFlyout ref={flyout} getAnchorRect={getAnchorRect} zIndex={100040}
       data-tab-context-menu data-pane-strip-color-submenu
+      data-tab-menu-owner-id={lease.entries[0]?.tabId}
+      data-pane-strip-selection-owner={JSON.stringify([lease.workflowId,lease.windowId??lease.paneIndex])}
       onPointerDownCapture={()=>{pointerDown.current=true;}} onMouseDown={event=>event.stopPropagation()} onClick={event=>event.stopPropagation()}>
       <div style={{...CONTEXT_MENU_PANEL_STYLE,background:'#2a2a2a',border:'1px solid #444'}}>
         <PaneStripGroupColorPicker key={choice.kind==='recolor'?choice.group.id:'new'} color={color} disabled={busy}

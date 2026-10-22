@@ -1,6 +1,8 @@
 'use strict';
 
 const fs = require('node:fs');
+const { currentReadControl } = require('./history-read-control');
+const { createJsonStringDecoder, SOURCE_LEAF_VERSION } = require('./history-source-leaf');
 
 // true retains a scalar; an object schema selects keys; ITEMS selects array
 // elements. PRESENCE keeps the JSON type/nullness, DEFER keeps an exact byte
@@ -11,6 +13,10 @@ const DEFER = Symbol('read selected value later');
 const PRESENCE = Symbol('preserve JSON type, omit body');
 const ITEMS = Symbol('array items');
 const RANGE = Symbol('physical JSON value');
+// Explicit internal opt-in: retain a verified source locator for a selected
+// JSON string. A public full response must resolve it through streamSourceLeaf;
+// it must never serialize the locator in place of text.
+const LEAF = Symbol('bounded selected JSON string');
 
 const CHUNK_BYTES = 1024 * 1024;
 const TOKEN_FRAGMENT_BATCH = 1024;
@@ -27,9 +33,9 @@ const range = (from, to) => ({ [RANGE]: true, from, to });
 // semantics. Large ignored strings/subtrees never become JS strings/objects.
 // Latin1 here is a byte-preserving transport; retained JSON strings are decoded
 // from UTF-8 only when complete, including a code point split across reads.
-function createJsonProjection(rootSchema) {
+function createJsonProjection(rootSchema, options = {}) {
   const stack = [];
-  let maxTokenBytes = 0, maxChunkBytes = 0, maxBufferedBytes = 0, chunkBytes = 0;
+  let maxTokenBytes = 0, maxChunkBytes = 0, maxBufferedBytes = 0, maxParserFrames = 0, chunkBytes = 0;
   let token = null, value, complete = false, invalid = false, seen = false, edgePrefix = '';
   const locatedProjection = schema => schema && typeof schema === 'object' && Object.hasOwn(schema, DEFER);
   const keyLimitFor = schema => {
@@ -60,6 +66,12 @@ function createJsonProjection(rootSchema) {
     parent.state = 'comma';
   };
   const append = text => {
+    if (token.decoder) {
+      token.decoder.write(text);
+      const bytes = token.decoder.stats().maxBufferedChars * 2;
+      maxTokenBytes = Math.max(maxTokenBytes, bytes);
+      maxBufferedBytes = Math.max(maxBufferedBytes, chunkBytes + bytes);
+    }
     if (!token.capture) return;
     token.length += text.length;
     // Only keys longer than every possible selected key can be discarded.
@@ -129,6 +141,10 @@ function createJsonProjection(rootSchema) {
           : !['zero', 'int', 'fraction', 'exponent'].includes(token.numberState)) throw Error('atom');
         if (token.capture) result = JSON.parse(tokenText());
         else if (token.schema === PRESENCE) result = token.word === 'null' ? null : 0;
+      } else if (token.decoder) {
+        const decoded = token.decoder.finish();
+        result = Object.freeze({ $historySourceLeaf: SOURCE_LEAF_VERSION,
+          from: token.from, to: end, totalChars: decoded.totalChars, contentHash: decoded.contentHash });
       } else if (token.capture) {
         result = JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8'));
       } else if (token.schema === PRESENCE) result = '';
@@ -211,8 +227,11 @@ function createJsonProjection(rootSchema) {
         if (char === '"') {
           token = { kind: 'string', key, schema, from: offset + index,
             keyLimit: parent?.keyLimit,
-            capture: key || (schema !== undefined && schema !== DEFER && schema !== PRESENCE && !locatedProjection(schema)),
+            capture: key || (schema !== undefined && schema !== DEFER && schema !== PRESENCE && schema !== LEAF && !locatedProjection(schema)),
             parts: [], length: 0 };
+          if (!key && schema === LEAF) token.decoder = createJsonStringDecoder({
+            chunkChars: Math.max(1, Math.floor((Number(options.selectedTokenBytes) || 64 * 1024) / 2)),
+          });
           append('"'); index++; continue;
         }
         if (char === '{' || char === '[') {
@@ -222,6 +241,7 @@ function createJsonProjection(rootSchema) {
             keyLimit: char === '{' ? keyLimitFor(schema) : 0,
             from: offset + index, value: schema === undefined || schema === DEFER
               ? undefined : char === '{' ? {} : [] });
+          maxParserFrames = Math.max(maxParserFrames, stack.length);
           index++; continue;
         }
         if (!'-0123456789tfn'.includes(char)) throw Error('value');
@@ -237,21 +257,35 @@ function createJsonProjection(rootSchema) {
   };
   // Encoded token + current write input only; excludes selected decoded values
   // and container/depth state. Ignored bodies never contribute token storage.
-  return { write, finish, stats: () => ({ maxTokenBytes, maxChunkBytes, maxBufferedBytes }) };
+  return { write, finish, stats: () => ({ maxTokenBytes, maxChunkBytes, maxBufferedBytes, maxParserFrames }) };
+}
+
+function readControl(options) {
+  const demand = options._readControl || options.control || currentReadControl();
+  const assertCurrent = () => { demand?.assertCurrent(); options.assertCurrent?.(); };
+  return { assertCurrent, async checkpoint() {
+    assertCurrent();
+    if (demand?.checkpoint) await demand.checkpoint(); else await yieldToMain();
+    assertCurrent();
+  } };
 }
 
 async function readProjectedValue(filePath, loc, schema, options = {}) {
-  const parser = createJsonProjection(schema);
+  const control = readControl(options);
+  control.assertCurrent();
+  const parser = createJsonProjection(schema, options);
   let offset = loc.from;
   for await (const bytes of fs.createReadStream(filePath, {
     start: loc.from, end: loc.to - 1, highWaterMark: options.highWaterMark || CHUNK_BYTES,
   })) {
+    control.assertCurrent();
     parser.write(bytes.toString('latin1'), offset);
     offset += bytes.length;
     options.onBytes?.(bytes.length);
-    await yieldToMain();
+    await control.checkpoint();
   }
   const result = parser.finish(offset);
+  control.assertCurrent();
   if (!result.valid) throw Error('codex-resume-source-changed');
   return result.value;
 }
@@ -261,15 +295,18 @@ async function readProjectedValue(filePath, loc, schema, options = {}) {
 // Only newline-committed records are visited; a partial tail is a byte locator,
 // never a retained giant buffer. Resume keeps its existing small-line fast path.
 async function readProjectedJsonlRange(filePath, startByte, endByte, options = {}) {
+  const control = readControl(options);
+  control.assertCurrent();
   let offset = startByte, start = startByte, line = options.startLine ?? options.lineCount ?? 0;
-  let parsed = 0, errors = 0, parser = createJsonProjection(options.schema);
+  let parsed = 0, errors = 0, parser = createJsonProjection(options.schema, options);
   const metrics = options.metrics;
   if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0,
-    maxTokenBytes: 0, maxChunkBytes: 0, maxBufferedBytes: 0 });
+    maxTokenBytes: 0, maxChunkBytes: 0, maxBufferedBytes: 0, maxParserFrames: 0,
+    maxCollectedRecords: 0, maxConsumerRecords: 0 });
   const measure = (readChunkBytes = 0) => {
     if (!metrics) return;
     const stats = parser.stats();
-    for (const key of ['maxTokenBytes', 'maxChunkBytes', 'maxBufferedBytes']) {
+    for (const key of ['maxTokenBytes', 'maxChunkBytes', 'maxBufferedBytes', 'maxParserFrames']) {
       metrics[key] = Math.max(metrics[key], stats[key]);
     }
     // The filesystem buffer can contain many lines, each a smaller write.
@@ -280,10 +317,12 @@ async function readProjectedJsonlRange(filePath, startByte, endByte, options = {
     start: startByte, end: endByte,
     highWaterMark: Math.max(1, Number(options.highWaterMark) || CHUNK_BYTES),
   })) {
+    control.assertCurrent();
     options.onChunk?.(bytes, offset);
     options.onBytes?.(bytes.length);
     let cursor = 0;
     while (cursor < bytes.length) {
+      control.assertCurrent();
       const newline = bytes.indexOf(10, cursor);
       const end = newline < 0 ? bytes.length : newline;
       parser.write(bytes.subarray(cursor, end).toString('latin1'), offset + cursor);
@@ -294,21 +333,24 @@ async function readProjectedJsonlRange(filePath, startByte, endByte, options = {
       if (result.valid) {
         parsed++;
         const record = { ...result.value, __line: line, __byteOffset: start };
+        if (metrics) metrics.maxConsumerRecords = 1;
         await options.onRecord?.(record, { filePath, fromByte: start, toByte: offset + end + 1, startLine: line });
+        control.assertCurrent();
       } else if (!result.empty) errors++;
       line++; start = offset + end + 1; cursor = end + 1;
-      parser = createJsonProjection(options.schema);
+      parser = createJsonProjection(options.schema, options);
     }
     offset += bytes.length;
     if (metrics) { metrics.bytes += bytes.length; metrics.chunks++; }
     options.onProgress?.(offset - startByte);
-    await yieldToMain();
+    await control.checkpoint();
   }
   measure();
+  control.assertCurrent();
   return { parsed, errors, lineCount: line, partialBytes: offset - start,
     partial: { filePath, fromByte: start, toByte: offset, startLine: line } };
 }
 
-module.exports = { DEFER, PRESENCE, ITEMS, RANGE, createJsonProjection,
+module.exports = { DEFER, PRESENCE, ITEMS, RANGE, LEAF, createJsonProjection,
   readProjectedValue, readProjectedJsonlRange };
 

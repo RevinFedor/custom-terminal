@@ -350,9 +350,10 @@ test('меню не предлагает удалённые scroll-mode и ав�
   assert.doesNotMatch(strip, /autoReveal|endInsetPx|scrollLeft/);
 });
 
-test('возврат фокуса сохраняет зарезервированную геометрию кнопок', () => {
-  assert.match(header, /data-wrap-reserved="1"/);
-  assert.match(header, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+test('шапка не резервирует скрытую terminal-кнопку при смене фокуса', () => {
+  assert.doesNotMatch(header, /data-split-pane-focus-actions|data-split-pane-terminal-slot|focusActionsVisible/);
+  assert.match(header, /data-split-button/);
+  assert.match(header, /data-split-strip-menu-button/);
 });
 
 // ── Git в шапке окна ──────────────────────────────────────────────────────

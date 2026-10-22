@@ -3,7 +3,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const path=require('node:path'),os=require('node:os'),http=require('node:http'),zlib=require('node:zlib'),vm=require('node:vm');
 const {EventEmitter,errorMonitor}=require('node:events'),{Worker}=require('node:worker_threads');
 const {createRequire}=require('node:module'),{performance}=require('node:perf_hooks'),{createHash}=require('node:crypto');
-const {createHttpReadDiagnostics,beginHttpReadDependency}=require('./http-read-diagnostics');
+const {createHttpReadDiagnostics,beginHttpReadDependency,readRoute}=require('./http-read-diagnostics');
 const ts=require('typescript');
 const sourceDirectory=process.env.HTTP_READ_SOURCE_DIR || __dirname;
 const web=fs.readFileSync(path.join(sourceDirectory,'web-server.js'),'utf8');
@@ -26,6 +26,21 @@ function get(port,pathname='/api/terminal-tabs/private-tab/history',headers={}){
  const req=http.get({hostname:'127.0.0.1',port,path:pathname,headers},res=>{const chunks=[];res.on('data',b=>chunks.push(b));
   res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}));res.on('error',reject);});req.on('error',reject);});}
 const ids={'X-Noted-Action-Id':'action-1','X-Noted-Read-Id':'read-1','X-Noted-Read-Attempt':'attempt-1','X-Noted-Ingress-Id':'ingress-1'};
+test('absolute-form diagnostic classification matches actual router pathname and keeps mutation/watch exclusions',()=>{
+ for(const url of ['/api/terminal-tabs/private-tab/history?token=PRIVATE_SECRET','/api/terminal-tabs/private-tab/timeline?last=80','/api/terminal-tabs/private-tab/history-payload?payloadId=PRIVATE_SECRET','/api/me?token=PRIVATE_SECRET']){
+  const expected=readRoute({method:'GET',url});assert.ok(expected);
+  for(const prefix of ['http://private.invalid','https://private.invalid'])assert.equal(readRoute({method:'GET',url:prefix+url}),expected);
+ }
+ for(const [method,url]of [['POST','http://private.invalid/api/terminal-tabs/t/send'],['GET','http://private.invalid/api/events'],['GET','http://private.invalid/api/terminal-tabs/t/history/stream']])assert.equal(readRoute({method,url}),null);
+});
+test('real absolute-form HTTP diagnostics retain correlation and terminal without URL/query disclosure',async t=>{
+ const f=diagnostics();const s=await server(t,(_req,res)=>{f.diag.phase(res,'route-enter');res.end('own');},f.diag);
+ const result=await get(s.port,'http://private.invalid/api/terminal-tabs/private-tab/history?token=PRIVATE_SECRET',ids);
+ assert.equal(result.status,200);assert.equal(result.body.toString(),'own');
+ assert.ok(f.records.some(x=>x.event==='http-enter'));assert.equal(f.records.filter(x=>x.terminal).length,1);
+ assert.ok(f.records.every(x=>x.route==='/api/terminal-tabs/:id/history'&&x.readId==='read-1'));
+ assert.equal(f.diag.snapshot().active.length,0);assert.doesNotMatch(JSON.stringify(f.records),/PRIVATE_SECRET|private\.invalid|private-tab/);
+});
 test('real HTTP/zlib: exact Unicode bytes/hash, one stringify, original gzip policy and one terminal',async t=>{
  const f=diagnostics(),send=sendJson(f.diag);let serializations=0;
  const value={entries:Array.from({length:1000},(_,i)=>({uuid:'row-'+i,text:('Привет🌍-'+i).repeat(160)}))};

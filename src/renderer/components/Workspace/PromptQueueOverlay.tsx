@@ -1,11 +1,13 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { initializeLoopDependencies, loopDependencyEntry, subscribeLoopDependencies } from '../../utils/loopDependencies.mjs';
+import { loopPromptMode } from '../../store/usePromptQueueStore';
 import { readTerminalMessageClipboard, terminalMessageTokenPresentation } from '../../utils/terminalMessageChips.mjs';
 import { useQueuedRewindLabels } from '../../hooks/useQueuedRewindLabels';
 import { queuedRewindLabel } from '../../utils/queuedRewindLabel.mjs';
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, GitBranch, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
 import { ComposerEditor } from '../ComposerEditor';
@@ -643,6 +645,11 @@ export function PromptQueueOverlay({
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
   const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
+  const ownTurnLoopEnabled = loopPromptEnabled && loopPromptMode(queue) === 'own-turn';
+  const standardLoopEnabled = loopPromptEnabled && !ownTurnLoopEnabled;
+  const loopWait = useSyncExternalStore(subscribeLoopDependencies,
+    () => queue ? loopDependencyEntry(tabId, queue) : null);
+  useEffect(() => { void initializeLoopDependencies().catch(() => {}); }, []);
   const loopPromptText = usePromptQueueStore((s) => s.sharedLoopPromptText);
   // Вкладка без своей записи в очереди = новая вкладка → свёрнуто. Локальный
   // `?? false` здесь раньше означал «развёрнуто» и переспорил бы дефолт стора.
@@ -3469,27 +3476,62 @@ export function PromptQueueOverlay({
               overflow: 'hidden',
               background: PANEL_BG,
             }}
+            data-prompt-queue-loop-modes
           >
             <ControlHint
-              label={loopPromptEnabled ? 'Остановить циклический prompt' : 'Отправлять prompt после каждого завершения'}
+              label={ownTurnLoopEnabled && loopWait ? 'Loop ON · ждёт: ' + loopWait.reason
+                : 'Loop после ответа · проверять работу, даже когда MCP ещё выполняются'}
+              side="left"
+            >
+              <button
+                type="button"
+                className="pq-edge-action"
+                data-prompt-queue-loop-own-turn
+                data-loop-wait-state={loopWait?.state || undefined}
+                aria-label="Loop после ответа — учитывать ожидание MCP"
+                aria-pressed={ownTurnLoopEnabled}
+                title={ownTurnLoopEnabled && loopWait ? 'Loop ON · ждёт: ' + loopWait.reason
+                  : ownTurnLoopEnabled ? 'Остановить Loop после ответа'
+                  : 'Loop после ответа: проверять работу при внешнем ожидании MCP'}
+                onClick={() => setLoopPromptEnabled(tabId, !ownTurnLoopEnabled, 'own-turn')}
+                style={{
+                  width: 22,
+                  height: overview ? 18 : 20,
+                  padding: 0,
+                  background: ownTurnLoopEnabled ? `${PULSE}22` : 'transparent',
+                  border: 0,
+                  borderRight: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
+                  color: ownTurnLoopEnabled ? PULSE : TEXT_MUTED,
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <GitBranch size={10} strokeWidth={2.2} aria-hidden />
+              </button>
+            </ControlHint>
+            <ControlHint
+              label={standardLoopEnabled ? 'Остановить обычный Loop' : 'Обычный Loop · ждать завершения всей связанной работы'}
               side="left"
             >
               <button
                 type="button"
                 className="pq-edge-action"
                 data-prompt-queue-loop-toggle
-                aria-pressed={loopPromptEnabled}
+                aria-label="Обычный Loop — ждать завершения всей работы"
+                aria-pressed={standardLoopEnabled}
                 onClick={() => {
-                  setLoopPromptEnabled(tabId, !loopPromptEnabled);
+                  setLoopPromptEnabled(tabId, !standardLoopEnabled, 'all-work');
                 }}
-                title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
+                title={standardLoopEnabled ? 'Остановить обычный Loop' : 'Обычный Loop: ждать завершения всех связанных задач'}
                 style={{
                   minWidth: 24,
                   height: overview ? 18 : 20,
                   padding: effectiveWidth >= 220 ? '0 6px' : '0 5px',
-                  background: loopPromptEnabled ? `${PULSE}22` : 'transparent',
+                  background: standardLoopEnabled ? `${PULSE}22` : 'transparent',
                   border: 0,
-                  color: loopPromptEnabled ? PULSE : TEXT_MUTED,
+                  color: standardLoopEnabled ? PULSE : TEXT_MUTED,
                   cursor: 'pointer',
                   fontSize: overview ? 7 : 9,
                   fontFamily: 'inherit',
@@ -3503,7 +3545,7 @@ export function PromptQueueOverlay({
                 {effectiveWidth >= 220 && <span>Loop</span>}
               </button>
             </ControlHint>
-            <ControlHint label="Изменить циклический prompt" side="left">
+            <ControlHint label="Изменить общий prompt обоих режимов Loop" side="left">
               <button
                 type="button"
                 className="pq-edge-action"

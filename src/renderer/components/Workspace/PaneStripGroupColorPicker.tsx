@@ -31,8 +31,11 @@ export default function PaneStripGroupColorPicker({color,onCommit,disabled=false
     onKeyUp={event=>{if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','Enter',' '].includes(event.key))commit();}}
     style={{pointerEvents:disabled?'none':undefined}}>
     <HsvColorPicker className="pane-strip-color-square" color={hsv} onChange={update}/>
-    <input className="pane-strip-color-hue" type="range" min="0" max="359" step="1" value={Math.round(hsv.h)}
-      disabled={disabled} aria-label="Оттенок группы" aria-orientation="vertical"
-      onChange={event=>update({...draft.current,h:Number(event.currentTarget.value)})}/>
+    <div className="pane-strip-color-hue">
+      <input className="pane-strip-color-hue-input" type="range" min="0" max="359" step="1" value={Math.round(hsv.h)}
+        disabled={disabled} aria-label="Оттенок группы" aria-orientation="vertical"
+        style={{accentColor:`hsl(${hsv.h} 100% 50%)`}}
+        onChange={event=>update({...draft.current,h:Number(event.currentTarget.value)})}/>
+    </div>
   </div>;
 }

@@ -78,6 +78,7 @@ export function createHorizontalDragGeometryCache() {
       wrap = false,
       includeRowPlacement = false,
       readChips,
+      selectChips,
     }) {
       const key = String(ownerKey || '');
       if (!key || typeof readChips !== 'function') return 0;
@@ -105,6 +106,20 @@ export function createHorizontalDragGeometryCache() {
       if (wrap) {
         const y = Number(clientY) - (Number(viewportTop) || 0) + (Number(scrollTop) || 0);
         const target = wrappedInsertTarget(lease.chips, pointerInContent, y, excluded);
+        // An absolute row can cover ordinary chips in this same strip. Its
+        // host may select members from this exact lease, without a second DOM
+        // read/cache or changing the shared insertion arithmetic.
+        if (typeof selectChips === 'function') {
+          const selected = selectChips(lease.chips, {x:pointerInContent,y});
+          if (selected === null) return null;
+          if (selected) {
+            const scoped = wrappedInsertTarget(selected.chips, pointerInContent, y, excluded);
+            const rowStartId = scoped.at === 0 && selected.chips.some(chip=>chip.id===target.rowStartId)
+              ? target.rowStartId : null;
+            const result = {...scoped,rowStartId,scopeId:selected.scopeId};
+            return includeRowPlacement ? result : result.at;
+          }
+        }
         return includeRowPlacement ? target : target.at;
       }
       return horizontalInsertIndex(lease.chips, pointerInContent);

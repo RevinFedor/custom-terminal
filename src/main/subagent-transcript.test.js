@@ -312,6 +312,47 @@ test('codex child keeps one canonical user carrier after its NEW_TASK boundary',
   });
 });
 
+test('codex first child input is preserved in either paired carrier order and with either single carrier', () => {
+  const sessionId = 'child-session', agentPath = '/root/reviewer';
+  const root = {type: 'session_meta', payload: {id: sessionId, thread_source: 'subagent', multi_agent_version: 'v2', agent_path: agentPath}};
+  const task = {type: 'response_item', payload: {type: 'agent_message', author: '/root', recipient: agentPath,
+    content: `Message Type: NEW_TASK\nTask name: ${agentPath}\nSender: /root\nPayload:\n`}};
+  const response = {type: 'response_item', payload: {type: 'message', role: 'user', id: 'first-user', content: [{type: 'input_text', text: 'уточнение'}]}};
+  const event = {type: 'event_msg', payload: {type: 'user_message', message: 'уточнение'}};
+  const answer = {type: 'response_item', payload: {type: 'message', role: 'assistant', id: 'first-answer', content: [{type: 'output_text', text: 'принято'}]}};
+  for (const input of [[event, response], [response, event], [event], [response]]) {
+    withTempFile([root, task, ...input, answer].map(codexLine).join(''), file => {
+      const result = readAgentSteps({toolType: 'codex', filePath: file, sessionId,
+        projectionState: createSubagentStepProjectionState({codexSessionId: sessionId})});
+      assert.deepEqual(result.steps.filter(step => step.kind === 'message').map(step => [step.role, step.text]),
+        [['user', 'уточнение'], ['assistant', 'принято']]);
+    });
+  }
+});
+
+test('recognised initial bootstrap stays hidden once while real child input after plugin markup remains visible', () => {
+  const sessionId = 'child-session', agentPath = '/root/reviewer';
+  const input = text => ({type: 'response_item', payload: {type: 'message', role: 'user', content: [{type: 'input_text', text}]}});
+  const bootstrap = '<recommended_plugins>fixture</recommended_plugins>\n# AGENTS.md instructions for /repo\n<INSTRUCTIONS>fixture</INSTRUCTIONS>\n<environment_context>fixture</environment_context>';
+  const real = '<recommended_plugins>quoted example</recommended_plugins>\nПроверь этот пример';
+  const records = [
+    {type: 'session_meta', payload: {id: sessionId, thread_source: 'subagent', multi_agent_version: 'v2', agent_path: agentPath}},
+    {type: 'response_item', payload: {type: 'agent_message', author: '/root', recipient: agentPath,
+      content: `Message Type: NEW_TASK\nTask name: ${agentPath}\nSender: /root\nPayload:\n`}},
+    input(bootstrap), {type: 'event_msg', payload: {type: 'user_message', message: bootstrap}},
+    input('<recommended_plugins>fixture</recommended_plugins>'),
+    input('<recommended_plugins>fixture</recommended_plugins>\n<environment_context>fixture</environment_context>'),
+    input(real), {type: 'event_msg', payload: {type: 'user_message', message: real}},
+    {type: 'response_item', payload: {type: 'message', role: 'assistant', content: [{type: 'output_text', text: 'принято'}]}},
+  ];
+  withTempFile(records.map(codexLine).join(''), file => {
+    const result = readAgentSteps({toolType: 'codex', filePath: file, sessionId,
+      projectionState: createSubagentStepProjectionState({codexSessionId: sessionId})});
+    assert.equal(result.steps.filter(step => step.kind === 'instruction').length, 1);
+    assert.deepEqual(result.steps.filter(step => step.kind === 'message').map(step => step.text), [real, 'принято']);
+  });
+});
+
 test('codex v1 child without a v2 NEW_TASK envelope keeps its own first prompt', () => {
   const records = [
     { type: 'session_meta', payload: { id: 'legacy-child', thread_source: 'subagent', multi_agent_version: 'v1' } },
@@ -422,6 +463,30 @@ test('a half-written trailing line is left for the next tick', () => {
     assert.equal(next.steps.length, 1);
     assert.equal(next.steps[0].text, 'дописанная');
   });
+});
+
+test('async and sync partial tails survive append with and without retained parser state', async () => {
+  const {readAgentStepsAsync} = require('./subagent-transcript');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-partial-reader-'));
+  const file = path.join(dir, 'synthetic.jsonl');
+  try {
+    for (const read of [readAgentSteps, readAgentStepsAsync]) {
+      for (const retained of [false, true]) {
+        const whole = claudeLine('целая'), next = claudeLine('дописанная');
+        const split = Math.floor(Buffer.byteLength(next) / 2);
+        fs.writeFileSync(file, Buffer.concat([Buffer.from(whole), Buffer.from(next).subarray(0, split)]));
+        const projectionState = retained ? createSubagentStepProjectionState() : undefined;
+        const first = await read({toolType: 'claude', filePath: file, projectionState});
+        assert.deepEqual(first.steps.map(step => step.text), ['целая']);
+        assert.equal(first.offset, retained ? first.size : Buffer.byteLength(whole));
+        fs.appendFileSync(file, Buffer.from(next).subarray(split));
+        const appended = await read({toolType: 'claude', filePath: file, projectionState, offset: first.offset});
+        assert.deepEqual(appended.steps.map(step => step.text), ['дописанная']);
+        const eof = await read({toolType: 'claude', filePath: file, projectionState, offset: appended.offset});
+        assert.equal(eof.steps.length, 0);
+      }
+    }
+  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
 test('a stale offset past the file size restarts from the beginning', () => {

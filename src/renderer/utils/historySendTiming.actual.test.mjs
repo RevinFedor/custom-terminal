@@ -6,20 +6,58 @@ import ts from 'typescript';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { historySendTimerState } from './historySendTiming.mjs';
-import { HistoryPromptHandoffStore, reconcileHistoryPromptHandoffRows } from './historyPromptHandoffs.ts';
+import { HistoryPromptHandoffStore, reconcileHistoryPromptHandoffRows, hydrateHistoryPromptHandoffFromDurableReceipt,
+  getHistoryPromptHandoffsSnapshot, consumeHistoryPromptHandoff } from './historyPromptHandoffs.ts';
 import { readHistorySendRecovery, saveHistorySendRecovery } from './historySendRecovery.mjs';
 import { createRequire } from 'node:module';
 
 const input = { tabId: 'T', handoffId: 'H', toolType: 'codex', text: 'original', submittedAt: 1000, initialStatus: 'preparing' };
-test('seconds include app queue; first Enter freezes even while confirming or provider-queued', () => {
-  for (const status of ['preparing', 'application-queued', 'sending'])
-    assert.deepEqual(historySendTimerState({ startedAt: 1000, status }, 66000), { running: true, seconds: 65 });
+test('clock excludes app queue and stops only at authored payload attempt, never at Enter/confirming', () => {
+  const sendInputTiming = { version: 1, preparationStartedAt: 6000 };
+  assert.equal(historySendTimerState({ status: 'application-queued', startedAt: 1000 }, 66000), null);
+  assert.equal(historySendTimerState({ sendInputTiming, status: 'application-queued' }, 66000), null);
+  for (const status of ['preparing', 'sending', 'audit-pending', 'queued'])
+    assert.deepEqual(historySendTimerState({ sendInputTiming, enterAttemptAt: 7000, status }, 66000), { running: true, seconds: 60 });
   for (const status of ['audit-pending', 'queued', 'sent'])
-    assert.deepEqual(historySendTimerState({ startedAt: 1000, enterAttemptAt: 13000, status }, 90000), { running: false, seconds: 12 });
-  assert.equal(historySendTimerState({ startedAt: 1000, status: 'audit-pending', changedAt: 15000 }, 90000), null);
-  assert.deepEqual(historySendTimerState({ startedAt: 1000, status: 'queued', reason: 'send-ready-queued' }, 66000), { running: true, seconds: 65 });
-  assert.equal(historySendTimerState({ startedAt: 1000, status: 'queued', reason: 'provider-queue-accepted' }, 66000), null);
-  assert.deepEqual(historySendTimerState({ startedAt: 1000, status: 'cancelled', changedAt: 5000 }, 90000), { running: false, seconds: 4 });
+    assert.deepEqual(historySendTimerState({ sendInputTiming: { ...sendInputTiming, payloadStartedAt: 18000 }, status }, 90000), { running: false, seconds: 12 });
+  assert.equal(historySendTimerState({ startedAt: 1000, enterAttemptAt: 13000, status: 'audit-pending' }, 90000), null, 'legacy Enter cannot be relabelled as paste');
+  assert.deepEqual(historySendTimerState({ sendInputTiming, status: 'cancelled', changedAt: 10000 }, 90000), { running: false, seconds: 4 });
+});
+test('exact payload timing survives remount; changed A or preparation scope cannot overwrite B', () => {
+  const store = new HistoryPromptHandoffStore(); store.begin({ ...input, sendAttemptId: 'A', sendOperationKey: 'O' });
+  const timing = { version: 1, preparationStartedAt: 6000, payloadStartedAt: 18000 };
+  store.recordInputTiming('T', 'H', { sendAttemptId: 'old', sendOperationKey: 'O', sendInputTiming: timing });
+  assert.equal(store.getSnapshot('T')[0].sendInputTiming, undefined);
+  store.recordInputTiming('T', 'H', { sendAttemptId: 'A', sendOperationKey: 'O', sendInputTiming: timing });
+  store.recordInputTiming('T', 'H', { sendAttemptId: 'A', sendOperationKey: 'O', sendInputTiming: { ...timing, payloadStartedAt: 22000 } });
+  assert.equal(store.getSnapshot('T')[0].sendInputTiming.payloadStartedAt, 18000);
+  const row = reconcileHistoryPromptHandoffRows({ rows: [], handoffs: store.getSnapshot('T'), createRow: () => ({}) }).rows[0];
+  assert.deepEqual(row.sendInputTiming, timing); assert.equal(row.optimisticAt, 1000);
+  store.begin({ ...input, sendAttemptId: 'B', sendOperationKey: 'O' });
+  store.recordInputTiming('T', 'H', { sendAttemptId: 'A', sendOperationKey: 'O', sendInputTiming: timing });
+  assert.equal(store.getSnapshot('T')[0].sendInputTiming, undefined);
+});
+test('durable waiting has no clock; ACTIVE HEAD and payload survive receipt/event loss and remount without authoring changes', t => {
+  const tabId = 'clock-durable-T', handoffId = 'clock-durable-H';
+  t.after(() => consumeHistoryPromptHandoff(tabId, handoffId));
+  const queued = { tabId, handoffId, surface: 'desktop-history', provider: 'codex', operationKey: 'history:clock:T',
+    attemptId: null, state: 'reserved', createdAt: 1000, applicationQueue: { version: 1, id: 1, state: 'waiting', queuedAt: 1000 },
+    receipt: { promptText: 'original', source: 'codex-history-panel', presentationSnapshot: { historySendStartedAt: 1000 } } };
+  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(queued).hydrated, true);
+  let row = getHistoryPromptHandoffsSnapshot(tabId)[0];
+  assert.equal(row.queueStatus, 'application-queued'); assert.equal(row.sendInputTiming, undefined);
+  const active = { ...queued, attemptId: 'A', state: 'in-flight', applicationQueue: { ...queued.applicationQueue, state: 'dispatching' },
+    receipt: { ...queued.receipt, enterAttemptAt: 7000, sendInputTiming: { version: 1, preparationStartedAt: 6000 } } };
+  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(active).hydrated, true);
+  row = getHistoryPromptHandoffsSnapshot(tabId)[0];
+  assert.equal(row.submittedAt, 1000); assert.equal(row.text, 'original');
+  assert.deepEqual(historySendTimerState({ ...row, status: row.queueStatus }, 18000), { running: true, seconds: 12 });
+  const pasted = { ...active, receipt: { ...active.receipt,
+    sendInputTiming: { version: 1, preparationStartedAt: 6000, payloadStartedAt: 18000 } } };
+  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(pasted).hydrated, true);
+  row = getHistoryPromptHandoffsSnapshot(tabId)[0];
+  assert.deepEqual(historySendTimerState({ ...row, status: 'audit-pending' }, 99000), { running: false, seconds: 12 });
+  assert.equal(row.submittedAt, 1000); assert.equal(row.enterAttemptAt, 7000);
 });
 test('first exact Enter time survives null→A binding, phase changes and remount projection; old A cannot change B', () => {
   const store = new HistoryPromptHandoffStore(); store.begin(input);
@@ -59,11 +97,11 @@ test('actual timer JSX freezes to static seconds while its adjacent status can k
   const ctx = vm.createContext({ React, memo: React.memo, useState: React.useState, useEffect: React.useEffect,
     historySendTimerState });
   vm.runInContext(code, ctx);
-  const html = renderToStaticMarkup(React.createElement(ctx.Component, { startedAt: 1000, enterAttemptAt: 66000, status: 'audit-pending' }));
+  const html = renderToStaticMarkup(React.createElement(ctx.Component, { sendInputTiming: { version: 1, preparationStartedAt: 1000, payloadStartedAt: 66000 }, status: 'audit-pending' }));
   assert.match(html, /65s<\/span>/); assert.match(html, /data-running="false"/); assert.doesNotMatch(html, /0:|aria-live/);
   assert.match(html, /Счёт остановлен/);
   assert.doesNotMatch(html, /noted-text-shimmer/, 'confirmation does not keep the frozen duration animated');
-  const runningHtml = renderToStaticMarkup(React.createElement(ctx.Component, { startedAt: Date.now(), status: 'preparing' }));
+  const runningHtml = renderToStaticMarkup(React.createElement(ctx.Component, { sendInputTiming: { version: 1, preparationStartedAt: Date.now() }, status: 'preparing' }));
   assert.match(runningHtml, /data-running="true"/);
   assert.doesNotMatch(runningHtml, /noted-text-shimmer|<svg/, 'the running duration has no animation');
   assert.match(runningHtml, /Счёт идёт/);

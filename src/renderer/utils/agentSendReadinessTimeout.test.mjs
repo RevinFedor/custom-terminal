@@ -22,6 +22,7 @@ test('real send readiness deadline yields exact before-paste failure, not delive
     ipcRenderer, AbortController, createAgentLaunchAdmission,
     ...target, Date: { now: () => now }, console: { log() {}, warn() {} },
     manualActionContract: require('../../shared/agent-manual-action.cjs'),
+    agentSendReadTiming: require('../../shared/agent-send-read-timing.cjs'),
     isCoordinatedAgentSendCancellationRequested: () => false,
     createAgentReadyWait() {
       waits++;

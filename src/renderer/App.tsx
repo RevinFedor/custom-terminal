@@ -175,7 +175,7 @@ import {
   AGENT_SETTINGS_INTENT_NONE,
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
-import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt, applyHistoryQueuedMessageMerge, recordHistorySendEnterAttempt, recordHistorySendReturnControl } from './utils/historyPromptHandoffs';
+import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt, applyHistoryQueuedMessageMerge, recordHistorySendEnterAttempt, recordHistorySendInputAttempt, recordHistorySendReturnControl } from './utils/historyPromptHandoffs';
 import { executeHistoryRewriteRewindScenario, executeHistoryDeleteIterationScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
@@ -3798,9 +3798,10 @@ function App() {
           }
           return reply(false, null, 'tab not open');
         }
-        if (action === 'sendCodexFast') {
-          const { tabId } = payload || {};
+        if (action === 'sendCodexFast' || action === 'setCodexFast') {
+          const { tabId, enabled } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
+          if (action === 'setCodexFast' && typeof enabled !== 'boolean') return reply(false, null, 'invalid_codex_fast_request');
           const found = findTabProject(tabId);
           if (!found) return reply(false, null, 'tab not open');
           const tab: any = found.tab;
@@ -3808,7 +3809,9 @@ function App() {
             return reply(false, null, 'tab is not Codex PTY');
           }
 
-          const result = await ipcRenderer.invoke('codex:toggle-fast-intent', { tabId });
+          const result = action === 'setCodexFast'
+            ? await ipcRenderer.invoke('codex:set-fast-intent', { tabId, enabled })
+            : await ipcRenderer.invoke('codex:toggle-fast-intent', { tabId });
           console.log('[MobileBridge] codex-fast intent tab=' + String(tabId).slice(-12)
             + ' result=' + JSON.stringify(result || null));
           if (!result?.success) {
@@ -5703,6 +5706,8 @@ function App() {
     ipcRenderer.on('agent:send-queue-receipt', handleSendQueueReceipt);
     const handleSendEnterAttempt = (_event: any, data: any) => { recordHistorySendEnterAttempt(data); };
     ipcRenderer.on('agent:send-enter-attempt', handleSendEnterAttempt);
+    const handleSendInputAttempt = (_event: any, data: any) => { recordHistorySendInputAttempt(data); };
+    ipcRenderer.on('agent:send-input-attempt', handleSendInputAttempt);
     const handleHistoryReturn = (_event: any, data: any) => { recordHistorySendReturnControl(data); };
     ipcRenderer.on('agent:history-send-return', handleHistoryReturn);
     const handleSendQueueMerge = (_event: any, result: any) => { applyHistoryQueuedMessageMerge(result); };
@@ -5982,6 +5987,7 @@ function App() {
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('agent:send-queue-receipt', handleSendQueueReceipt);
       ipcRenderer.removeListener('agent:send-enter-attempt', handleSendEnterAttempt);
+      ipcRenderer.removeListener('agent:send-input-attempt', handleSendInputAttempt);
       ipcRenderer.removeListener('agent:history-send-return', handleHistoryReturn);
       ipcRenderer.removeListener('agent:send-queue-merged', handleSendQueueMerge);
       void ipcRenderer.invoke('agent:send-queue-ready', false).catch(() => {});
@@ -7328,7 +7334,7 @@ function App() {
           // Status-marker clicks deliberately inspect/change metadata without
           // moving either pane focus or keyboard focus.
           if (target?.closest?.(
-            '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu]',
+            '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu], [data-pane-strip-group-count]',
           )) return;
           if (view === 'dashboard') {
             setActiveArea('projects');

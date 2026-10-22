@@ -48,6 +48,11 @@ const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
 const { createHttpReadDiagnostics, beginHttpReadDependency } = require(path.join(srcMainDir, 'http-read-diagnostics'));
+const { isFiniteHistoryHttpRead, runHttpHistoryRead, assertHttpHistoryCurrent,
+  rethrowHistoryTerminal } = require(path.join(srcMainDir, 'history-http-consumer'));
+const { isHistoryReadCancelled, currentReadControl } = require(path.join(srcMainDir, 'history-read-control'));
+const { sendHistoryJson, sendHistoryNdjson } = require(path.join(srcMainDir, 'history-json-stream'));
+const { sendHistoryEntriesStream } = require(path.join(srcMainDir, 'history-credit-http'));
 const { performance: readPerformance } = require('node:perf_hooks');
 const { causal: perfCausal } = require(path.join(srcMainDir, 'perf-causal-context'));
 const { AgentSendQueue, hasCanonicalSendConsumption } = require(path.join(srcMainDir, 'agent-send-queue'));
@@ -86,6 +91,8 @@ const {
 const { resolveAiToolOwner } = require('./ai-tool-owner');
 const { prepareReusedInboxTab } = require('./inbox-tab-reuse');
 const { prepareClosedCodexSettings } = require('./closed-codex-settings');
+const { CODEX_SETTINGS_CAPABILITY, settingsError: codexSettingsError, normalizeCodexModelEffort,
+  captureCodexSettingsTarget } = require(path.join(srcMainDir, 'codex-settings-control'));
 const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
 const { PROMPT_LIBRARY_READ_CAPABILITY } = require('./saved-prompt-service');
 const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
@@ -325,6 +332,7 @@ async function resolveProjectAgentModelRequest(projectManager, {
   provider,
   model,
   modelSelection,
+  catalogModels,
 } = {}) {
   const selection = resolveAgentModelRequest({
     provider,
@@ -332,7 +340,7 @@ async function resolveProjectAgentModelRequest(projectManager, {
     modelSelection,
     configuredModels: configuredModelsForProvider(projectManager, provider),
     catalogModels: String(modelSelection?.kind || '').trim().toLowerCase() === 'catalog'
-      ? await projectedModelsForProvider(projectManager, provider, { strict: true })
+      ? catalogModels || await projectedModelsForProvider(projectManager, provider, { strict: true })
       : undefined,
   });
   if (selection.requestedModel && (
@@ -411,6 +419,333 @@ function webServerServiceHealth() {
 // Injected from main at start() — reads the live busy/running Maps (the same
 // ones that drive the per-tab UI loader). Used by GET /api/active-loaders.
 let computeActiveLoaders = null;
+let computeInstallInputBlockers = null;
+let readInstallMcpStatus = null;
+let buildInstallContinuations = null;
+let loopDependencies = null;
+let buildContinueOperations = null;
+const BUILD_CONTINUE_ADMISSION = Symbol('build-continue-admission');
+let releaseLoopReceipt = null;
+let loopMessageStartupReady = null;
+const loopNaturalEvidence = new Map();
+const loopDecisionLanes = new Map();
+async function serializeLoopDecision(tabId, action) {
+  const previous = loopDecisionLanes.get(tabId) || Promise.resolve();
+  const next = previous.catch(() => {}).then(action);
+  loopDecisionLanes.set(tabId, next);
+  try { return await next; }
+  finally { if (loopDecisionLanes.get(tabId) === next) loopDecisionLanes.delete(tabId); }
+}
+const { loopEpoch, loopPromptMode, sameLoopTurn, loopRunAdmission } = require('../shared/loop-dependencies.cjs');
+const { isPromptLoopAutomationSource } = require('./prompt-queue-source');
+function readPersistedLoopQueue(tabId) {
+  let queues = require('./project-manager').db.getAppState('promptQueueByTab');
+  if (typeof queues === 'string') queues = JSON.parse(queues);
+  return queues?.[tabId] || null;
+}
+function loopNativeReceipt(tabId, handoffId, expected = null) {
+  const rows = agentSendReceiptStore?.list({ tabId, handoffId, state: 'confirmed' }) || [];
+  if (rows.length !== 1) return null;
+  const row = rows[0], audit = row.auditIdentity;
+  if ((!audit?.entryUuid && !audit?.sourceIdentity) || audit.attemptId !== row.attemptId || audit.sessionId !== row.sessionId
+    || audit.promptHash !== row.promptHash) return null;
+  if (expected?.operationKey && row.operationKey !== expected.operationKey) return null;
+  if (expected?.source) {
+    const item = agentSendQueue?.item(row.operationKey);
+    if (!item) return null;
+    const request = JSON.parse(item.request_json);
+    if (request.source !== expected.source || item.request_hash !== fingerprintAgentSendRequest(request)) return null;
+  }
+  return { operationKey: row.operationKey, attemptId: row.attemptId, userUuid: audit.entryUuid,
+    sourceIdentity: audit.sourceIdentity, sessionId: row.sessionId, provider: row.provider,
+    executionContext: row.receipt?.auditExecutionContext || null };
+}
+async function readLoopDependency(ref, source) {
+  if (ref.kind === 'run') {
+    const run = await getOrchestrationRunStore().get(ref.id);
+    if (!run || run.sourceTabId !== source.tabId
+      || (run.sourceSessionId || run.sourceExecutionContext?.sessionId || run.sourceSendTarget?.sessionId) !== source.sessionId) {
+      return { known: false, code: 'loop_dependency_source_mismatch' };
+    }
+    const terminal = ['completed', 'failed', 'cancelled'].includes(run.status);
+    return { known: true, identity: fingerprintAgentSendRequest([run.runId, run.sourceTabId,
+      source.sessionId, run.targetTabId, run.externalResearchJobId || null, run.createdAt]),
+      actionable: terminal && (run.status !== 'completed' || run.resultComplete !== false),
+      delivery: run.notifySource !== false && !run.notificationSuppressed ? 'callback' : 'loop',
+      receipt: run.notificationHandoffId ? loopNativeReceipt(source.tabId, run.notificationHandoffId,
+        { source: 'orchestration-completion:' + run.runId }) : null,
+      disposition: run.status };
+  }
+  const value = getTabMessageService().getMessage(ref.id), message = value?.message;
+  if (message?.kind !== 'question' || message.sourceTabId !== source.tabId || message.sourceSessionId !== source.sessionId) {
+    return { known: false, code: 'loop_dependency_source_mismatch' };
+  }
+  return { known: true, identity: fingerprintAgentSendRequest([message.messageId, message.sourceTabId,
+    message.sourceSessionId, message.targetTabId, message.targetSessionId, message.requestId]),
+    actionable: !!value.reply || !!message.cancelledAt,
+    delivery: value.reply && !message.cancelledAt ? 'callback' : 'loop',
+    receipt: value.reply ? loopNativeReceipt(source.tabId, value.reply.handoffId, { operationKey: value.reply.operationKey }) : null,
+    disposition: message.cancelledAt ? 'cancelled' : value.reply ? 'answered' : 'waiting' };
+}
+function getLoopDependencies() {
+  if (!loopDependencies) {
+    const db = require('./project-manager').db;
+    loopDependencies = require('./loop-dependencies').createLoopDependencies({
+      read: () => db.getAppState('loopDependencies.v1'), write: value => db.setAppState('loopDependencies.v1', value),
+      readQueue: readPersistedLoopQueue, readState: tabId => getAgentResponseState?.(tabId),
+      readInspection: tabId => captureTabInspection?.(tabId),
+      readDependency: readLoopDependency,
+      readLoopReceipt: async ({ tabId, subject }) => {
+        const context = subject.targetExecutionContext;
+        const observed = subject.toolType === 'codex' ? await readAgentObservedResponse?.({ tabId,
+          expectedSessionId: subject.sessionId, subject, maxChars: 1 }) : null;
+        const observedUser = observed?.result?.sourceVerified === true
+          && sameLoopTurn(observed.subject?.targetExecutionContext, context) ? observed.result.userUuid : null;
+        const exactUser = subject.toolType === 'claude' ? subject.providerPromptId : observedUser;
+        const rows = agentSendReceiptStore?.list({ tabId, state: 'confirmed' }) || [];
+        const matches = rows.filter(row => {
+          const audited = row.receipt?.auditExecutionContext;
+          if (!sameLoopTurn(audited, context) && (!exactUser || row.auditIdentity?.entryUuid !== exactUser)) return false;
+          if (audited && !sameLoopTurn(audited, context)) return false;
+          const item = agentSendQueue?.item(row.operationKey);
+          if (!item) return false;
+          const request = JSON.parse(item.request_json);
+          return isPromptLoopAutomationSource(request.source)
+            && item.request_hash === fingerprintAgentSendRequest(request);
+        });
+        const receipt = matches.length === 1 ? loopNativeReceipt(tabId, matches[0].handoffId) : null;
+        if (!receipt) console.warn('[LoopDependencies] Loop receipt pending tab=' + tabId
+          + ' native=' + rows.length + ' matching=' + matches.length + ' currentUserProven=' + !!exactUser);
+        if (!receipt) return null;
+        const request = JSON.parse(agentSendQueue.item(receipt.operationKey).request_json);
+        const tokens = [...String(request.prompt).matchAll(/<loop_review_token>([^<]+)<\/loop_review_token>/g)];
+        return { ...receipt, executionContext: receipt.executionContext || context,
+          reviewToken: tokens.at(-1)?.[1] || null };
+      },
+      readResult: (source, receipt, context) => {
+        if (receipt.sessionId !== source.sessionId || receipt.provider !== source.provider) return null;
+        const read = source.provider === 'claude' ? readAgentContinuationOriginalProof : getAgentTurnResult;
+        return read?.({ sessionId: source.sessionId, cwd: source.cwd, toolType: source.provider,
+          promptUserUuid: receipt.userUuid, promptSourceIdentity: receipt.sourceIdentity || undefined,
+          targetExecutionContext: context, forceFresh: true, resultReadMode: 'source-proof', maxChars: 1 });
+      },
+      changed: (entry, revision) => publishBuildInstallEvent('loop-dependencies:changed', { entry, revision }),
+    });
+  }
+  return loopDependencies;
+}
+function wakeLoopDependencies(tabId) {
+  buildContinueOperations?.wake();
+  if (loopDependencies) void loopDependencies.reconcile(tabId).catch(error => {
+    console.warn('[LoopDependencies] reconcile pending: ' + String(error.code || error.message));
+  });
+}
+async function readLoopDependencies() {
+  await agentSendReceiptStartupReady;
+  if (loopMessageStartupReady) await loopMessageStartupReady;
+  const service = getLoopDependencies(); await service.reconcile(); return service.snapshot();
+}
+function getBuildContinueOperations() {
+  if (buildContinueOperations) return buildContinueOperations;
+  const manager = require('./project-manager');
+  const { capturedCodexSubject, readBuildContinueOriginal } = require('./build-continue-proofs');
+  const { createContinuationInputReader } = require('./orchestration-continuation-input');
+  const readState = createContinuationInputReader({ readResponseState: tabId => getAgentResponseState(tabId),
+    readRuntimeSnapshot: tabId => readAgentRuntimeSnapshot(tabId),
+    readSendDestination: (...args) => readAgentSendDestination?.(...args) });
+  buildContinueOperations = require('./build-continue-operation').createBuildContinueOperations({
+    read: () => manager.db.getAppState('buildContinueOperations.v1'),
+    write: value => manager.db.setAppState('buildContinueOperations.v1', value),
+    instanceId: webServerInstanceId,
+    readRuns: () => getOrchestrationRunStore().installSnapshot(),
+    readMessages: () => getTabMessageService().restartReferences(),
+    captureOne: tabId => captureTabInspection?.(tabId),
+    captureTabs: () => listExecutionNamespaces(manager).flatMap(project => (project.tabs || []).map(tab => {
+      const view = captureTabInspection?.(tab.tabId);
+      if (!view) throw Error('build_continue_runtime_reader_unavailable');
+      return { ...view, tabId: tab.tabId, projectId: project.id, name: tab.name, subject: capturedCodexSubject(view) };
+    })),
+    readCaptureSubject: async view => {
+      if (view.subject) return view.subject;
+      const state = await getAgentResponseState(view.tabId), expected = view.executionContext, actual = state.executionContext;
+      return state.known === true && state.busy === true && state.sessionId === view.sessionId
+        && actual?.turnId === expected?.turnId && actual?.generation === expected?.generation
+        && String(actual?.processId) === String(expected?.processId) ? state.currentSubject : null;
+    },
+    readMcp: () => ({ coverage: 'shared-hub-server-level', exactRpcOwners: false,
+      status: typeof readInstallMcpStatus === 'function' ? readInstallMcpStatus() : null }),
+    readStartup: () => startupInterruptedSnapshot,
+    readState,
+    readInputFence: tabId => readAgentLaunchFence?.(tabId),
+    readLoopCause: (tabId, handoffId) => {
+      const pointer = readPersistedLoopQueue(tabId)?.pendingDelivery;
+      return pointer?.kind === 'loop' && pointer.handoffId === handoffId ? pointer.loopCause : null;
+    },
+    readOriginal: (target, state) => readBuildContinueOriginal(target, state, {
+      readObserved: readAgentObservedResponse, readClaude: readAgentContinuationOriginalProof }),
+    readLatest: (target, state) => readAgentObservedResponse({ tabId: target.source.tabId,
+      expectedSessionId: state.sessionId, maxChars: 500,
+      ...(target.source.provider === 'codex' ? { purpose: 'continuation-history' } : {}) }),
+    readInputInterval: (target, state, original, latest) => target.source.provider === 'codex'
+      ? require('./ipc/codex-data')._api.readCachedCodexInputInterval({ sessionId: state.sessionId, cwd: target.source.cwd,
+        from: { userUuid: original.userUuid, sourceIdentity: original.sourceIdentity, executionContext: original.executionContext },
+        through: { userUuid: latest.result?.userUuid, sourceIdentity: latest.result?.sourceIdentity,
+          executionContext: latest.subject?.targetExecutionContext || latest.result?.executionContext },
+        readSourceRevision: () => transcriptService.readCodexResultSourceRevision(state.sessionId) })
+      : readAgentObservedResponse({ tabId: target.source.tabId, expectedSessionId: state.sessionId,
+        purpose: 'continuation-input-interval', from: original, through: latest }),
+    readMessage: id => getTabMessageService().restartReference(id),
+    readCallbackExecution: async (record, request) => {
+      if (record.receipt?.auditExecutionContext) return record.receipt.auditExecutionContext;
+      const result = await getAgentTurnResult({ toolType: record.provider, sessionId: record.sessionId,
+        cwd: request.cwd, promptUserUuid: record.auditIdentity.entryUuid, promptSourceIdentity: record.auditIdentity.sourceIdentity,
+        promptHash: require('./claude-prompt-carriers').promptFingerprint(request.prompt), forceFresh: true,
+        resultReadMode: 'prompt-proof', maxChars: 500 });
+      return result.found === true && result.sourceVerified === true ? result.executionContext : null;
+    },
+    send: request => runAgentSendScenario({ ...request, [BUILD_CONTINUE_ADMISSION]: true }),
+    continueRun: async runId => {
+      await reconcileOrchestrationRun(runId, 'build-continue-restore');
+      return getOrchestrationContinuationService().continueRequest(runId);
+    },
+    reconcileRunContinuation: runId => getOrchestrationContinuationService().reconcile(runId),
+    getRun: runId => getOrchestrationRunStore().getInternal(runId),
+    readReceipt: operationKey => agentSendReceiptStore?.get(operationKey),
+    readQueued: operationKey => agentSendQueue?.item(operationKey),
+    readPrepared: (tabId, handoffId) => tabWorkContext?.readPreparedHandoff(tabId, handoffId),
+    changed: operation => {
+      void scheduleOrchestrationPolicyTimer().catch(error => console.warn('[BuildContinue] policy rearm pending: ' + String(error.code || error.message)));
+      if (operation.phase !== 'captured') for (const target of operation.targets) {
+        agentSendQueue?.notifyRuntime(target.source.tabId);
+        if (responseObservationService) void responseObservationService.wakeTarget(target.source.tabId, 'build-continue-operation');
+        if (tabMessageService) void tabMessageService.wake(target.source.tabId, 'build-continue-operation');
+      }
+    },
+  });
+  return buildContinueOperations;
+}
+async function loopSendAdmission(request) {
+  const q = readPersistedLoopQueue(request.tabId), pointer = q?.pendingDelivery;
+  const mode = loopPromptMode(q);
+  if (!q?.loopPromptEnabled || pointer?.kind !== 'loop' || pointer.handoffId !== request.handoffId
+    || !pointer.loopCause || pointer.loopEpoch !== loopEpoch(q)
+    || loopPromptMode(pointer) !== mode) return { cancel: true, reason: 'loop-cause-changed' };
+  const service = mode === 'own-turn' ? getLoopDependencies() : null;
+  if (service) await service.reconcile(request.tabId);
+  const ready = service?.readyWake(request.tabId);
+  const controlWake = ready && pointer.loopWaitId === ready.id && pointer.causeKey === ready.id + ':dependency-ready'
+    && ready.source.sessionId === pointer.loopCause.sessionId && ready.source.provider === pointer.loopCause.provider;
+  const inspection = captureTabInspection?.(request.tabId);
+  const claudeProof = inspection?.toolType === 'claude' ? loopNaturalEvidence.get(request.tabId) : null;
+  const currentTurnId = inspection?.turn?.turnId || (claudeProof?.sessionId === inspection?.sessionId
+    && claudeProof.runtimeGeneration === inspection?.runtime?.lifecycleGeneration ? claudeProof.turnId : null);
+  if (inspection?.known !== true || inspection.busy !== false || inspection.transitioning
+    || !controlWake && (inspection.turn?.status !== 'completed' || currentTurnId !== pointer.loopCause.turnId)
+    || inspection.sessionId !== pointer.loopCause.sessionId || inspection.toolType !== pointer.loopCause.provider
+    || inspection.backgroundWorkCount !== 0 || inspection.goalWork?.pending === true) return false;
+  if (service?.blocks(request.tabId, pointer.loopCause)) return false;
+  const runs = await getOrchestrationRunStore().listForTab(request.tabId);
+  if (!loopRunAdmission(runs, request.tabId, mode)) return false;
+  const status = await coherentPublicRuntimeSnapshot(request.tabId);
+  if (status?.status !== 'active' || status.inputReady !== true) return false;
+  if (request.provider === 'codex' && readAutomaticSendFrame?.(request.tabId,
+    () => agentSendQueue?.notifyRuntime(request.tabId))?.ready !== true) return false;
+  const latest = captureTabInspection?.(request.tabId), latestQueue = readPersistedLoopQueue(request.tabId);
+  if (latest?.revision !== inspection.revision || !latestQueue?.loopPromptEnabled
+    || loopEpoch(latestQueue) !== loopEpoch(q) || loopPromptMode(latestQueue) !== mode
+    || latestQueue.pendingDelivery?.handoffId !== pointer.handoffId) return { cancel: true, reason: 'loop-source-changed' };
+  return true;
+}
+let buildInstallStatusClient = null;
+let buildInstallPresentation = null;
+function projectBuildInstallStatus(snapshot, tabId = null) {
+  if (!buildInstallPresentation) buildInstallPresentation = require(path.join(srcMainDir, 'build-install-presentation'))
+    .createBuildInstallPresentation({ owner: getBuildInstallContinuations() });
+  return buildInstallPresentation.project(snapshot, tabId);
+}
+function publishBuildInstallEvent(channel, value) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try { if (!win.isDestroyed() && !win.webContents?.isDestroyed?.()) win.webContents.send(channel, value); }
+    catch (error) { console.warn('[BuildInstall] window publication unavailable: ' + String(error.message)); }
+  }
+}
+function getBuildInstallStatusClient() {
+  if (!buildInstallStatusClient) {
+    const db = require('./project-manager').db;
+    buildInstallStatusClient = require(path.join(srcMainDir, 'build-install-status')).createBuildInstallStatus({
+      token: () => token,
+      read: () => db.getAppState('buildInstallStatus.v1'),
+      write: value => db.setAppState('buildInstallStatus.v1', value),
+      changed: snapshot => {
+        for (const job of snapshot.jobs) {
+          try { getBuildInstallContinuations().settleNoCallback(job); }
+          catch (error) { console.warn('[BuildInstallContinuation] terminal disposition pending: ' + String(error.code || error.message)); }
+        }
+        publishBuildInstallEvent('build-install:status', projectBuildInstallStatus(snapshot));
+      },
+    });
+    buildInstallStatusClient.start();
+  }
+  return buildInstallStatusClient;
+}
+function readBuildInstallStatus(tabId) { return projectBuildInstallStatus(getBuildInstallStatusClient().snapshot(tabId), tabId); }
+function cancelBuildInstallFromDock(request) {
+  if (request?.action === 'cancel-continuation') {
+    const status = getBuildInstallStatusClient().snapshot(request.tabId);
+    const continuation = getBuildInstallContinuations().cancelConfirmedWait(request, status);
+    return { ok: true, continuation };
+  }
+  return getBuildInstallStatusClient().cancel(request);
+}
+let releaseBuildInstallReceipt = null;
+function wakeBuildInstallContinuations(tabId) {
+  if (!buildInstallContinuations) return;
+  void buildInstallContinuations.reconcile(tabId).catch(error => {
+    console.warn('[BuildInstallContinuation] proof pending: ' + String(error.code || error.message));
+  });
+}
+function getBuildInstallContinuations() {
+  if (!buildInstallContinuations) {
+    const db = require('./project-manager').db;
+    buildInstallContinuations = require(path.join(srcMainDir, 'build-install-continuation')).createBuildInstallContinuations({
+      read: () => db.getAppState('buildInstallContinuations.v1'),
+      write: value => db.setAppState('buildInstallContinuations.v1', value),
+      receipts: () => agentSendReceiptStore,
+      readQueuedRequest: key => agentSendQueue?.item(key),
+      readPreparedHandoff: (tabId, handoffId) => tabWorkContext?.readPreparedHandoff(tabId, handoffId),
+      readSource: tabId => readAgentRuntimeSnapshot ? readAgentRuntimeSnapshot(tabId) : Promise.resolve({ coherent: false }),
+      readResult: request => getAgentTurnResult ? getAgentTurnResult(request) : Promise.resolve({ found: false }),
+      changed: entry => {
+        const snapshot = projectBuildInstallStatus(getBuildInstallStatusClient().snapshot());
+        publishBuildInstallEvent('build-install:continuation', snapshot.continuations.find(value => value.requestId === entry.requestId));
+        publishBuildInstallEvent('build-install:status', snapshot);
+        scheduleTabActivityBroadcast?.('build-install-continuation');
+        agentSendQueue?.wake(entry.source.tabId);
+      },
+    });
+  }
+  return buildInstallContinuations;
+}
+async function readBuildInstallContinuations() {
+  const ready = await agentSendReceiptStartupReady;
+  if (ready?.ready === false) throw new Error('install_continuation_receipts_unavailable');
+  const owner = getBuildInstallContinuations();
+  await owner.reconcile();
+  const status = projectBuildInstallStatus(getBuildInstallStatusClient().snapshot());
+  return { ...owner.snapshot(), entries: status.continuations };
+}
+function buildInstallAutomationBlocked(tabId) {
+  try { return getBuildInstallContinuations().blocked(tabId); } catch { return true; }
+}
+function readBuildInstallActivity() {
+  return getBuildInstallContinuations().snapshot().entries.filter(entry => require('../shared/build-install-activity.cjs').pending(entry));
+}
+function readBuildInstallInheritedActivity() {
+  const status = buildInstallStatusClient?.snapshot() || { known: false, stale: true, jobs: [] };
+  const activity = require('../shared/build-install-activity.cjs');
+  return getBuildInstallContinuations().snapshot().entries.filter(entry => activity.inherited(entry,
+    status.jobs.find(job => activity.ownedJob(entry, job)), status));
+}
 // Injected from main at start() — tiny aggregate for the native iOS project
 // list badge. This is deliberately project-scoped, not a tab transcript stream:
 // one SSE connection carries a full snapshot of {projectId,count,streaming}.
@@ -473,6 +808,7 @@ let readCodexNativeRewindState = null;
 let recoverCodexRewindPostEnter = null;
 let readCodexRewindPostEnterResult = null;
 let savedHistoryOperations = null;
+let workingDirectoryOperations = null;
 let historyMutationInput = null;
 let inboxSavedHistoryOperations = null;
 let savedHistoryIpcRegistered = false;
@@ -803,7 +1139,10 @@ function stampPublicRuntimeSnapshot(tabId, payload = {}) {
       : sessionStatus === 'busy';
   const lifecycleGeneration = field('lifecycleGeneration');
   const sessionId = codexOwnerChanged ? (Object.hasOwn(payload, 'sessionId') ? payload.sessionId : null) : field('sessionId');
-  const readSessionId = payload.coherent === true || codexOwnerChanged ? (payload.readSessionId ?? payload.codexReadSessionId ?? null) : (payload.readSessionId
+  // An explicit current Main revoke outranks a compatibility alias retained
+  // from the older pre-await base. Alias-only/partial producers keep support.
+  const readSessionId = payload.coherent === true || codexOwnerChanged
+    ? (Object.hasOwn(payload, 'readSessionId') ? payload.readSessionId ?? null : payload.codexReadSessionId ?? null) : (payload.readSessionId
     ?? payload.codexReadSessionId
     ?? prior.readSessionId
     ?? prior.codexReadSessionId
@@ -886,6 +1225,8 @@ let orchestrationSourceProofCoordinator = null;
 function getOrchestrationRunStore() {
   if (!orchestrationRunStore) {
     orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'), {
+      readRecoveryHold: run => getBuildContinueOperations().recoveryHold(run),
+      readRestartSourceFollowup: request => getBuildContinueOperations().sourceFollowupBinding(request),
       startupMaintenance: require('./external-research-maintenance').startupFromArgv(process.argv),
       beforeStartupMaintenance: async () => {
         const ready = await agentSendReceiptStartupReady;
@@ -1038,6 +1379,29 @@ function revokeExternalCompletionDelivery(run, delivery) {
     reason: 'external-completion-revoked', presentationDismissed: true });
 }
 
+async function externalResearchCancellationReceipt(runId) {
+  const run = await getOrchestrationRunStore().getInternal(runId);
+  if (!isExternalResearchRun(run)) return null;
+  const completion = require(path.join(srcMainDir, 'external-research-completion-delivery'));
+  const delivery = run.externalResearchDelivery;
+  const candidate = delivery?.request && agentSendReceiptStore?.get(delivery.request.sendOperationKey);
+  const record = candidate && completion.receiptMatchesDelivery(delivery, candidate,
+    agentSendQueue?.item(candidate.operationKey)) ? candidate : null;
+  // Cancellation is a future-write fence, not a substitute for input evidence.
+  // Keep canonical late evidence readable even after the user revoked delivery.
+  let sourceInput = 'unknown';
+  if (run.sourceFollowupStartedAt || record?.state === 'confirmed') sourceInput = 'confirmed';
+  else if (isAgentSendProviderQueueAccepted(record?.receipt)) sourceInput = 'accepted';
+  else if (record?.receipt?.submitted === false && record.receipt.pasteWritten === false
+    && record.receipt.enterWritten === false) sourceInput = 'not_submitted';
+  else if (record && !record.attemptId && ['reserved', 'preparing'].includes(record.state)
+    || !delivery?.request && completion.hasBirth(run) && !run.notificationAttemptedAt
+      && !run.notificationPromptHash && !run.notificationAttempt) sourceInput = 'not_attempted';
+  return { deliveryIntentCancelled: run.notificationSuppressed === true,
+    resultRetained: run.resultComplete === true, sourceInput,
+    tooLate: sourceInput === 'confirmed' || sourceInput === 'accepted' };
+}
+
 function getExternalCompletionDelivery() {
   if (externalCompletionDelivery) return externalCompletionDelivery;
   const { createExternalCompletionDelivery } = require(path.join(srcMainDir, 'external-research-completion-delivery'));
@@ -1153,6 +1517,7 @@ function getResponseObservationService() {
       unsubscribe: request => responseTranscriptService.unsubscribe(request),
       onChanged: emitOrchestrationChanges,
       onSettled: finalizeSettledOrchestration,
+      readRestartBinding: run => getBuildContinueOperations().observationBinding(run),
     });
   }
   return responseObservationService;
@@ -1184,6 +1549,14 @@ function getResponseObservationApi() {
 
 function recordAgentObservedCompletion(event) {
   responseObservationService?.recordCompletion(event);
+  const subject = event?.subject, result = event?.result;
+  if (subject?.toolType === 'claude' && result?.complete === true && result.sourceVerified === true && !result.error) {
+    const inspection = captureTabInspection?.(event.tabId);
+    loopNaturalEvidence.set(event.tabId, { sessionId: subject.sessionId,
+      turnId: subject.targetExecutionContext.turnId, runtimeGeneration: inspection?.runtime?.lifecycleGeneration });
+  }
+  wakeBuildInstallContinuations(event?.tabId);
+  wakeLoopDependencies(event?.tabId);
 }
 
 async function prepareOrchestrationCompletionContent(run) {
@@ -1286,6 +1659,8 @@ async function captureOrchestrationSourceTarget(source, priorRun, expectedExecut
 }
 
 function emitTabMessage(message, reason) {
+  wakeLoopDependencies(message.sourceTabId);
+  wakeLoopDependencies(message.targetTabId);
   const payload = { type: 'tab-message-update', message: compactTabMessage(message), reason };
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send('tab-messages:changed', payload);
@@ -1298,6 +1673,7 @@ function getTabMessageService() {
     tabMessageService = new TabMessageService({
       db: require(path.join(srcMainDir, 'project-manager')).db.db,
       resolveTab: resolveTabMessageIdentity,
+      readRestartBinding: request => getBuildContinueOperations().messageBinding(request),
       getReceipt: operationKey => {
         const record = agentSendReceiptStore?.get(operationKey);
         return record ? agentSendQueue?.projectRecord(record) || record : null;
@@ -1538,6 +1914,7 @@ async function releaseOrchestrationSourceProof(runId, reason) {
 }
 
 function notifyAgentTranscriptChanged(meta = {}) {
+  wakeBuildInstallContinuations(meta.tabId);
   const resultWakes = orchestrationResultProofCoordinator?.handleTranscriptChanged(meta) || 0;
   const sourceWakes = orchestrationSourceProofCoordinator?.handleTranscriptChanged(meta) || 0;
   const observationWakes = responseObservationService?.handleTranscriptChanged(meta) || 0;
@@ -2826,7 +3203,12 @@ function checkAuth(req) {
 // which is the difference between a 15s WiFi transfer and a 1.5s one.
 const GZIP_THRESHOLD = 4 * 1024;
 function sendJson(res, status, body) {
-  // Closing the HTTP observer does not cancel the owned work.
+  // History owns a separate transport lease; diagnostics remain observational.
+  if (isFiniteHistoryHttpRead(res.req || {}) && currentReadControl()) {
+    return sendHistoryJson(res, status, body, {
+      onPhase: (event, fields) => httpReadDiagnostics.phase(res, event, fields),
+    });
+  }
   if (res.writableEnded || res.destroyed) {
     httpReadDiagnostics.phase(res, 'response-discarded', { destroyed: res.destroyed });
     return;
@@ -3250,6 +3632,17 @@ function externalRunStatusFromDurableRecord(record) {
   return 'setup_unknown';
 }
 
+function readBuildContinueDeferredReceipt(record) {
+  if (record?.attemptId || !record?.deliveryControl?.cancelledAt
+    || !String(record.deliveryControl.reason || '').startsWith('build-continue-stale-loop:')) return null;
+  const item = agentSendQueue?.item(record.operationKey);
+  if (!item) return null;
+  const request = JSON.parse(item.request_json);
+  if (item.request_hash !== fingerprintAgentSendRequest(request)) return null;
+  return require('../shared/build-continue-automation.cjs').buildContinueDeferredReceipt({ ...record,
+    receipt: { ...record.receipt, source: request.source } });
+}
+
 function durableAgentSendReplay(record, overrides = {}) {
   // A certified automatic wait retains its negative physical attempt. Do not
   // feed a UI/application acceptance back into the physical receipt registry:
@@ -3280,6 +3673,8 @@ function durableAgentSendReplay(record, overrides = {}) {
     ...receipt, ...overrides, success: false, accepted: false, submitted: false,
     pasteWritten: false, enterWritten: false, status: 'not-submitted', code: 'agent_send_cancelled',
     deliveryControl, inputSlot, replayed: true,
+    ...(String(deliveryControl.reason || '').startsWith('build-continue-stale-loop:')
+      ? readBuildContinueDeferredReceipt(record) || {} : {}),
   };
   if (!currentProviderQueue && !['confirmed', 'not-submitted', 'provider-not-accepted'].includes(state)) return {
     ...receipt, ...overrides, success: null, accepted: true,
@@ -3499,6 +3894,15 @@ function projectCardsSnapshot(projectId, tabs) {
 }
 
 async function runAgentSendScenario(args) {
+  if (require(path.join(srcMainDir, 'prompt-queue-source')).isPromptQueueAutomationSource(args.source, args)
+    && !(args.sendOperationKey && agentSendReceiptStore?.get(args.sendOperationKey))) {
+    try {
+      if (getBuildContinueOperations().pending(args.tabId)) return require(path.join(srcMainDir, '../shared/build-continue-automation.cjs')).deferredBuildContinueInput();
+    } catch { return require(path.join(srcMainDir, '../shared/build-continue-automation.cjs')).deferredBuildContinueInput('build_continue_authority_unknown'); }
+  }
+  if (String(args.source || '').startsWith('build-install-continue:') && args[BUILD_CONTINUE_ADMISSION] !== true) {
+    throw Object.assign(Error('Build continuation is server-owned'), { code: 'build_continue_admission_required', submitted: false });
+  }
   if (args.completionDeliveryRef && args[COMPLETION_ADMISSION] !== true) {
     throw Object.assign(new Error('Completion admission is server-owned'), { code: 'completion_admission_required', submitted: false });
   }
@@ -3788,6 +4192,12 @@ async function runPreparedAgentSendScenario(args) {
               : ownedAttachments ? 'attachment_context_not_durable' : 'agent_send_preflight_scope_not_durable',
             error: 'The exact send context could not be recorded before submission.',
           };
+          else if (preflightScope) {
+            // Publish the exact ACTIVE HEAD preparation clock before cold CLI
+            // startup. Queue residence/click time and delivery stay unchanged.
+            try { agentSendQueue?.publishRecord?.(staged.record, false); }
+            catch (error) { console.warn('[AgentSendTiming] preparation timing publication unavailable:', error?.message || error); }
+          }
         }
         if (!result && expectedTarget?.expectedBinding === 'none') {
           conversationOwners.claimSend(tabId, expectedTarget, { sendOperationKey, sendAttemptId: durableAttemptId });
@@ -4953,17 +5363,21 @@ async function readHistoryFreshnessWindow({ info, readScope, requestedRevision, 
   const prior = publicHistoryRevisions.lookup(requestedRevision, readScope);
   const priorCoverage = publicHistoryRevisions.lookupFreshness(requestedRevision, readScope);
   const head = await owner.probe(scope);
+  assertHttpHistoryCurrent();
   if (prior && priorCoverage?.state === 'known' && head.state === 'known'
     && priorCoverage.epoch === head.epoch && priorCoverage.token === head.token) {
     return { success: true, unchanged: true, revision: prior, historyFreshness: head };
   }
   const ticket = await owner.beginRead(scope);
+  assertHttpHistoryCurrent();
   const result = await transcriptService.getHistory({ ...readScope, ifRevision: prior,
     freshnessProof: true, deltaOk,
     deltaConsumerId: deltaOk ? 'http:' + crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex') : null,
   });
+  assertHttpHistoryCurrent();
   if (!result?.success) return result;
   const historyFreshness = await owner.bounded(scope, owner.completeRead(scope, result, ticket));
+  assertHttpHistoryCurrent();
   const { freshnessReadSources: _sources, freshnessReader: _reader, ...data } = result;
   return { ...data, historyFreshness };
 }
@@ -5205,6 +5619,7 @@ function emitOrchestrationRun(run, reason = 'changed') {
     tabWorkContext?.release(run.targetTabId, 'orchestration:' + run.runId);
   }
   if (!run) return;
+  wakeLoopDependencies(run.sourceTabId);
   if (responseObservationService && run.sourceTabId) {
     void responseObservationService.wakeTarget(run.sourceTabId, 'child-' + reason);
   }
@@ -6693,7 +7108,13 @@ async function scheduleOrchestrationPolicyTimer() {
   if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
   orchestrationPolicyTimer = null;
   const store = getOrchestrationRunStore();
-  const recoveryAt = await store.nextRecoveryDeadline();
+  let recoveryAt;
+  try { recoveryAt = await store.nextRecoveryDeadline(); }
+  catch (error) {
+    if (!String(error.code || '').startsWith('build_continue_')) throw error;
+    console.warn('[BuildContinue] recovery deadline authority unknown: ' + error.code);
+    recoveryAt = null;
+  }
   const allRuns = await store.listAll();
   const autoStopAt = allRuns.reduce((next, run) => {
     if (run.status !== 'completed'
@@ -7014,6 +7435,7 @@ function getOrchestrationContinuationService() {
   const { createContinuationInputReader } = require('./orchestration-continuation-input');
   orchestrationContinuationService = createOrchestrationContinuationService({
     store: getOrchestrationRunStore(), receipts: agentSendReceiptStore,
+    readRestartHistoryProof: request => getBuildContinueOperations().restartHistoryForRun(request),
     readState: createContinuationInputReader({ readResponseState: getAgentResponseState,
       readRuntimeSnapshot: typeof readAgentRuntimeSnapshot === 'function' ? readAgentRuntimeSnapshot : null,
       readSendDestination: readAgentSendDestination }),
@@ -7143,6 +7565,16 @@ async function performOrchestrationAction(runId, action, options = {}) {
   }
 
   if (action === 'detach' || action === 'cancel' || (isResponseObservation(current) && action === 'dismiss')) {
+    if (isExternalResearchRun(current)) {
+      const cancellation = await store.cancel(runId, {
+        reason: 'detached-by-user', suppressNotification: true, outcome: 'detached',
+      });
+      emitOrchestrationChanges(cancellation.changed, 'detached-by-user');
+      await finalizeSettledOrchestrations(cancellation.settled, 'detached-by-user');
+      void scheduleOrchestrationPolicyTimer();
+      return { ok: true, detached: true, run: withOrchestrationUrls(cancellation.run),
+        cancellation: await externalResearchCancellationReceipt(runId) };
+    }
     if (isResponseObservation(current) && isTerminalStatus(current.status) && current.notificationSuppressed === true) {
       await store.persistStrict();
       return { ok: true, detached: true, run: withOrchestrationUrls(current) };
@@ -8262,6 +8694,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
           ? { tabInspection: require('./tab-inspection').TAB_INSPECTION_CAPABILITY } : {}),
         ...(publicHistoryFreshness ? { historyFreshness: historyFreshnessCapability } : {}),
         completionNotifications: completionNotificationCapability,
+        buildInstall: { version: 1, force: true, interruptionSnapshot: '/api/build-install/interruption-snapshot',
+          eligibility: '/api/install-eligibility', source: '/api/build-install/source', callerTurnExcluded: false },
+        buildContinue: { version: 2, proofRevision: 2, command: 'build:i-c', operations: '/api/build-continue/operations',
+          captureBeforeQuit: true, quitBeforeBuild: true, durable: true, ownTurnsOnly: true },
         ...(userNotificationOutbox ? { userNotifications: userNotificationCapability } : {}),
         ...(sendIntentCancellationAvailable()
           ? { sendIntentCancellation: { version: 1, providers: ['claude', 'codex'],
@@ -8294,6 +8730,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(readAgentParams ? { agentParams: { version: 1, coherentCurrent: true,
           providers: ['codex', 'claude'], operationProviders: agentParamsService ? ['claude'] : [],
           requestId: 'client-stable', operationRead: '/api/terminal-tabs/:tabId/params?operationId=:operationId' } } : {}),
+        ...(readAgentParams ? { codexSettings: CODEX_SETTINGS_CAPABILITY } : {}),
         ...(readAgentRuntimeSnapshot ? { codexRuntimePolicy: { version: 1, dialogs: ['resume-goal', 'usage-exhaustion'],
           liveSettings: true, manualAction: true, background: true } } : {}),
         ...(codexGoalActions ? { codexGoal: codexGoalCapability } : {}),
@@ -8302,6 +8739,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
           receipts: true, structuredDraft: true, nativeRewindUnchanged: true,
           codexPhysicalSuffix: true, repairOfOperationId: !!savedHistoryOperations.inspectRepair } } : {}),
+        ...(workingDirectoryOperations ? { workingDirectory: require(path.join(srcMainDir, 'working-directory-operation-api')).WORKING_DIRECTORY_CAPABILITY } : {}),
         ...(conversationOwners ? { conversationOwner: { version: 1, providers: ['codex', 'claude'],
           applicability: '/api/terminal-tabs/:tabId/history-operations/:operationId/applicability',
           strictKnownEmptySend: ['claude'], order: 'ownerOrder', receiptUnchanged: true } } : {}),
@@ -8330,6 +8768,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           kinds: ['catalog', 'custom'],
         },
         loopTaskCompletion: { version: 2, statuses: ['completed', 'blocked'] },
+        loopDependencies: { version: 1, reviewTokenRequired: true, kinds: ['run', 'message'],
+          endpoint: '/api/terminal-tabs/:tabId/await-dependencies' },
         tabMessages: { version: 1, durable: true, replyTo: true, dismiss: true, sourceNavigation: true,
           cancellation: { version: 1, durable: true, deliveryEvidencePreserved: true } },
         orchestrationInlineResults: { version: 1 },
@@ -8570,6 +9010,90 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // allowed to be closed by build:install. Computed in main against the live
   // Maps that already drive the UI loader — no separate busy notion.
   // See computeActiveLoaders() in main.js.
+  if (parsed.pathname === '/api/install-eligibility' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    try {
+      if (!computeActiveLoaders || !computeInstallInputBlockers || !agentSendQueue || !sendQueueRecoveryReady) {
+        throw new Error('install_input_state_unavailable');
+      }
+      getBuildInstallContinuations().snapshot(); // unknown local persistence cannot approve Quit
+      const read = require(path.join(srcMainDir, 'build-install-eligibility')).createBuildInstallEligibility({
+        store: getOrchestrationRunStore(), readRuntime: computeActiveLoaders,
+        readInput: async () => [...await computeInstallInputBlockers(), ...agentSendQueue.installBlockers()],
+      });
+      return sendJson(res, 200, { ...await read(), pid: process.pid });
+    } catch (error) {
+      return sendJson(res, 503, { version: 1, known: false, eligible: false, error: String(error.code || error.message) });
+    }
+  }
+
+  if (parsed.pathname === '/api/build-install/source' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    try {
+      const body = await readBody(req);
+      const owner = getBuildInstallContinuations();
+      const existingSource = owner.sourceReservation({ requestId: body.installRequestId, jobId: body.installJobId,
+        tabId: body.tabId, sessionId: body.sessionId, projectId: body.projectId });
+      if (existingSource) return sendJson(res, 200, { source: existingSource, idempotent: true });
+      let identity;
+      try { identity = await resolveTabMessageIdentity(body.tabId, 'build-install-source'); }
+      catch (error) {
+        if (body.force !== true) throw error;
+        const saved = findOrchestrationTabDescriptor(body.tabId);
+        if (!saved || !saved.sessionId || saved.sessionId !== body.sessionId || !['claude', 'codex'].includes(saved.toolType)) throw error;
+        identity = { ...saved, provider: saved.toolType, sendTarget: { toolType: saved.toolType, sessionId: saved.sessionId },
+          identityBasis: 'saved-conversation-for-forced-restart' };
+      }
+      if (!identity?.sendTarget?.sessionId || !body.sessionId
+        || identity.sendTarget.sessionId !== body.sessionId
+        || body.projectId && body.projectId !== identity.projectId) {
+        return sendJson(res, 409, { error: 'build_install_source_changed' });
+      }
+      const source = { version: 1, tabId: body.tabId,
+        projectId: identity.projectId, toolType: identity.provider, sessionId: identity.sendTarget.sessionId,
+        cwd: identity.cwd || identity.projectPath || null,
+        identityBasis: identity.identityBasis || 'current-runtime',
+        expectedTarget: { toolType: identity.provider, sessionId: identity.sendTarget.sessionId } };
+      getBuildInstallContinuations().reserve({ requestId: body.installRequestId, jobId: body.installJobId, source });
+      getBuildInstallStatusClient();
+      return sendJson(res, 200, { source });
+    } catch (error) { return sendJson(res, 409, { error: String(error.code || error.message) }); }
+  }
+
+  if (parsed.pathname === '/api/build-install/interruption-snapshot' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    const body = await readBody(req);
+    const tabIds = Array.isArray(body.tabIds) ? body.tabIds.filter(id => typeof id === 'string').slice(0, 200) : [];
+    const unavailable = () => { throw Error('owner unavailable'); };
+    const capture = require(path.join(srcMainDir, 'build-install-snapshot')).createBuildInstallSnapshot({
+      runtime: computeActiveLoaders || unavailable,
+      input: () => agentSendQueue ? agentSendQueue.installBlockers() : unavailable(),
+      runs: async () => (await getOrchestrationRunStore().listActive()).map(run => ({
+        runId: run.runId, runKind: run.runKind, sourceTabId: run.sourceTabId, targetTabId: run.targetTabId,
+        externalResearchJobId: run.externalResearchJobId || null, status: run.status,
+        resultComplete: run.resultComplete === true, notificationStatus: run.notificationStatus,
+      })),
+      mcp: readInstallMcpStatus || unavailable, startup: () => startupInterruptedSnapshot || unavailable(),
+      readTab: readAgentRuntimeSnapshot || unavailable,
+    });
+    return sendJson(res, 200, { snapshot: await capture({ tabIds }) });
+  }
+
+  if (parsed.pathname === '/api/build-install/status' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    if (!parsed.query.tabId) return sendJson(res, 400, { error: 'tabId required' });
+    return sendJson(res, 200, { ok: true, ...readBuildInstallStatus(String(parsed.query.tabId)) });
+  }
+
+  if (parsed.pathname === '/api/build-install/callback' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    try {
+      const body = await readBody(req);
+      const continuation = getBuildInstallContinuations().armCallback(body);
+      return sendJson(res, 200, { ok: true, continuation });
+    } catch (error) { return sendJson(res, 409, { error: String(error.code || error.message) }); }
+  }
+
   if (parsed.pathname === '/api/active-loaders' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     if (!computeActiveLoaders) {
@@ -8582,6 +9106,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const runtimeSnapshot = await Promise.resolve(computeActiveLoaders());
       const orchestrationRuns = await getOrchestrationRunStore().listActive();
       const snapshot = mergeActiveLoadersWithOrchestrations(runtimeSnapshot, orchestrationRuns);
+      const seen = new Set(snapshot.loaders.map(row => row.tabId));
+      for (const entry of readBuildInstallActivity()) if (!seen.has(entry.source.tabId)) {
+        seen.add(entry.source.tabId);
+        snapshot.loaders.push({ tabId: entry.source.tabId, kind: 'build-install', status: entry.state,
+          requestId: entry.requestId, jobId: entry.jobId, projectId: entry.source.projectId, name: 'Build Install' });
+      }
+      snapshot.count = snapshot.loaders.length;
+      snapshot.idle = snapshot.idle === true && snapshot.count === 0;
       logActiveLoadersSnapshot(snapshot, 200);
       return sendJson(res, 200, snapshot);
     } catch (e) {
@@ -8799,6 +9331,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/build-continue/operations' || parsed.pathname.startsWith('/api/build-continue/operations/')) {
+    if (!checkAuth(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    await agentSendReceiptStartupReady;
+    if (loopMessageStartupReady) await loopMessageStartupReady;
+    return require('./build-continue-api').handleBuildContinueApi({ req, res, parsed,
+      service: getBuildContinueOperations(), readBody, sendJson, quit: () => app.quit() });
+  }
+
   // Immutable boot snapshot of the Claude/Codex PTYs stopped by the previous
   // graceful app shutdown. `build:i-cont` reads this only from the replacement
   // app and submits through the ordinary Project API send scenario.
@@ -8990,7 +9530,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ? await getOrchestrationRunStore().getInternal(continueFromRunId)
         : null;
       const request = continueFromRunId
-        ? continuationRequest(previous, body, { validateMode: !existingRun })
+        ? continuationRequest(previous, body, { validateMode: !existingRun, existingRequest: existingRun?.externalResearchIntent })
         : normalizeExternalResearchRequest(body);
 
       const sourceMeta = body.sourceMeta && typeof body.sourceMeta === 'object'
@@ -9779,7 +10319,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : await runAgentInterruptScenario(current.targetTabId, 5000)
           .catch((error) => ({ success: false, error: String(error?.message || error) }));
     }
-    return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(cancelled), interrupt });
+    return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(cancelled), interrupt,
+      ...(isExternalResearchRun(current) ? { cancellation: await externalResearchCancellationReceipt(runId) } : {}) });
   }
 
   const orchestrationActionMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/action$/);
@@ -13090,6 +13631,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (await require(path.join(srcMainDir, 'working-directory-operation-api')).handleWorkingDirectoryOperationApi({
+    req, res, parsed, service: workingDirectoryOperations, readBody, sendJson,
+  })) return;
+
   // A separate current verdict; the operation GET itself remains immutable.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history-operations\/([^/]+)\/applicability$/);
   if (m && req.method === 'GET') {
@@ -13192,6 +13737,52 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { pendingQuestion: q });
   }
 
+  // Standalone Codex choices share the desktop intent; no user prompt is made.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/codex\/settings$/);
+  if (m && (req.method === 'GET' || req.method === 'POST')) {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    try {
+      const tabId = decId(m[1]);
+      const target = captureCodexSettingsTarget(findOrchestrationTabDescriptor(tabId));
+      if (req.method === 'GET') {
+        if (!readAgentParams) throw codexSettingsError('codex_settings_reader_unavailable', 503);
+        const data = await readAgentParams(tabId);
+        if (data?.provider !== 'codex' || data.coherent !== true
+          || captureCodexSettingsTarget(findOrchestrationTabDescriptor(tabId)) !== target) {
+          throw codexSettingsError('codex_settings_target_changed', 409);
+        }
+        return sendJson(res, 200, data);
+      }
+      const input = normalizeCodexModelEffort(await readBody(req));
+      let model;
+      if (input.modelSelection) {
+        const models = input.modelSelection.kind === 'catalog'
+          ? await projectedModelsForProvider(projectManager, 'codex', { strict: true }) : undefined;
+        model = (await resolveProjectAgentModelRequest(projectManager, {
+          provider: 'codex', modelSelection: input.modelSelection, catalogModels: models,
+        })).model;
+        if (input.modelSelection.kind === 'catalog' && input.effort) {
+          const selected = models.find(row => row.id === input.modelSelection.id);
+          if (!selected || !Array.isArray(selected.efforts) || !selected.efforts.includes(input.effort)) {
+            throw codexSettingsError('codex_settings_effort_not_supported');
+          }
+        }
+      }
+      if (captureCodexSettingsTarget(findOrchestrationTabDescriptor(tabId)) !== target) {
+        throw codexSettingsError('codex_settings_target_changed', 409);
+      }
+      const data = await bridgeRequest('setSDKParams', { tabId,
+        ...(model !== undefined ? { model } : {}), ...(input.effort !== undefined ? { effort: input.effort } : {}) });
+      if (data?.tabId !== tabId || data.queued !== true && data.applied !== true) {
+        throw codexSettingsError('codex_settings_acceptance_unconfirmed', 503);
+      }
+      return sendJson(res, 200, { ...data, accepted: true, applied: data?.applied === true });
+    } catch (error) {
+      return sendJson(res, error.statusCode || 409, { success: false,
+        code: error.bridgeData?.code || error.code || 'codex_settings_failed', error: String(error.message) });
+    }
+  }
+
   // SDK params (model/effort/thinking) for a tab — read & update.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/params$/);
   if (m && req.method === 'GET') {
@@ -13250,9 +13841,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/codex\/fast$/);
   if (m && req.method === 'POST') {
     try {
-      const data = await bridgeRequest('sendCodexFast', { tabId: decId(m[1]) });
+      const body = await readBody(req);
+      const tabId = decId(m[1]);
+      const absolute = Object.prototype.hasOwnProperty.call(body, 'enabled');
+      if (absolute) {
+        if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+        if (typeof body.enabled !== 'boolean' || Object.keys(body).some(key => key !== 'enabled')) {
+          throw codexSettingsError('invalid_codex_fast_request');
+        }
+        captureCodexSettingsTarget(findOrchestrationTabDescriptor(tabId));
+      }
+      const data = await bridgeRequest(absolute ? 'setCodexFast' : 'sendCodexFast', {
+        tabId, ...(absolute ? { enabled: body.enabled } : {}),
+      });
+      if (absolute && (data?.tabId !== tabId || data.desiredFast !== body.enabled
+        || !Number.isInteger(data.revision) || data.revision <= 0)) {
+        throw codexSettingsError('codex_settings_acceptance_unconfirmed', 503);
+      }
       return sendJson(res, 200, data);
-    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+    } catch (e) { return sendJson(res, e.statusCode || 409, { error: String(e.message),
+      ...(e.code ? { code: e.code } : {}) }); }
   }
 
   // Prompt-queue ("Run after") for a tab — read live core + sibling AI-tabs, or
@@ -13321,6 +13929,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
     catch (e) { return runAfterFailure(res, e); }
   }
 
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/await-dependencies$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]), body = await readBody(req);
+    if (cleanOptionalString(body?.sourceMeta?.tabId, '') !== tabId) return sendJson(res, 403, { code: 'source_tab_mismatch' });
+    try {
+      const entry = await serializeLoopDecision(tabId, () => getLoopDependencies().request({ tabId,
+        dependencies: body.dependencies, reason: body.reason, reviewToken: body.reviewToken }));
+      return sendJson(res, 200, { ok: true, entry });
+    } catch (error) { return sendJson(res, error.statusCode || 409, { ok: false, code: error.code || error.message }); }
+  }
+
   // Explicit task completion is scoped to the caller's current live turn. It
   // does not finish a run by itself; main attaches the intent to the matching
   // authoritative turn-end edge, where Loop can consume it exactly once.
@@ -13332,8 +13951,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     if (sourceTabId !== tabId) {
       return sendJson(res, 403, { ok: false, code: 'source_tab_mismatch' });
     }
+    return serializeLoopDecision(tabId, async () => {
     if (typeof registerTaskCompletionIntent !== 'function') {
       return sendJson(res, 503, { ok: false, code: 'completion_registry_unavailable' });
+    }
+
+    if (loopPromptMode(readPersistedLoopQueue(tabId)) === 'own-turn'
+      && getLoopDependencies().completionBlocked(tabId)) {
+      return sendJson(res, 409, { ok: false, code: 'loop_dependencies_pending' });
     }
 
     const blockers = findTaskCompletionBlockers(
@@ -13356,6 +13981,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       ok: true,
       idempotent: result.idempotent === true,
       turn: result.turn,
+    });
     });
   }
 
@@ -13422,6 +14048,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const tBridge = Date.now();
       const info = await resolveHistorySessionInfo(tabId, 1500);
+      assertHttpHistoryCurrent();
       const sessionId = info?.sessionId || null;
       const cwd = info?.cwd || null;
       const toolType = info?.toolType || null;
@@ -13432,6 +14059,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       if (transcriptService && (toolType === 'codex' || toolType === 'claude')) {
         const timelineResult = await transcriptService.getTimeline({ tabId, toolType, sessionId, cwd });
+        assertHttpHistoryCurrent();
         if (!timelineResult?.success) {
           clearPending();
           console.log(`${timelinePrefix} TRANSCRIPT_NO_TIMELINE tool=${toolType} bridge=${tBridge-t0}ms total=${Date.now()-t0}ms error=${String(timelineResult?.error || '-')}`);
@@ -13445,8 +14073,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (entries.some(e => e?.type === 'compact' || e?.role === 'compact' || e?.kind === 'compact')) {
           try {
             const full = await transcriptService.getHistory({ tabId, toolType, sessionId, cwd });
+            assertHttpHistoryCurrent();
             fullEntries = Array.isArray(full?.entries) ? full.entries : [];
           } catch (summaryErr) {
+            rethrowHistoryTerminal(summaryErr);
             console.log(`[WebTiming] /timeline TRANSCRIPT_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
           }
         }
@@ -13472,6 +14102,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           return sendJson(res, 500, { error: 'codex timeline parser not loaded' });
         }
         const loaded = await loadCodexSessionRecords(sessionId, cwd);
+        assertHttpHistoryCurrent();
         if (!loaded?.success) {
           clearPending();
           console.log(`${timelinePrefix} CODEX_NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
@@ -13482,8 +14113,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (entries.some(e => e?.type === 'compact' || e?.role === 'compact')) {
           try {
             const full = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+            assertHttpHistoryCurrent();
             fullEntries = Array.isArray(full?.entries) ? full.entries : [];
           } catch (summaryErr) {
+            rethrowHistoryTerminal(summaryErr);
             console.log(`[WebTiming] /timeline CODEX_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
           }
         }
@@ -13509,8 +14142,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (entries.some(e => e?.type === 'compact' || e?.role === 'compact')) {
         try {
           const full = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+          assertHttpHistoryCurrent();
           fullEntries = Array.isArray(full?.entries) ? full.entries : [];
         } catch (summaryErr) {
+          rethrowHistoryTerminal(summaryErr);
           console.log(`[WebTiming] /timeline CLAUDE_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
         }
       }
@@ -13521,6 +14156,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
     } catch (e) {
       clearPending();
+      rethrowHistoryTerminal(e);
       console.log(`${timelinePrefix} ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
       return sendJson(res, 500, { error: String(e.message) });
     }
@@ -13564,12 +14200,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
     if (!transcriptService?.getToolPayload) return sendJson(res, 503, { success: false, error: 'history_payload_unavailable' });
     try {
       const info = await resolveHistorySessionInfo(tabId, 1500);
+      assertHttpHistoryCurrent();
       if (!info?.sessionId) return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
       if (info.sessionId !== request.sessionId || info.toolType !== request.toolType) {
         return sendJson(res, 409, { success: false, error: 'history_read_identity_changed' });
       }
       const result = await transcriptService.getToolPayload({ ...request, tabId, cwd: info.cwd || null });
+      assertHttpHistoryCurrent();
       const current = await resolveHistorySessionInfo(tabId, 1500);
+      assertHttpHistoryCurrent();
       if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)) {
         return sendJson(res, 409, { success: false, error: 'history_read_identity_changed' });
       }
@@ -13580,6 +14219,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : /^(history_payload_(generation_changed|changed)|history_source_changed_during_preparation|lineage_unresolved)/.test(result?.error || '') ? 409 : 500;
       return sendJson(res, status, result || { success: false, error: 'history_payload_unavailable' });
     } catch (error) {
+      rethrowHistoryTerminal(error);
       console.log('[WebTiming] /history-payload ERROR reason=' + String(error.message) + ' ms=' + (Date.now() - started));
       return sendJson(res, error.message === 'history_payload_range_invalid' ? 400 : 500,
         { success: false, error: error.message });
@@ -13626,12 +14266,73 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (transcriptService) {
           try {
             const info = await resolveHistorySessionInfo(tabId, 1500);
+            assertHttpHistoryCurrent();
             if ((info?.toolType === 'codex' || info?.toolType === 'claude') && info?.sessionId) {
               const bounds = { last: lastN, afterUuid, beforeUuid, fromUuid, aroundUuid, radius: aroundRadius };
               readScope = { tabId, toolType: info.toolType, sessionId: info.sessionId, cwd: info.cwd || null, bounds };
               if (freshnessRequested) readScope.freshness = 'v1';
               if (payloadPolicy) Object.assign(readScope, { payloadPolicy, dehydrate: true,
                 payloadHeaderVersion: historyPayloadCapability.headerVersion });
+              // Preserve the ordinary full JSON endpoint while avoiding a
+              // second entries graph in Main. Conditional/freshness responses
+              // retain their existing exact protocol until separately migrated.
+              if (info.toolType === 'codex' && transcriptService.openHistoryStream
+                && !freshnessRequested && requestedRevision == null && !deltaOk) {
+                const historyReadEnd = beginHttpReadDependency('history-service');
+                let stream;
+                try {
+                  stream = await transcriptService.openHistoryStream(readScope,
+                    { projection: 'history-entries', format: 'json', payloadPolicy, control: currentReadControl() });
+                  assertHttpHistoryCurrent();
+                  const meta = stream.metadata;
+                  const result = meta?.result;
+                  if (!result || result.success !== true) {
+                    stream.close();
+                    return sendJson(res, result?.error === 'lineage_unresolved' ? 409 : 500,
+                      { ...(result || { success: false, error: 'history_read_unavailable' }),
+                        toolType: info.toolType, sessionId: info.sessionId });
+                  }
+                  const verify = async () => {
+                    assertHttpHistoryCurrent();
+                    const current = await resolveHistorySessionInfo(tabId, 1500);
+                    assertHttpHistoryCurrent();
+                    if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType
+                      || (current?.cwd || null) !== (info.cwd || null)
+                      || (info.readIdentitySource === 'empty-resume-source'
+                        && current?.readIdentitySource !== 'empty-resume-source')) {
+                      throw Object.assign(new Error('history_read_identity_changed'),
+                        { code: 'HISTORY_READ_IDENTITY_CHANGED' });
+                    }
+                  };
+                  await verify(); stream.assertCurrent();
+                  const header = { ...result, toolType: info.toolType, commandType: info.toolType,
+                    sessionId: info.sessionId, readSessionId: info.sessionId,
+                    writerSessionId: info.writerSessionId || null, writerConfirmed: info.writerConfirmed === true,
+                    ...(payloadPolicy ? { payloadPolicy, payloadHeaderVersion: historyPayloadCapability.headerVersion } : {}),
+                    historyRevision: publicHistoryRevisions.remember(result.revision, readScope),
+                    ...finishConversationOwnerRead(tabId, ownerBeforeRead),
+                    total: Number.isFinite(result.total) ? result.total : meta.entryCount,
+                    dropped: Number.isFinite(result.dropped) ? result.dropped : 0,
+                    truncated: result.truncated === true, etag: meta.etag,
+                    firstUuid: meta.firstUuid, lastUuid: meta.lastUuid };
+                  publishTabTiming(tabId, 'history-read');
+                  await sendHistoryEntriesStream(res, 200, header, stream, { verify });
+                  console.log('[WebTiming] /history DONE view=history transport=byte-credit tool=codex'
+                    + ' total=' + header.total + ' returned=' + meta.entryCount + ' ms=' + (Date.now() - t0));
+                  return;
+                } catch (error) {
+                  // An admitted stream is never replayed through renderer/full
+                  // fallback after a lost transport result or partial response.
+                  stream?.close();
+                  if (error?.code === 'HISTORY_READ_IDENTITY_CHANGED' && !res.headersSent) {
+                    return sendJson(res, 409, { success: false, error: error.message });
+                  }
+                  rethrowHistoryTerminal(error);
+                  if (res.headersSent) { res.destroy(error); return; }
+                  return sendJson(res, error?.code === 'HISTORY_READ_IDENTITY_CHANGED' ? 409 : 500,
+                    { success: false, error: error.message });
+                } finally { stream?.close(); historyReadEnd(); }
+              }
               const historyReadEnd = beginHttpReadDependency(freshnessRequested ? 'history-freshness' : 'history-service');
               try { data = freshnessRequested ? await readHistoryFreshnessWindow({ info, readScope, requestedRevision, deltaOk })
                 : await transcriptService.getHistory({
@@ -13642,9 +14343,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
                   ? 'http:' + crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex')
                   : null,
               }); } finally { historyReadEnd(); }
+              assertHttpHistoryCurrent();
               if (data?.success) {
                 if (freshnessRequested || payloadPolicy || requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
                   const current = await resolveHistorySessionInfo(tabId, 1500);
+                  assertHttpHistoryCurrent();
                   if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)
                     || (info.readIdentitySource === 'empty-resume-source' && current?.readIdentitySource !== 'empty-resume-source')) {
                     return sendJson(res, 409, { success: false, error: 'history_read_identity_changed',
@@ -13673,13 +14376,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
               }
             }
           } catch (e) {
+            rethrowHistoryTerminal(e);
             console.log(`[WebTiming] /history TRANSCRIPT_HISTORY_SKIP ${String(e.message)}`);
           }
         }
         if (!data && (freshnessRequested || payloadPolicy || requestedRevision != null || deltaOk)) {
           return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
         }
+        assertHttpHistoryCurrent();
         if (!data) data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+        assertHttpHistoryCurrent();
         data = { ...data, ...finishConversationOwnerRead(tabId, ownerBeforeRead) };
         // Neither unchanged nor delta means "empty history". Keep both shapes
         // intact; do not feed a missing entries array through the window parser.
@@ -13713,6 +14419,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (transcriptService) {
         try {
           const info = await resolveAgentSessionInfo(tabId, 1500);
+          assertHttpHistoryCurrent();
           if (info?.toolType === 'codex' && info?.sessionId) {
             data = await transcriptService.getMessages({
               tabId,
@@ -13720,6 +14427,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
               sessionId: info.sessionId,
               cwd: info.cwd || null,
             });
+            assertHttpHistoryCurrent();
             if (data?.success) {
               data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId };
             } else {
@@ -13727,10 +14435,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
             }
           }
         } catch (e) {
+          rethrowHistoryTerminal(e);
           console.log(`[WebTiming] /history TRANSCRIPT_MESSAGES_SKIP ${String(e.message)}`);
         }
       }
+      assertHttpHistoryCurrent();
       if (!data) data = await bridgeRequest('loadSDKHistory', { tabId });
+      assertHttpHistoryCurrent();
       const allMsgs = data?.messages || [];
       const total = allMsgs.length;
 
@@ -13769,78 +14480,19 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 200, { ...data, messages, total, truncated, dropped, etag, lastUuid, firstUuid });
       }
 
-      // ─── NDJSON streaming path ────────────────────────────────────────
-      // Pipe: write() lines → Brotli transform (if accepted) → response.
-      const accept = req.headers['accept-encoding'] || '';
-      const useBrotli = /\bbr\b/.test(accept);
-      const useGzip = !useBrotli && /\bgzip\b/.test(accept);
-
-      res.writeHead(200, {
-        'Content-Type': 'application/x-ndjson; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Vary': 'Accept-Encoding, Accept',
-        ...(useBrotli ? { 'Content-Encoding': 'br' } : useGzip ? { 'Content-Encoding': 'gzip' } : {}),
-        // Tell intermediaries (and clients) we want chunked-transfer, not
-        // wait-for-full-length. Critical for streaming perception.
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-cache',
-      });
-
-      let sink = res;
-      if (useBrotli) {
-        // Quality 4 = balanced ratio/speed for live encoding (~20-40 MB/s).
-        // Higher quality (11 default) is 100x slower for tiny ratio win.
-        const br = zlib.createBrotliCompress({
-          params: {
-            [zlib.constants.BROTLI_PARAM_QUALITY]: 4,
-            [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
-          },
-        });
-        br.pipe(res);
-        sink = br;
-      } else if (useGzip) {
-        const gz = zlib.createGzip({ level: 4 });
-        gz.pipe(res);
-        sink = gz;
+      // The same NDJSON contract, with bounded string encoding and real
+      // backpressure. The done sentinel is emitted only after every message.
+      function* historyWireRows() {
+        yield { type: 'meta', total, returned: messages.length, truncated, dropped,
+          sessionId: data?.sessionId, etag, lastUuid, firstUuid };
+        for (const message of messages) yield message;
+        yield { type: 'done', written: messages.length };
       }
-
-      const writeLine = (obj) => sink.write(JSON.stringify(obj) + '\n');
-
-      // Meta first — client uses `total` for the progress bar, `etag` for cache key.
-      // `firstUuid` enables phase-2 prefix backfill (`?before=<firstUuid>`).
-      writeLine({
-        type: 'meta',
-        total,
-        returned: messages.length,
-        truncated,
-        dropped,
-        sessionId: data?.sessionId,
-        etag,
-        lastUuid,
-        firstUuid,
-      });
-
-      // Yield to event loop every 200 messages so we don't synchronously block
-      // when a single client requests a 5000-message dump. The lighter pulse
-      // keeps the HTTP server responsive to other requests during a big stream.
-      const FLUSH_EVERY = 200;
-      let written = 0;
-      for (const msg of messages) {
-        writeLine(msg);
-        written += 1;
-        if (written % FLUSH_EVERY === 0) {
-          await new Promise((r) => setImmediate(r));
-        }
-      }
-      // End sentinel — client can rely on `done` to know stream completed
-      // cleanly vs was cut off mid-flight.
-      writeLine({ type: 'done', written });
-      sink.end();
-      console.log(`[WebTiming] /history DONE total=${total} returned=${messages.length} dropped=${dropped} ms=${Date.now()-t0} mode=ndjson enc=${useBrotli ? 'br' : useGzip ? 'gz' : 'plain'}`);
+      await sendHistoryNdjson(res, historyWireRows());
+      console.log(`[WebTiming] /history DONE total=${total} returned=${messages.length} dropped=${dropped} ms=${Date.now()-t0} mode=ndjson`);
       return;
     } catch (e) {
+      rethrowHistoryTerminal(e);
       console.log(`[WebTiming] /history ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
       if (!res.headersSent) return sendJson(res, 500, { error: String(e.message) });
       try { res.end(); } catch {}
@@ -14003,6 +14655,12 @@ function webBroadcast(tabId, payload) {
     payload = { ...stampPublicRuntimeSnapshot(tabId, payload), ...tabActivityProjection({ tabId }) };
   }
   const type = payload && payload.type;
+  if (['busy', 'done'].includes(type) && payload?.busy !== true) wakeBuildInstallContinuations(tabId);
+  if (['busy', 'done', 'snapshot', 'queue-update', 'bridge-update'].includes(type)) wakeLoopDependencies(tabId);
+  if (type === 'background-work') {
+    wakeLoopDependencies(tabId);
+    agentSendQueue?.notifyRuntime(tabId, 'loop-background:' + fingerprintAgentSendRequest(payload));
+  }
   if (publicHistoryFreshness?.hasTab(tabId)
     && ['transcript-changed','timing-changed','snapshot','bridge-update'].includes(type)) {
     const historyFreshness = publicHistoryFreshness.invalidate(tabId, type);
@@ -14439,6 +15097,8 @@ function start({
   cancelAgentSend: cancelAgentSendFn,
   readAgentSendInputSlot: readAgentSendInputSlotFn,
   computeActiveLoaders: computeFn,
+  computeInstallInputBlockers: computeInstallFn,
+  readInstallMcpStatus: readInstallMcpStatusFn,
   computeProjectActivity: computeProjectActivityFn,
   readWorkflowPublication: readWorkflowPublicationFn,
   readTabActivityState,
@@ -14452,6 +15112,7 @@ function start({
   transcriptService: transcriptServiceFn,
   savedHistoryRuntime,
   historyMutationInput: historyMutationInputValue,
+  workingDirectoryOperations: workingDirectoryOperationsValue,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
   readCodexNativeRewindState: readCodexNativeRewindStateFn,
@@ -14502,12 +15163,21 @@ function start({
   publicTabActivity = typeof readTabActivityState === 'function'
     ? require('./public-tab-activity').createPublicTabActivity({
       readState: readTabActivityState,
-      readInherited: () => getOrchestrationRunStore().readInheritedActivity(),
+      readInherited: () => {
+        const activity = getOrchestrationRunStore().readInheritedActivity();
+        try { return { ...activity, sourceTabIds: [...new Set([...activity.sourceTabIds, ...readBuildInstallInheritedActivity().map(entry => entry.source.tabId)])] }; }
+        catch { return { known: false, reason: 'install-continuation-unavailable', sourceTabIds: [] }; }
+      },
       onChanged: reason => scheduleTabActivityBroadcast?.(reason),
     }) : null;
   mobileAttachmentAssetStore = mobileAttachmentAssetStoreInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
+  releaseBuildInstallReceipt?.();
+  releaseBuildInstallReceipt = agentSendReceiptStore?.subscribe?.(record => {
+    if (String(record.handoffId || '').startsWith('build-install-return:')) wakeBuildInstallContinuations(record.tabId);
+  }) || null;
   historyMutationInput = historyMutationInputValue || null;
+  workingDirectoryOperations = workingDirectoryOperationsValue || null;
   reconcileAgentSendReceipt = reconcileAgentSendReceiptFn || null;
   sendQueueRecoveryReady = false;
   if (agentSendReceiptStore?.subscribe) {
@@ -14517,7 +15187,8 @@ function start({
       cancelAttempt: record => cancelAgentSendFn?.(record),
       readInputSlot: typeof readAgentSendInputSlotFn === 'function' ? readAgentSendInputSlotFn : null,
       projectPresentation: record => record.surface === 'tab-message'
-        ? tabMessageService?.receiptPresentation(record.operationKey, record.tabId) : null,
+        ? tabMessageService?.receiptPresentation(record.operationKey, record.tabId)
+        : readBuildContinueDeferredReceipt(record),
       admit: admitQueuedAgentSend,
       claimDispatch: historyMutationInput ? request => historyMutationInput.claimSend(request.tabId) : null,
       transferMergedContext: ({ tabId, requests, request }) => {
@@ -14542,8 +15213,13 @@ function start({
         const operational = String(request.source || '').startsWith('research-operational:') || !!request.operationalNoticeRef;
         const continuation = String(request.source || '').replace(/^codex-/, '').startsWith('orchestration-continue:');
         const continuationRunId = continuation ? require('./orchestration-continuation').continuationRunIdFromAudit(request) : null;
+        const buildContinueId = String(request.source || '').startsWith('build-install-continue:')
+          ? request.source.slice('build-install-continue:'.length) : null;
         const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
           ...(operational ? { [OPERATIONAL_ADMISSION]: true } : {}),
+          ...(buildContinueId ? { [BUILD_CONTINUE_ADMISSION]: true, prepareSend: async () => {
+            if (await getBuildContinueOperations().admit(request) !== true) throw Error('build_continue_admission_changed');
+          } } : {}),
           ...(request.completionDeliveryRef ? { [COMPLETION_ADMISSION]: true } : {}),
           sendRequestFingerprint: scope.requestFingerprint,
           ...(scope.expectedTarget ? { expectedTarget: scope.expectedTarget } : {}),
@@ -14619,6 +15295,8 @@ function start({
     }
   }
   computeActiveLoaders = computeFn || null;
+  computeInstallInputBlockers = computeInstallFn || null;
+  readInstallMcpStatus = readInstallMcpStatusFn || null;
   computeProjectActivity = computeProjectActivityFn || null;
   readWorkflowPublication = typeof readWorkflowPublicationFn === 'function' ? readWorkflowPublicationFn : null;
   readAgentTabTiming = readAgentTabTimingFn || null;
@@ -14643,6 +15321,8 @@ function start({
   releaseTimingBindingObserver = observeHistoryResponseTimingBindings(detail => {
     if (detail.tabId) publishTabTiming(detail.tabId, 'history-response-bound', true);
   });
+  releaseLoopReceipt?.();
+  releaseLoopReceipt = agentSendReceiptStore?.subscribe?.(record => wakeLoopDependencies(record.tabId));
   if (savedHistoryRuntime && transcriptService) {
     conversationOwners = savedHistoryRuntime.owner || null;
     const { SavedHistoryOperations } = require(path.join(srcMainDir, 'saved-history-operation'));
@@ -14734,10 +15414,20 @@ function start({
   console.log('[WebServer:Health] start-request pid=' + process.pid + ' preferredPort=' + PORT_PREFERRED
     + ' instance=' + webServerInstanceId);
   registerBridgeReplyHandler();
+  ipcMain.removeHandler?.('loop-dependencies:list');
+  ipcMain.handle('loop-dependencies:list', () => readLoopDependencies());
+  void readLoopDependencies().catch(error => console.warn('[LoopDependencies] restore pending: ' + String(error.code || error.message)));
   const messageServiceForStart = getTabMessageService();
-  void agentSendReceiptStartupReady.then(() => messageServiceForStart.initialize())
+  loopMessageStartupReady = agentSendReceiptStartupReady.then(() => messageServiceForStart.initialize());
+  void loopMessageStartupReady.then(() => wakeLoopDependencies())
     .catch(error => console.warn('[TabMessages] startup-failed error=' + error.message));
   void startOrchestrationStartupRecovery();
+  try {
+    if (require('./project-manager').db.getAppState('buildContinueOperations.v1')) {
+      void agentSendReceiptStartupReady.then(() => getBuildContinueOperations().restore()).catch(error =>
+        console.warn('[BuildContinue] restore pending: ' + String(error.code || error.message)));
+    }
+  } catch (error) { console.warn('[BuildContinue] journal unavailable: ' + String(error.code || error.message)); }
 
   httpServer = http.createServer((req, res) => httpReadDiagnostics.run(req, res, () => {
     if ((req.headers['x-noted-main-pid'] && req.headers['x-noted-main-pid'] !== String(process.pid))
@@ -14750,17 +15440,24 @@ function start({
       webServerLastRequest = String(req.method || 'GET') + ' ' + parsed.pathname;
       webServerRequestCount += 1;
       httpReadDiagnostics.phase(res, 'route-enter');
-      handleApi(req, res, parsed, sdkSessions).then(() => {
+      return Promise.resolve(runHttpHistoryRead(req, res, () => handleApi(req, res, parsed, sdkSessions))).then(() => {
         httpReadDiagnostics.phase(res, 'handler-return');
       }).catch((err) => {
+        if (isHistoryReadCancelled(err)) {
+          httpReadDiagnostics.phase(res, 'consumer-revoked', { code: err.code });
+          // No synthetic empty success, fallback read or worker termination.
+          if (!res.destroyed && !res.writableFinished) res.destroy();
+          return;
+        }
         console.error('[WebServer] handler error:', err);
         if (err?.code === 'orchestration_store_unavailable') {
           return sendJson(res, 503, { ok: false, code: err.code,
             error: String(err.message), retryable: true });
         }
-        sendJson(res, 500, { error: String(err.message) });
+        if (res.headersSent) { if (!res.destroyed) res.destroy(); return; }
+        return sendJson(res, 500, { error: String(err.message),
+          ...(String(err?.code || '').startsWith('HISTORY_READER_') ? { code: err.code } : {}) });
       });
-      return;
     }
     serveStatic(req, res, parsed);
   }));
@@ -14828,6 +15525,19 @@ function writeWebServerDiscovery() {
 }
 
 function stop() {
+  buildInstallStatusClient?.stop();
+  buildInstallStatusClient = null;
+  releaseBuildInstallReceipt?.();
+  releaseBuildInstallReceipt = null;
+  releaseLoopReceipt?.();
+  releaseLoopReceipt = null;
+  loopDependencies?.dispose();
+  loopDependencies = null;
+  buildContinueOperations?.dispose();
+  buildContinueOperations = null;
+  loopMessageStartupReady = null;
+  loopNaturalEvidence.clear();
+  ipcMain.removeHandler?.('loop-dependencies:list');
   releaseAgentResponseCompletion?.();
   releaseAgentResponseCompletion = null;
   const responseObservationStopPromise = responseObservationService?.dispose().catch(() => {}) || Promise.resolve();
@@ -14888,6 +15598,8 @@ function stop() {
   console.log('[WebServer:Health] stopped pid=' + process.pid + ' requests=' + webServerRequestCount);
   wss = null;
   computeActiveLoaders = null;
+  computeInstallInputBlockers = null;
+  readInstallMcpStatus = null;
   computeProjectActivity = null;
   readWorkflowPublication = null;
   publicTabActivity = null;
@@ -15095,11 +15807,31 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
 }
 
 async function admitQueuedAgentSend(request) {
+  try { if (getBuildContinueOperations().capturing(request.tabId)) return false; }
+  catch (error) { if (String(error.code || '').startsWith('build_continue_')) return false; throw error; }
+  if (String(request.source || '').startsWith('build-install-continue:')) {
+    try { return await getBuildContinueOperations().admit(request); }
+    catch (error) {
+      if (/persistence|journal|unavailable/.test(error.code || '')) return false;
+      return { cancel: true, reason: error.code || error.message };
+    }
+  }
+  if (require(path.join(srcMainDir, 'prompt-queue-source')).isPromptQueueAutomationSource(request.source, request)) {
+    if (buildInstallAutomationBlocked(request.tabId)) return false;
+  }
+  if (isPromptLoopAutomationSource(request.source)) {
+    try { const stale = getBuildContinueOperations().staleLoopAdmission(request); if (stale) return stale; }
+    catch { return false; }
+  }
   if (historyMutationInput?.held(request.tabId)) {
     // Also arms a recovered passive hold on the first FIFO demand after boot.
     // No timer, new attempt, or provider action is created by this observation.
     void historyMutationInput.notify(request.tabId);
     return false;
+  }
+  if (isPromptLoopAutomationSource(request.source)) {
+    try { return await loopSendAdmission(request); }
+    catch (error) { console.warn('[LoopDependencies] admission pending: ' + String(error.code || error.message)); return false; }
   }
   if (isAutomaticPromptQueueRequest(request)) {
     const diagnosticKey = JSON.stringify([request.tabId, request.handoffId]);
@@ -15157,6 +15889,10 @@ async function admitQueuedAgentSend(request) {
 }
 
 module.exports = {
+  readBuildInstallStatus,
+  cancelBuildInstallFromDock,
+  readBuildInstallContinuations,
+  buildInstallAutomationBlocked,
   // Read-only health for the existing diagnostics owner; no new HTTP route.
   getHttpReadDiagnosticsSnapshot: () => ({ ...httpReadDiagnostics.snapshot(),
     historyReader: transcriptService?.historyReader?.getReadDiagnosticHealth?.() || null }),
@@ -15171,7 +15907,9 @@ module.exports = {
   readQueuedMessageMerge: ({ tabId, requestId }) => agentSendQueue?.readMerge(requestId, tabId) || null,
   readAutomaticSendAdmission: async ({ tabId, handoffId, operationKey, attemptId }) => {
     const item = agentSendQueue?.item(operationKey), record = agentSendReceiptStore?.get(operationKey);
-    if (!item || !isAutomaticPromptQueueRequest(JSON.parse(item.request_json))) return true;
+    if (!item) return true;
+    const request = JSON.parse(item.request_json);
+    if (!isAutomaticPromptQueueRequest(request) && !isPromptLoopAutomationSource(request.source)) return true;
     if (record?.attemptId !== attemptId || record?.tabId !== tabId || record?.handoffId !== handoffId
       || record.state !== 'in-flight' || item.state !== 'dispatching') return { cancel: true };
     return admitQueuedAgentSend(JSON.parse(item.request_json));

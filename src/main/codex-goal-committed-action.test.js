@@ -13,7 +13,7 @@ const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const menu = 'Resume paused goal?\nGoal: continue the existing task\n› 1. Resume goal   Mark it active and continue when idle\n  2. Leave paused  Keep it paused; use /goal resume later\nPress enter to confirm or esc to go back';
 function part(start, end) { const a = source.indexOf(start), b = source.indexOf(end, a); assert.ok(a >= 0 && b > a); return source.slice(a, b); }
 
-function harness({ configured, override, screen = menu, usagePolicy } = {}) {
+function harness({ configured = true, override, screen = menu, usagePolicy } = {}) {
   const writes = [], microtasks = [], timers = [], clears = [];
   const state = { armedAt: 100, raw: '', allowedPromptTypes: new Set(['resume-goal']), firedTypes: new Set(), actionInFlightPrompt: null };
   const startup = new Map([['T', state]]), runtime = { input: 1, runSeq: 1, isRunning: true, screen };
@@ -61,6 +61,7 @@ function harness({ configured, override, screen = menu, usagePolicy } = {}) {
       selectCodexCurrentInteractiveFrameText(lines), '', { requireSyncMarker: false, requireInitializedComposer: true, source }),
     parseCodexVerifiedComposerFooter,
     publishCodexRuntimeProjection: () => ({ sessionStatus: 'starting' }), _webBroadcast() {},
+    captureTerminalHistoryPreviewDiagnostic: async () => ({ incidentId: 'controlled-goal-diagnostic' }),
     scheduleProjectActivityBroadcast() {}, emitAgentReadinessChanged() {}, mainWindow: null,
     markCodexTuiReadyAfterVerifiedComposer: async () => true,
     stopAiProcessInTabSerialized: async (_tab, options) => {
@@ -185,8 +186,8 @@ test('wrapped goal labels/footer remain a current modal, while an old dialog abo
   assert.equal(policy.inspectCodexResumeGoalPrompt('› Ask Codex to do anything').visible, false);
 });
 
-test('preference defaults to Resume and explicit operation policy wins', () => {
-  assert.equal(policy.resolveCodexResumeGoalPreference(undefined, undefined), true);
+test('unset preference asks; explicit saved and operation policies retain their choices', () => {
+  assert.equal(policy.resolveCodexResumeGoalPreference(undefined, undefined), null);
   assert.equal(policy.resolveCodexResumeGoalPreference(undefined, false), false);
   assert.equal(policy.resolveCodexResumeGoalPreference(false, true), false);
   assert.equal(policy.resolveCodexResumeGoalPreference(true, false), true);

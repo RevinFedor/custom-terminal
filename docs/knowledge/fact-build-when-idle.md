@@ -40,17 +40,16 @@ hold переживает обычный restart; completed ID не открыв
 contract/tests, не свидетельство уже выполненной установки. Старые idle/owner-ACK
 guards и внешний Voice Record callback остаются отдельными механизмами.
 
-При unrelated CURRENT WIP можно заранее подготовить frozen bundle и явно
-зарезервировать `release/prepared-install-intent.json` (version1/pending, baseline
-ASAR SHA, candidate SHA, Source pins). Этот путь выполняет ТОТ ЖЕ внешний installer,
-но не компилирует CURRENT и не публикует его MCP/hook integrations. Под normal install
-lock сверяются baseline/candidate/Source; exact intent атомарно становится claimed
-под Voice Record job nonce. Candidate повторно проверяется в stage, после idle ACK
-и после install. Lost/failed job не разрешает другой cut без разбора receipt;
-manual CURRENT build не потребляет pending prepared intent. Подготовка сама не
-Quit/не install/не launch. Для narrow Main overlay проверяются все ASAR leaves,
-неизменность renderer/прочего runtime, embedded Electron header integrity и прежняя
-локальная codesign identity; подпись сама по себе не проверяет корректный header.
+`build:install` / `build:i` и внешний Voice Record hook всегда заново собирают
+текущие исходники. Разовый механизм `release/prepared-install-intent.json` удалён
+по поручению Fedor20.10: агент добавил его ради установки пяти Main-исправлений
+поверх установленного приложения без остальных текущих правок. Но резерв не был
+связан с жизненным циклом Voice Record job: отмена на этапе observing оставляла
+`pending`, после чего ручной install запрещался, а новый hook мог подхватить старую
+копию. Сохранённый JSON больше не читается, не выбирает приложение и не блокирует
+новую сборку; удалять его руками для продолжения не требуется. Единственный install
+lock защищает от одновременно работающих установщиков, освобождается после
+завершения/обработанной отмены; доказанно мёртвый владелец допускает прежний takeover.
 
 Run After `after app restart` отслеживает identity нового Electron main, а не имя install-команды. `build:install`/alias `build:i`, ожидающий `build:i-obs` и `build:i-cont` удовлетворяют его после замены и открытия приложения; обычный Quit/Open тоже. Package-only build либо отказ сборки до замены не удовлетворяет условие. Возврат `continue`/AI-hop callback и такой queue-item — отдельные явно настроенные сообщения, одно не заменяет другое. Готовность Resume ограничивает физическую отправку карточки, но прошлый assistant outcome не является дополнительным условием запуска; подробности — `fact-prompt-queue.md::Overlay UI`.
 
@@ -117,7 +116,7 @@ Run After `after app restart` отслеживает identity нового Elect
 откатов при успехе, её отсутствие при сбое, неприкосновенность замка и чужих
 приложений, устойчивость установки к сбою уборки.
 
-## Соседний режим: `build:i-cont`
+## Соседний legacy режим: `build:i-cont`
 
 `npm run build:i-cont` намеренно не ждёт idle: он выполняет канонический
 `build:install`, затем отправляет ровно слово `continue` каждой Claude/Codex
@@ -161,7 +160,47 @@ blocker/error предыдущего. Это исключает launch storm о�
 источника; production запуск 11 Resume одновременно дал восемь ошибок и
 ложный `shell_not_idle` у вкладки, где AI-потомков уже не было.
 
-## Что считается «активным» (блокирует ребилд)
+## Немедленный снимок и продолжение: `build:i-c`
+
+`npm run build:i-c` запускают из внешнего терминала. Пользователю нужен набор
+работавших вкладок на момент команды, поэтому этот режим сначала сохраняет
+операцию и закрывает Main, затем готовит candidate. Это отдельный явный режим;
+обычные `build:i` и idle hook сохраняют прежний порядок. Установленный Noted
+должен уже поддерживать capture/restore v2 с `proofRevision:2`: старый app,
+включая промежуточный v2 без полного recovery-контракта, получает отказ до Quit,
+его нельзя обновить этой же ещё не загруженной функцией.
+
+Снимок различает собственный model turn и унаследованное ожидание. Вкладка,
+только ожидающая Terminal MCP/SC, сохраняет прежнюю зависимость без `continue`.
+Own+external получает одно продолжение собственной работы; исходные run/job,
+notification handoff и UNKNOWN не пересоздаются. Входящее поручение продолжает
+существующий orchestration owner; второй generic `continue` поверх него запрещён.
+Пассивное наблюдение само не отправляет input: exact restart связывает старый
+subject с доказанным continuation, сохраняя отдельное evidence/provenance.
+
+Результат или reply может оказаться в FIFO раньше `continue`. Он обрабатывается
+первым. Допуск последующего продолжения требует полного verified интервала
+сообщений и canonical receipts именно захваченных зависимостей. Callback не
+становится финалом прерванного поручения. Новый manual input, Stop, замена owner,
+разрыв источника или неизвестный Enter не дают права на автоматический ввод.
+Проверка интервала читает уже прогретый структурный индекс, не запускает полный
+History ради отрицательного proof. Холодный/неполный индекс остаётся unknown.
+
+Loop ON/autoRun/карточки сохраняются. Новая автоматика до enqueue получает
+известный deferred/no-input. Старый Loop cause можно убрать из FIFO только по
+exact captured operation и отсутствию native attempt; его receipt остаётся,
+живой caller и restore сохраняют ON. Ручная очередь и UNKNOWN не переставляются.
+
+Одна maintenance identity проходит begin до Quit → startup beforeRestore →
+complete; SC сохраняет тот же job и future final. Ошибка подготовки открывает
+прежнее приложение и восстанавливает ту же операцию. Потеря ACK восстанавливается
+по сохранённому operationId, при необходимости `npm run build:i-c -- --resume ID`;
+эта команда не начинает вторую сборку. API ACK означает регистрацию восстановления,
+не завершение всех задач. Точный отчёт доступен по возвращённому reportUrl.
+Подтверждённый отказ continuation отмечается как unresolved и снимает restart hold;
+сохранённая отрицательная квитанция не превращается в success или автоматический retry.
+
+## Общая активность и допуск установки
 Единый ответ `/api/active-loaders` объединяет два авторитетных main-process источника: runtime-снимок `computeActiveLoaders()` и durable store оркестраций. Runtime-часть **переиспользует те же самые live-Map'ы, что питают per-tab loader в UI**; inherited/completion-часть читается прямо из сохранённых run, а не из renderer/Zustand:
 
 | Источник | Map в main | Семантика |
@@ -173,13 +212,13 @@ blocker/error предыдущего. Это исключает launch storm о�
 | Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + (`tabs.restart_after_workflow_ids`, `tabs.restart_after_tab_ids` или legacy `tabs.restart_after_tab_id`) | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока у вкладки есть хотя бы одна trigger-подписка. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 | Git-операции | `ipc/git.js` active operations registry | `kind:"git"` для generate/commit/undo/push/fetch/checkout пока операция in-flight. Это нужно для сценария Git run-after: AI-вкладка завершилась, Git-панель начала generate+commit, и `build:i-obs` не должен закрыть приложение между AI-trigger и фактическим commit/push |
 | Взведённая очередь (Run after / Loop) | persisted `promptQueueByTab` + `promptQueueSharedLoopPrompt` через `computePromptQueueInstallBlockers` | Общий endpoint по-прежнему проецирует обещание как `kind:"prompt-queue", status:"queued"`, но ручной `build:i-obs` отбрасывает этот пассивный вид перед подсчётом idle. Вооружённое условие на остановленной вкладке не является текущей работой; когда оно реально запускает `/compact` или следующий prompt, появившийся `claude`/`codex busy` снова блокирует сборку. Другие потребители `/api/active-loaders` сохраняют прежнюю семантику. |
-| Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует реальный target и inherited source; `waiting_descendants` остаётся работой ветки; `completed + resultComplete=false` проецируется как `result-proof`; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. `waiting_recovery` и ошибка доставки также блокируют install как нерешённые состояния, но не считаются активной анимацией. Generic `busy:true` ничего из этого не снимает. Все tracked-состояния переживают restart и retention, а auto-stop запрещён до полного result-proof |
+| Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует реальный target и inherited source; `waiting_descendants` остаётся работой ветки; `completed + resultComplete=false` проецируется как `result-proof`; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. `waiting_recovery` и ошибка доставки сохраняют completion-блокировку и не считаются активной анимацией. В обычном install-допуске SOURCE20.10 исключение возможно только для строго сохранённого внешнего SC ожидания без неясного локального ввода; реальные target/result/input blockers сохраняются. Generic `busy:true` ничего из этого не снимает. Все tracked-состояния переживают restart и retention, а auto-stop запрещён до полного result-proof |
 
-Дедупликация по `tabId` (один таб = максимум один loader). Runtime-loader имеет приоритет над orchestration-проекцией того же таба; активный child всё равно сохраняет отдельный target-blocker. Это важно для `returnTo.tabId`: Voice Record исключает только вызывающий source, но не работающую целевую вкладку.
+Общая проекция дедуплицируется по tabId с приоритетом runtime. SOURCE20.10 install-eligibility отдельно сохраняет все настоящие input/turn blockers той же вкладки; returnTo больше не является исключением из них.
 
 Идемпотентно для idle-определения: `idle === (loaders.length === 0)`.
 
-Важно для логов: `idle:true` в `/api/active-loaders` означает только «нет install-блокеров», а не «в Noted Terminal вообще нет живых процессов». Ручной `npm run dev` или idle Codex/Claude PTY могут продолжать существовать. Web-server логирует изменившиеся снимки как `[ActiveLoaders] status=... idle=... count=... kinds=... tabs=...`, поэтому диагностика `build:i-obs` должна читать этот смысл, а не текст старого wrapper'а `already idle`.
+Важно для логов: `idle:true` в `/api/active-loaders` означает «нет отражённой общей активности», а не «в Noted Terminal вообще нет живых процессов». Ручной `npm run dev` или idle Codex/Claude PTY могут продолжать существовать. Web-server логирует изменившиеся снимки как `[ActiveLoaders] status=... idle=... count=... kinds=... tabs=...`, поэтому диагностика `build:i-obs` должна читать этот смысл, а не текст старого wrapper'а `already idle`.
 
 **Шрам «дыра между звеньями цепочки» (2026-08-16).** До этой правки список блокеров отвечал на вопрос «идёт ли ход прямо сейчас», а вызывающая сторона спрашивала «осталась ли работа, которую пользователь ждёт». Для цепочки Run after это разные вопросы: между двумя звеньями никто не работает — триггер уже закончил, владелец ещё не стартовал. Замерено в production.log: `tab-2532` завершилась в 07:35:01.6, `tab-2570` стартовала в 07:35:03.3, а опрос idle попал в 07:35:02.0 — **дыра шириной 1.7 секунды**. Ребилд получил `idle=true count=0`, погасил приложение, и Codex записал `turn_aborted` без ошибки; пользователь увидел «кодекс просто остановился». Дальше цепочка встала законно: `tab-2572` ждала штатного завершения `tab-2570`, а прерывание им не является.
 
@@ -189,7 +228,7 @@ blocker/error предыдущего. Это исключает launch storm о�
 - **Живость очереди = строка вкладки существует, а НЕ живой PTY.** Это позволяет другим клиентам видеть обещание, даже когда очередь законно ждёт остановленную вкладку и позже сама её поднимет (`inactive → LAUNCH_FOR_QUEUE start-fresh`). Ручной observer затем делает собственную более узкую проекцию и не считает это обещание причиной откладывать сборку.
 - **Ошибка чтения очереди не роняет весь снимок.** `try/catch` вокруг сохраняет остальные живые turn-блокеры. `build:i-obs` игнорирует и `prompt-queue-state`, потому что для его нового контракта состояние пассивной очереди вообще не участвует в решении.
 
-Продуктовое уточнение 2026-08-25: `build:i-obs` ждёт фактически выполняемую работу, а не возможную будущую работу. Это осознанно отменяет для ручной команды старое правило «durable Run after promise закрывает любую дыру между звеньями». `IDLE_CONFIRM` остаётся защитой от коротких переходов реальных runtime-сигналов, но не обещает дождаться ещё не запущенной карточки. Scope намеренно локален wrapper-у; Voice Record и другие клиенты общего endpoint не изменены.
+Продуктовое уточнение 2026-08-25: `build:i-obs` ждёт фактически выполняемую работу, а не возможную будущую работу. Это осознанно отменяет для ручной команды старое правило «durable Run after promise закрывает любую дыру между звеньями». `IDLE_CONFIRM` остаётся защитой от коротких переходов реальных runtime-сигналов, но не обещает дождаться ещё не запущенной карточки. На25.08 scope был локален wrapper-у. SOURCE20.10 Voice Record и wrapper используют отдельную install-eligibility; другие клиенты общего activity endpoint сохраняют свою семантику.
 
 Шрам mobile install preflight: если `terminalCommandState.isRunning` применять ко всем вкладкам без фильтра AI, `/api/active-loaders` возвращает десятки `kind:"process", status:"running"` для idle Claude/Codex табов. На iOS это выглядит как ложный alert «Terminal занят, остановите вкладки где идёт streaming/loader», хотя loader нигде не идёт. Разделитель: AI tabs блокируют install только через свои deterministic busy-сигналы выше; обычные shell-команды не блокируют install, кроме случая `kind:"restart-after"` — команда была запущена `Restart after` и её надо дождаться как AI-turn.
 
@@ -249,7 +288,7 @@ notification при том же ID не создаёт новую строку, 
 ### Гарантии безопасности
 - **`IDLE_CONFIRM=2`** (env-настраиваемо): ребилд только после N подряд idle-поллов. Гасит 1-тиковый разрыв между двумя turn'ами из очереди (turn A кончился → 0 на один полл → turn B стартанул).
 - **Failed poll ≠ idle**: таймаут/сетевой блип сбрасывает `idleStreak=0`, не считается за idle.
-- **Старый билд без эндпоинта** (404): печатает «predates /api/active-loaders», просит разовый `build:install` для бутстрапа, exit 2. НЕ строит вслепую.
+- **Старый билд без эндпоинта** (404): печатает «predates /api/install-eligibility», просит разовый `build:install` для бутстрапа, exit 2. НЕ строит вслепую.
 - **Прод не запущен**: нечего ждать → строит сразу (или exit при `NO_BUILD=1`).
 
 11.10 incident00:06BKK(10.10 17:06UTC): пользователь подтвердил `build:i-obs`.
@@ -275,60 +314,88 @@ Live GET-only observer увидел installedPID32057/7878 и9blockers, зате
 отменён;реальныйinstall/закрытие пользователя не выполнялись. Evidence:
 `/private/tmp/noted-build-cache-20261011.eWevI4/HANDOFF.md`.
 
-### Observe-фаза в Voice Record endpoint (НЕ wrapper-скрипт)
-`build:i-obs` (wrapper `scripts/build-when-idle.js`) — команда для внешнего ручного запуска
-в отдельном терминале. Voice Record endpoint `/api/terminal/build-install` этот **wrapper не
-запускает** (он foreground-поллер, а Voice Record — sibling-сервис), но с июня 2026 делает
-**собственную observe-фазу** против того же `/api/active-loaders` перед спавном `build:install`.
+### Observe-фаза в Voice Record endpoint (SOURCE20.10)
 
-Оба пути после observe сходятся в каноническом `npm run build:install`. После успешного
-Electron package-build этот workflow вызывает `npm run install:terminal-mcp`, затем
-`npm run install:claude-hook`, и только после обеих синхронизаций заменяет и открывает новую
-app-копию. Поэтому Voice Record не копирует runtime-интеграции самостоятельно, а новый backend
-не запускается со старым Terminal MCP client или turn-hook без causal prompt identity. Обычный
-`npm run build` остаётся package-only и реальный HOME не меняет.
+Voice Record — отдельный владелец установки: закрытие Noted не убивает job,
+его журнал, control pipe или возврат исходному агенту. Обычный hook и ручной
+`build:i-obs` читают **`/api/install-eligibility`**, а `/api/active-loaders`
+сохраняет общую проекцию runtime/унаследованной работы, включая ожидание install.
+Это разные вопросы: сохранённый внешний SC Research остаётся видимой работой,
+но закрытие Noted не должно отменять его или бесконечно задерживать update.
 
-Синхронизация MCP-файла не перезапускает уже живой stdio MCP. Новую версию получает только
-новый или переподключённый Claude/Codex-процесс; проверка nested orchestration после install
-обязана создать/перезапустить MCP-клиента, а не продолжать процесс, который загрузил старый
-server. Turn-hook, напротив, запускается новым процессом на каждое событие и читает обновлённый
-файл уже на следующем submit, если его registration в Claude settings не менялась.
+Допуск строится в Main из настоящего runtime, launch/Stop/history/PTY input,
+нативного FIFO/receipt и строго записанного RunStore. Для внешнего ожидания нужны
+app-owned job/intent/fingerprint и точный source; supplied `preserved:true` не
+даёт исключения. Одна вкладка может одновременно иметь переносимое ожидание и
+настоящий input/turn blocker — дедупликация не должна скрывать последний.
+Неизменившаяся когорта использует только квитанцию последнего успешного writer
+с тем же epoch; новый/неуспешный write отзывает её. Наблюдение не переписывает
+весь RunStore каждую секунду без новой информации. Физические слоты всех вкладок
+сверяются ещё раз после последнего await всей runtime-когорты; равные tab keys/count
+не скрывают замену PTY, а paste в уже прочитанном shell не теряется за медленным
+соседним reader.
 
-Раньше (graveyard) endpoint строил **мгновенно** без idle-проверки, полагаясь на то, что iOS
-сделал preflight перед confirm. Это ломалось при AI-hop: агент в одной вкладке дёргал rebuild,
-а `build:install` через `pkill` гасит **весь** прод — включая соседние проекты, где в этот
-момент шёл turn. Теперь endpoint ждёт, пока все сессии **кроме вызвавшей** не уйдут в idle.
+Обычный observer ждёт **также исходный ход**. MCP быстро принимает долговечный
+job, агент заканчивает текущий ход; ждать работу всего поручения не требуется.
+Старое exclude-caller правило вычитало целую вкладку, включая подготовку/ввод,
+а `inherited-busy` чужого SC ожидания оставалось вечным blocker. Теперь эти оси
+разделены. Две свежие проверки нужны до compiler и ещё раз после package-build,
+непосредственно перед единственным owner ACK на Quit. Таймаут, 404 старого Main,
+ошибка/неясность process discovery и persistence не превращаются в idle.
+Положительно наблюдаемое отсутствие production допускает прежний bootstrap.
 
-Механика observe (`observeTerminalIdle` в voice-record `web-server.js`):
-- **Exclude-caller**: `returnTo.tabId` вычитается из списка блокеров. Вкладка-инициатор busy
-  именно потому, что запустила rebuild — ждать её = вечный дедлок. iOS-путь без `returnTo`
-  больше не делает собственный blocking preflight: телефон показывает confirm/status, а
-  решение “что можно остановить, а что надо ждать” живёт здесь, в Mac-side Voice Record.
-- **Auto-stop только для обычных процессов**: исторически endpoint пробовал остановить blockers
-  `kind:"process"` / devServer через `POST /terminal/stop`. Новый `/api/active-loaders` не
-  возвращает ручные shell-команды как blockers, а restart-after-owned процессы отдаёт отдельным
-  `kind:"restart-after"` — их нужно ждать, а не auto-stop'ить. AI/Claude/Codex/Gemini blockers
-  и `kind:"orchestration"` также никогда не auto-stop'ятся, чтобы не убить turn или completion-handoff посередине.
-  Результат пишется в `wait.autoStopped`/`job.autoStopped` для desktop и iOS status UI.
-  Если установленный прод ещё не знает `/terminal/stop`, Voice Record использует fallback
-  Ctrl+C через старый `/terminal/run` route.
-- **Discovery прода**: `web-server-<pid>.json` (живой PID) + авторитетный `isPackaged` из
-  соседнего `mcp-port-<pid>` (тот же main PID пишет оба файла); фоллбэк — `ps`-маркер
-  `/Applications/Noted Terminal.app`. Тот же stale-файл фильтр, что в wrapper'е.
-- **Fail-safe сохраняет «строить даже когда прод недоступен»** (старый rationale): нет живого
-  прод-инстанса → строить сразу; 404 (старый прод без эндпоинта, этот же build его и завезёт)
-  → строить; 503/timeout/401 **никогда** не считается idle (сбрасывает streak); `IDLE_CONFIRM=2`
-  подряд гасит 1-тиковый разрыв между turn'ами. Любая ошибка наблюдения → строить (явно
-  запрошенный rebuild не должен застрять из-за бага в idle-watching).
-- Прогресс виден в `GET /api/terminal/build-install`: `job.phase` (pending→observing→building→
-  finished), `job.wait.blockers` (какая соседняя сессия держит).
+После обеих проверок пути сходятся в каноническом CURRENT `npm run build:install`:
+проверка release/stage, синхронизация Terminal MCP и turn hook, maintenance,
+штатный Quit, rollback-копия, замена, запуск и проверка связи. Отмена control pipe
+не означает завершения compiler до его close/result; при неясном прежнем исходе
+новый hook, в том числе Force, не создаётся. `phase` и nonce-bound `stage`
+приходят от настоящего владельца, не от локального spinner.
+
+### Явный Force и отчёт восстановления (SOURCE20.10)
+
+`force:true` относится к одной операции и входит в неизменную request identity.
+Он пропускает ожидание activity/loaders/MCP перед сборкой и перед Quit. Force не
+является fallback обычного режима и не отменяет проверку candidate, исходного
+адреса/журнала, control-pipe cancellation и persistent Browser/maintenance contracts.
+Перед Quit Voice Record сохраняет доступные снимки Main; каждый недоступный
+участник помечается unknown с bounded deadline, не ждётся бесконечно.
+
+После успешного install один отчёт идёт **только согласованному returnTo**.
+Он различает активность до Quit, подтверждённую остановку локального процесса
+по exact shutdown receipt, восстановленный процесс и реально идущую работу.
+Input сохраняет operation/handoff/attempt IDs; SC сохраняет run/job и не получает
+фиктивный remote Stop. Shared MCP hub может пережить Noted: server PID/counts —
+не журнал исходов RPC. Отчёт честно оставляет эти исходы и внешние/plugin/stdio
+MCP неизвестными; исчезновение loader/pending не разрешает replay. Большой отчёт
+сохраняется полностью и читается по исходному requestId вместо молчаливой обрезки.
+
+SOURCE20.10 post-live: callback теперь короткая служебная квитанция со счётчиками
+и exact `GET /api/terminal/build-install?requestId=…`, поле `job.interruptionReport`.
+Длина сообщения не растёт с inventory и не повторяет custom многоабзацный план;
+он сохраняется как `callbackInstructions` полного отчёта. Historical pending input
+receipt не доказывает живой процесс/активный turn и не попадает в `wasActive`:
+это отдельный сохранённый ledger, не список вкладок для массового Resume.
+Report v2 разделяет pre-Quit process/work, exact shutdown interruption и unknown.
+Read-only API projection исправляет legacy классификацию по сохранённым snapshots,
+не переписывая original job/report/callback bytes или native receipt. Если исходного
+snapshot нет, legacy active остаётся unknown. Уже frozen callback не переформатируется.
+
+### Индикатор установки (SOURCE20.10)
+
+Build Install — отдельный typed `install` в правом dock вкладки рядом с MCP
+запросами, через тот же layout/row/history owner. Это не fake Research run и не
+глобальная кнопка здоровья MCP-хаба. Noted Main читает singleton Voice Record
+HTTP/SSE, сохраняет bounded status cache и публикует исходной вкладке SAME job,
+revision, mode, phase/stage, callback/error/report. После restart сначала виден
+честный stale cache, затем состояние живого владельца. Cancel адресует точные
+requestId/jobId/source своему installer API; orchestration detach не вызывается.
 
 ### AI-hop изнутри Noted Terminal
 Когда rebuild инициирует агент внутри самого Noted Terminal, он не должен запускать
 `npm run build:install` в своей PTY-вкладке: управляющий процесс умрёт вместе с приложением.
 Terminal MCP tool `build_install_noted_terminal` передаёт задачу в Voice Record
 `POST /api/terminal/build-install` с `returnTo` (`tabId`, `sessionId`, `projectId`,
-`projectPath`). MCP tool сразу возвращает job id; ожидание соседей (observe-фаза выше) и
+`projectPath`) и requestId. До Voice POST Main сохраняет source continuation, поэтому ACK/end текущего хода не открывает Loop. MCP tool возвращает job id; ожидание соседей (observe-фаза выше) и
 ожидание рестарта (callback ниже) живут в Voice Record — вызвавший агент не блокируется.
 
 После exit build-команды Voice Record читает live `~/.noted-terminal/mcp-port-*`:
@@ -343,6 +410,28 @@ live-only `/terminal/ai-prompt`. Project API найден по `web-server-<pid>
 а уже работающая — обычную отправку/очередь, без отдельной реализации запуска в Voice Record.
 Модель и effort callback не переопределяет. Статус виден в Voice Record
 `GET /api/terminal/build-install` (`returnTo`, `callback`, `logTail`).
+
+Voice Record строго сохраняет requestId/immutable source, compiler/result и frozen
+callback target/prompt/attempt в своём журнале. Same-ID retry не создаёт другой hook
+и не меняет адрес. Restore до compiler продолжает тот же intent; уже начатый
+compiler без terminal receipt остаётся unknown и не respawn'ится. Сохранённый
+primary result переживает потерю close ACK. Поздний canonical callback receipt
+можно принять пассивным чтением после deadline, без нового Send.
+
+SOURCE20.10 post-live: app-added working context меняет transport, поэтому hash
+логического callback нельзя сравнивать с transport audit token как одну identity.
+Continuation сохраняет immutable logical SHA256, связывает его с exact app-owned
+preparation (`base_hash`/actual prepared bytes), проверяет неизменный FIFO request,
+canonical attempt/provider/session/audit и source до/после natural-result read.
+Audit token остаётся SHA1/16; result reader получает полный normalized SHA256
+точного transport. Main при exact UUID/source использует эти physical identities;
+hash-only поиск отдельно требует именно полного normalized digest. Тот же SID или
+совпавший suffix не заменяют этот chain. Восстановленная binding сохраняется до
+ожидания final; stale ACK не может заменить её другим attempt. Старый v1 logical
+hash восстанавливается только из reversible exact preparation с проверкой её
+сохранённого full base hash и frozen audit token; недоказуемый legacy остаётся
+unknown, без нового Send. Проверка с refreshed embedded wrapper проходит по
+сохранённому logical hash, даже когда исходного suffix больше нет.
 
 У операции постоянный `handoffId = build-install-return:<jobId>`. `sent`/`queued` принимаются
 только с подтверждением общей отправки. После `202`, потерянного POST-ответа или признака
@@ -380,13 +469,25 @@ requested same Resume, второй получил agent_lifecycle_claimed. Об
 с его generation. Подробности и регрессии — `fact-codex.md`. Не исправлять это
 слепым повтором callback, ожиданием произвольной задержки или снятием shell guard.
 
+### Применение к живому владельцу
+
+Новый hook требует обновлённого **работающего Voice Record** с journal/report
+helpers и capability version2, а также нового Noted Main/renderer для eligibility,
+source continuation и dock. Публикация Terminal MCP wrapper/metadata через штатную
+синхронизацию не обновляет загруженный код sibling Voice Record. В shared hub новый
+Terminal child подхватывает wrapper после согласованного restart только этого child;
+legacy stdio-клиенту требуется перечитать свой каталог. Browser/hub целиком ради этого
+не перезапускаются. Ручная первая установка сама не регистрирует completion prompt:
+возврат оркестратора требует заранее явно настроенного действительного Run After
+`after app restart` либо отдельного пользовательского продолжения после restore.
+
 ### Env-кнобы
 
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878`
 (выбрать подтверждённый productionport; не обход discovery для dev/test).
 
 ## Тестирование без ребилда
-`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`. Observer тестируется через экспортированный`waitForIdle` с контролируемымиinspect/read, не запуском destructiveCLI против`PORT=<mockport>`: с11.10порт должен принадлежать реальному installedMain. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия обязана проверять, что incomplete result переживает restart/retention, блокирует install и не запускает auto-stop. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Реальная установка/пользовательскийQuit в E2E не выполняются;canonicaldriver gate проверяетсянаownedtempFS сmockbuild/sign/quit.
+`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`. Observer тестируется через экспортированный`waitForIdle` с контролируемымиinspect/read, не запуском destructiveCLI против`PORT=<mockport>`: с11.10порт должен принадлежать реальному installedMain. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия проверяет, что incomplete локальный target-result переживает restart/retention, блокирует обычную установку и не запускает auto-stop; сохранённый внешний SC wait проверяется отдельно через strict eligibility. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Реальная установка/пользовательскийQuit в E2E не выполняются;canonicaldriver gate проверяетсянаownedtempFS сmockbuild/sign/quit.
 
 ## Целостность пакета до закрытия приложения
 

@@ -230,7 +230,7 @@ async function runAgentPromptScenario({
     },
     ensureReady: async (context: AgentSendFlowContext): Promise<AgentSendReadyContext> => {
       const readyForSend = await adapter.ensureReady({
-        sendOperationKey, sendAttemptId,
+        sendOperationKey, sendAttemptId, handoffId,
         sessionId: context.recordWithoutReply ? context.restartSessionId : sessionId,
         expectedTarget: context.recordWithoutReply ? undefined : expectedTarget,
         cwd,

@@ -2,6 +2,19 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const { cloneProjectionGraphAsync } = require('./codex-projection-checkpoint');
+const { createProjectionControl } = require('./codex-turns-projection');
+const { currentReadControl, withReadControl, isHistoryReadCancelled,
+  isHistoryReadUnavailable } = require('./history-read-control');
+
+const assertDemand = () => currentReadControl()?.assertCurrent();
+const checkpoint = async () => {
+  assertDemand();
+  const control = currentReadControl();
+  if (control?.checkpoint) await control.checkpoint();
+  else await new Promise(resolve => setImmediate(resolve));
+  assertDemand();
+};
 
 const {
   normalizeCodexForkLineageManifest,
@@ -20,6 +33,7 @@ function lineageError(reason, detail = null) {
 }
 
 async function hashFileSegment(filePath, fromByte, toByte) {
+  assertDemand();
   const start = Number(fromByte);
   const endExclusive = Number(toByte);
   if (!filePath
@@ -38,8 +52,10 @@ async function hashFileSegment(filePath, fromByte, toByte) {
       highWaterMark: HASH_CHUNK_BYTES,
     });
     for await (const chunk of stream) {
+      assertDemand();
       hash.update(chunk);
       bytes += chunk.length;
+      await checkpoint();
     }
   }
   if (bytes !== endExclusive - start) {
@@ -139,7 +155,8 @@ function createCodexVirtualTranscriptStore({
   const cache = new Map();
   const chains = new Map();
   let retainedBytes = 0;
-  const metrics = { sourceBytes: 0, sourceVerificationBytes: 0, continuationRestores: 0 };
+  const metrics = { sourceBytes: 0, sourceVerificationBytes: 0, continuationRestores: 0,
+    maxCollectedRecords: 0, maxConsumerRecords: 0 };
   const hashSegment = async (...args) => {
     const result = await hashFileSegment(...args); metrics.sourceVerificationBytes += result.bytes; return result;
   };
@@ -147,6 +164,7 @@ function createCodexVirtualTranscriptStore({
     && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs
     && a.fileIdentity === b.fileIdentity && a.sourceGeneration === b.sourceGeneration;
   const capture = async (reads, filePath, sessionId) => {
+    assertDemand();
     if (!reads.has(filePath)) {
       if (codexApi.beginCodexSourceRead) reads.set(filePath, await codexApi.beginCodexSourceRead(filePath, sessionId));
       else {
@@ -155,9 +173,11 @@ function createCodexVirtualTranscriptStore({
           ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, linkKind: 'end' } });
       }
     }
+    assertDemand();
     return reads.get(filePath).snapshot;
   };
   const assertReads = async reads => {
+    assertDemand();
     for (const read of reads.values()) {
       if (codexApi.assertCodexSourceRead) await codexApi.assertCodexSourceRead(read);
       else {
@@ -165,6 +185,7 @@ function createCodexVirtualTranscriptStore({
         if (!sameSource(read.snapshot, { ...read.snapshot, size: stat.size, mtimeMs: stat.mtimeMs,
           ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino })) throw lineageError('source-changed-during-read');
       }
+      assertDemand();
     }
   };
   const finishReads = reads => { for (const read of reads.values()) codexApi.finishCodexSourceRead?.(read); };
@@ -227,12 +248,14 @@ function createCodexVirtualTranscriptStore({
     return found.filePath;
   };
 
-  const feedRecords = (state, records, segment, segmentIndex) => {
-    for (const record of Array.isArray(records) ? records : []) {
-      const physical = decoratePhysicalRecord(record, segment, segmentIndex);
-      state.historyProjector.feed(physical);
-      state.timelineProjector.feed(physical);
-    }
+  const feedRecord = async (state, record, segment, segmentIndex) => {
+    assertDemand();
+    metrics.maxConsumerRecords = 1;
+    const physical = decoratePhysicalRecord(record, segment, segmentIndex);
+    state.historyProjector.feed(physical);
+    state.timelineProjector.feed(physical);
+    state.fedRecords++;
+    if (state.fedRecords % 256 === 0) await checkpoint();
   };
 
   const verifyFrozenSegment = async (state, segment, cwd, reads) => {
@@ -278,6 +301,8 @@ function createCodexVirtualTranscriptStore({
       const filePath = await verifyFrozenSegment(state, segment, cwd, reads);
       const read = await codexApi.readJsonlRange(filePath, segment.fromByte, segment.toByte - 1, {
         lineCount: segment.startLine,
+        collectRecords: false, _readControl: currentReadControl(),
+        onRecord: record => feedRecord(state, record, segment, index),
         onChunk: chunk => { metrics.sourceBytes += chunk.length; },
       });
       if (read.errors > 0
@@ -285,8 +310,6 @@ function createCodexVirtualTranscriptStore({
         || read.lineCount !== segment.endLine) {
         throw lineageError('source-segment-record-boundary-mismatch', segment.segmentId);
       }
-      feedRecords(state, read.records, segment, index);
-      state.fedRecords += read.records.length;
     }
 
     const tail = childTailSegment(descriptor);
@@ -303,11 +326,11 @@ function createCodexVirtualTranscriptStore({
       childFilePath,
       tail.fromByte,
       childStat.size - 1,
-      { lineCount: tail.startLine, onChunk: (chunk, offset) => rememberChunk(state, chunk, offset) },
+      { lineCount: tail.startLine, collectRecords: false, _readControl: currentReadControl(),
+        onRecord: record => feedRecord(state, record, tail, frozen.length),
+        onChunk: (chunk, offset) => rememberChunk(state, chunk, offset) },
     );
     if (tail.fromByte > 0) state.childProof.unshift({ offset: 0, bytes: tail.fromByte, hash: childPrefix.sha256 });
-    feedRecords(state, childRead.records, tail, frozen.length);
-    state.fedRecords += childRead.records.length;
     state.childFilePath = childFilePath;
     state.childSnapshot = childStat;
     state.childSize = childStat.size;
@@ -341,6 +364,15 @@ function createCodexVirtualTranscriptStore({
       || stat.sourceGeneration !== state.childSnapshot.sourceGeneration || stat.size <= state.childSize) {
       return buildState(state.descriptor, cwd, reads);
     }
+    // The committed cursor and its pending-call graph must move together.
+    // Keep the old graph available if this append loses its final demand.
+    // This copy is still O(graph); disk-backed reducer ownership is separate.
+    const cloned = await cloneProjectionGraphAsync({ history: state.historyProjector.exportState(),
+      timeline: state.timelineProjector.exportState() }, undefined,
+    { assertCurrent: assertDemand, schedule: checkpoint });
+    state.historyProjector = codexApi.createCodexHistoryProjector(state.descriptor.viewOwnerSessionId, cloned.value.history);
+    state.timelineProjector = codexApi.createCodexTimelineProjector(state.descriptor.viewOwnerSessionId, cloned.value.timeline);
+    state.fedRecords = 0;
     const tail = childTailSegment(state.descriptor);
     const read = await codexApi.readJsonlRange(
       state.childFilePath,
@@ -349,17 +381,17 @@ function createCodexVirtualTranscriptStore({
       {
         lineCount: state.childLineCount,
         leftoverBuffer: state.childLeftoverBuffer,
+        collectRecords: false, _readControl: currentReadControl(),
+        onRecord: record => feedRecord(state, record, tail, state.descriptor.manifest.sourceSegments.length),
         onChunk: (chunk, offset) => rememberChunk(state, chunk, offset),
       },
     );
-    feedRecords(state, read.records, tail, state.descriptor.manifest.sourceSegments.length);
     state.childSize = stat.size;
     state.childSnapshot = stat;
     state.childMtimeMs = stat.mtimeMs;
     state.childLineCount = read.lineCount;
     state.childLeftoverBuffer = read.leftoverBuffer || Buffer.alloc(0);
     state.mode = 'append';
-    state.fedRecords = read.records.length;
     return state;
   };
 
@@ -385,12 +417,16 @@ function createCodexVirtualTranscriptStore({
   };
 
   const projectInner = async (input, cwd) => {
+    assertDemand();
     const descriptor = normalizeDescriptor(input);
     const key = cacheKeyForDescriptor(descriptor);
     const reads = new Map();
     const release = !cache.has(key) ? await storage?.enterCold?.() : null;
     try {
       let state = cache.get(key) || await restoreState(descriptor, cwd);
+      assertDemand();
+      if (state) state = { ...state, segmentFiles: new Map(state.segmentFiles),
+        sourceVerification: new Map(state.sourceVerification), childProof: (state.childProof || []).slice() };
       state = state ? await advanceState(state, cwd, reads) : await buildState(descriptor, cwd, reads);
       state.descriptor = descriptor;
       const tail = childTailSegment(descriptor);
@@ -398,23 +434,31 @@ function createCodexVirtualTranscriptStore({
         [...descriptor.manifest.sourceSegments, tail]
           .map((segment) => [segment.physicalSessionId, segment]),
       );
+      const control = createProjectionControl({ assertCurrent: assertDemand, schedule: checkpoint });
       const historyEntries = decorateVirtualEntries(
-        state.historyProjector.finalize(),
+        await control.drain('historyFinalize', state.historyProjector.finalizeSteps()),
         descriptor.viewOwnerSessionId,
         segmentBySession,
       );
       const timelineEntries = decorateVirtualEntries(
-        state.timelineProjector.finalize(),
+        await control.drain('timelineFinalize', state.timelineProjector.finalizeSteps()),
         descriptor.viewOwnerSessionId,
         segmentBySession,
       );
       await assertReads(reads);
       if (storage && descriptor.payloadPolicy === 'dehydrated' && state.mode !== 'unchanged') {
         prepareEntries?.(historyEntries, descriptor.viewOwnerSessionId);
+        assertDemand();
         const { historyProjector, timelineProjector, ...continuation } = state;
-        storage.saveVirtualState({ sessionId: descriptor.viewOwnerSessionId, cwd }, { ...continuation,
-          history: historyProjector.exportState(), timeline: timelineProjector.exportState() });
+        const owner = { sessionId: descriptor.viewOwnerSessionId, cwd };
+        const savedState = { ...continuation,
+          history: historyProjector.exportState(), timeline: timelineProjector.exportState() };
+        await (storage.saveVirtualStateAsync
+          ? storage.saveVirtualStateAsync(owner, savedState)
+          : storage.saveVirtualState(owner, savedState));
+        assertDemand();
       }
+      assertDemand();
       recostAndPrune(state);
       return {
         success: true,
@@ -445,11 +489,15 @@ function createCodexVirtualTranscriptStore({
         childLineCount: state.childLineCount,
         childHasPartialRecord: state.childLeftoverBuffer?.length > 0,
       };
-    } catch (error) { forget(key); throw error; }
+    } catch (error) {
+      if (!isHistoryReadCancelled(error) && !isHistoryReadUnavailable(error)) forget(key);
+      throw error;
+    }
     finally { finishReads(reads); release?.(); }
   };
 
-  const project = (input, cwd) => {
+  const project = (input, cwd, options = {}) => {
+    const control = options._readControl || options.control || currentReadControl();
     let descriptor;
     try {
       descriptor = normalizeDescriptor(input);
@@ -458,7 +506,7 @@ function createCodexVirtualTranscriptStore({
     }
     const key = cacheKeyForDescriptor(descriptor);
     const previous = chains.get(key) || Promise.resolve();
-    const run = previous.catch(() => {}).then(() => projectInner(descriptor, cwd));
+    const run = previous.catch(() => {}).then(() => withReadControl(control, () => projectInner(descriptor, cwd)));
     chains.set(key, run);
     run.finally(() => {
       if (chains.get(key) === run) chains.delete(key);

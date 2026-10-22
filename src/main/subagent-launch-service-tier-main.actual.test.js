@@ -54,6 +54,90 @@ function harness(filePath, overrides = {}) {
   };
 }
 
+function threadResolverHarness() {
+  const begin = source.indexOf('function resolveCodexLiveAgentThreadId(');
+  const end = source.indexOf("ipcMain.handle('subagent:resolve-codex-thread'", begin);
+  assert.ok(begin > 0 && end > begin);
+  const live = new Map(), known = new Map();
+  const scope = {codexTabLiveSubagents: live, codexTabKnownSubagents: known};
+  const resolve = vm.runInNewContext(source.slice(begin, end) + '\nresolveCodexLiveAgentThreadId;', scope);
+  return {live, known, resolve};
+}
+
+test('actual Main resolver never substitutes sole child B for an unknown or not-yet-bound requested call A', () => {
+  const h = threadResolverHarness();
+  const childB = {threadId: 'child-B'};
+  h.live.set('tab-A', new Map([['call-B', childB]]));
+  h.known.set('tab-A', new Map([['call-A', {threadId: ''}], ['call-B', childB]]));
+  assert.equal(h.resolve('tab-A', 'unknown-call'), '');
+  assert.equal(h.resolve('tab-A', 'call-A'), '');
+  assert.equal(h.resolve('tab-A', 'call-A:canonical:0'), '');
+  assert.equal(h.resolve('tab-A', 'call-B'), 'child-B');
+  assert.equal(h.resolve('tab-A', 'call-B:canonical:0'), 'child-B');
+  assert.equal(h.resolve('other-tab', 'call-B'), '');
+  assert.equal(h.resolve('tab-A', ''), 'child-B', 'preserve no-card legacy lookup');
+  h.known.get('tab-A').get('call-A').threadId = 'child-A';
+  assert.equal(h.resolve('tab-A', 'call-A'), 'child-A', 'late exact identity remains usable');
+  assert.equal(h.resolve('tab-A', 'call-A:canonical:0'), 'child-A');
+  h.live.delete('tab-A');
+  assert.equal(h.resolve('tab-A', 'call-A'), 'child-A', 'known completed child can reopen');
+  assert.equal(h.resolve('tab-A', ''), '', 'no-card fallback is live-only');
+});
+
+test('actual Main pending read distinguishes missing child identity from missing transcript and logs no prompt/path', async () => {
+  const main = harness(null);
+  const unknown = {agentSessionId: '', agentId: '', taskText: 'PRIVATE TASK BODY', cwd: '/private/secret-cwd'};
+  const first = await main.read('reader-unresolved', 0, unknown);
+  assert.equal(first.success, true);
+  assert.equal(first.pending, true);
+  assert.equal(first.reason, 'child-thread-unresolved');
+  assert.equal(first.offset, 0);
+  await main.read('reader-unresolved', 0, unknown);
+  assert.equal(main.logs.length, 1, 'same phase does not log each tail tick');
+  const withId = await main.read('reader-unresolved');
+  assert.equal(withId.reason, 'transcript-not-found');
+  assert.equal(main.logs.length, 2, 'new phase has its own explanation');
+  assert.equal(main.counts().reads, 0);
+  assert.equal(main.counts().scans, 0);
+  for (const value of main.logs) {
+    assert.ok(!value.includes('PRIVATE TASK BODY'));
+    assert.ok(!value.includes('/private/secret-cwd'));
+  }
+  const trace = JSON.parse(main.logs[0].slice('[SubagentSteps] pending '.length));
+  assert.equal(trace.readerId, 'reader-unresolved');
+  assert.equal(trace.tabId, 'tab-A');
+  assert.equal(trace.chipKey, 'task:spawn-A');
+  assert.equal(trace.parentSessionId, 'parent');
+  assert.equal(trace.childSessionId, '');
+  main.release('reader-unresolved');
+});
+
+test('actual Main root and NEW_TASK waits have distinct reasons without advancing or bypassing their guards', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-inspector-pending-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    for (const [boundary, reason] of [
+      [{rootMetaSeen: false}, 'root-meta-pending'],
+      [{rootMetaSeen: true, requiresBoundary: true, found: false}, 'new-task-boundary-pending'],
+    ]) {
+      const main = harness(filePath, {findCodexSubagentNewTaskBoundary: async () => boundary});
+      const first = await main.read('reader-pending');
+      assert.equal(first.success, true);
+      assert.equal(first.pending, true);
+      assert.equal(first.reason, reason);
+      assert.equal(first.offset, 0);
+      assert.equal(first.size, fs.statSync(filePath).size);
+      assert.equal(first.launchSettings, undefined);
+      assert.equal(first.requestServiceTier, undefined);
+      assert.equal(main.counts().reads, 0, 'no child rows before required identity boundary');
+      await main.read('reader-pending');
+      assert.equal(main.logs.length, 1);
+      main.release('reader-pending');
+    }
+  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
 function tierAuthority() {
   const terminal = {};
   const owner = {sourceId: 'source-A', terminalToken: terminal, runSeq: 2,

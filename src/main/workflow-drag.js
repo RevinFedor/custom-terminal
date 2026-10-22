@@ -3,6 +3,7 @@
 const {fail,stableJson,layoutReferences,executionScopeForRow}=require('../shared/workflow-organization.cjs');
 const {dragPlacement,dragRelation,dragFamily,applyDragLayout}=require('../shared/workflow-drag.cjs');
 const {assertPaneStripGroupDrag}=require('../shared/pane-strip-drag-guard.cjs');
+const {assertPaneStripGroupRelease,paneStripGroupReleases}=require('../shared/pane-strip-group-admission.cjs');
 const same=(a,b)=>stableJson(a)===stableJson(b);
 
 /** One canonical transaction for the forest that was actually painted. */
@@ -112,10 +113,29 @@ class WorkflowDrag {
           || !same(old.metadata.reserveRootOrder || [],proposal.expectedReserveRootOrder))fail('workflow_drag_destination_changed');
         return {proposal,old,layout:applyDragLayout(old.layout,proposal.beforeLayout,proposal.layout)};
       });
-      assertPaneStripGroupDrag(currentWorkflows,workflows,request,id=>{
-        const tab=byId.get(id);
-        return tab ? !!(tab.nativeRow||tab.legacyRow)&&tab.nativeRow?.execution_archived!==1 : undefined;
-      });
+      const stripReleases=paneStripGroupReleases(new Map(workflows.map(change=>[change.old.id,change])),request.stripGroupReleases);
+      const releasedRoots=new Map();
+      const isActive=id=>{
+        const tab=byId.get(id),row=tab?.nativeRow||tab?.legacyRow;
+        return row ? row.execution_archived!==1 : undefined;
+      };
+      for(const change of workflows) {
+        const intent=stripReleases.get(change.old.id);if(!intent)continue;
+        const rootIds=request.destinationKind==='window'?request.paneRootTabIds:request.sourceRootTabIds;
+        if(!same(intent.rootTabIds,rootIds)||!Array.isArray(intent.placementTabIds)
+          ||intent.placementTabIds.some(id=>!request.movingFamilyIds.includes(id))
+          ||intent.targetOwner&&(request.destinationKind!=='window'||request.targetWorkflowId!==change.old.id))
+          fail('workflow_drag_strip_group_release_owner_changed');
+        if(intent.targetOwner&&rootIds.some(id=>!rows.some(({proposal})=>proposal.tabId===id&&proposal.workflowId===change.old.id)))
+          fail('workflow_drag_strip_group_release_owner_changed');
+        change.stripColorGroups=assertPaneStripGroupRelease(intent,{workflowId:change.old.id,
+          field:change.old.metadata.stripColorGroups,beforeLayout:change.old.layout,layout:change.layout,
+          rootTabIds:rootIds,placementTabIds:intent.placementTabIds,targetOwner:intent.targetOwner,isActive}).nextState;
+        releasedRoots.set(change.old.id,new Set(rootIds));
+      }
+      assertPaneStripGroupDrag(currentWorkflows,workflows,request,isActive,releasedRoots);
+      for(const change of workflows)this.org.assertLayoutPair(change.old,change.layout,
+        stripReleases.has(change.old.id)?change.stripColorGroups:change.old.metadata.stripColorGroups);
       // A move cannot leave a placement behind in an unguarded hidden/profile
       // owner. Every touched workflow must be part of this immutable command.
       const touched=new Set(workflows.map(({old})=>old.id));
@@ -142,9 +162,10 @@ class WorkflowDrag {
       }
       this.groups.applyDragAssignments(request.tabs);
       this.groups.applyDragEmptyGroups(request.emptyGroupMoves || []);
-      for(const {proposal,old,layout} of workflows) {
+      for(const {proposal,old,layout,stripColorGroups} of workflows) {
         this.org.validateLayout(old.id,layout);
         const metadata={...old.metadata,reserveOrder:proposal.reserveOrder,reserveRootOrder:proposal.reserveRootOrder};
+        if(stripColorGroups!==undefined)metadata.stripColorGroups=stripColorGroups;
         if(!same(layout,old.layout) || !same(metadata,old.metadata))this.db.prepare(
           'UPDATE workflow_org_workflows SET layout_json=?,metadata_json=?,revision=revision+1 WHERE workflow_id=?')
           .run(stableJson(layout),stableJson(metadata),old.id);

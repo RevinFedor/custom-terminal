@@ -45,7 +45,7 @@ export function codexSettingsIntentIsWaiting({ isCodex, isCommandRunning, provid
     && !providerState?.codexSettingsIntentError;
 }
 
-// Desired choice is labelled pending by the existing spinner; it is not live
+// Desired choice has pending styling; the native-input activity owns the spinner. It is not live
 // application proof. A late source/composer observation cannot rename that
 // choice while the same revision is still waiting for the native picker.
 export function codexSettingsSelection({ isCommandRunning, providerState, effectiveSettings,
@@ -60,7 +60,11 @@ export function codexSettingsSelection({ isCommandRunning, providerState, effect
   };
 }
 
-export function settingsPresentation({ localBusy, localTarget, activity, intentWaiting, intentTarget } = {}) {
-  const busy = !!localBusy || activity?.busy === true || !!intentWaiting;
+export function settingsPresentation({ localBusy, localTarget, activity, intentWaiting, intentTarget, replaceQueuedIntent = false } = {}) {
+  // A saved desired pair waiting for Resume/readiness is not a physical picker.
+  // Its replacement still uses Main's revisioned intent. The local save and
+  // non-replaceable activity retain the serialization/admission barrier.
+  const busy = !!localBusy || (activity?.busy === true && !(replaceQueuedIntent && activity.replaceable === true))
+    || (!!intentWaiting && !replaceQueuedIntent);
   return { busy, target: localBusy ? localTarget : activity?.busy ? activity.target : intentWaiting ? intentTarget || 'model' : null };
 }

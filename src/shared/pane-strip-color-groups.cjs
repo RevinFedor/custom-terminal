@@ -8,7 +8,8 @@ function validatePaneStripColorGroups(value) {
   const groups=new Set(),members=new Set();
   for(const group of value.groups) {
     if(!group||typeof group.id!=='string'||!group.id||groups.has(group.id)||!Number.isSafeInteger(group.revision)||group.revision<1
-      ||!/^#[\da-f]{6}$/i.test(group.color)||!Array.isArray(group.tabIds)||!group.tabIds.length)fail('invalid');
+      ||!/^#[\da-f]{6}$/i.test(group.color)||!Array.isArray(group.tabIds)||!group.tabIds.length
+      ||group.collapsed!==undefined&&typeof group.collapsed!=='boolean')fail('invalid');
     groups.add(group.id);
     for(const id of group.tabIds) {if(typeof id!=='string'||!id||members.has(id))fail('invalid');members.add(id);}
   }
@@ -47,7 +48,7 @@ function mergePaneStripColorGroups(current,requested,edit,isMember=()=>true) {
       // Recolor cannot merge/replace an old membership. Order belongs to
       // the window layout, so color metadata keeps its original member set.
       if(stableJson([...old.tabIds].sort())!==stableJson([...group.tabIds].sort()))fail('membership_changed');
-      const changed=old.color!==group.color;
+      const changed=old.color!==group.color||!!old.collapsed!==!!group.collapsed;
       if(group.revision!==old.revision+Number(changed))fail('revision_changed');
     } else if(group.revision!==1)fail('revision_changed');
   }
@@ -59,7 +60,8 @@ function paneStripColorGroupEdits(requested,raw) {
   const result=new Map();
   for(const edit of raw) {
     if(!edit||typeof edit.workflowId!=='string'||!requested.has(edit.workflowId)||result.has(edit.workflowId)
-      ||typeof edit.basis!=='string'||Object.keys(edit).some(key=>!['workflowId','basis','gather'].includes(key)))fail('basis_invalid');
+      ||typeof edit.basis!=='string'||Object.keys(edit).some(key=>!['workflowId','basis','gather','arrange'].includes(key))
+      ||edit.gather&&edit.arrange)fail('basis_invalid');
     result.set(edit.workflowId,edit);
   }
   return result;
@@ -87,6 +89,7 @@ function gatherPaneStripSlots(slots,selectedIds) {
 }
 const paneStripSlotOrder=slots=>slots.map(slot=>slot.tabId?['tab',slot.projectId,slot.tabId]:['chooser',slot.slotId]);
 function assertPaneStripGather(beforeLayout,afterLayout,beforeGroups,afterGroups,edit) {
+  if(edit?.arrange)return assertPaneStripAnchorArrangement(beforeLayout,afterLayout,beforeGroups,afterGroups,edit.arrange);
   const previous=new Set((beforeGroups?.groups||[]).map(group=>group.id));
   const created=(afterGroups?.groups||[]).filter(group=>!previous.has(group.id));
   if(!edit?.gather) {
@@ -116,6 +119,34 @@ function assertPaneStripGather(beforeLayout,afterLayout,beforeGroups,afterGroups
   if(stableJson(paneStripSlotOrder(slots))!==stableJson(paneStripSlotOrder(after.slots)))fail('order_changed');
   if(before.pane&&['tabId','projectId','selectedSlotId'].some(key=>before.pane[key]!==after.pane?.[key]))fail('order_changed');
   return {...after,slots}; // preserve Main's canonical chooser/unknown slot fields
+}
+
+/** OPEN may move only the representative among its own group. This is the
+ * existing layout transaction, never a membership writer or an inferred ACK. */
+function assertPaneStripAnchorArrangement(beforeLayout,afterLayout,beforeGroups,afterGroups,arrange) {
+  const {owner,groupId,representative,beforeSlots,order}=arrange||{};
+  if(!owner||typeof groupId!=='string'||typeof representative!=='string'||!Array.isArray(order)||!Array.isArray(beforeSlots)
+    ||Object.keys(arrange).some(key=>!['owner','groupId','representative','beforeSlots','order'].includes(key))
+    ||Object.keys(owner).some(key=>!['windowId','paneIndex','centerKey'].includes(key))
+    ||!(owner.paneIndex===null||Number.isSafeInteger(owner.paneIndex)&&owner.paneIndex>=0))fail('basis_invalid');
+  const beforeGroup=beforeGroups?.groups?.find(group=>group.id===groupId),afterGroup=afterGroups?.groups?.find(group=>group.id===groupId);
+  if(!beforeGroup||!afterGroup||stableJson(beforeGroup)!==stableJson(afterGroup)||!beforeGroup.collapsed)fail('revision_changed');
+  const before=paneStripLayoutOwner(beforeLayout,owner),after=paneStripLayoutOwner(afterLayout,owner);
+  if(!before||!after||stableJson(paneStripSlotOrder(before.slots))!==stableJson(paneStripSlotOrder(beforeSlots)))fail('order_changed');
+  const positions=order.map(id=>before.slots.findIndex(slot=>slot.tabId===id));
+  if(new Set(order).size!==order.length||!order.includes(representative)||positions.some(index=>index<0)
+    ||order.some(id=>!beforeGroup.tabIds.includes(id))||Math.max(...positions)-Math.min(...positions)+1!==order.length)fail('order_changed');
+  const start=Math.min(...positions),original=before.slots.slice(start,start+order.length);
+  if(stableJson(original.filter(slot=>slot.tabId!==representative).map(slot=>slot.tabId))
+    !==stableJson(order.filter(id=>id!==representative)))fail('order_changed');
+  // Every placed group member participates; closed provenance outside this
+  // window remains in raw metadata, but cannot be silently removed here.
+  if(before.slots.some((slot,index)=>beforeGroup.tabIds.includes(slot.tabId)&&(index<start||index>=start+order.length)))fail('order_changed');
+  const byId=new Map(original.map(slot=>[slot.tabId,slot]));
+  const slots=[...before.slots.slice(0,start),...order.map(id=>byId.get(id)),...before.slots.slice(start+order.length)];
+  if(stableJson(paneStripSlotOrder(slots))!==stableJson(paneStripSlotOrder(after.slots)))fail('order_changed');
+  if(before.pane&&['tabId','projectId','selectedSlotId'].some(key=>before.pane[key]!==after.pane?.[key]))fail('order_changed');
+  return {...after,slots};
 }
 /** Only this field is adopted; newer local layout/settings are not replaced. */
 function adoptPaneStripColorGroups(currentSpaces,publishedSpaces) {

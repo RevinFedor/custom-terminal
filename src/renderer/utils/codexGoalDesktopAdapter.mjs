@@ -25,11 +25,14 @@ export function createCodexGoalDesktopAdapter({ invoke, createRequestId = () => 
     const receipt = requestId ? state.receipts.get(requestId) : null;
     // A lost ACK/receipt cannot be replaced with an old available snapshot.
     const uncertain = receipt?.transportUnknown === true;
+    const rejectedBeforeAction = receipt?.status === 'rejected' && receipt.accepted === false;
     const view = uncertain ? { ...current, ...receipt, status: 'unknown', availableActions: [] }
       : receipt && receipt.operationId === current.operationId ? receipt : current;
     const allowed = !state.writing && !state.error && !uncertain && current.currentOperation === true
-      && current.runtimeLive === true && (view.status === 'available' || view.status === 'unknown' && view.recoveryAvailable === true)
-      ? ACTIONS.filter(action => current.availableActions?.includes(action) && view.availableActions?.includes(action)) : [];
+      && current.runtimeLive === true && (view.status === 'available' || view.status === 'unknown' && view.recoveryAvailable === true
+        || rejectedBeforeAction && current.status === 'available')
+      ? ACTIONS.filter(action => current.availableActions?.includes(action)
+        && (rejectedBeforeAction || view.availableActions?.includes(action))) : [];
     return { ...view, tabId, operationId: current.operationId, requestId: requestId || null,
       availableActions: allowed, pending: state.writing || view.status === 'pending',
       hidden: state.hidden.has(current.operationId), error: state.error,
@@ -117,7 +120,7 @@ export function createCodexGoalDesktopAdapter({ invoke, createRequestId = () => 
       state.revision++;
       notify(state);
       // One read after the action, never another POST. Later reads are event-
-      // driven or an explicit Check status click, without polling/timers.
+      // driven; no polling, duplicate key or user-facing refresh control.
       void refresh(tabId);
     }
     return true;
@@ -149,28 +152,30 @@ export function watchCodexGoalDesktop(adapter, ipcRenderer, tabId, sessionId, on
   return () => { unsubscribe(); for (const channel of channels) ipcRenderer.removeListener(channel, wake); };
 }
 
-export function projectCodexGoalLifecycle(base, goal, { onChoose, onRefresh, onDismiss } = {}) {
+export function projectCodexGoalLifecycle(base, goal, { onChoose, onDismiss } = {}) {
   if (!goal || base && (base.tabId !== goal.tabId || base.engine !== 'codex'
-    || base.kind === 'stopping' || base.kind === 'error' || base.kind === 'warning')) return base;
+    || base.kind === 'stopping')) return base;
   // Other manual blockers (auth/usage) must retain their own explanation.
   const baseIsGoal = base?.goalOperationId === goal.operationId;
-  if (base?.goalControlsBlocked || base && !baseIsGoal && base.kind !== 'starting') return base;
+  if (base?.goalControlsBlocked || base?.goalStartupPending && !baseIsGoal
+    || base && !baseIsGoal && base.kind !== 'starting') return base;
   // Operational-turn proof can handle the dialog without confirming the
   // choice. Retain its unknown request receipt, but do not resurrect the old
   // Goal banner that sessionStartingState has already cleared.
   if (goal.hidden || goal.phase === 'handled' || goal.status === 'confirmed' && goal.choiceConfirmed === true) return baseIsGoal ? null : base;
-  const description = goal.error ? 'Goal: статус недоступен'
-    : goal.status === 'rejected' ? 'Goal: действие отклонено'
-    : goal.status === 'unknown' ? 'Goal: результат не подтверждён'
-    : goal.pending ? 'Goal: ожидается подтверждение'
-    : goal.availableActions.length ? 'Goal ждёт выбора' : 'Goal: выбор недоступен';
+  const pendingAction = goal.pending && isChoice(goal.action) ? goal.action : null;
+  const actionLabel = goal.action === 'leave-paused' ? 'Leave paused' : 'Resume Goal';
+  const failed = !!goal.error || ['unknown', 'rejected', 'unavailable'].includes(goal.status);
+  const description = failed ? `Не удалось завершить ${actionLabel}`
+    : pendingAction ? '' : 'Выберите действие';
   return { tabId: goal.tabId, engine: 'codex', sessionId: goal.owner?.sessionId || null,
-    kind: 'info', title: 'CODEX GOAL', description, spinner: false,
+    kind: failed ? 'error' : 'info', title: 'CODEX GOAL', description, spinner: false,
     detail: [goal.error || goal.reason, goal.requestId && `Request ${goal.requestId}`,
       goal.recoveryAvailable ? 'Main подтвердил новое меню Goal; доступен новый явный выбор.' : null,
+      failed ? 'Нет результата выбора от Codex. Повторная клавиша автоматически не отправляется; сообщение не переотправлено.' : null,
       'Resume Goal продолжает цель; Leave paused оставляет её на паузе. Сообщение повторно не отправляется.'].filter(Boolean).join('\n'),
     goalOperationId: goal.operationId,
     goalActions: { operationId: goal.operationId, availableActions: goal.availableActions,
-      onChoose, onRefresh: goal.error || goal.status === 'unknown' || goal.status === 'rejected' || goal.status === 'unavailable' ? onRefresh : undefined },
+      pendingAction, onChoose },
     dismissLabel: 'Скрыть сообщение', onDismiss };
 }

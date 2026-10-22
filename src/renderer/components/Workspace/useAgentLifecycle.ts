@@ -792,8 +792,8 @@ export function useAgentLifecycle({
         title: presentation.title,
         description: presentation.subtitle,
         detail: presentation.detail,
-        goalControlsBlocked: sessionStarting.launchPreparing === true || sessionStarting.startupPending === true
-          || /auth-required|usage-exhaustion|trust-directory|cwd-chooser/.test(
+        goalStartupPending: sessionStarting.launchPreparing === true || sessionStarting.startupPending === true,
+        goalControlsBlocked: /auth-required|usage-exhaustion|trust-directory|cwd-chooser/.test(
             [sessionStarting.lastNotReady?.reason, ...(sessionStarting.lastNotReady?.blockers || [])].join(' ')),
         goalOperationId: sessionStarting.engine === 'codex'
           && (sessionStarting.lastNotReady?.blockers?.includes('resume-goal')
@@ -823,7 +823,6 @@ export function useAgentLifecycle({
       if (targetRef.current !== target) return;
       void codexGoalDesktop.choose(target.tabId, target.sessionId, goalState.operationId, action);
     },
-    onRefresh: () => { void codexGoalDesktop.refresh(target.tabId); },
     onDismiss: () => { codexGoalDesktop.dismiss(target.tabId, goalState.operationId); },
   });
 }

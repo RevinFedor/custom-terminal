@@ -172,6 +172,19 @@ execution context, полный внутренний intent и пару
 SC Desktop `/research-start` и ждёт `/research-status?wait=60000`; MCP-модель
 после accepted заканчивает исходный ход и ничего не поллит.
 
+Continue после read-only import — новый авторский вопрос, не ещё один импорт.
+Blind merge прежних options переносил `readOnlyImport:true`: новая карточка могла
+показывать Chat6/xhigh, а SC journal оставался `purpose=observe`, Sendnot_attempted
+и строго сохранял прежний final. Это не stale answer cache и не provider latency.
+SOURCE20Oct очищает import/draft execution flags у нового продолжения, сохраняя
+conversation/browser, модельные предпочтения, prompt и новые файлы. Повтор уже
+зарегистрированного legacy intent нормализуется по его frozen options без изменения
+fingerprint: принятый observer никогда не превращается задним числом в Send.
+Actual Noted request → SC HTTP/SQLite проверяет author intent и отказ старому user;
+browser/provider controlled. На старой установленной версии explicit
+`readOnlyImport:false, composeOnly:false` предотвращает наследование только для
+новой согласованной отправки. Ошибочный прежний observer/receipt сохраняется.
+
 Повтор того же run сначала сверяет fingerprint. Тот же запрос продолжает тот же
 детерминированный SC job, изменённый получает409. Перед повторным start coordinator
 читает status; SC дополнительно восстанавливает request/job из durable metadata,
@@ -395,6 +408,18 @@ settings без этого поля. Подготовленный SOURCE20.10 de
 публикации: он отключал требуемое ночное восстановление вне обслуживания. Явный
 false сохраняет отдельный opt-out; он не меняет `notifySource`, birth, исходные
 run/job/Send или доставку полного ответа. Incidents всё равно сохраняются в журнале.
+
+SOURCE22Oct принимает сохранённое SC UI-recovery state по epoch/revision, а не
+называет любой nonterminal queued «Запуском». Остановка подготовки, ожидание Retry,
+восстановление и требуемое действие показываются статично/amber; running-spinner
+не доказывает работающую модель. Счётчик SC — всё elapsed после запуска, включая
+подготовку/паузы, не model time. Для исчерпания/UNKNOWN Retry+Edit приходит один
+особый operational report с числом сохранённых попыток и границей неизвестного
+provider outcome; он не приглашает слепо повторить Send. Обычный healthy controller
+не опережается generic no-progress wake. Успешный full answer с context-length
+notice получает next-new-chat hint вне неизменённых answer bytes; текущий ответ
+не становится ошибкой. Это consumer SOURCE с отдельными actual-module тестами:
+установка SC/extension сама по себе Noted не обновляет, rollout фиксируется отдельно.
 
 Автоматический Research Telegram — отдельная политика от source-agent wake.
 SOURCE20Oct default-off применяется и к `onBlocked` operational delivery, и к
@@ -650,6 +675,16 @@ serialization-lane и уведомляет source. Draft не очищается
 
 Во время grace-периода ручного interrupt пользователь может снять таймер и ждать следующего сообщения без срока, вручную восстановить выбранную связь, передать ошибку родителю сейчас или закрыть связь без сообщения. Ручное восстановление остаётся запасным путём для неоднозначного случая с несколькими ожидающими run; обычный единственный run продолжится автоматически. Для закрытого/ошибочного target восстановление всегда явное: это либо действие Retry/Resume, либо новый адресный `send_prompt`/`delegate_to_session`, но не фоновое наблюдение. Закрытие вкладки проходит через общий `closeTab` и сообщает store сразу, поэтому все связанные активные run получают исход вместо вечного `queued`.
 
+Отдельное ранее выданное разрешение — сохранённая операция `build:i-c`:
+после её restart тот же continuation owner восстанавливает захваченную own работу
+одним input. Saved SID или purple loader такого разрешения не дают. Exact hold
+сохраняет прежний recovery deadline и исключается из его планирования, а не
+продлевает срок таймером. Доставленный раньше `continue` child callback потребляет
+child, но не перепривязывает прерванный parent к callback-turn. Только canonical
+continuation receipt меняет execution parent. Полный интервал original→latest
+повторно проверяется перед FIFO input, включая промежуточный manual ввод.
+См. `fact-build-when-idle.md::Немедленный снимок и продолжение`.
+
 `Продолжить запрос` в hover-карточке — отдельное app-owned действие `continue`,
 а не прежний Retry исходного текста и не обычный ControlBar Resume. Оно проверяет
 source/target history и исходный/последний выбранный prompt, строго сохраняет
@@ -693,6 +728,13 @@ continuation cancellation у прежнего FIFO/receipt owner, затем clo
 исторический Enter, но cancelled run не оживает. Подтверждённый receipt удерживается
 pin до strict projection; после restart неизвестный Enter re-audit/reconcile,
 не новый prompt. Для одной target-вкладки competing accepted request не обходится.
+
+SOURCE20.10: completion-блокировка этой связи и install-допуск разделены.
+Все описанные ниже local target/result/input/неясные delivery blockers сохраняются;
+строго сохранённый внешний SC job/intent/source без локальной передачи может быть
+перенесён через обычный Build Install, оставаясь видимой inherited работой.
+Это не общий busy=false и не изменение Pause/Cancel/UNKNOWN; отдельный Force
+пропускает activity waits одной операции. Детали — `fact-build-when-idle.md`.
 
 Pause относится к связи run, а не к процессу target. Исполнитель продолжает жить, пользователь может отправлять ему сообщения, но ходы, начатые до Resume, не возвращаются source и не создают новых причинных потомков приостановленного run. Resume не перечитывает «последний доступный ответ»: он сохраняет новую временную границу и принимает только точный provider/session/turn, реально начавшийся после неё. Запоздалый audit исходного prompt и завершение хода из периода паузы эту границу не обходят. Пауза переживает restart, остаётся жёлтым completion-блокером для Run After и Build Install, но не включает фиолетовый inherited shimmer. После Resume до точного старта нового хода сохраняется та же жёлтая блокировка без фиолетовой анимации; фиолетовая активность возвращается только по этому старту. После начала source-handoff ставить связь на паузу уже поздно; остаются действия доставки или отвязки.
 
@@ -803,6 +845,18 @@ RAM tombstone сохраняется при ENOSPC; повтор already-cancell
 Проверка `external-research-durable-cancel.actual.test.js` использует настоящий
 RunStore/atomic-file IO и actual web function с controlled provider/input leaves;
 это не установка Noted и не причина исторического инцидента.
+
+SOURCE20Oct уточняет позднюю границу: `completed` у External Research — готовность
+provider result, не завершение будущей source delivery. Public `/cancel` и UI
+Cancel/Detach теперь сохраняют completed/result/birth, но независимо и строго
+подавляют ещё не выполненную доставку, включая preparing, FIFO head, waiting-for-input
+и unconfirmed. Revocation использует прежний exact receipt/FIFO owner; повтор после
+ошибки strict write заново подтверждает fence. Ответ cancellation отдельно сообщает
+source input evidence: unknown не превращается в no-input, confirmed/accepted
+возвращает `tooLate`, а поздняя canonical receipt уточняет прошлое без нового Send.
+Private actual HTTP caller/Store/SQLite/FIFO controls проверяют эти переходы и reopen;
+physical input и provider контролируемые. Это не обещание отменить уже введённый
+текст и не доказательство сохранения run cancellation после удаления старой history.
 
 Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для source completion сначала проверяется точная durable History-квитанция того же handoff; при недостаточном proof используется прежний exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие обоих доказательств переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle. После authoritative target completion UI немедленно меняет running-spinner на отдельную статичную фазу проверки результата; жёлтый timer относится только к реальному recovery.
 

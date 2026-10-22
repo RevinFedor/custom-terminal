@@ -52,6 +52,9 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
   fontSize?: number;
   /** Pane group outline is below these two overhanging signals. */
   cornerSignalZIndex?: number;
+  /** Optional strip-group counter; other card surfaces retain their layout. */
+  cornerAdornment?: React.ReactNode;
+  cornerAdornmentCount?: number;
   onTaskClick?: (taskId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
   /** Opt-in only for placed pane cards; other consumers keep their own lanes. */
   onLinkedFileOpen?: (file: LinkedFile) => void;
@@ -64,7 +67,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   pressed = false, fullWidth = false, truncate = true, showShownStripe = false,
   showProjectIcon: _showProjectIcon = false, showTaskMarkers: _showTaskMarkers, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
   label, children, trailingActions, sharedActivity = null, activityOverride,
-  geometry, fontSize, cornerSignalZIndex = 8, onTaskClick: _onTaskClick, onLinkedFileOpen, linkedFilesMode = 'menu', style, onMouseEnter, onMouseLeave, ...elementProps
+  geometry, fontSize, cornerSignalZIndex = 8, cornerAdornment, cornerAdornmentCount, onTaskClick: _onTaskClick, onLinkedFileOpen, linkedFilesMode = 'menu', style, onMouseEnter, onMouseLeave, ...elementProps
 }, ref) {
   const [hovered, setHovered] = useState(false);
   const nativeQuestion = useCodexNativeQuestion(tabId);
@@ -140,6 +143,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   });
   const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation, nameSetManually, name: tabName });
   const linkedFileHeight = Math.max(15, Math.ceil(metrics.fontSize * .72) + 4);
+  const cornerWidth=Math.max(19,Math.ceil(.8*(Math.max(3,String(cornerAdornmentCount??0).length+1)*(metrics.fontSize*.72+2)*.7+8)));
   const titleLineRef=useRef<HTMLSpanElement>(null);
   const titleLayout=useLinkedTitleLayout(titleLineRef,true,{text:pending||(typeof label==='string'?label:tabName),fontSize:metrics.fontSize,
     paddingY:parseFloat(metrics.padding),gap:TAB_STRIP_ROW_GAP,chipHeight:linkedFileHeight,
@@ -159,6 +163,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
       : `1px solid ${/^#[\da-f]{6}$/i.test(chrome.borderColor) ? chrome.borderColor + '55' : '#6666'}`,
     borderRadius: metrics.borderRadius,
     padding: metrics.padding,
+    ...(cornerAdornment?{paddingRight:Math.max(geo.paddingX,cornerWidth+4),'--tab-group-count-width':`${cornerWidth}px`} as React.CSSProperties:{}),
     // All cards share the measured font profile, with or without attachments.
     // The file itself stays absolute; count/hover never change the row pitch.
     ...(hasLinkedFiles ? { '--tab-linked-file-height': `${linkedFileHeight}px`,
@@ -170,6 +175,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     marginBottom: reserveSignalSpace && contextUpdate ? Math.max(0, tabFastBadgeOutsidePx(geo.gap ?? 4) - 1) : undefined,
     transition: 'none', ...style,
   };
+  (frameStyle as any)['--tab-card-surface-background']=frameStyle.background;
   const titleContents = <>
     {chooser ? <Plus size={12} /> : tabType === 'file' ? <FileText size={14} style={{ color: '#a78bfa', flexShrink: 0 }} />
       : empty ? <Folder size={10} style={{ color: '#8a8a92', flexShrink: 0 }} /> : null}
@@ -181,6 +187,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     {trailingActions}
   </>;
   const contents = <>
+    {cornerAdornment}
     {nativeQuestion && <span data-tab-codex-question-ring aria-hidden
       className="tab-codex-question-ring noted-infinite-animation" style={{ zIndex: 3 }} />}
     {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
@@ -214,7 +221,7 @@ const ChooserTabCard = forwardRef<HTMLElement, TabCardProps>(function ChooserTab
   projectId, tabId, as = 'span', shown, active, selected, pressed, fullWidth, truncate = true,
   showShownStripe, showProjectIcon: _showProjectIcon, showTaskMarkers: _showTaskMarkers, reserveSignalSpace: _reserveSignalSpace, interactiveStatus: _interactiveStatus, chooser: _chooser,
   label, children, trailingActions, sharedActivity: _sharedActivity, activityOverride: _activity,
-  geometry, fontSize, cornerSignalZIndex: _cornerSignalZIndex, onTaskClick: _onTaskClick, onLinkedFileOpen: _onLinkedFileOpen, linkedFilesMode: _linkedFilesMode, style, onMouseEnter, onMouseLeave, ...props
+  geometry, fontSize, cornerSignalZIndex: _cornerSignalZIndex, cornerAdornment: _cornerAdornment, cornerAdornmentCount: _cornerAdornmentCount, onTaskClick: _onTaskClick, onLinkedFileOpen: _onLinkedFileOpen, linkedFilesMode: _linkedFilesMode, style, onMouseEnter, onMouseLeave, ...props
 }, ref) {
   const configuredGeometry = useUIStore(s => s.tabGeometry);
   const configuredFont = useUIStore(s => s.tabsFontSize);

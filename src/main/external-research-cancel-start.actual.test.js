@@ -28,6 +28,8 @@ async function fixture(t) {
     externalResearchIntent: { provider: 'chatgpt', prompt: 'private fixture', options: {}, files: [] } });
   const emissions = [], finalizations = [], starts = [];
   const ctx = vm.createContext({ ...runs, isResponseObservation,
+    require, path, srcMainDir: __dirname, agentSendReceiptStore: null, agentSendQueue: null,
+    isAgentSendProviderQueueAccepted: require('./agent-send-receipt-registry').isAgentSendProviderQueueAccepted,
     getOrchestrationRunStore: () => store, withOrchestrationUrls: value => value,
     emitOrchestrationRun: value => emissions.push(value),
     emitOrchestrationChanges: values => emissions.push(...values),
@@ -39,10 +41,12 @@ async function fixture(t) {
     sendJson: (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); },
   });
   const action = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'performOrchestrationAction');
+  const cancelReceipt = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'externalResearchCancellationReceipt');
   const begin = source.indexOf('  const orchestrationCancelMatch =');
   const end = source.indexOf('  const orchestrationAckMatch =', begin);
   assert.ok(action && begin > 0 && end > begin);
-  vm.runInContext(action.getText(ast) + '\nasync function route(req,res,parsed){' + source.slice(begin, end) + '}', ctx);
+  assert.ok(cancelReceipt);
+  vm.runInContext(cancelReceipt.getText(ast) + '\n' + action.getText(ast) + '\nasync function route(req,res,parsed){' + source.slice(begin, end) + '}', ctx);
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://private');
     ctx.route(req, res, { pathname: url.pathname }).catch(error => { res.writeHead(500); res.end(JSON.stringify({ error: error.message })); });

@@ -30,6 +30,7 @@ const { performance } = require('perf_hooks');
 const { buildChildProcessEnv } = require('./child-process-env');
 const { createFlightRecorder } = require('./perf-flight-recorder');
 const { createCausalJournal } = require('./perf-causal-journal');
+const { sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
 const { createNativeStallSampler } = require('./perf-stall-sampler');
 const { captureNativeSnapshot } = require('./process-metrics-source');
 
@@ -142,7 +143,7 @@ function onHeartbeat(key, pid, label, payload) {
     if (typeof payload.ops === 'string') p.lastOps = payload.ops.slice(0, 600);
     if (typeof payload.context === 'string') p.context = payload.context.slice(0, 800);
     if (payload.causal && label === 'main') {
-      p.causal = payload.causal;
+      p.causal = { ...payload.causal, sqlWitness: sanitizeSqlWitness(payload.causal.sqlWitness,0) };
       causalJournal?.reconcile(payload.causal, { pid, kind: label });
     }
     if (payload.diagnosticHealth && typeof payload.diagnosticHealth === 'object') p.diagnosticHealth = payload.diagnosticHealth;
@@ -303,6 +304,7 @@ process.on('SIGINT', () => cleanupAndExit(0));
 
 function cleanupAndExit(code) {
   try { stallSampler?.stop(); } catch {}
+  // Same bounded journal/append on disconnect; no new logger or persistence gate.
   try { causalJournal?.flush(true); } catch {}
   try { flight?.stop(); } catch {}
   try { if (SOCKET_PATH) fs.unlinkSync(SOCKET_PATH); } catch {}

@@ -1,3 +1,4 @@
+const { historyIpcDemands } = require('../history-ipc-demand');
 const { ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -4744,7 +4745,7 @@ function register({
     }
   };
   _api.getTimeline = getTimeline;
-  ipcMain.handle('claude:get-timeline', (_event, payload = {}) => getTimeline(payload));
+  ipcMain.handle('claude:get-timeline', (event, payload = {}) => historyIpcDemands.run(event, payload, request => getTimeline(request)));
 
   // Export Claude session as clean text (with options and backtrace)
   ipcMain.handle('claude:export-clean-session', async (event, {
@@ -6586,8 +6587,8 @@ function register({
     }
   };
 
-  ipcMain.handle('claude:get-full-history', (event, payload = {}) => (
-    _api.getFullHistory(payload, { sender: event?.sender || null })
+  ipcMain.handle('claude:get-full-history', (event, payload = {}) => historyIpcDemands.run(event, payload,
+    request => _api.getFullHistory(request, { sender: event?.sender || null })
   ));
 
   // ========== TIMELINE NOTES ==========

@@ -1,5 +1,6 @@
 // Diagnostic data only: no store imports, layout reads, user text or retained DOM.
 const absNow = () => performance.timeOrigin + performance.now();
+export const uiDiagnosticAbsNow = absNow;
 // Never coerce objects (toString/toJSON can expose content), or copy a URL.
 const short = (value, limit = 140) => typeof value === 'string'
   && !/\w+:\/\/|^(?:data|blob|javascript|mailto|tel):|^\/\/|www\./i.test(value.slice(0, limit))
@@ -158,10 +159,14 @@ export function formatDiagnosticKey(snapshot) {
 // Only scalar latest input is touched on pointermove. Samples share its rAF.
 const DRAG_FRAME_CAP = 120, DRAG_PHASE_CAP = 32, DRAG_MEMBER_CAP = 128;
 const dragStrings = ['gestureId','sessionId','sourceId','owner','ownerKey','workflowId','paneKey',
-  'windowId','zone','reason','presentation','mutationId','operationId','runId','axis'];
+  'windowId','zone','reason','presentation','mutationId','operationId','runId','axis','operationKind','recoveryMutationId'];
 const dragNumbers = ['pointerId','eventAbs','x','y','left','top','width','height','grabX','grabY',
   'ownerEpoch','revision','at','boundary','depth','scrollTop','scrollLeft','processed','received',
-  'sourceLayoutTop','intendedTop','forestOffset','previousBoundaryTop','nextBoundaryTop','queuedOverwrites','generation','publicationRevision','membershipRevision','sourceCount','familyCount','paneCount'];
+  'sourceLayoutTop','intendedTop','forestOffset','previousBoundaryTop','nextBoundaryTop','queuedOverwrites','generation','publicationRevision','membershipRevision','sourceCount','familyCount','paneCount',
+  'enqueueAbs','laneStartAbs','recoveryStartAbs','recoveryEndAbs','snapshotStartAbs','snapshotEndAbs','cloneStartAbs','cloneEndAbs',
+  'ipcSendAbs','ipcReplyAbs','receiptReadStartAbs','receiptReadEndAbs','publicationStartAbs','publicationEndAbs','operationEndAbs',
+  'readStartAbs','readEndAbs','projectionStartAbs','projectionEndAbs','setStartAbs','setEndAbs',
+  'queueDepth','workflowCount','membershipCount','catalogCount','timingUnavailable'];
 function dragFields(value) {
   const out = Object.create(null);
   out.identifiersTruncated=0;

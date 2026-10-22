@@ -84,7 +84,7 @@ npm run build:app
 
 После отдельного решения о запуске откройте локальную `.app` обычным способом. Для packaged runtime нужны уже установленные helpers и Node в доступном PATH. Mic/Accessibility давайте при использовании соответствующей диктовки; обычная AI-сессия не требует этих дополнительных возможностей.
 
-**Не используйте `build:install`, `build:i`, `build:i-obs` или `build:i-cont` для первого знакомства.** Это оставленные maintainer paths: они могут остановить и заменить установленное приложение и зависят от локального certificate-backed install flow. Они не входят в этот public quickstart.
+**Не используйте `build:install`, `build:i`, `build:i-obs`, `build:i-cont` или `build:i-c` для первого знакомства.** Это maintainer paths: они могут остановить и заменить установленное приложение и зависят от локального certificate-backed install flow. Они не входят в этот public quickstart.
 
 ## Обновление
 

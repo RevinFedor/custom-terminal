@@ -397,7 +397,15 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     return decision.allowed;
   }
   function persist() {
-    try { if (active) artifacts.write(active.id + '.json', active); }
+    try {
+      if(active) {
+        // Existing incident/stop persistence retains the latest receiver view,
+        // including SQL entered after the incident began. Other context stays
+        // pinned to the incident edge. No extra timer, capture or disk quota.
+        try { const latest=context();if(latest?.causal)active.context={...active.context,causal:latest.causal}; } catch {}
+        artifacts.write(active.id + '.json', active);
+      }
+    }
     catch (err) {
       if (monoNow() - lastWriteErrorAt > 30000) {
         lastWriteErrorAt = monoNow(); log('[Perf:Incident] write-failed error=' + String(err.message).slice(0, 160));

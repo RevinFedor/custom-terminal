@@ -30,6 +30,11 @@ import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { openTabLinkedFile } from '../../utils/tabLinkedFilePreview';
 import { useUIStore } from '../../store/useUIStore';
 import {usePaneStripSelection} from './PaneStripSelection';
+import type {PaneStripGroupControl} from './PaneStripCollapsedGroup';
+import {CHIP_HOVER_STYLE} from '../../utils/chipHoverIntent.mjs';
+import {createPaneStripBadgeHover} from '../../utils/paneStripBadgeHover.mjs';
+import NavigationDwellStroke from './NavigationDwellStroke';
+import {currentUIActionId,uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -54,11 +59,12 @@ export interface PaneTabChipProps {
   releasedPlacement?: boolean;
   /** Keep this chip's slot visible while its full preview follows the pointer. */
   dragPlaceholder?: boolean;
+  groupControl?: PaneStripGroupControl;
 }
 
 export default function PaneTabChip({
   projectId, tabId, shown, paneFocused, paneIndex, inSplit, index = 0, inStrip = false, sharedActivity = null,
-  previewOnly = false, dragPlaceholder = false,releasedPlacement = false,
+  previewOnly = false, dragPlaceholder = false,releasedPlacement = false,groupControl,
 }: PaneTabChipProps) {
   const tabExists = useWorkspaceStore(s => !!s.openProjects.get(projectId)?.tabs.has(tabId));
   const activeSpaceId = useWorkspaceStore(s => s.activeSpaceId);
@@ -68,6 +74,13 @@ export default function PaneTabChip({
   const selectionRef=useRef(stripSelection);selectionRef.current=stripSelection;
 
   const chipRef = useRef<HTMLSpanElement | null>(null);
+  const controlRef=useRef(groupControl);controlRef.current=groupControl;
+  const [badgeProgress,setBadgeProgress]=useState(false);
+  const badgeHover=useRef<ReturnType<typeof createPaneStripBadgeHover>|null>(null);
+  if(groupControl&&groupControl.count>0&&!badgeHover.current&&typeof window!=='undefined')badgeHover.current=createPaneStripBadgeHover({target:window,
+    getControl:()=>controlRef.current,isInstant:()=>useUIStore.getState().paneStripInstantHover===true,
+    publish:setBadgeProgress,phase:phase=>uiPerformancePhaseForAction(currentUIActionId(),`strip-group:dwell-${phase}`,{tabId})});
+  useEffect(()=>()=>badgeHover.current?.cancel(),[projectId,tabId,groupControl?.groupId,groupControl?.revision,groupControl?.available,groupControl?.count,groupControl?.open]);
   // Immediate acknowledgement lives on the chip, independently of the heavy
   // surface switch. `shown` clears it only after the selected tab really owns
   // the pane, so the background never flashes off during the 80–120ms commit.
@@ -139,7 +152,7 @@ export default function PaneTabChip({
     const paneKey = paneStripKey(paneIndex);
     return bindPaneTabPointerDrag(element, () => ({
       owner: 'pane', entries: selectionRef.current?.dragEntries(tabId) || [{ projectId, tabId }], rootTabId: tabId,
-      groupDrag:selectionRef.current?.captureGroupDrag(tabId),
+      groupDrag:selectionRef.current?.captureGroupDrag(tabId,{internalScope:!!controlRef.current}),
       sourcePaneKey: paneKey, sourceSpaceId: activeSpaceId,
       ...(releasedPlacement ? canonicalPaneDragAddress(useWorkspaceStore.getState(),projectId,tabId):{}),
     }), () => { setPointerHeld(false); setPressed(false); });
@@ -173,6 +186,22 @@ export default function PaneTabChip({
       selected={stripSelection?.selected(tabId)}
       pressed={pressed} showShownStripe={inStrip} truncate={!inStrip}
       cornerSignalZIndex={11}
+      cornerAdornmentCount={groupControl?.count}
+      cornerAdornment={groupControl&&groupControl.count>0?<button type="button" className="pane-strip-group-count"
+        data-pane-strip-group-count={groupControl.groupId} data-group-unread={groupControl.unread?'1':undefined}
+        aria-label={`Ещё вкладок: ${groupControl.count}. ${groupControl.open?'Группа раскрыта':'Раскрыть группу'}`}
+        aria-expanded={groupControl.open} aria-busy={groupControl.busy||undefined}
+        onMouseEnter={event=>{if(!event.buttons)badgeHover.current?.enter(event.currentTarget);}}
+        onMouseLeave={()=>badgeHover.current?.cancel()}
+        style={{...CHIP_HOVER_STYLE,color:groupControl.color}} onPointerDown={event=>{event.stopPropagation();}}
+        onMouseDown={event=>event.stopPropagation()} onDoubleClick={event=>event.stopPropagation()}
+        onClick={event=>{event.preventDefault();event.stopPropagation();groupControl.toggle();}}>
+        {groupControl.busy?'…':`+${groupControl.count}`}
+        {badgeProgress&&<svg data-pane-strip-badge-progress aria-hidden="true"
+          style={{position:'absolute',inset:-1,width:'calc(100% + 2px)',height:'calc(100% + 2px)',overflow:'visible',pointerEvents:'none'}}>
+          <NavigationDwellStroke shape="rect" attributes={{x:1,y:1,width:'calc(100% - 2px)',height:'calc(100% - 2px)',rx:4,pathLength:100}}/>
+        </svg>}
+      </button>:undefined}
       interactiveStatus sharedActivity={sharedActivity}
       onLinkedFileOpen={previewOnly ? undefined : file => {
         void openTabLinkedFile(projectId, file, () => useWorkspaceStore.getState().openTabById(tabId, {
@@ -181,8 +210,13 @@ export default function PaneTabChip({
       }}
       onTaskClick={(taskId, event) => {
         event.stopPropagation();
-        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-        requestTaskPlanNavigation({ tabId, taskId, view: 'active' });
+        if(groupControl)groupControl.selected(tabId,
+          ()=>useWorkspaceStore.getState().openTabById(tabId,{projectId,reason:'pane-tab-chip-task'}),
+          ()=>requestTaskPlanNavigation({tabId,taskId,view:'active'}));
+        else {
+          useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+          requestTaskPlanNavigation({ tabId, taskId, view: 'active' });
+        }
       }}
       // Named so a test can ask "does the chip FOR THIS TAB carry the
       // loader" — the question the process-bar bugs kept getting wrong,
@@ -263,10 +297,14 @@ export default function PaneTabChip({
           useWorkspaceStore.getState().focusSplitPane(paneIndex, { keepSidebar: true });
           return;
         }
-        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-        const preview = useUIStore.getState().filePreview;
-        if (preview?.ownerTabId) useUIStore.getState().closeFilePreview();
-        requestTabPrimaryInputFocus(tabId, 'pane-tab-chip-click');
+        const selected=()=>{
+          const preview=useUIStore.getState().filePreview;
+          if(preview?.ownerTabId)useUIStore.getState().closeFilePreview();
+          requestTabPrimaryInputFocus(tabId,'pane-tab-chip-click');
+        };
+        if(groupControl)groupControl.selected(tabId,
+          ()=>useWorkspaceStore.getState().openTabById(tabId,{projectId,reason:'pane-tab-chip-click'}),selected);
+        else {useWorkspaceStore.getState().activateCenterTab(projectId,tabId);selected();}
         if (shown) setPressed(false);
         else {
           if (pressedFallbackRef.current !== null) window.clearTimeout(pressedFallbackRef.current);
