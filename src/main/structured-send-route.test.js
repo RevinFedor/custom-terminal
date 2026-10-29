@@ -7,11 +7,15 @@ const vm = require('node:vm');
 const ts = require('typescript');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation } = require('./structured-authoring');
 const { createAgentSendReceiptRegistry, fingerprintAgentSendRequest, RECEIPT_STATES, isAgentSendProviderQueueAccepted } = require('./agent-send-receipt-registry');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
 const { withPromptOriginPresentation } = require('./history-prompt-presentations');
+const { withTerminalMcpPromptSource } = require('./terminal-mcp-prompt-source');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { buildCodexImagePastePlan } = require('./codex-image-transport');
 const { prepareClaudePromptTransport } = require('./claude-prompt-transport');
@@ -28,10 +32,14 @@ const routeSource = source.slice(source.indexOf('  // Send prompt to a project t
 async function harness({ loseReply = false } = {}) {
   const calls = [], prefix = 'current pending context\n\n';
   let target = { tabId: 'T', sessionId: 'S', toolType: 'codex', projectId: 'P', tabType: 'terminal' };
+  let sender = { tabId: 'sender', tabName: 'Captured sender', projectId: 'P' };
   const sendJson = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
   const context = vm.createContext({
-    console: { log() {}, warn() {} }, crypto, prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation,
-    promptAuditFingerprint, fingerprintAgentSendRequest, withPromptOriginPresentation, agentSendTargetPreconditionFailure,
+    console: { log() {}, warn() {} }, crypto, require, path, srcMainDir: __dirname,
+    prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation,
+    ...require('./agent-send-preparation'), buildContinueOperations: null, readAgentRuntimeSnapshot: null,
+    COMPLETION_ADMISSION: Symbol('controlled-completion-admission'),
+    promptAuditFingerprint, fingerprintAgentSendRequest, withPromptOriginPresentation, withTerminalMcpPromptSource, agentSendTargetPreconditionFailure,
     AGENT_SEND_RECEIPT_STATES: RECEIPT_STATES, agentSendReceiptRegistry: createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptStore: null, agentSendBridgeTimeoutMs: 1000,
     classifyAgentSendReceipt, isAgentSendProviderQueueAccepted, projectManager: {},
@@ -40,7 +48,7 @@ async function harness({ loseReply = false } = {}) {
     readBody: req => new Promise((resolve, reject) => {
       let body = ''; req.on('data', chunk => { body += chunk; }); req.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(e); } });
     }),
-    findOrchestrationTabDescriptor: () => target,
+    findOrchestrationTabDescriptor: id => id === 'sender' ? sender : target,
     findRestorableAgentTabDescriptor: () => { throw Error('unexpected archive restore'); },
     ensureExplicitAgentTabOpen: async () => { calls.push(['prepareSend']); return { descriptor: target }; },
     resolveProjectAgentModelRequest: async () => ({ model: undefined }),
@@ -89,13 +97,64 @@ async function harness({ loseReply = false } = {}) {
   const run = vm.runInContext('(async (req,res,parsed)=>{ let m; ' + routeSource + '})', context);
   const server = http.createServer((req, res) => run(req, res, { pathname: req.url }).catch(e => sendJson(res, 500, { error: e.message })));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { calls, prefix, setTarget: value => { target = value; },
+  return { calls, prefix, port: server.address().port,
+    setTarget: value => { target = value; }, setSender: value => { sender = value; },
     close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }),
-    post: async body => {
-      const res = await fetch('http://127.0.0.1:' + server.address().port + '/api/terminal-tabs/T/send', { method: 'POST', body: JSON.stringify(body) });
+    post: async (body, headers = {}) => {
+      const res = await fetch('http://127.0.0.1:' + server.address().port + '/api/terminal-tabs/T/send', { method: 'POST', headers, body: JSON.stringify(body) });
       return { status: res.status, data: await res.json() };
     } };
 }
+
+for (const provider of ['codex', 'claude']) test(provider + ' actual one-way MCP HTTP send keeps sender beside unchanged prompt and attachments', async () => {
+  const h = await harness();
+  try {
+    h.setTarget({ tabId: 'T', sessionId: 'S', toolType: provider, projectId: 'P', tabType: 'terminal' });
+    const prompt = 'Literal **notice**; no reply needed';
+    const body = { prompt, handoffId: 'source-notice', source: 'terminal-mcp', queue: true };
+    const headers = { 'x-noted-terminal-source': Buffer.from(JSON.stringify({ server: 'terminal', mode: 'internal',
+      tabId: 'sender', projectId: 'P', tabName: 'Forged name' })).toString('base64url') };
+    assert.equal((await h.post(body, headers)).status, 200);
+    const payload = h.calls.find(call => call[0] === 'bridge')[1];
+    assert.equal(payload.prompt, h.prefix + prompt);
+    assert.equal(payload.source, 'terminal-mcp');
+    assert.equal(payload.queue, true);
+    assert.equal(payload.handoffId, 'source-notice');
+    const tag = payload.presentationSnapshot.semanticTags[0];
+    assert.equal(tag.sourceTabId, 'sender'); assert.equal(tag.sourceTabName, 'Captured sender');
+    assert.equal(tag.messageId, undefined); assert.equal(tag.runId, undefined);
+    h.setSender(null);
+    assert.equal((await h.post(body, headers)).status, 200);
+    assert.equal(h.calls.filter(call => call[0] === 'bridge').length, 1);
+    assert.equal((await h.post({ ...body, prompt: 'changed' }, headers)).status, 409);
+  } finally { await h.close(); }
+});
+
+test('actual MCP dispatcher and HTTP Send route agree on one-way sender without modifying the body', async () => {
+  const h = await harness();
+  try {
+    const mcp = fs.readFileSync(path.join(__dirname, '../../mcp/terminal-server.mjs'), 'utf8');
+    const executable = mcp.slice(0, mcp.lastIndexOf('// stdio transport')).replace(/^import .*;\n/gm, '');
+    const context = vm.createContext({
+      AsyncLocalStorage, Buffer, URL, URLSearchParams, basename: path.basename, join: path.join, resolve: path.resolve,
+      promisify, execFile, randomUUID: crypto.randomUUID, homedir: () => '/fixture', readdirSync: () => [], fetch,
+      process: { env: {}, argv: ['node', 'terminal-server.mjs'], cwd: () => '/fixture', stderr: { write() {} } },
+      testPickInstance: () => ({ port: h.port }),
+    });
+    vm.runInContext(executable + '\npickWebInstance=testPickInstance;readSharedToken=()=>"fixture";globalThis.dispatch=handleRequest;', context);
+    const result = JSON.parse(await context.dispatch({ id: 1, method: 'tools/call', params: {
+      name: 'send_prompt', arguments: { tabId: 'T', prompt: 'One notice, no reply', handoffId: 'fixed', queue: true },
+      _meta: { noted: { tabId: 'sender', projectId: 'P', cwd: '/fixture' } },
+    } })).result;
+    assert.equal(result.isError, undefined, result.content[0].text);
+    const sent = h.calls.filter(call => call[0] === 'bridge');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0][1].prompt, h.prefix + 'One notice, no reply');
+    assert.equal(sent[0][1].presentationSnapshot.semanticTags[0].sourceTabName, 'Captured sender');
+    assert.equal(sent[0][1].presentationSnapshot.semanticTags[0].sourceTabId, 'sender');
+    assert.equal(sent[0][1].presentationSnapshot.semanticTags[0].messageId, undefined);
+  } finally { await h.close(); }
+});
 
 const request = () => ({ handoffId: 'one-new-explicit-send', expectedSessionId: 'S', expectedToolType: 'codex',
   authoring: { version: 1, parts: [{ kind: 'text', text: 'user ' }, { kind: 'paste', chipId: 'p' },

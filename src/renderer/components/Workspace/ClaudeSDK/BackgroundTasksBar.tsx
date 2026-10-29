@@ -18,12 +18,7 @@ const EMPTY: BgTask[] = [];
 function StatusDot() {
   return (
     <span
-      className="inline-block w-[6px] h-[6px] rounded-full shrink-0 noted-infinite-animation"
-      style={{
-        background: '#d97706',
-        animation: 'sdk-bg-task-pulse 1.4s ease-in-out infinite',
-        boxShadow: '0 0 4px rgba(217, 119, 6, 0.4)',
-      }}
+      className="inline-block w-[6px] h-[6px] rounded-full shrink-0 noted-infinite-animation animate-glow-yellow noted-background-task-dot"
     />
   );
 }

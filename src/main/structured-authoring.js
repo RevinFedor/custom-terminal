@@ -221,12 +221,62 @@ async function prepareStructuredAuthoring(input, { allowUploadFiles = false } = 
 function bindStructuredAuthoringPresentation(snapshot, originalPrompt, preparedPrompt) {
   const plan = snapshot?.authoringTransport;
   if (!plan) return snapshot;
+  if (originalPrompt === preparedPrompt) {
+    return { ...snapshot, authoringTransport: validateAuthoringTransport(originalPrompt, plan) };
+  }
+  if (plan.bodyLength === undefined && preparedPrompt.endsWith(originalPrompt)) {
+    return { ...snapshot, authoringTransport: editAuthoringTransport(originalPrompt, plan,
+      [{ start: 0, end: 0, text: preparedPrompt.slice(0, preparedPrompt.length - originalPrompt.length) }]).authoringTransport };
+  }
   if (plan.sourceHash !== hash(originalPrompt) || preparedPrompt.length < plan.bodyLength
     || hash(preparedPrompt.slice(preparedPrompt.length - plan.bodyLength)) !== plan.bodyHash) fail('prepared context changed authoring body');
   const delta = preparedPrompt.length - originalPrompt.length;
   return { ...snapshot, authoringTransport: { sourceHash: hash(preparedPrompt),
     ...(plan.fileRanges ? { fileRanges: plan.fileRanges.map(range => ({ ...range, start: range.start + delta, end: range.end + delta })) } : {}),
     imageRanges: plan.imageRanges.map(range => ({ ...range, start: range.start + delta, end: range.end + delta })) } };
+}
+
+function validateAuthoringTransport(prompt, plan) {
+  if (!plan || plan.sourceHash !== hash(prompt) || !Array.isArray(plan.imageRanges)) fail('transport source changed');
+  let last = 0;
+  for (const range of plan.imageRanges) {
+    const marker = prompt.slice(range?.start, range?.end);
+    const match = /^\[imagePath:\s*([^\]\r\n]+?)\s*\]$/i.exec(marker);
+    if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range?.end)
+      || range.start < last || range.end <= range.start || range.end > prompt.length
+      || !match || match[1] !== range.path || !path.isAbsolute(range.path.trim())) fail('transport image range changed');
+    last = range.end;
+  }
+  last = 0;
+  for (const range of plan.fileRanges || []) {
+    if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range?.end)
+      || range.start < last || range.end <= range.start || range.end > prompt.length
+      || prompt.slice(range.start, range.end) !== range.sourcePath) fail('transport file range changed');
+    last = range.end;
+  }
+  return { ...plan, imageRanges: plan.imageRanges.map(range => ({ ...range })),
+    ...(plan.fileRanges ? { fileRanges: plan.fileRanges.map(range => ({ ...range })) } : {}) };
+}
+
+// These edits come from the existing context producer as it performs them,
+// never from searching for a similar attachment in the resulting text.
+function editAuthoringTransport(prompt, plan, edits) {
+  let current = prompt, result = validateAuthoringTransport(prompt, plan);
+  for (const edit of edits) {
+    if (!Number.isSafeInteger(edit.start) || !Number.isSafeInteger(edit.end) || edit.start < 0
+      || edit.end < edit.start || edit.end > current.length || typeof edit.text !== 'string') fail('context edit invalid');
+    const delta = edit.text.length - (edit.end - edit.start);
+    const move = range => {
+      if (range.end <= edit.start) return [{ ...range }];
+      if (range.start >= edit.end) return [{ ...range, start: range.start + delta, end: range.end + delta }];
+      if (range.start >= edit.start && range.end <= edit.end) return []; // replaced app-owned wrapper
+      fail('context edit split an attachment');
+    };
+    current = current.slice(0, edit.start) + edit.text + current.slice(edit.end);
+    result = { sourceHash: hash(current), imageRanges: result.imageRanges.flatMap(move),
+      ...(result.fileRanges ? { fileRanges: result.fileRanges.flatMap(move) } : {}) };
+  }
+  return { prompt: current, authoringTransport: validateAuthoringTransport(current, result) };
 }
 
 function validateStructuredSendEnvelope(body) {
@@ -247,4 +297,5 @@ function validateStructuredSendEnvelope(body) {
   }
 }
 
-module.exports = { prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation, STRUCTURED_AUTHORING_LIMITS: LIMITS };
+module.exports = { prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation,
+  validateAuthoringTransport, editAuthoringTransport, STRUCTURED_AUTHORING_LIMITS: LIMITS };

@@ -134,25 +134,50 @@ function rendererUiProbe(options, projectNode, target) {
     result.ancestorLimitReached = !!ancestor;
     return projectNode(result);
   }
-  const output = { entries: [], observedCount: 0, countLimited: false, sizeLimited: false, timeLimited: false };
+  const output = { entries: [], observedCount: 0, scannedCount: 0, selection: 'running-first-capped-prefix',
+    countLimited: false, sizeLimited: false, timeLimited: false };
   if (options.mode === 'root') output.node = describe(target);
   const source = options.mode === 'root' ? target : document;
   if (!source || typeof source.getAnimations !== 'function') { output.unavailable = true; return output; }
   const animations = options.mode === 'root' ? source.getAnimations({ subtree: true }) : source.getAnimations();
   output.observedCount = animations.length;
   const limit = options.mode === 'root' ? 32 : Math.min(256, options.limit);
-  let bytes = 0;
+  output.countLimited = animations.length > limit;
+  // Partition only the old capped prefix, using playState alone. In particular,
+  // do not describe paused owners before running candidates can use the byte
+  // credit. Neither this scan nor its retained references cover all animations.
+  const running = [], remaining = [];
   for (let i = 0; i < Math.min(limit, animations.length); i++) {
     if (expired()) { output.timeLimited = true; break; }
-    const animation = animations[i];
-    const entry = { cssName: name(animation.animationName), playState: state(animation.playState) };
-    if (options.mode !== 'root') entry.target = describe(animation.effect?.target);
-    const cost = JSON.stringify(entry).length + 1; // projected strings are ASCII
-    if (bytes + cost > options.maxBytes) { output.sizeLimited = true; break; }
-    bytes += cost; output.entries.push(entry);
+    const animation = animations[i], playState = state(animation.playState);
+    (playState === 'running' ? running : remaining).push({ animation, playState });
+    output.scannedCount++;
   }
-  output.countLimited = animations.length > limit;
+  let bytes = 0;
+  selection: for (const candidates of [running, remaining]) {
+    for (const { animation, playState } of candidates) {
+      if (expired()) { output.timeLimited = true; break selection; }
+      const entry = { cssName: name(animation.animationName), playState };
+      if (options.mode !== 'root') entry.target = describe(animation.effect?.target);
+      const cost = JSON.stringify(entry).length + 1; // projected strings are ASCII
+      if (bytes + cost > options.maxBytes) { output.sizeLimited = true; break selection; }
+      bytes += cost; output.entries.push(entry);
+    }
+  }
+  if (expired()) output.timeLimited = true;
   return output;
+}
+
+function projectAnimationInventory(raw, limit) {
+  const observedCount = Number.isSafeInteger(raw.observedCount) ? Math.max(0, raw.observedCount) : null;
+  return {
+    observedCount,
+    scannedCount: Number.isSafeInteger(raw.scannedCount) && raw.scannedCount >= 0 && raw.scannedCount <= limit
+      && observedCount !== null && raw.scannedCount <= observedCount ? raw.scannedCount : null,
+    selection: raw.selection === 'running-first-capped-prefix' ? raw.selection : null,
+    countLimited: raw.countLimited === true || raw.entries.length > limit || observedCount > limit,
+    sizeLimited: raw.sizeLimited === true, timeLimited: raw.timeLimited === true, unavailable: raw.unavailable === true,
+  };
 }
 
 function projectAnimation(raw, withTarget) {
@@ -245,9 +270,7 @@ async function collectIncidentUiMetadata({ sendCommand, isOwned, traceRoots, cap
           objectGroup: group, returnByValue: true, silent: true, timeout: config.budgetMs,
         });
         const raw = value(response);
-        report.animationInventory = { observedCount: Number.isSafeInteger(raw.observedCount) ? Math.max(0, raw.observedCount) : null,
-          countLimited: raw.countLimited === true || raw.entries.length > MAX_ANIMATIONS,
-          sizeLimited: raw.sizeLimited === true, timeLimited: raw.timeLimited === true, unavailable: raw.unavailable === true };
+        report.animationInventory = projectAnimationInventory(raw, MAX_ANIMATIONS);
         let bytes = 0;
         for (const entry of raw.entries.slice(0, MAX_ANIMATIONS)) {
           const projected = projectAnimation(entry, true), cost = Buffer.byteLength(JSON.stringify(projected)) + 1;
@@ -272,8 +295,7 @@ async function collectIncidentUiMetadata({ sendCommand, isOwned, traceRoots, cap
           const raw = value(response);
           entry = { backendNodeId, status: 'ok', node: sanitizeUiNode(raw.node),
             subtreeAnimations: raw.entries.slice(0, 32).map(a => projectAnimation(a, false)),
-            countLimited: raw.countLimited === true || raw.entries.length > 32,
-            sizeLimited: raw.sizeLimited === true, timeLimited: raw.timeLimited === true };
+            ...projectAnimationInventory(raw, 32) };
           if (raw.unavailable) { entry.status = 'partial'; error('root-animations', 'api-unavailable', backendNodeId); }
         } catch (err) {
           entry = { backendNodeId, status: 'error', code: failureCode(err) };

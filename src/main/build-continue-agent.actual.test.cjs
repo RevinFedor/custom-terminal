@@ -59,7 +59,7 @@ test('incoming delegated task has ONE owner continuation, bound new turn and ori
       subject: { kind: 'codex-execution', toolType: 'codex', sessionId: 'worker-A', targetExecutionContext: old } }],
     readStartup: () => ({ source: 'exact-shutdown-snapshot', capturedAt: 1001, shutdownPid: 11,
       targets: [{ tabId: 'worker', provider: 'codex', sessionId: 'worker-A' }] }),
-    readState: async () => ({ ...current }), continueRun: id => continuation.continueRequest(id), getRun: id => store.getInternal(id),
+    readState: async () => ({ ...current }), continueRun: (id, options) => continuation.continueRequest(id, options), getRun: id => store.getInternal(id),
     readReceipt: key => receipts.get(key), readQueued: key => queue.item(key),
     send: () => assert.fail('must not create a second generic build continue'),
   });

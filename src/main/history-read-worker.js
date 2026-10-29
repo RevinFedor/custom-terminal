@@ -329,7 +329,7 @@ function prepareSourceEpoch(filePath) {
   const control = currentReadControl();
   control?.assertCurrent();
   context?.sources.add(filePath);
-  if (sourceEpochSlots.has(filePath)) return Promise.resolve();
+  if (sourceEpochSlots.has(filePath)) return require('./codex-rollout-read-views').assertCodexRolloutReadViewCurrent(filePath);
   const endWait = beginWorkPhase('source-epoch');
   let registration = epochPending.get(filePath);
   if (!registration) {
@@ -340,12 +340,15 @@ function prepareSourceEpoch(filePath) {
     }) };
     epochPending.set(filePath, registration);
     requestPhase(context, 'source-epoch-request');
-    send({ event: 'source-epoch', filePath, diagnostic: context?.correlation });
+    send({ event: 'source-epoch', filePath,
+      backingPaths: require('./codex-rollout-read-views').codexRolloutBackingPaths(filePath),
+      diagnostic: context?.correlation });
   } else requestPhase(context, 'source-epoch-join');
   // Slot registration is tiny shared infrastructure, not A's read Promise.
   // Each borrower runs its own demand check and source restoration afterwards.
   return registration.promise.then(async () => {
     control?.assertCurrent();
+    await require('./codex-rollout-read-views').assertCodexRolloutReadViewCurrent(filePath);
     processEpochs.refresh();
     const owner = context?.payload;
     if (owner?.sessionId) {
@@ -424,6 +427,7 @@ async function enterCold() {
   return () => {}; // The owning RPC releases exactly once in its finally.
 }
 cache.enterCold = enterCold;
+require('./codex-rollout-read-views').setCodexRolloutReadViewAdmission(enterCold);
 
 const findSource = api.findCodexSessionFile;
 api.findCodexSessionFile = async (id, cwd) => {
@@ -714,6 +718,7 @@ parentPort.on('message', message => {
     // fence cannot authorize a read; the next request boundary re-observes it.
     try { processEpochs.refresh(); } catch (error) { emitDiagnostic('source-fence-observation', { errorCode: error.code }); }
     api.invalidateJsonlCache(message.filePath, message);
+    for (const view of message.readViewPaths || []) api.invalidateJsonlCache(view, message);
     publishCacheMemory();
     return;
   }

@@ -12,6 +12,7 @@ const { runKeyedExclusive } = require('./codex-writer-ownership');
 const { createAgentLaunchPreparationRegistry } = require('./agent-launch-preparation');
 const { OrchestrationRunStore } = require('./orchestration-runs');
 const { normalizeAgentLaunchSource } = require('./ai-lifecycle-authority');
+const { createHistoryMutationInputGate } = require('./history-mutation-input');
 const { createCodexLaunchPendingResult, classifyCodexLaunchPreparationResult } = require('./codex-runtime-contract');
 
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -31,7 +32,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function harness(t, { holdInner = null } = {}) {
+function harness(t, { holdInner = null, resumeGoalPreference = true } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-resume-join-'));
   const orchestrationStore = new OrchestrationRunStore(path.join(directory, 'runs.json'));
   t.after(async () => {
@@ -62,7 +63,7 @@ function harness(t, { holdInner = null } = {}) {
     const proof = {
       ...request, sessionId, launchId, terminalToken: context.terminals.get(tabId),
       runSeq: state.runSeq, lifecycleGeneration: context.getTerminalLifecycleGeneration(tabId),
-      materializedFresh: false, resumePausedGoal: true,
+      materializedFresh: false, resumePausedGoal: resumeGoalPreference,
     };
     context.codexLastRunCommandPayload.set(tabId, proof);
     context.codexLaunchAcceptancePending.set(tabId, launchId);
@@ -76,6 +77,8 @@ function harness(t, { holdInner = null } = {}) {
     agentLaunchPreparations: preparations,
     codexLaunchInflight: new Map(), aiLifecycleActionInflight: new Map(),
     terminals: new Map([[tabId, term]]),
+    terminalLaunchFenceOrders: new WeakMap(), nextTerminalLaunchFenceOrder: 0,
+    historyMutationInput: createHistoryMutationInputGate(),
     terminalCommandState: new Map([[tabId, { runSeq: 7, isRunning: false }]]),
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-epoch']]),
     getTerminalStopRevision: () => 0,
@@ -103,6 +106,7 @@ function harness(t, { holdInner = null } = {}) {
   });
   vm.runInContext([
     'captureAgentLaunchFence', 'withAgentLaunchFence', 'assertAgentSendLaunchCurrent', 'returnAgentSendLaunchRefusal',
+    'runAgentLaunchIntentAttempt',
     'getTerminalLifecycleGeneration', 'getCodexWriterProofSnapshot',
     'getCodexResumeSourceLeaseForTab', 'getCodexResumeReadIdentityLeaseForTab',
     'currentCodexAcceptedResumeSourceProof', 'admitAiLifecycleLaunch',
@@ -149,6 +153,103 @@ test('actual AutoResume + History callers share one physical Resume and one prep
   assert.equal(h.context.aiLifecycleActionInflight.size, 0);
   assertNoInputReadinessClaim(first);
   assertNoInputReadinessClaim(second);
+});
+
+for (const preference of [false, null]) test('after-restart first + AutoResume join preserves existing Goal policy ' + preference, async t => {
+  const release = deferred();
+  const h = harness(t, { holdInner: release, resumeGoalPreference: preference });
+  const queuedStart = h.run({ launchSource: 'explicit' });
+  await h.innerReached.promise;
+  const auto = h.run({ launchSource: 'auto-resume' });
+  release.resolve();
+  const [first, second] = await Promise.all([queuedStart, auto]);
+  assert.equal(first.success, true);
+  assert.equal(second.success, true, 'same already-written Resume is not another foreground command');
+  assert.equal(second.joined, true);
+  assert.equal(second.acceptancePending, true);
+  assert.equal(second.launchId, first.launchId);
+  assert.equal(second.sessionId, null, 'a pending Resume is not a proven writer');
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.innerCalls.length, 1);
+  assert.equal(h.preparationChanges.filter(s => s.preparing).length, 1);
+  assert.equal(h.preparationChanges.filter(s => s.preparing === false && s.accepted === false).length, 0);
+  assert.equal(h.preparations.get(h.request.tabId), null, 'no red rejected-preparation snapshot');
+  assert.equal(h.context.codexLastRunCommandPayload.get(h.request.tabId).resumePausedGoal, preference,
+    'joining never changes the policy selected by the original launch');
+  assertNoInputReadinessClaim(second);
+});
+
+test('explicit different Resume Goal intent still refuses an in-flight Leave-paused launch', async t => {
+  const h = harness(t, { resumeGoalPreference: false });
+  h.installPending();
+  const result = await h.run({ resumePausedGoal: true });
+  assert.equal(result.success, false);
+  assert.equal(result.joined, undefined);
+  assert.equal(h.writes.length, 0);
+});
+
+test('actual AutoResume caller joins queue-started Leave paused, waits for ready and emits no failure toast', async t => {
+  const h = harness(t, { resumeGoalPreference: false });
+  const first = await h.run({ launchSource: 'explicit' });
+  assert.equal(first.success, true);
+  const { classifyInterruptedRestoreRuntime, isTransientInterruptedRestoreAdmission,
+    buildInterruptedRestoreIncidentReport } = await import('../renderer/utils/interruptedAutoRestore.mjs');
+  const { resolvePtyAgentOwner } = await import('../renderer/utils/ptyAgentOwner.mjs');
+  const state = { tabId: h.request.tabId, cwd: h.request.cwd, tabType: 'terminal',
+    commandType: 'codex', codexSessionId: h.request.sessionId, wasInterrupted: false };
+  const store = { getState: () => ({ openProjects: new Map([['P', { tabs: new Map([[state.tabId, state]]) }]]) }),
+    subscribe: () => () => {} };
+  const readyEntered = deferred(), ready = deferred();
+  t.after(() => ready.resolve({ success: false, ready: false, error: 'test-cleanup' }));
+  let cleared = 0;
+  const source = fs.readFileSync(path.join(__dirname, '../renderer/utils/continueInterruptedSession.ts'), 'utf8');
+  const tree = ts.createSourceFile('continue.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const code = tree.statements.filter(node => !ts.isImportDeclaration(node)).map(node => node.getText(tree)).join('\n')
+    .replace("await import('../store/useWorkspaceStore')", 'await importWorkspaceStore()');
+  const ipc = { invoke: async (channel, payload) => {
+    if (channel === 'codex:get-runtime-projection') return { success: true, liveLifecycle: true,
+      sessionStatus: 'starting', writerConfirmed: false, sessionId: null,
+      readIdentitySource: 'unresolved', readSessionId: null, launchId: first.launchId,
+      lifecycleGeneration: h.context.getTerminalLifecycleGeneration(state.tabId) };
+    if (channel === 'codex:run-command') return h.run(payload);
+    if (channel === 'agent:wait-start-ready') {
+      assert.equal(payload.expectedOwner.launchId, first.launchId);
+      assert.equal(payload.expectedOwner.lifecycleGeneration, h.context.getTerminalLifecycleGeneration(state.tabId));
+      readyEntered.resolve(); return ready.promise;
+    }
+    throw Error('unexpected controlled IPC: ' + channel);
+  } };
+  // Admission transport/store/readiness ports are controlled. The actual
+  // renderer caller, Main queues/guard/registry, join helper and App toast
+  // consumer run; this is not a packaged UI or physical provider acceptance.
+  const context = vm.createContext({ exports: {}, console: { log() {}, warn() {} }, AbortController,
+    window: { require: name => { assert.equal(name, 'electron'); return { ipcRenderer: ipc }; } },
+    terminalRegistry: { get: () => null }, clearPendingResume() {}, markPendingResume() {},
+    buildCodexRunPayload: payload => payload, resolvePtyAgentOwner,
+    classifyInterruptedRestoreRuntime, isTransientInterruptedRestoreAdmission,
+    importWorkspaceStore: async () => ({ useWorkspaceStore: store }),
+    createAgentLaunchAdmission: () => ({ run: (channel, payload) => ipc.invoke(channel, payload),
+      finish: async () => {}, snapshot: () => ({}) }) });
+  vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.CommonJS } }).outputText, context);
+  const pending = context.exports.continueInterruptedSession({ ...h.request, projectId: 'P', engine: 'codex',
+    clearInterruptedState: () => { cleared++; }, launchSource: 'auto-resume', waitUntilReady: true });
+  const phase = await Promise.race([readyEntered.promise.then(() => 'waiting'), pending.then(() => 'settled')]);
+  assert.equal(phase, 'waiting', 'joined is not a false startup error or a readiness claim');
+  assert.equal(cleared, 0);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.preparationChanges.filter(row => row.accepted === false).length, 0);
+  ready.resolve({ success: true, ready: true, status: { inputReady: true } });
+  const result = await pending;
+  assert.equal(result.success, true); assert.equal(result.ready, true); assert.equal(cleared, 1);
+  const app = fs.readFileSync(path.join(__dirname, '../renderer/App.tsx'), 'utf8');
+  const begin = app.indexOf('for (const { item, result } of startResults)');
+  const end = app.indexOf('const startedCount =', begin);
+  assert(begin > 0 && end > begin);
+  const toasts = [];
+  vm.runInNewContext(app.slice(begin, end), { startResults: [{ item: { ...h.request, engine: 'codex' }, result }],
+    showToast: (...args) => toasts.push(args), buildInterruptedRestoreIncidentReport, Date });
+  assert.equal(toasts.length, 0);
 });
 
 const nonJoinCases = [

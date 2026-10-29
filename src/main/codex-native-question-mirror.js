@@ -19,6 +19,39 @@ const isBoldQuestionRow = row => /(?:^|,)bold(?:,|$)/.test(String(row?.firstText
   && !/(?:^|,)dim(?:,|$)/.test(String(row?.firstTextStyle || ''));
 const isNativeTitleRow = row => (row?.hasNonDefaultBg || row?.hasNonDefaultFg)
   && isBoldQuestionRow(row);
+const isColoredTitleRow = row => row?.hasNonDefaultFg === true
+  && !/(?:^|,)dim(?:,|$)/.test(String(row?.firstTextStyle || ''))
+  && /(?:^|,)fg=(?!0:-1(?:,|$))\d+:-?\d+(?:,|$)/.test(String(row?.firstTextStyle || ''));
+
+// Keep the failed observation distinct from the collector's later/current
+// frame. This is bounded styled-screen evidence, not a fabricated raw replay.
+function snapshotQuestionFailureFrame(frame) {
+  if (!frame) return null;
+  const allRows=Array.isArray(frame.lines) ? frame.lines : [];
+  let remaining=32768,truncatedValues=0;
+  const take=(value,limit)=>{
+    const text=String(value || ''), size=Math.min(limit,remaining);
+    if(text.length>size)truncatedValues++;
+    const result=text.slice(0,size);remaining-=result.length;return result;
+  };
+  const scalar={};
+  for(const key of ['success','source','tabId','authoritativeFrameCommitted','mirrorGeneration',
+    'lifecycleGeneration','writeSeq','flushedSeq','committedFrameGeneration','baseY',
+    'cursorX','cursorY','cols','rows','synchronizedOutputOpen']) {
+    const value=frame[key];
+    if(typeof value==='string')scalar[key]=take(value,256);
+    else if(typeof value==='boolean' || typeof value==='number' && Number.isFinite(value))scalar[key]=value;
+  }
+  const lines=allRows.slice(-128).map(row=>({row:Number.isFinite(row?.row) ? row.row : null,
+    text:take(row?.text,4096),wrapped:row?.wrapped===true,
+    firstTextStyle:take(row?.firstTextStyle,256),
+    styles:Array.isArray(row?.styles) ? row.styles.slice(0,6).map(value=>take(value,256)) : [],
+    hasInverse:row?.hasInverse===true,hasNonDefaultFg:row?.hasNonDefaultFg===true,
+    hasNonDefaultBg:row?.hasNonDefaultBg===true,hasDim:row?.hasDim===true,allTextDim:row?.allTextDim===true}));
+  return {...scalar,lines,coverage:{sourceRows:allRows.length,omittedRows:Math.max(0,allRows.length-128),
+    maxRows:128,maxCodeUnits:32768,truncatedValues,
+    styleListsTruncated:allRows.slice(-128).filter(row=>Array.isArray(row?.styles)&&row.styles.length>6).length}};
+}
 
 // A painted selection in a sequential native list anchors the title ABOVE
 // that list. Do not let a later bold fragment replace it. The caller also
@@ -26,19 +59,28 @@ const isNativeTitleRow = row => (row?.hasNonDefaultBg || row?.hasNonDefaultFg)
 function findNativeChoiceGroup(choices, rows, lines) {
   let group=null, found=null;
   const finish=()=>{
+    if(group?.selections===1 && !group.painted && group.selected!=null) {
+      const selected=rows[group.selected];
+      const bg=/(?:^|,)bg=([^,]+)/.exec(String(selected?.firstTextStyle || ''))?.[1];
+      // Editing Other can remove bold. A distinct, explicitly painted row
+      // still proves selection; a common menu background does not.
+      if(selected?.hasNonDefaultBg && bg && !['0:-1','-:-1','-:-','none'].includes(bg)
+        && group.rows.every(row=>row===group.selected
+          || /(?:^|,)bg=([^,]+)/.exec(String(rows[row]?.firstTextStyle || ''))?.[1]!==bg))group.painted=true;
+    }
     if(group?.size>=2 && group.selections===1 && group.painted)found=group;
   };
   for(const choice of choices) {
     if(choice.number===1) {
       finish();
-      group={first:choice.row,last:choice.row,size:0,selections:0,painted:false};
+      group={first:choice.row,last:choice.row,size:0,selections:0,painted:false,selected:null,rows:[]};
     } else if(!group || choice.number!==group.size+1) {
       finish();group=null;
     }
     if(!group)continue;
-    group.size++;group.last=choice.row;
+    group.size++;group.last=choice.row;group.rows.push(choice.row);
     if(QUESTION_OPTION_RE.exec(lines[choice.row])?.[1]) {
-      group.selections++;
+      group.selections++;group.selected=choice.row;
       const row=rows[choice.row];
       group.painted ||= row?.hasInverse===true || !!(row?.hasNonDefaultBg && isNativeTitleRow(row));
     }
@@ -117,6 +159,22 @@ function inspectCodexNativeQuestions(frame) {
     }
     const nativeGroup=sectionKnown ? findNativeChoiceGroup(choices,rows,lines) : null;
     if(nativeGroup)while(titleRows.length && titleRows[titleRows.length-1]>=nativeGroup.first)titleRows.pop();
+    // Some native screens paint the title in accent without bold. Accept only
+    // the FIRST contiguous coloured block of the proven current section, with
+    // a painted sequential choice group (or the cursor-proven free editor).
+    // An accent fragment after options/prose is never promoted to the title.
+    if(!titleRows.length && sectionKnown && (nativeGroup || !choices.length)) {
+      const end=nativeGroup?.first ?? footer;
+      let first=sectionStart;
+      while(first<end && !lines[first].trim())first++;
+      let next=first;
+      while(next<end && lines[next].trim() && isColoredTitleRow(rows[next])
+        && !QUESTION_OPTION_RE.test(lines[next]))next++;
+      if(next>first && (nativeGroup ? lines.slice(next,end).every(line=>!line.trim())
+        : next<end && !lines[next].trim())) {
+        for(let i=first;i<next;i++)titleRows.push(i);
+      }
+    }
     if (!titleRows.length)return {kind:'unknown',reason:'native-question-title-unproven',
       diagnostic:{sectionKnown,footerRow:footer,choices:choices.length,
         boldRows:rows.slice(sectionStart,footer).filter(isBoldQuestionRow).length,
@@ -129,7 +187,8 @@ function inspectCodexNativeQuestions(frame) {
     while(titleIndex>0 && titleRows[titleIndex-1]===titleFirst-1) {
       titleFirst--;titleIndex--;
     }
-    const titleStyle=rows.slice(titleFirst,titleLast+1).some(isNativeTitleRow) ? 'accent-bold' : 'default-bold';
+    const titleStyle=rows.slice(titleFirst,titleLast+1).some(isNativeTitleRow) ? 'accent-bold'
+      : rows.slice(titleFirst,titleLast+1).some(isColoredTitleRow) ? 'accent-colour' : 'default-bold';
     if(titleStyle==='default-bold' && choices.length && !nativeGroup)return {kind:'unknown',
       reason:'native-question-selection-unproven',diagnostic:{sectionKnown,choices:choices.length}};
     const title=lines.slice(titleFirst,titleLast+1).reduce((value,line,index)=>value
@@ -182,7 +241,7 @@ function inspectCodexNativeQuestions(frame) {
   return {kind:'unknown'};
 }
 
-function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames, withWriter, publish, log }) {
+function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames, withWriter, publish, log, captureFailure }) {
   const states=new Map();
   const pendingActions=new Map();
   const stateFor=tabId=>{
@@ -309,8 +368,36 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
     if(!['open','close','next','previous','skip','answer'].includes(action))return {success:false,error:'question_action_unknown'};
     pendingActions.set(tabId,requestId); // synchronous admission before await
     let inputWritten=false, submitWritten=false;
+    const expectedOwner=readOwner(tabId);
+    let failureCaptured=false,readWriterDiagnostic=null;
+    const captureUnconfirmed=(reason,observed=null)=>{
+      if(failureCaptured || typeof captureFailure!=='function')return;
+      failureCaptured=true;
+      // Do not pin a replacement physical owner for an older failed command.
+      if(!expectedOwner || readOwner(tabId)?.key!==expectedOwner.key) {
+        log('diagnostic-skipped',tabId,{requestId,action,reason:'question-owner-changed'});return;
+      }
+      try {
+        const result=captureFailure(tabId,{requestId:requestId.slice(0,256),action,
+          reason:String(reason || 'question_control_failed').slice(0,256),
+          targetId:String(args.targetId || '').slice(0,256),inputWritten,submitted:submitWritten,
+          expectedOwner:{key:String(expectedOwner.key || '').slice(0,512),
+            sessionId:String(expectedOwner.sessionId || '').slice(0,128),
+            lifecycleGeneration:String(expectedOwner.lifecycleGeneration || '').slice(0,256)},
+          writer:typeof readWriterDiagnostic==='function' ? readWriterDiagnostic() : null,
+          wait:observed ? {ready:observed.ready===true,reason:observed.reason,
+            frames:observed.observedFrames,elapsedMs:observed.elapsedMs,
+            inspection:observed.lastInspection ? {kind:observed.lastInspection.kind,
+              reason:observed.lastInspection.reason || null,diagnostic:observed.lastInspection.diagnostic || null} : null} : null,
+          observedFrame:snapshotQuestionFailureFrame(observed?.lastSnapshot || readFrame(tabId))});
+        Promise.resolve(result).catch(error=>log('diagnostic-failed',tabId,
+          {requestId,action,error:String(error?.message || error).slice(0,256)}));
+      } catch(error) {log('diagnostic-failed',tabId,
+        {requestId,action,error:String(error?.message || error).slice(0,256)});}
+    };
     try {
       return await withWriter(tabId,async writer=>{
+        readWriterDiagnostic=writer.readDiagnostic || null;
         const state=stateFor(tabId), ownerKey=state?.ownerKey, epoch=state?.epoch;
         const read=()=>inspectCodexNativeQuestions(readFrame(tabId));
         const abort=()=>{
@@ -337,7 +424,12 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
             titleStyle:observed.lastInspection?.titleStyle || null,
             inspectionReason:observed.lastInspection?.reason || null,
             diagnostic:observed.lastInspection?.diagnostic || null});
-          if(!observed.ready)throw new Error(observed.reason || 'question_frame_unconfirmed');
+          if(!observed.ready) {
+            // Start the shared raw pin synchronously at this boundary, before
+            // throwing/releasing the PTY lock; never await disk/renderer here.
+            captureUnconfirmed(observed.reason || 'question_frame_unconfirmed',observed);
+            throw new Error(observed.reason || 'question_frame_unconfirmed');
+          }
           refresh(tabId,observed.lastSnapshot);
           return observed.lastInspection;
         }
@@ -406,6 +498,7 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
         return {success:true,requestId,inputWritten,handledLocally:true,providerConfirmed:null};
       });
     } catch(error) {
+      captureUnconfirmed(error.message || 'question_control_failed');
       log('control-unconfirmed',tabId,{requestId,action,inputWritten,error:error.message});
       refresh(tabId);
       return {success:false,requestId,inputWritten,submitted:submitWritten,deliveryUnknown:submitWritten,
@@ -417,4 +510,4 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
     control,clear};
 }
 
-module.exports={createCodexNativeQuestionMirror,inspectCodexNativeQuestions};
+module.exports={createCodexNativeQuestionMirror,inspectCodexNativeQuestions,snapshotQuestionFailureFrame};

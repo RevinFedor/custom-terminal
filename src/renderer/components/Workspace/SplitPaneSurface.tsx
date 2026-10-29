@@ -300,7 +300,6 @@ export default function SplitPaneSurface({
   const setTabTerminalIsPrimary = useUIStore((state) => state.setTabTerminalIsPrimary);
   const historyPanelWidth = useUIStore((state) => state.historyPanelWidth);
   const notesPanelWidth = useUIStore((state) => state.notesPanelWidth);
-  const timelinePinned = useUIStore((state) => state.timelinePinned);
   const sideTerminalOpen = useUIStore((state) => state.sideTerminalOpenTabs[tabId] ?? false);
   const setSideTerminalOpen = useUIStore((state) => state.setSideTerminalOpen);
   const sideHistoryOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
@@ -364,14 +363,16 @@ export default function SplitPaneSurface({
     timelineSubscribeRequired: showTimeline && timelineToolType !== 'gemini',
   };
 
-  const completeAdmission = useCallback((reason: string) => {
+  const completeAdmission = useCallback((reason: string, advanceHeavy = true) => {
     const tracker = admissionTrackerRef.current;
     if (!tracker) return;
     admissionTrackerRef.current = null;
     if (tracker.timeout !== null) window.clearTimeout(tracker.timeout);
     tracker.timeout = null;
-    heavyActivationPhaseRef.current = 'ready';
-    startTransition(() => setHeavyActivationPhase('ready'));
+    if (advanceHeavy) {
+      heavyActivationPhaseRef.current = 'ready';
+      startTransition(() => setHeavyActivationPhase('ready'));
+    }
     tracker.endMark?.();
     console.warn('[Perf:PanePrewarm] phase=complete tab=' + tabId.slice(-12)
       + ' pane=' + paneIndex
@@ -447,8 +448,19 @@ export default function SplitPaneSurface({
   }, [maybeAdvanceAdmission, paneIndex, reconcileAdmissionTracker, tabId]);
 
   const handleHistoryInitialSourceSignal = useCallback((signal: HistoryInitialSourceSignal) => {
+    if (signal.phase === 'load' && signal.status === 'deferred') {
+      const tracker = reconcileAdmissionTracker('history-deferred');
+      if (tracker?.requirements.has('history:load')
+        && panePrewarmSignalMatches(prewarmConfigRef.current, 'history:load', signal.ownerKey)) {
+        // Nothing was read. Retire only this background admission; keeping
+        // the heavy phase unchanged prevents a hidden Timeline cold load.
+        // The ordinary foreground wake still admits both visible surfaces.
+        completeAdmission('history-load-deferred', false);
+      }
+      return;
+    }
     settleAdmissionRequirement('history:' + signal.phase, signal.ownerKey, signal.status);
-  }, [settleAdmissionRequirement]);
+  }, [settleAdmissionRequirement, reconcileAdmissionTracker, completeAdmission]);
 
   const handleTimelineInitialSourceSignal = useCallback((signal: TimelineInitialSourceSignal) => {
     settleAdmissionRequirement('timeline:' + signal.phase, signal.ownerKey, signal.status);
@@ -483,7 +495,18 @@ export default function SplitPaneSurface({
       timeout: null as number | null,
     };
     tracker.timeout = window.setTimeout(() => {
-      if (admissionTrackerRef.current === tracker) completeAdmission('component-timeout');
+      if (admissionTrackerRef.current !== tracker) return;
+      tracker.timeout = null;
+      // The request may still be queued or executing. Releasing here also
+      // woke Timeline and admitted another pane over that unfinished work.
+      // Preserve the source signals and foreground promotion; only report
+      // this deadline, without declaring readiness or ending its lease.
+      tracker.lease.reportOverdue('component-timeout');
+      console.warn('[Perf:PanePrewarm] phase=overdue tab=' + tabId.slice(-12)
+        + ' pane=' + paneIndex
+        + ' reason=component-timeout'
+        + ' pending=' + Math.max(0, tracker.requirements.size - tracker.settled.size)
+        + ' durMs=' + (performance.now() - tracker.startedAt).toFixed(1));
     }, 55_000);
     admissionTrackerRef.current = tracker;
     surfacesAwakeRef.current = true;
@@ -897,7 +920,6 @@ export default function SplitPaneSurface({
             initialPresented={historySurfacePresented}
             isOpen
             toolType={timelineToolType}
-            pinned={timelinePinned}
             historySurfaceVisible={historySelected}
             backgroundPrewarmAdmitted={renderedHeavyActivationPhase === 'timeline' && !historySurfacePresented}
             onInitialSourceSignal={handleTimelineInitialSourceSignal}

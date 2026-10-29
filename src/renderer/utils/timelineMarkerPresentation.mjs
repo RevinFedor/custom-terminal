@@ -1,5 +1,6 @@
 import { getAutomaticContinuationKind, getTerminalMcpTag, isSystemPromptEntry } from '../../shared/prompt-origin.mjs';
 import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
+export {timelineAutomaticGroupKind} from '../../shared/timeline-entry-facts.mjs';
 
 const isScResearchTag = tag => tag?.kind === 'orchestration' && tag.runKind === 'external-research'
   && typeof tag.runId === 'string' && !!tag.runId.trim();
@@ -16,11 +17,6 @@ export function timelineMarkerKind(entry, fingerprint) {
 
 /** SC Desktop owns a standalone source point, even next to other SC results.
  * It also breaks a run of MCP entries: grouping must not bridge across it. */
-export function timelineAutomaticGroupKind(entry) {
-  const tag = getTerminalMcpTag(entry);
-  if (tag) return isScResearchTag(tag) ? null : 'orchestration';
-  return entry?.isSubAgent || entry?.isSubAgentTimeout ? 'subagent' : null;
-}
 
 export function collectTimelineDocs(entries) {
   const edited = new Set();

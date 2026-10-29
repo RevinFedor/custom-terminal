@@ -16,6 +16,7 @@ import {projectPaneStripRowPlacement,samePaneStripRowPlacement} from '../../shar
 import {projectPaneStripLayoutRows} from '../../shared/pane-strip-row-layout.cjs';
 import {preparePaneStripGroupColor,applyPaneStripGatherPublication,readPaneStripGroupState,readPaneStripActiveGroups} from '../utils/paneStripGroupsModel.mjs';
 import {commitPaneStripGroupPresentation} from '../utils/paneStripGroupPresentationCommit.mjs';
+import {commitPaneStripGroupAdd} from '../utils/paneStripGroupAddCommit.mjs';
 import {classifyPaneStripColorSelection,normalizeStripGroupColor} from '../utils/paneStripSelectionModel.mjs';
 import {createWorkflowGroupClient,newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
 import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
@@ -92,6 +93,7 @@ import {
   reorderPaneTab,
   replacePaneShownTab,
   dropTabFromAllPaneStrips,
+  dropClosedTabPlacements,
   paneIndexHoldingTab,
   reprojectPaneTabs,
   insertIntoStrip,
@@ -1943,8 +1945,9 @@ interface WorkspaceStore {
   bootstrapOrganization: (options?: {fresh?: boolean;savedSession?:any}) => Promise<void>;
   commitOrganization: (diagnostic?:{gestureId:string}) => Promise<any>;
   commitPaneStripGroupColor: (lease:any,color:string) => Promise<any>;
+  commitPaneStripGroupAdd: (lease:any,groupId:string) => Promise<any>;
   settlePaneStripGroupPresentation: () => Promise<void> | null;
-  commitPaneStripGroupPresentation: (lease:any,groupId:string,options:{collapsed?:boolean;order?:string[];representative?:string;selectedTabId?:string;selectionReady?:Promise<boolean>}) => Promise<any>;
+  commitPaneStripGroupPresentation: (lease:any,groupId:string,options:{collapsed?:boolean;order?:string[];representative?:string;selectedTabId?:string;selectionReady?:Promise<boolean>;ungroup?:boolean}) => Promise<any>;
   commitWorkflowDrag: (request:any, options?:{isCurrent?:()=>boolean;isSourceCurrent?:()=>boolean;isRevealCurrent?:()=>boolean}) => Promise<boolean>;
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
@@ -2621,6 +2624,40 @@ const tabIdsOfPanesInLayout = (layout: any): Set<string> => {
   return ids;
 };
 
+// Main retains archived subjects/membership and may retain their old workflow
+// layout. Only an explicit archived row authorizes presentation cleanup: missing
+// or unresolved catalog entries are not proof of closure. Apply AFTER release
+// publication so its older layout cannot put a confirmed closed chip back.
+const reconcileArchivedWorkspacePlacements = (snapshot: any, state: any, patch: any) => {
+  const closed = (snapshot.tabs || []).filter((row: any) => {
+    if (row.nativeRow?.execution_archived !== 1) return false;
+    const subject = row.executionSubject;
+    const current = state.openProjects.get(subject?.executionNamespace || subject?.projectId)?.tabs.get(row.tabId);
+    // The publication revision does not own a newer restored/replaced runtime
+    // row. An archived read captured before that restore cannot vacate it.
+    if (current?.executionSubject?.version === 2 && (current.executionSubject.subjectId !== subject?.subjectId
+      || current.executionSubject.executionNamespace !== subject?.executionNamespace)) return false;
+    if (Number.isSafeInteger(current?.executionStorageRevision)
+      && Number.isSafeInteger(row.nativeRow.execution_storage_revision)
+      && current.executionStorageRevision > row.nativeRow.execution_storage_revision) return false;
+    return true;
+  }).map((row: any) => row.tabId);
+  if (!closed.length) return patch;
+  const combined = {...state, ...patch};
+  const cleaned = dropClosedTabPlacements(combined, closed);
+  if (cleaned === combined) return patch;
+  console.log('[Split] archived-placement-purge closed=' + closed.length
+    + ' live=' + (cleaned.splitPanes !== combined.splitPanes ? 1 : 0)
+    + ' snapshots=' + (cleaned.spaces !== combined.spaces ? 1 : 0)
+    + ' publication=' + snapshot.publication.revision);
+  return {...patch,
+    ...(cleaned.splitPanes !== combined.splitPanes ? {splitPanes: cleaned.splitPanes,
+      splitFocusedIndex: cleaned.splitFocusedIndex, splitSizes: cleaned.splitSizes} : {}),
+    ...(cleaned.centerStrips !== combined.centerStrips ? {centerStrips: cleaned.centerStrips} : {}),
+    ...(cleaned.activeSpaceTab !== combined.activeSpaceTab ? {activeSpaceTab: cleaned.activeSpaceTab} : {}),
+    ...(cleaned.spaces !== combined.spaces ? {spaces: cleaned.spaces} : {})};
+};
+
 export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   const set: typeof baseSet = ((partial: any, replace?: boolean) => {
     (baseSet as any)((state: WorkspaceStore) => {
@@ -3096,9 +3133,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     const ordered = reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId);
     const spaces = inbox && !ordered.some(space => space.id === inbox.id) ? [...ordered,inbox] : ordered;
     // A catalog refresh cannot replace a local layout or steal focus.
-    const pairPublication=applyPaneStripReleasePublication(state,{spaces:adoptPaneStripColorGroups(spaces,projection.spaces)},projection.spaces,snapshot.publication,projection.tabCatalog);
-    set({openProjects,...pairPublication,organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
-      globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
+    const pairPublication=applyPaneStripReleasePublication(state,{spaces:adoptPaneStripColorGroups(spaces,projection.spaces)},projection.spaces,snapshot.publication,projection.tabCatalog,undefined,projection.tabWorkflowMembership);
+    set(reconcileArchivedWorkspacePlacements(snapshot,state,{openProjects,...pairPublication,organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
+      globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation}));
   },
   activeTabNavigationIntent:null,
   navigationKey:null,
@@ -3138,10 +3175,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       sidebarOpen:false,openFilePath:null,sidebarExpandedDirs:null,sidebarScrollTop:0,tabListScrollTop:0,currentView:'terminal',viewingSubAgentTabId:null});
     const projection = organizationProjection(snapshot,get());
     const released=restorePaneStripReleasedPairs({...get(),...projection},options?.savedSession);
-    set({...projection,pendingTabWorkflowMembership:{},...released,openProjects,
+    set(reconcileArchivedWorkspacePlacements(snapshot,get(),{...projection,pendingTabWorkflowMembership:{},...released,openProjects,
       activeProjectId:projection.activeProjectId || GLOBAL_EXECUTION_NAMESPACE,
       focusedProjectId:projection.focusedProjectId || projection.activeProjectId || GLOBAL_EXECUTION_NAMESPACE,
-      runAfterWorkflowScopeVersions:get().runAfterWorkflowScopeVersions || {}});
+      runAfterWorkflowScopeVersions:get().runAfterWorkflowScopeVersions || {}}));
     // Migration publishes policy in the SAME Main generation. A policy that
     // hydrated earlier must adopt those preserved eligibility exceptions.
     const raw = await ipcRenderer.invoke('app:getState','globalAutoCompact');
@@ -3163,6 +3200,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
   commitPaneStripGroupPresentation: (lease,groupId,options) => commitPaneStripGroupPresentation({getState:get,
     committer:organizationCommitter,lease,groupId,...options}),
+
+  commitPaneStripGroupAdd: (lease,groupId) => commitPaneStripGroupAdd({getState:get,
+    committer:organizationCommitter,lease,groupId}),
 
   commitPaneStripGroupColor: async (lease,color) => {
     const initial=get(),before=readPaneStripGroupState(initial,lease.workflowId);
@@ -3267,11 +3307,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           layout:applyWorkflowDragLayout(currentLayout,change,{reveal})};
       });
       const live=byId.has(state.activeSpaceId)?spaces.find(space=>space.id===state.activeSpaceId)?.layout:{};
-      const pairPublication=applyPaneStripReleasePublication(state,{spaces,...live},projection.spaces,snapshot.publication,projection.tabCatalog,frozen);
+      const pairPublication=applyPaneStripReleasePublication(state,{spaces,...live},projection.spaces,snapshot.publication,projection.tabCatalog,frozen,projection.tabWorkflowMembership);
       presentation?.applying();
-      set({openProjects,...pairPublication,globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
+      set(reconcileArchivedWorkspacePlacements(snapshot,state,{openProjects,...pairPublication,globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
         tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
-        organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
+        organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation}));
       if(frozen.destinationKind==='window' && state.activeSpaceId===frozen.targetWorkflowId
         && reveal) {
         const shown=get().activeSpaceTab;
@@ -7203,6 +7243,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
     }
 
+    // The close ACK owns these IDs only before the next await. Include the
+    // active saved-space snapshot as well as dormant layouts, then schedule
+    // persistence through the existing organization queue/CAS. A later restore
+    // must not be purged by this close's post-orchestration continuation.
+    const placementState = get();
+    const placementAfterClose = dropClosedTabPlacements(placementState, closedIds);
+    if (placementAfterClose !== placementState) set({
+      splitPanes: placementAfterClose.splitPanes, splitFocusedIndex: placementAfterClose.splitFocusedIndex,
+      splitSizes: placementAfterClose.splitSizes, centerStrips: placementAfterClose.centerStrips,
+      activeSpaceTab: placementAfterClose.activeSpaceTab, spaces: placementAfterClose.spaces,
+    });
+    get().saveSession();
+
     // Use startTransition to prevent UI blocking
     startTransition(() => {
       set({ openProjects: new Map(get().openProjects) });
@@ -10506,15 +10559,15 @@ const organizationCommitter = createOrganizationCommitter({
       }
       const gathered=applyPaneStripGatherPublication(state,
         adoptPaneStripColorGroups(reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId),projection.spaces),projection.spaces,request);
-      const groupPublication=applyPaneStripReleasePublication(state,gathered,projection.spaces,snapshot.publication,projection.tabCatalog,request);
+      const groupPublication=applyPaneStripReleasePublication(state,gathered,projection.spaces,snapshot.publication,projection.tabCatalog,request,projection.tabWorkflowMembership);
       mark('projectionEndAbs');
       mark('setStartAbs');
-      useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,...groupPublication,
+      useWorkspaceStore.setState(reconcileArchivedWorkspacePlacements(snapshot,state,{tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,...groupPublication,
         organizationWorkflowOrder:projection.organizationWorkflowOrder,
         organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
         globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
         pendingTabWorkflowMembership:pending,organizationError:result?.deferredStripReleases?.length
-          ?'workflow_strip_groups_release_unreconciled':null});
+          ?'workflow_strip_groups_release_unreconciled':null}));
       mark('setEndAbs');
       if(timing)try {if(Array.isArray(snapshot.workflows))timing.workflowCount=snapshot.workflows.length;
         if(Array.isArray(snapshot.tabs))timing.catalogCount=snapshot.tabs.length;}catch{timing.timingUnavailable++;}

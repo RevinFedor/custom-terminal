@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
-const { captureIncidentProfile } = require('./perf-incident-profile');
+const { captureIncidentProfile, deadline } = require('./perf-incident-profile');
 
 function fixture(t, options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-profile-test-'));
@@ -13,12 +13,16 @@ function fixture(t, options = {}) {
   const calls = [], commands = [], dbg = new EventEmitter();
   let attached = !!options.attached;
   let reads = 0;
+  let resolveCpuStart = null;
   dbg.isAttached = () => attached;
   dbg.attach = () => { calls.push('attach'); attached = true; };
   dbg.detach = () => { calls.push('detach'); attached = false; dbg.emit('detach', {}, 'target closed'); };
   dbg.sendCommand = async (method, params) => {
     calls.push(method);
     commands.push({ method, params });
+    if (method === 'Profiler.enable' && options.cpuEnableFailed) throw new Error('CPU profiler unavailable');
+    if (method === 'Profiler.start' && options.cpuStartFailed) throw new Error('Profiler.start:timeout');
+    if (method === 'Profiler.start' && options.cpuStartPending) return new Promise(resolve => { resolveCpuStart = resolve; });
     if (method === 'Tracing.start' && options.traceBusy) throw new Error('Tracing already started');
     if (method === 'Profiler.start' && options.loseOwnership) {
       dbg.emit('detach', {}, 'replaced-with-devtools'); attached = true; // now somebody else's connection
@@ -28,6 +32,7 @@ function fixture(t, options = {}) {
     }
     if (method === 'Tracing.end') dbg.emit('message', {}, 'Tracing.tracingComplete', { stream: 's', dataLossOccurred: false });
     if (method === 'Profiler.stop') {
+      resolveCpuStart?.(); resolveCpuStart = null;
       if (options.stopFailed) throw new Error('stop-failed');
       return { profile: { nodes: [], samples: [] } };
     }
@@ -117,6 +122,61 @@ test('unconfirmed CPU stop records an explicit UI skip', async t => {
   const ui = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.ui.json')));
   assert.equal(ui.status, 'skipped'); assert.equal(ui.reason, 'capture-stop-unconfirmed');
   assert.ok(!f.calls.includes('Runtime.evaluate')); assert.equal(f.calls.filter(x => x === 'detach').length, 1);
+});
+
+test('failed CPU start is stopped once before independent native trace collection', async t => {
+  const f = fixture(t, { cpuStartFailed: true });
+  await captureIncidentProfile(f);
+  assert.equal(f.calls.filter(x => x === 'Profiler.start').length, 1);
+  assert.equal(f.calls.filter(x => x === 'Profiler.stop').length, 1);
+  assert.ok(f.calls.indexOf('Profiler.stop') < f.calls.indexOf('Tracing.start'));
+  const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.equal(status.rendererSetupFailed, true); assert.equal(status.rendererPid, 12);
+  assert.equal(status.traceComplete, true); assert.ok(status.errors.includes('Profiler.start:timeout'));
+  assert.equal(status.rendererStartedWallMs, undefined, 'unknown start time must remain unknown');
+  const ui = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.ui.json')));
+  assert.equal(ui.trace.roots[0].backendNodeId, 753);
+  assert.ok(ui.startedWallMs >= status.rendererStoppedWallMs && ui.startedWallMs >= status.traceStoppedWallMs);
+});
+
+test('unsupported CPU profiler does not prevent the independent native trace', async t => {
+  const f = fixture(t, { cpuEnableFailed: true });
+  await captureIncidentProfile(f);
+  assert.ok(!f.calls.includes('Profiler.start')); assert.ok(!f.calls.includes('Profiler.stop'));
+  assert.equal(f.calls.filter(x => x === 'Tracing.start').length, 1);
+  const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.equal(status.traceComplete, true); assert.equal(status.rendererSetupFailed, true);
+});
+
+test('failed cleanup after a CPU start error forbids trace and UI metadata without replay', async t => {
+  const f = fixture(t, { cpuStartFailed: true, stopFailed: true });
+  await captureIncidentProfile(f);
+  assert.equal(f.calls.filter(x => x === 'Profiler.stop').length, 1);
+  assert.ok(!f.calls.includes('Tracing.start')); assert.ok(!f.calls.includes('Runtime.evaluate'));
+  const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.equal(status.traceSkipped, 'renderer-cpu-stop-unconfirmed');
+});
+
+test('late original CPU start settles through one stop before native trace; no start replay or deadline renewal', async t => {
+  const f = fixture(t, { cpuStartPending: true });
+  let startSettled = false, timedOut = 0;
+  f.commandDeadline = (promise, label, ms) => {
+    if (label === 'Profiler.start') {
+      promise.then(() => { startSettled = true; }, () => {});
+      timedOut++;
+      return Promise.reject(new Error('Profiler.start:timeout'));
+    }
+    return deadline(promise, label, ms);
+  };
+  await captureIncidentProfile(f);
+  assert.equal(timedOut, 1); assert.equal(startSettled, true);
+  assert.equal(f.calls.filter(x => x === 'Profiler.start').length, 1);
+  assert.equal(f.calls.filter(x => x === 'Profiler.stop').length, 1);
+  assert.ok(f.calls.indexOf('Profiler.stop') < f.calls.indexOf('Tracing.start'));
+  const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.equal(status.traceComplete, true); assert.equal(status.intendedDurationMs, 0);
+  assert.ok(status.rendererStoppedWallMs <= status.traceStartedWallMs);
+  assert.equal(status.rendererStartedWallMs, undefined);
 });
 test('DevTools replacement during metadata forbids group release and detach through the new owner', async t => {
   const f = fixture(t, { loseDuringUi: true });

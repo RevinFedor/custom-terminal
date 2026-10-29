@@ -28,7 +28,7 @@ VSCode-style полоса по всей нижней границе окна (п
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
-| `H` / `T` pin split | `History pin` (`Cmd+]` / `Option+]`) и `Timeline pin` (`Cmd+\` / `Option+\`) независимо выбирают overlay vs reserved layout для двух разных правых поверхностей | SQLite `app:setState(historyPinned/timelinePinned)` + localStorage boot mirror |
+| History pin | Для боковой History (`Cmd+]` / `Option+]`) выбирает overlay или колонку. Timeline (`Cmd+\\` / `Option+\\`) всегда overlay; отдельного Timeline pin нет | SQLite `app:setState(historyPinned)` + localStorage boot mirror |
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
@@ -41,9 +41,9 @@ Usage-popover: скрытие провайдера убирает одновре
 
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
 
-**History/Timeline pin split.** Раньше один pin смешивал две разные поверхности: HistoryPanel (`Cmd+]` / `Option+]`) и expanded Timeline (`Cmd+\` / `Option+\`). Это разные жесты и разные layout-риски: пользователь может хотеть держать History обычной колонкой, но Timeline оставлять overlay поверх терминала для быстрого скана, или наоборот. Поэтому StatusBar показывает две соседние половины с независимым active state. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы существующим пользователям не сломать привычную pinned-историю после обновления; дальше значения живут отдельно.
+**Независимый History pin; Timeline всегда overlay.** SOURCE27.10 по решению Fedor переключатель Timeline удалён, в StatusBar осталась только кнопка History. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы сохранить прежний режим боковой History. Это read-only migration seed: сохранённое старое значение и поздний hydrate не возвращают Timeline колонку.
 
-Для Timeline pin есть отдельный event-boundary: wrapper `H/T` имеет `data-history-timeline-pin-toggle`, и Workspace outside-click handler expanded Timeline его пропускает. Иначе клик по `T` сначала свернул бы unpinned overlay на `mousedown`, а `click` уже закреплял бы пустое состояние; пользователь не мог бы превратить «просто открыт» в pinned layout одним жестом. См. [`fact-timeline.md::Expanded mode`](fact-timeline.md).
+History-кнопка имеет `data-history-pin-toggle`; outside-click handler раскрытого Timeline считает её внутренним действием и сохраняет открытый Timeline при переключении History pin. Клик в обычную область Workspace возвращает Timeline в rail. См. [Expanded mode](fact-timeline.md#expanded-mode-chippreview).
 
 ## MCP Activity chip
 

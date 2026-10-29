@@ -12,6 +12,7 @@ const { createOrchestrationContinuationService } = require('./orchestration-cont
 const { OrchestrationRunStore } = require('./orchestration-runs');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
+const { TabMessageService } = require('./tab-messages');
 const copy = value => JSON.parse(JSON.stringify(value));
 
 async function fixture(t, options = {}) {
@@ -25,6 +26,7 @@ async function fixture(t, options = {}) {
   const outgoing = [{ runId: 'external-last', runKind: 'external-research', sourceTabId: 'worker', targetTabId: null,
     createdAt: 77, sourceSendTarget: { toolType: 'codex', sessionId: old.sessionId }, externalResearchJobId: 'same-SC-job', status: 'running' }];
   if (options.manual) outgoing.push({ ...outgoing[0], runId: 'external-first', externalResearchJobId: 'same-first-job' });
+  if (options.sharedMessage) outgoing.length = 0;
   let operation, saved = null;
   let state = { known: true, exists: true, toolType: 'codex', sessionId: 'B', acceptedResumeSourceSessionId: old.sessionId,
     cwd: index.root, busy: false, transitioning: false, processStatus: 'found', revision: 'callback-final', backgroundWorkCount: 0 };
@@ -57,6 +59,27 @@ async function fixture(t, options = {}) {
       auditTimestamp: new Date(2000).toISOString(), transcriptBoundary: { byteOffset: 1 }, queuedAtSubmit: false }).promoted, true);
     return identity;
   }
+  const messages = new TabMessageService({ db,
+    cancelDelivery: () => ({ ok: true }),
+    resolveTab: async id => ({ tabId: id, projectId: 'project', provider: 'codex',
+      sessionId: id === 'worker' ? old.sessionId : 'parent-S', cwd: index.root }),
+    send: async message => {
+      if (message.kind === 'reply') {
+        require('node:fs').writeFileSync(index.file, require('./fixtures/build-continue-index.cjs').encode(turn('callback', message.prompt)));
+        const result = await index.latest();
+        recordInput({ tabId: 'worker', provider: 'codex', prompt: message.prompt,
+          expectedTarget: { toolType: 'codex', sessionId: old.sessionId }, handoffId: message.handoffId,
+          source: 'tab-message:' + message.messageId, sendOperationKey: message.operationKey }, result);
+      }
+      return { state: 'confirmed' }; // Controlled native leaf; SQL/receipt/parser owners are actual.
+    },
+  });
+  await messages.initialize();
+  const sharedIds = [];
+  if (options.sharedMessage) for (let i = 0; i < 2; i++) {
+    sharedIds.push((await messages.sendMessage({ source: 'worker', target: 'parent', text: 'Q' + i, requestId: 'Q' + i })).message.messageId);
+    while (messages.lanes.size) await Promise.all([...messages.lanes.values()]);
+  }
   const sent = [], next = { provider: 'codex', sessionId: 'B', turnId: 'own-continued', generation: 3, processId: null, startedAt: 3000 };
   const send = async request => {
     await request.prepareSend(); sent.push(request);
@@ -74,7 +97,8 @@ async function fixture(t, options = {}) {
   };
   const readLatest = async () => {
     const result = await index.latest(); latest.subject.targetExecutionContext = result.executionContext;
-    latest.result = { ...result, found: result.success === true }; return latest;
+    latest.result = { ...result, found: result.success === true,
+      ...(controls.latestUnverified ? { sourceVerified: false } : {}) }; return latest;
   };
   const continuation = createOrchestrationContinuationService({ store, receipts, now: () => 2000,
     readState: async id => id === 'parent' ? { ...state, sessionId: 'parent-S', busy: false, revision: 'parent' } : copy(state),
@@ -85,6 +109,7 @@ async function fixture(t, options = {}) {
   const make = pid => createBuildContinueOperations({ pid, instanceId: 'instance-' + pid, now: () => 1000,
     read: () => saved, write: value => { saved = copy(value); },
     readRuns: async () => [...new Map([...await store.installSnapshot(), ...copy(outgoing)].map(run => [run.runId, run])).values()],
+    readMessages: () => messages.restartReferences(), readMessage: id => messages.restartReference(id),
     captureTabs: () => [{ tabId: 'worker', known: true, toolType: 'codex', sessionId: old.sessionId, cwd: index.root,
       projectId: 'project', busy: true, executionContext: old, subject: { kind: 'codex-execution', toolType: 'codex',
         sessionId: old.sessionId, targetExecutionContext: old } }],
@@ -92,12 +117,22 @@ async function fixture(t, options = {}) {
       targets: [{ tabId: 'worker', provider: 'codex', sessionId: old.sessionId }] }),
     readState: async () => copy(state), readOriginal: async () => original, readLatest,
     readInputInterval: async () => { controls.interval?.(); return index.interval(); },
-    continueRun: id => continuation.continueRequest(id), reconcileRunContinuation: id => continuation.reconcile(id),
+    continueRun: (id, options) => continuation.continueRequest(id, options), reconcileRunContinuation: id => continuation.reconcile(id),
     getRun: async id => outgoing.find(run => run.runId === id) || store.getInternal(id),
     readReceipt: key => { const record = receipts.get(key); if (record && controls.wrongAttempt) record.auditIdentity.attemptId = 'foreign'; return record; },
+    readCallbackExecution: async record => {
+      const context = record.receipt?.auditExecutionContext || null;
+      if (controls.changedProof && ++controls.proofReads % 2 === 0) return { ...context, turnId: 'different-proof' };
+      return context;
+    },
     readQueued: key => queue.item(key), send,
   });
   operation = make(11); await operation.capture('callback-first-restart', 11);
+  if (options.sharedMessage) {
+    await messages.replyToMessage({ responder: 'parent', messageIds: sharedIds, text: 'one common answer', requestId: 'shared-R' });
+    while (messages.lanes.size) await Promise.all([...messages.lanes.values()]);
+    if (options.cancelPrimary) messages.cancelMessage({ tabId: 'worker', messageId: sharedIds[0] });
+  }
   for (const run of outgoing) {
     const first = run.runId === 'external-first';
     const result = first ? await index.reader.loadHistoricalObservedExecution({ ...index.request,
@@ -117,20 +152,42 @@ async function fixture(t, options = {}) {
   }
   if (options.agent) await store.beginRecovery('incoming-own-task', 'interrupted', 'turn_aborted');
   operation.dispose(); operation = make(22);
-  t.after(async () => { operation.dispose(); queue.dispose(); await store.flush(); db.close(); });
+  t.after(async () => { messages.dispose(); operation.dispose(); queue.dispose(); await store.flush(); db.close(); });
   return { index, controls, outgoing, sent, store, receipts, queue, old, latest, next,
     get operation() { return operation; }, get state() { return state; }, set state(value) { state = value; },
     activate: async () => { operation.activate('callback-first-restart'); await operation.reconcile('callback-first-restart'); } };
 }
 
+for (const cancelPrimary of [false, true]) test('audit: captured Q references accept ONE shared Reply after restart; cancel primary=' + cancelPrimary, async t => {
+  const h = await fixture(t, { sharedMessage: true, cancelPrimary });
+  await h.activate();
+  const target = h.operation.get('callback-first-restart').targets[0];
+  assert.equal(h.sent.length, 1, JSON.stringify(target));
+  assert.equal(target.historyProof.covered, true);
+  assert.equal(target.historyProof.inputs.length, 1);
+  assert.match(target.historyProof.inputs[0].operationKey, /^tab-message:/);
+  await h.operation.reconcile('callback-first-restart'); assert.equal(h.sent.length, 1);
+});
+for (const changed of ['wrongAttempt', 'changedProof']) test('audit: shared Reply restart refuses ' + changed + ' facts instead of collapsing their identity', async t => {
+  const h = await fixture(t, { sharedMessage: true });
+  h.controls[changed] = true; h.controls.proofReads = 0;
+  await h.activate(); assert.equal(h.sent.length, 0);
+});
+
 test('own+external: real callback is FIFO first, then ONE continue across exact parent A→child B', async t => {
   const h = await fixture(t); await h.activate();
-  assert.equal(h.sent.length, 1); assert.equal(h.sent[0].prompt, 'continue');
+  assert.equal(h.sent.length, 1); assert.equal(h.sent[0].prompt, require('./build-continue-prompt').RESTART_PROMPT);
   assert.equal(h.sent[0].expectedTarget.sessionId, 'A');
   const callback = h.queue.item('history:worker:orchestration-complete:external-last'), own = h.queue.item(h.sent[0].sendOperationKey);
   assert(callback.id < own.id, 'shared FIFO retains callback before continue');
   assert.equal(h.outgoing[0].externalResearchJobId, 'same-SC-job');
   await h.operation.reconcile('callback-first-restart'); assert.equal(h.sent.length, 1, 'admitted unknown is not replayed');
+});
+
+test('verified complete input interval retains its existing authority when latest reader alone is unverified', async t => {
+  const h = await fixture(t); h.controls.latestUnverified = true; await h.activate();
+  assert.equal(h.sent.length, 1, 'the new positive supersession path must not narrow the existing callback interval path');
+  assert.equal(h.operation.get('callback-first-restart').targets[0].historyProof.covered, true);
 });
 
 for (const kind of ['manual', 'wrongSource', 'gap', 'wrongAttempt', 'replacement-during-read']) test(kind + ' refuses restart continuation after callback', async t => {

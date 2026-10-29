@@ -70,6 +70,19 @@ Incident показал renderer5031 против Main5132 и строку ра�
 read-транзакции для обоих провайдеров; см.
 [`fact-terminal-core.md`](fact-terminal-core.md#единое-наблюдение-ввода-до-записи).
 
+26.10 `/compact`367 — другой подтверждённый случай, не stale-renderer takeover:
+Main отказал до input на коротком unknown-frame probe, а настоящий redraw
+закрылся через7.53s. Bounded raw tail и полный retained mirror journal дали
+156точных пересечений после штатной UUID-раскраски; replay восстановил partial
+экран на flushed12097 и поздний empty на12209. Закрывающий marker не потерян.
+Ремонт соединяет typed pending-frame с уже существующим Main Compact lifetime,
+не объявляет partial/renderer-empty достаточным и не продлевает истёкший intent.
+Проверять путь shared scenario→renderer transport→Main, а не только Main Compact:
+изолированная Main-проверка уже проходила, когда ранний History caller отказывал.
+Поздний draft должен дать0write, Stop/смена owner/expiry запрещают поздний Enter.
+Source/private regression не является повтором исторической команды или
+подтверждением установленного приложения.
+
 ## Проверка
 
 Регрессия merge воспроизвела отказ до правки. После — actual main request

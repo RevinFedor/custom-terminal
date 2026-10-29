@@ -10,16 +10,18 @@ const end = source.indexOf('\n}', begin) + 2;
 const code = source.slice(begin, end) + '\nglobalThis.admit = loopSendAdmission;';
 function fixture() {
   const queue = { loopPromptEnabled: true, loopPromptMode: 'own-turn', loopPromptEpoch: 'E', pendingDelivery: {
-    kind: 'loop', loopPromptMode: 'own-turn', handoffId: 'H', loopEpoch: 'E', loopCause: { provider: 'codex', sessionId: 'S', turnId: 'T' } } };
+    kind: 'loop', loopPromptMode: 'own-turn', handoffId: 'H', loopEpoch: 'E', loopCause: { provider: 'codex', sessionId: 'S', turnId: 'T', inputBoundary: 'input-A' } } };
   const inspection = { known: true, busy: false, transitioning: false, revision: 'R',
-    toolType: 'codex', sessionId: 'S', backgroundWorkCount: 0, goalWork: { pending: false },
+    toolType: 'codex', sessionId: 'S', loopInputBoundary: 'input-A', backgroundWorkCount: 0, goalWork: { pending: false },
     turn: { status: 'completed', turnId: 'T' } };
   const runtime = { status: 'active', inputReady: true };
   const controls = { blocked: false, ready: true, afterRuntime: null, wake: null };
   const runs = [{ runId: 'R', sourceTabId: 'P', targetTabId: 'child', status: 'running' }];
   const context = vm.createContext({ loopEpoch, loopPromptMode, loopRunAdmission, loopExternalWaitAdmission, loopNaturalEvidence: new Map(),
+    acceptedReplyInputPending: () => false, // No message reservations in this mode/runtime baseline.
     readPersistedLoopQueue: () => queue, captureTabInspection: () => ({ ...inspection }),
     getLoopDependencies: () => ({ reconcile: async () => {}, blocks: () => controls.blocked, readyWake: () => controls.wake }),
+    getMessageLoopWaits: () => ({ reconcile: async () => {}, admission: () => true }),
     getOrchestrationRunStore: () => ({ listForTab: async () => runs }),
     coherentPublicRuntimeSnapshot: async () => { controls.afterRuntime?.(); return runtime; },
     readAutomaticSendFrame: () => ({ ready: controls.ready }), agentSendQueue: { notifyRuntime() {} } });

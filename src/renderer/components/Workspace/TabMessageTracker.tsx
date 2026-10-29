@@ -1,14 +1,15 @@
-import { useEffect, useLayoutEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { CSSProperties, RefObject } from 'react';
-import { createPortal } from 'react-dom';
 import { Markdown } from '@noted/claude-blocks';
 import { Check, ChevronRight, CircleAlert, CircleCheck, LoaderCircle, MessageSquare, MessageSquareReply, RotateCcw, SendHorizontal, Timer, X } from 'lucide-react';
 import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
 import { HistoryPromptSource, TabMessageSourceChip } from './TabMessageSourceChip';
-import { tabMessageDelivery, tabMessageDismissed, tabMessagePeer, tabMessageReplyPresentation, tabMessagePresentation, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
+import { tabMessageDelivery, tabMessageDismissed, tabMessagePeer, tabMessageReplyDelivery, tabMessagePresentation, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle } from './RequestTrackerRow';
 import type { MessagePresentation, TabMessage, TabMessageThread } from '../../utils/tabMessageProjection';
 import type { TabMessagesController } from '../../hooks/useTabMessages';
+import { RequestDetailsPopover } from './RequestDetailsPopover';
+import type { RequestPreviewAnchor } from './RequestDetailsPopover';
 
 const { ipcRenderer } = window.require('electron');
 const iconButton: CSSProperties = { width: 23, height: 23, display: 'grid', placeItems: 'center', flexShrink: 0, padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: '#aaa', cursor: 'pointer' };
@@ -16,10 +17,16 @@ const exactText: CSSProperties = { margin: 0, fontFamily: 'inherit', fontSize: 1
 
 function DeliveryIcon({ presentation, header = false }: { presentation: MessagePresentation; header?: boolean }) {
   const Icon = presentation.icon === 'error' ? CircleAlert : presentation.icon === 'delivered' ? header ? CircleCheck : Check : presentation.icon === 'sending' ? LoaderCircle : Timer;
-  return <Icon size={header ? 14 : 11} strokeWidth={header ? 2.2 : 2} style={{ flexShrink: 0, color: presentation.color }} className={presentation.spinning ? 'animate-spin noted-infinite-animation' : undefined} />;
+  const size = header ? 14 : 11;
+  const icon = <Icon size={size} strokeWidth={header ? 2.2 : 2} style={{ flexShrink: 0, color: presentation.color, display: presentation.spinning ? 'block' : undefined }} />;
+  if (!presentation.spinning) return icon;
+  // Like StatusIcon, rotate an HTML host to avoid SVG-driven retained layer rebuilds.
+  return <span className="animate-spin noted-infinite-animation" style={{ display: 'block', width: size, height: size, flexShrink: 0, willChange: 'transform' }}>
+    {icon}
+  </span>;
 }
 
-export type MessageSelection = { messageId: string; anchor: HTMLElement; rect: DOMRect };
+export type MessageSelection = RequestPreviewAnchor & { messageId: string };
 
 export function TabMessageRow({ thread, tabId, onOpen, onDismiss, error, history = false, selected = false }: {
   thread: TabMessageThread; tabId: string; onOpen: (selection: MessageSelection) => void;
@@ -29,12 +36,14 @@ export function TabMessageRow({ thread, tabId, onOpen, onDismiss, error, history
   const presentation = tabMessagePresentation(thread);
   const stages = [
     { id: 'send', label: 'Send', Icon: SendHorizontal, state: tabMessageDelivery(question), hint: 'Вопрос', delivery: question.deliveryState },
-    { id: 'reply', label: 'Reply', Icon: MessageSquareReply, state: tabMessageReplyPresentation(thread), hint: 'Ответ', delivery: thread.reply?.deliveryState || 'waiting' },
+    { id: 'reply', label: 'Reply', Icon: MessageSquareReply, state: tabMessageReplyDelivery(thread), hint: 'Ответ', delivery: thread.reply?.deliveryState || thread.question.loopWait?.replyDeliveryState || 'waiting' },
   ];
   return <div data-tab-message-row={question.messageId} data-tab-message-history-row={history ? question.messageId : undefined}
     style={{ minWidth: 0, height: 48, flexShrink: 0, borderBottom: '1px solid #303030', boxSizing: 'border-box' }}>
     <RequestTrackerRow actions={onDismiss && !tabMessageDismissed(question, tabId) && <button type="button" data-tab-message-dismiss={question.messageId}
-      aria-label="Отменить переписку" title={error || 'Остановить дальнейшую доставку и ожидание ответа. Уже переданная часть может быть получена; History сохраняется.'}
+      aria-label="Скрыть переписку" title={error || (thread.incoming
+        ? 'Скрыть у себя. Доставка и ожидание отправителя сохраняются.'
+        : 'Скрыть и больше не ждать. Поздний ответ будет доставлен и сохранён в истории.')}
       onClick={() => onDismiss(question.messageId)} style={{ ...requestRowActionStyle, color: error ? '#f87171' : '#999' }}>
       {error ? <CircleAlert size={13} /> : <X size={13} />}
     </button>}>
@@ -89,7 +98,9 @@ function MessageBody({ message, label, onNavigate }: { message: TabMessage; labe
       <details style={{ marginTop: 8, fontSize: 9, color: '#999', overflowWrap: 'anywhere' }}>
         <summary style={{ cursor: 'pointer' }}>Источник и ID</summary>
         <dl style={{ display: 'grid', gridTemplateColumns: '82px minmax(0, 1fr)', gap: '4px 6px', margin: '6px 0 0' }}>
-          {Object.entries({ messageId: message.messageId, replyTo: message.replyTo, sourceTabId: message.sourceTabId, sourceSessionId: message.sourceSessionId, targetTabId: message.targetTabId, targetSessionId: message.targetSessionId, createdAt: message.createdAt }).map(([key, value]) => (
+          {Object.entries({ messageId: message.messageId, replyTo: message.replyTo,
+            ...(message.replyToIds?.length ? { replyToIds: message.replyToIds.join(', ') } : {}),
+            sourceTabId: message.sourceTabId, sourceSessionId: message.sourceSessionId, targetTabId: message.targetTabId, targetSessionId: message.targetSessionId, createdAt: message.createdAt }).map(([key, value]) => (
             <div key={key} style={{ display: 'contents' }}><dt>{key}</dt><dd style={{ margin: 0, fontFamily: 'monospace' }}>{value == null ? '-' : String(value)}</dd></div>
           ))}
         </dl>
@@ -118,7 +129,6 @@ export function TabMessagePreview({ selection, thread, controller, onClose, prev
   selection: MessageSelection; thread: TabMessageThread; controller: TabMessagesController; onClose: () => void;
   previewRef: RefObject<HTMLElement | null>;
 }) {
-  const [position, setPosition] = useState({ left: 8, top: 8 });
   const [reading, setReading] = useState(false);
   const [readError, setReadError] = useState('');
   const [retry, setRetry] = useState(0);
@@ -131,7 +141,8 @@ export function TabMessagePreview({ selection, thread, controller, onClose, prev
     setReadError('');
     void ipcRenderer.invoke('tab-messages:get', { messageId }).then((result: { message: TabMessage; reply?: TabMessage | null }) => {
       if (result?.message?.messageId !== messageId || result.message.kind !== 'question') throw new Error('Вопрос не найден');
-      if (result.reply && (result.reply.kind !== 'reply' || result.reply.replyTo !== messageId)) throw new Error('Ответ относится к другому вопросу');
+      if (result.reply && (result.reply.kind !== 'reply'
+        || !(result.reply.replyToIds || [result.reply.replyTo]).includes(messageId))) throw new Error('Ответ относится к другому вопросу');
       if (typeof result.message.text !== 'string' || (result.reply && typeof result.reply.text !== 'string')) throw new Error('Полный текст сообщения недоступен');
       if (alive) merge([result.message, ...(result.reply ? [result.reply] : [])]);
     }).catch((error: unknown) => {
@@ -140,52 +151,13 @@ export function TabMessagePreview({ selection, thread, controller, onClose, prev
     return () => { alive = false; };
   }, [messageId, replyId, thread.question.answeredAt, retry, merge]);
 
-  useLayoutEffect(() => {
-    const reposition = () => {
-      const target = anchor.isConnected ? anchor.getBoundingClientRect() : rect;
-      const parent = anchor.closest('[data-orchestration-history-panel]')?.getBoundingClientRect() || target;
-      const preview = previewRef.current?.getBoundingClientRect();
-      if (!preview) return;
-      const left = parent.left >= preview.width + 14 ? parent.left - preview.width - 6 : parent.right + 6;
-      setPosition({ left: Math.max(8, Math.min(left, window.innerWidth - preview.width - 8)), top: Math.max(8, Math.min(target.top, window.innerHeight - preview.height - 8)) });
-    };
-    reposition();
-    const observer = new ResizeObserver(reposition);
-    if (previewRef.current) observer.observe(previewRef.current);
-    window.addEventListener('resize', reposition);
-    window.addEventListener('scroll', reposition, true);
-    return () => { observer.disconnect(); window.removeEventListener('resize', reposition); window.removeEventListener('scroll', reposition, true); };
-  }, [anchor, rect, previewRef]);
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !event.defaultPrevented) {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-      }
-    };
-    const onMouseDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!anchor.contains(target) && !previewRef.current?.contains(target)) onClose();
-    };
-    document.addEventListener('keydown', onKeyDown);
-    document.addEventListener('mousedown', onMouseDown);
-    return () => { document.removeEventListener('keydown', onKeyDown); document.removeEventListener('mousedown', onMouseDown); };
-  }, [anchor, onClose, previewRef]);
-
-  return createPortal(<aside ref={previewRef} id={'tab-message-preview-' + messageId} data-tab-message-preview={messageId} role="dialog" aria-label="Вопрос и ответ"
-    onMouseDown={event => event.stopPropagation()} onClick={event => event.stopPropagation()}
-    style={{ position: 'fixed', ...position, zIndex: 220, width: 310, maxWidth: 'calc(100vw - 16px)', maxHeight: 'min(520px, calc(100vh - 16px))', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#151515', color: '#d4d4d4', border: '1px solid #444', borderRadius: 6, boxShadow: '0 10px 28px rgba(0,0,0,0.44)', pointerEvents: 'auto' }}>
+  return <RequestDetailsPopover anchor={anchor} rect={rect} previewRef={previewRef} onClose={onClose}
+    id={'tab-message-preview-' + messageId} attributes={{ 'data-tab-message-preview': messageId }}
+    title="Вопрос и ответ" icon={<MessageSquare size={13} color="#93c5fd" />} closeLabel="Закрыть вопрос и ответ">
     <style>{'[data-tab-message-body][open] > summary .tab-message-disclosure { transform: rotate(90deg); }'}</style>
-    <div style={{ display: 'flex', alignItems: 'center', padding: '4px 6px 4px 10px', gap: 6, flexShrink: 0 }}>
-      <MessageSquare size={13} color="#93c5fd" /><strong style={{ flex: 1, fontSize: 11 }}>Вопрос и ответ</strong>
-      <button type="button" aria-label="Закрыть вопрос и ответ" title="Закрыть" onClick={onClose} style={iconButton}><X size={14} /></button>
-    </div>
-    <div className="scrollbar-thin" style={{ overflowY: 'auto', minHeight: 0 }}>
       {reading && <div role="status" style={{ padding: '4px 10px', fontSize: 10, color: '#999' }}>Загрузка текста...</div>}
       {readError && <div role="alert" style={{ ...exactText, display: 'flex', alignItems: 'center', padding: '4px 10px', gap: 5, color: '#fca5a5' }}><span style={{ flex: 1 }}>{readError}</span><button type="button" aria-label="Повторить загрузку текста" title="Повторить загрузку текста" onClick={() => setRetry(n => n + 1)} style={iconButton}><RotateCcw size={12} /></button></div>}
       <MessageBody key={thread.question.messageId} message={thread.question} label="Вопрос" onNavigate={onClose} />
       {thread.reply ? <MessageBody key={thread.reply.messageId} message={thread.reply} label="Ответ" onNavigate={onClose} /> : <div style={{ padding: '8px 10px', fontSize: 11, color: '#999', borderTop: '1px solid #303030' }}>{thread.answerAvailable ? 'Ответ сохранён; доставка уточняется' : 'Ответа пока нет'}</div>}
-    </div>
-  </aside>, document.body);
+  </RequestDetailsPopover>;
 }

@@ -28,8 +28,11 @@ function harness(invoke) {
 const event = () => ({ stopPropagation() {} });
 test('arrow and browser icons invoke separate exact-run channels without disclosure', async () => {
   const h = harness(() => ({ success: true, jobId: 'job', tabId: 7 }));
-  const desktop = h.Component({ runId: 'run', iconOnly: true });
-  const browser = h.Component({ runId: 'run', iconOnly: true, destination: 'browser' });
+  const buttonStyle = { width: 24, height: 24, padding: 0 };
+  const desktop = h.Component({ runId: 'run', iconOnly: true, buttonStyle });
+  const browser = h.Component({ runId: 'run', iconOnly: true, destination: 'browser', buttonStyle });
+  assert.equal(desktop.props.style, buttonStyle);
+  assert.equal(browser.props.style, buttonStyle);
   assert.match(renderToStaticMarkup(desktop), /lucide-arrow-up-right/);
   assert.match(renderToStaticMarkup(browser), /lucide-globe/);
   assert.equal(browser.props.title, 'Открыть разговор в браузере');

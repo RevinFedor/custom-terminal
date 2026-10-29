@@ -83,19 +83,31 @@ test('unmount/failure releases and stale lease cannot release the next job', () 
   assert.equal(admission.activeKey(), null);
 });
 
-test('timeout boundedly releases a job that never reports completion', () => {
+test('timeout reports unfinished work without admitting another hidden job', () => {
   const idle = scheduler();
   let timeoutCallback = null;
   const starts = [];
+  const leases = [];
+  const events = [];
   const admission = createDormantSurfaceAdmissionQueue({
     schedule: idle.schedule,
     setTimer: (callback) => { timeoutCallback = callback; return 7; },
     clearTimer: () => {},
+    onTransition: event => events.push(event),
   });
-  admission.enqueue('a', () => starts.push('a'));
-  admission.enqueue('b', () => starts.push('b'));
+  admission.enqueue('a', lease => { starts.push('a'); leases.push(lease); });
+  admission.enqueue('b', lease => { starts.push('b'); leases.push(lease); });
   idle.flushOne();
   timeoutCallback();
   idle.flushOne();
+  assert.deepEqual(starts, ['a']);
+  assert.equal(admission.activeKey(), 'a');
+  assert.equal(events.filter(event => event.phase === 'overdue').length, 1);
+  assert.equal(leases[0].reportOverdue('component-timeout'), false, 'deadline is reported once');
+  assert.equal(leases[0].complete('late-source-settled'), true);
+  idle.flushOne();
   assert.deepEqual(starts, ['a', 'b']);
+  assert.equal(leases[0].complete('stale-settled'), false);
+  assert.equal(leases[0].reportOverdue('stale-timeout'), false);
+  assert.equal(admission.activeKey(), 'b');
 });

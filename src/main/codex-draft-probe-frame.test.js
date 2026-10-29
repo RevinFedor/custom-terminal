@@ -65,7 +65,7 @@ for (const frameBlocker of ['synchronized-output-open', 'frame-not-flushed', 'po
     assert.equal(state.observation.status, 'expired');
     assert.equal(state.frameBlocker, frameBlocker);
     assert.equal(h.incidents.length, 1);
-    assert.equal(h.incidents[0].key, 'draft-frame:T:pty-a:' + frameBlocker);
+    assert.equal(h.incidents[0].key, 'draft-frame:T:pty-a:' + frameBlocker + ':-');
     assert.equal(h.incidents[0].payload.incidentReason, 'draft-frame-unresolved');
     assert.equal(h.incidents[0].payload.context.mainProof.frameState.writeSeq, 100);
   });

@@ -9,6 +9,23 @@ const terminal = run => ['completed', 'failed', 'cancelled'].includes(run.status
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 const clone = value => value == null ? null : JSON.parse(JSON.stringify(value));
 const bounded = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\x00-\x1f]/.test(value);
+function recoveryDisposition(value, nested = false) {
+  if (!value || !['ui_recovery_reported', 'ui_resume_revoked', 'reader_validation_expired'].includes(value.kind)
+    || !bounded(value.code) || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(value.code)
+    || !['owner_recovery_required', 'reconcile_existing_reader'].includes(value.nextAction)
+    || value.operationId != null && !bounded(value.operationId)
+    || value.phase != null && !['ui_recovery', 'owner_authority', 'reader_validation'].includes(value.phase)
+    || value.phaseInstanceId != null && !bounded(value.phaseInstanceId)
+    || value.settledAt != null && (!Number.isSafeInteger(value.settledAt) || value.settledAt < 0)) return null;
+  const result = Object.fromEntries(['kind', 'phase', 'phaseInstanceId', 'settledAt', 'operationId', 'code', 'nextAction']
+    .filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]));
+  if (value.outcomes != null) {
+    if (nested || !Array.isArray(value.outcomes) || value.outcomes.length > 3) return null;
+    result.outcomes = value.outcomes.map(item => recoveryDisposition(item, true));
+    if (result.outcomes.some(item => !item)) return null;
+  }
+  return result;
+}
 function validAttention(a, jobId, epoch) {
   return a?.version === 2 && a.jobId === jobId && a.controlEpoch === epoch && bounded(a.episodeId)
     && Number.isSafeInteger(a.updateSeq) && a.updateSeq > 0 && Number.isSafeInteger(a.wakeSeq) && a.wakeSeq > 0
@@ -78,13 +95,15 @@ function canDeliver(run, notice, { humanOnly = false } = {}) {
     : notice.origin === 'sc' && o?.sc?.controlEpoch === notice.scControlEpoch
       && o.sc.latestAttention?.state === 'open' && o.sc.latestAttention.episodeId === notice.episodeId
       && o.sc.latestAttention.wakeSeq === notice.wakeSeq;
+  const dispositionAllowed = !notice.recoveryDisposition || isDeepStrictEqual(notice.recoveryDisposition,
+    o?.sc?.latestAttention?.recoveryDisposition);
   return !!run && run.runKind === 'external-research' && (localDelivery ? !run.sourceFollowupStartedAt
       && require('./external-research-completion-delivery').authorized(run)
       && !['delivered', 'observing'].includes(run.externalResearchDelivery.phase) : !terminal(run)) && run.notifySource !== false
     && !run.notificationSuppressed && !run.notificationCancelRequestedAt
     && (humanOnly || !suppressionReason(run, notice.origin)) && rearmNoticeAllowed(run, notice)
     && run.externalResearchJobId === notice.jobId && run.sourceTabId === notice.sourceTabId
-    && run.createdAt === notice.runCreatedAt && episodeAllowed
+    && run.createdAt === notice.runCreatedAt && episodeAllowed && dispositionAllowed
     && isDeepStrictEqual(sourceTarget(run), notice.sourceTarget)
     && notice.delivery !== 'sent' && (notice.delivery !== 'suppressed'
       || humanOnly && ['operational_prompts_disabled', 'planned_maintenance'].includes(notice.suppressionReason));
@@ -115,13 +134,35 @@ function synchronizeRevocations(run, revoke, now = Date.now()) {
   return failure;
 }
 function noticeBody(run, attention, execution, origin, rearm) {
+  if (origin === 'noted-delivery') {
+    // The provider has already reached its terminal outcome. This notice is
+    // about the separate source-input receipt, not a new provider failure or
+    // the status of files. Existing frozen notice bodies remain immutable.
+    const source = sourceTarget(run)?.toolType;
+    const label = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'исходную AI';
+    const provider = (run.externalResearchProvider || run.externalResearchIntent?.provider) === 'chatgpt' ? 'ChatGPT' : 'исследования';
+    const intro = run.status === 'completed' && run.resultComplete === true
+      ? 'Ответ ' + provider + ' сохранён.' : 'Исход запроса сохранён.';
+    const envelope = require('./external-research-recovery-envelope').recoveryEnvelope(run);
+    return '[External Research: доставка результата]\n'
+      + intro + ' Подтверждение доставки в ' + label + '-вкладку пока не получено.\n'
+      + JSON.stringify({ origin, runId: run.runId, jobId: run.externalResearchJobId,
+        episodeId: attention.episodeId, wakeSeq: attention.wakeSeq, phase: attention.phase,
+        reason: attention.reason, blockerCode: attention.code || null }) + '\n'
+      + '[external-research-recovery ' + JSON.stringify(envelope) + ']\n'
+      + 'Это состояние передачи результата в исходную вкладку, не описание исхода Research и не отчёт о файлах. '
+      + 'Ввод мог быть доставлен: не повторяй его из-за отсутствия подтверждения. '
+      + 'Проверяй прежнюю квитанцию и исходный результат; не запускай новый Research и не нажимай Send/Stop/Retry/reload для этого уведомления.';
+  }
   const recovery = execution.uiRecovery;
-  if (recovery?.reportedAt && ['exhausted', 'blocked', 'unknown'].includes(recovery.status)) {
+  const disposition = recoveryDisposition(attention.recoveryDisposition);
+  if ((!disposition || disposition.kind === 'ui_recovery_reported') && recovery?.reportedAt && ['exhausted', 'blocked', 'unknown'].includes(recovery.status)) {
     const exhausted = recovery.outcome === 'ui_recovery_exhausted';
     return '[External Research: восстановление UI завершено]\n'
       + JSON.stringify({ runId: run.runId, jobId: run.externalResearchJobId, controlEpoch: attention.controlEpoch,
         conversationId: execution.turn?.conversationId, userMessageId: execution.turn?.userMessageId,
-        outcome: recovery.outcome, attempts: recovery.attempts?.length || 0, providerOutcome: 'unresolved' }) + '\n'
+        outcome: recovery.outcome, attempts: recovery.attempts?.length || 0, providerOutcome: 'unresolved',
+        ...(disposition ? { recoveryDisposition: disposition, nextAction: disposition.nextAction } : {}) }) + '\n'
       + (exhausted ? 'Лимит двух попыток автоматического восстановления исчерпан. Полного ответа пока нет. Рекомендуется новый чат с полным контекстом; это отдельное решение, новая отправка не выполнена. '
         : 'Автоматическое восстановление остановлено: действие или его результат не подтверждены. Не повторяй неизвестную отправку. ')
       + 'Сохрани исходные квитанции. Это не экспертное заключение. Уже существующий поздний полный ответ остаётся доступен под исходным job; не закрывай его единственную копию. Сообщи известному владельцу SC только при необходимости адресного восстановления, без повторных опросов.';
@@ -132,16 +173,17 @@ function noticeBody(run, attention, execution, origin, rearm) {
       episodeId: attention.episodeId, wakeSeq: attention.wakeSeq, phase: attention.phase, reason: attention.reason,
       browserInstanceId: run.externalResearchBrowserInstanceId, sendState: execution.send?.state || 'unknown',
       conversationId: execution.turn?.conversationId || null, userMessageId: execution.turn?.userMessageId || null,
-      blockerCode: execution.operation?.blocker?.code || (['noted-delivery', 'noted-recheck'].includes(origin) ? attention.code : null) || null,
+      blockerCode: disposition?.code || execution.operation?.blocker?.code || (['noted-delivery', 'noted-recheck'].includes(origin) ? attention.code : null) || null,
+      ...(disposition ? { recoveryDisposition: disposition, nextAction: disposition.nextAction } : {}),
       ...(rearm ? { maintenanceRecheck: rearm } : {}) }) + '\n'
     + (rearm ? 'Это новая подтверждённая проверка после обслуживания, не повтор старого подавленного уведомления. ' : '')
-    + 'В этом служебном ходе сохрани исходные run/job, ошибку и квитанции, один раз сообщи известному владельцу SC/Research через Terminal MCP send_message и жди его восстановления либо полного штатного ответа. '
-    + 'Не восстанавливай канал самостоятельно новым Chat, сменой Chat/Work/модели/браузера, ручным Send/Stop/reload или заменяющим research. '
-    + 'Исключение — текущая вкладка сама назначена владельцем этого инфраструктурного ремонта; тогда она восстанавливает только существующий intent/turn по журналу в разрешённых границах. '
+    + '[external-research-recovery ' + JSON.stringify(require('./external-research-recovery-envelope').recoveryEnvelope(run,
+      { id: run.externalResearchJobId, browserInstanceId: run.externalResearchBrowserInstanceId, execution })) + ']\n'
+    + require('./external-research-recovery-envelope').recoveryInstructions(require('./external-research-recovery-envelope').recoveryEnvelope(run)) + '\n'
     + 'Это не поручение продолжать продуктовую реализацию до консультации и не замена ответа Astra. '
     + 'Если исходная работа ждёт экспертного заключения, вернись к её реализации только после фактического полного результата. '
     + 'Не создавай новый research, не повторяй Send при неизвестном исходе, не меняй браузер/аккаунт '
-    + 'и не закрывай единственную копию ответа. Не начинай независимые правки по этому уведомлению. '
+    + 'и не закрывай единственную копию ответа. Это событие само по себе не поручает новые продуктовые правки. '
     + 'Событие не завершает ожидание результата.';
 }
 function operationalState(run) {
@@ -161,6 +203,7 @@ function addNotice(run, attention, execution, origin, now, rearm = null) {
   o.notices[id] = { version: 1, id, origin, runId: run.runId, runCreatedAt: run.createdAt,
     jobId: run.externalResearchJobId, ...(origin === 'sc' ? { scControlEpoch: attention.controlEpoch, episodeId: attention.episodeId }
       : { localEpisodeId: attention.episodeId }), wakeSeq: attention.wakeSeq, body, bodyHash: hash(body),
+    ...(recoveryDisposition(attention.recoveryDisposition) ? { recoveryDisposition: recoveryDisposition(attention.recoveryDisposition) } : {}),
     sourceTabId: run.sourceTabId, sourceTarget: sourceTarget(run), handoffId: id,
     operationKey: `history:${run.sourceTabId}:${id}`, cancelRevision: 0,
     delivery: suppression ? 'suppressed' : 'pending',
@@ -222,7 +265,8 @@ function ingestOperational(run, snapshot, now = Date.now()) {
   if (!validAttention(a, snapshot.id, e.controlEpoch)) return { changed: structuralChange, created: false };
   if (sc.latestAttention?.episodeId === a.episodeId && a.updateSeq < sc.latestAttention.updateSeq) return { changed: structuralChange, created: false };
   sc.latestAttention = { version: 2, episodeId: a.episodeId, state: a.state, phase: a.phase, reason: a.reason,
-    updateSeq: a.updateSeq, wakeSeq: a.wakeSeq, updatedAt: now };
+    updateSeq: a.updateSeq, wakeSeq: a.wakeSeq, updatedAt: now,
+    ...(recoveryDisposition(a.recoveryDisposition) ? { recoveryDisposition: recoveryDisposition(a.recoveryDisposition) } : {}) };
   if (a.state !== 'open' || terminal(run) || run.notifySource === false || run.notificationSuppressed) return { changed: true, created: false };
   return addNotice(run, a, e, 'sc', now);
 }

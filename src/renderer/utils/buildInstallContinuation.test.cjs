@@ -66,5 +66,5 @@ test('finished installer awaiting callback proof remains blocked and visible, bu
   const job = { id: 'J', requestId: 'I', running: false, cancelled: true, callback: { status: 'sent' }, continuation: entry };
   assert.equal(presentation.buildInstallVisibleInDock(job), true);
   assert.equal(presentation.buildInstallPresentation(job).spinning, false);
-  assert.match(presentation.buildInstallPresentation(job).label, /продолжения/);
+  assert.equal(presentation.buildInstallPresentation(job).label, 'Ждём завершения ответа на уведомление');
 });

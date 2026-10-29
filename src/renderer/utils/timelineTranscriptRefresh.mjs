@@ -1,4 +1,4 @@
-import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+import {timelineEntryMatchesSentHandoff} from '../../shared/timeline-entry-facts.mjs';
 import { resolveHistoryPromptHandoffSemanticTags, resolveHistoryOrchestrationPromptPresentation,
   projectHistoryServicePromptBody } from './historyOrchestrationPromptPresentation.mjs';
 import { getTerminalMcpTag, isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
@@ -50,18 +50,6 @@ function provenResearchReply(record, fingerprint) {
   return projected.projected && !projected.questionReply;
 }
 
-function timelineEntryMatchesSentHandoff(entry, handoffEntry) {
-  const candidateIdentities = [
-    handoffEntry?.uuid,
-    handoffEntry?.sourceIdentity,
-    ...(Array.isArray(handoffEntry?.sourceIdentityAliases)
-      ? handoffEntry.sourceIdentityAliases
-      : []),
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-  return candidateIdentities.some((identity) => (
-    historyEntryHasExactIdentity(entry, identity)
-  ));
-}
 
 /**
  * A confirmed History send already owns an exact durable user record even

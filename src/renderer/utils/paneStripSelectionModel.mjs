@@ -41,6 +41,17 @@ export function classifyPaneStripColorSelection(groups, selectedIds) {
   return {kind:'disabled',reason:'mixed-or-partial-membership'};
 }
 
+/** Explicit Add is separate from color: selected old members identify ONE
+ * destination; only selected free roots are appended, in visual order. */
+export function classifyPaneStripGroupAddSelection(groups, selectedIds) {
+  const ids=orderedIds(selectedIds),selected=new Set(ids);
+  const touched=(groups || []).filter(group=>(group.tabIds || []).some(id=>selected.has(id)));
+  if(touched.length!==1)return {kind:'disabled',reason:'one-group-required'};
+  const occupied=new Set((groups || []).flatMap(group=>group.tabIds || []));
+  const tabIds=ids.filter(id=>!occupied.has(id));
+  return tabIds.length?{kind:'add',group:touched[0],tabIds}:{kind:'disabled',reason:'free-selection-required'};
+}
+
 export function normalizeStripGroupColor(value) {
   if(typeof value!=='string'||!/^#[\da-f]{6}$/i.test(value))throw Object.assign(Error('strip_group_color_invalid'),{code:'strip_group_color_invalid'});
   return value.toLowerCase();

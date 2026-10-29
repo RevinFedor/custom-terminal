@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { openTimelineView } from '../utils/timelineViewClient.mjs';
 import { PROMPT_SUMMARY_PROMPT_ID, usePromptsStore } from './usePromptsStore';
 import { generateTimelinePromptSummaryFromPrompt, isEligibleTabTitleEntry, trimTimelinePromptSummarySource, type TabTitleSourceEntry } from '../utils/generateTabTitle';
 import { useWorkspaceStore } from './useWorkspaceStore';
@@ -268,6 +269,8 @@ interface TimelineSummaryStore {
     previousUserMessages?: string[];
     iterationIndex?: number | null;
     force?: boolean;
+    retainResult?: boolean;
+    existingSummary?: TimelinePromptSummary | null;
   }) => Promise<TimelinePromptSummary | null>;
   refreshEntriesForTab: (args: {
     tabId: string;
@@ -337,7 +340,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
     set({ previousUserContextCount: clamped });
   },
 
-  generateSummary: async ({ tabId, toolType, sessionId, entry, previousUserMessages = [], iterationIndex = null, force = false }) => {
+  generateSummary: async ({ tabId, toolType, sessionId, entry, previousUserMessages = [], iterationIndex = null, force = false, retainResult = true, existingSummary = null }) => {
     const content = String(entry?.content || '').trim();
     if (!tabId || !sessionId || !entry?.uuid || !content || !isEligibleTabTitleEntry(entry)) return null;
 
@@ -356,7 +359,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
       model: promptConfig?.model || 'gemini-3.5-flash-lite',
       thinkingLevel: promptConfig?.thinkingLevel || 'NONE',
     }));
-    const existing = get().summaries[key];
+    const existing = existingSummary || get().summaries[key];
     if (!force && existing?.summary && existing.sourceHash === sourceHash) return existing;
     if (get().loadingKeys.has(key)) return null;
 
@@ -390,8 +393,9 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
         promptId: promptConfig?.id || PROMPT_SUMMARY_PROMPT_ID,
         thinkingLevel: promptConfig?.thinkingLevel || 'NONE',
       };
-      await ipcRenderer.invoke('timeline-prompt-summaries:save', row);
-      set((state) => ({ summaries: { ...state.summaries, [key]: row } }));
+      const saved = await ipcRenderer.invoke('timeline-prompt-summaries:save', row);
+      if (!retainResult && saved?.success !== true) throw new Error(saved?.error || 'Summary save is unconfirmed');
+      if (retainResult) set((state) => ({ summaries: { ...state.summaries, [key]: row } }));
       return row;
     } catch (err) {
       console.warn('[TimelineSummary] generate failed:', err);
@@ -532,3 +536,42 @@ function writeLocalAutoMirror(args: {
     console.warn('[TimelineSummary] auto-settings hydrate failed:', err?.message || err);
   }
 })();
+
+// Explicit generation remains BodyOPEN. Its inputs are the session and held
+// capability, never a renderer-owned N-entry/UUID list. The independent reader
+// survives the mounted Timeline's replacement/unmount; only a few context texts
+// and one row are retained by this job. Generated values persist in Main, while
+// the root renderer subsequently reads selected annotations.
+export async function refreshRootTimelineSummaries({ address, parent, force = false, since = 0 }: {
+  address: { tabId: string; sessionId: string; cwd: string }; parent: any; force?: boolean; since?: number;
+}) {
+  const store = useTimelineSummaryStore;
+  if (store.getState().batchProgressByTab[address.tabId]?.running) return;
+  let done = 0, total = 0, error = '';
+  const progress = (running: boolean) => store.setState(state => ({ batchProgressByTab: {
+    ...state.batchProgressByTab, [address.tabId]: { ...address, toolType: 'codex', running, done, total, error },
+  } }));
+  progress(true);
+  let reader: any;
+  try {
+    reader = parent ? await parent.retainSnapshot()
+      : await openTimelineView(ipcRenderer.invoke.bind(ipcRenderer), { ...address, timelineReadClass: 'source',
+        timelineViewOptions: { expandedLayout: false, treeMode: false, width: 32, viewportExtent: 1,
+          fontSize: 12, summaryFontSize: 11, lineClamp: 3, layoutFingerprint: 'summary-job-v1' } });
+    const status = await reader.query('status'); total = status.eligibleCount; progress(true);
+    const previous: string[] = [], contextCount = store.getState().previousUserContextCount;
+    for (let rank = 0; rank < reader.header.logicalEntryCount; rank++) {
+      const { entry, facts } = await reader.row(rank);
+      if (!facts.summaryEligible) continue;
+      if (force || Date.parse(entry.timestamp) >= since) {
+        const existing = facts.summaryOrdinal == null ? null : await reader.annotation('summary', facts.summaryOrdinal);
+        const result = await store.getState().generateSummary({ ...address, toolType: 'codex', entry,
+          iterationIndex: done + 1, previousUserMessages: previous, force, retainResult: false, existingSummary: existing });
+        if (!result) error = 'Не удалось создать summary для ' + entry.uuid;
+      }
+      if (contextCount > 0) { previous.push(entry.content); if (previous.length > contextCount) previous.shift(); }
+      done++; progress(true);
+    }
+  } catch (failure: any) { error = String(failure?.message || failure); throw failure; }
+  finally { await reader?.close(); progress(false); }
+}

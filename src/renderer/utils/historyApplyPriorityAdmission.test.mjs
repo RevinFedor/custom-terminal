@@ -74,6 +74,18 @@ test('actual visible lightweight service delta bypasses continuous input priorit
   assert.equal(h.calls(), 0, 'confirmed small service rows must not wait behind typing');
 });
 
+test('actual apply promotes a qualified visible hydration but rechecks loss of demand', async () => {
+  const h = harness(true);
+  await h.wait('refresh', { visibleHydrationDelta: () => true });
+  assert.equal(h.calls(), 0);
+  let current = false;
+  const pending = h.wait('refresh', { visibleHydrationDelta: () => current });
+  assert.equal(h.calls(), 1); assert.equal(h.bypass(), false);
+  current = true; assert.equal(h.bypass(), true);
+  h.ref.current.presented = false; assert.equal(h.bypass(), false);
+  h.release(); await pending;
+});
+
 test('hidden lightweight service delta waits but promotes as soon as its pane is shown', async () => {
   const h = harness(false);
   const pending = h.wait('refresh', {

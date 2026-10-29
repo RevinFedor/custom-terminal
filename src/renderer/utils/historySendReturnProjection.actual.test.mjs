@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
-import { HistoryPromptHandoffStore } from './historyPromptHandoffs.ts';
+import { HistoryPromptHandoffStore, historyPromptHandoffRecoveryFields } from './historyPromptHandoffs.ts';
 import { historySendReturnEnabled } from './historySendReturn.mjs';
 const source = fs.readFileSync(process.env.HISTORY_RETURN_PANEL_SOURCE
   || new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
@@ -32,6 +32,7 @@ for (const queueStatus of ['preparing', 'failed']) test('actual live subscriber 
     queueStatus, historyReturn: control, promptChips: [], imagePaths: [], requiresAuditIdentity: true }];
   let meta;
   const ctx = vm.createContext({ tabId: 'T', toolType: 'codex', sessionId: 'S',
+    historyPromptHandoffRecoveryFields,
     subscribeHistoryPromptHandoffs: (_id, cb) => cb(records, { type: 'replay' }),
     resolveHistoryPromptHandoffPresentationSession: () => ({ belongsToCurrent: true, presentationSessionId: 'S' }),
     resolveHistoryPromptHandoffSemanticTags: () => [], removeLocalPromptEntry() {}, updateLocalPromptEntry() {},

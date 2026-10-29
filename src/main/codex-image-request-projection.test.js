@@ -231,7 +231,7 @@ test('actual pre-Enter staging persists typed image proof across SQLite close/re
   const start = mainSource.indexOf('  if (sendOperationKey && sendAttemptId) {\n    durablePreSubmitBoundary = isCodexPasteSource');
   const end = mainSource.indexOf('\n  if (shouldStageClaudeAudit', start);
   assert.ok(start > 0 && end > start);
-  const runStage = vm.runInNewContext('(function runStage(){' + mainSource.slice(start, end) + '\n})', {
+  const runStage = vm.runInNewContext('(function runStage(){ codexImageSourceAuthoringTransport = presentationSnapshot.authoringTransport; ' + mainSource.slice(start, end) + '\n})', {
     agentSendReceiptStore: store, createCodexImageRequestProjection,
     sendOperationKey: identity.operationKey, sendAttemptId: identity.attemptId,
     handoffId: identity.handoffId, broadcastTabId: identity.tabId,
@@ -240,6 +240,7 @@ test('actual pre-Enter staging persists typed image proof across SQLite close/re
     captureCodexPromptAuditBoundary: () => boundary,
     durableRawPrompt: actual.requestText, content: actual.plan.text,
     codexImagePasteSegments: actual.plan.segments, stagedCodexImageRefs: actual.plan.staged,
+    codexImageSourceAuthoringTransport: null, codexImageTransformStages: [],
     source: 'codex-terminal-mcp', normalizedPresentationSnapshot: null,
     presentationSnapshot: { authoringTransport: {
       sourceHash: require('node:crypto').createHash('sha256').update(actual.requestText).digest('hex'),

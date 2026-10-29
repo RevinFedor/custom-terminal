@@ -10,13 +10,16 @@ const source = fs.readFileSync(
   'utf8',
 );
 
-test('response clock lives in the History footer, never in the composer plate', () => {
+test('response clock uses the work header when proven and retains the footer fallback, never the composer plate', () => {
   assert.match(source, /data-history-tail-response-timer/);
   assert.doesNotMatch(source, /data-history-response-timer(?:\s|>)/);
   assert.match(source, /Footer:\s*HistoryTerminalPreviewFooter/);
+  assert.match(source, /<HistoryResponseWorkHeader/);
+  assert.match(source, /historyResponseWorkClock\(group, responseWorkTailTiming\)/);
+  assert.match(source, /responseTiming:\s*activeClockInWork\s*\?\s*null\s*:\s*responseTailTiming/);
 });
 
-test('one-second ticks are isolated inside the O(1) footer component', () => {
+test('one-second ticks remain isolated inside the O(1) timer component', () => {
   const start = source.indexOf('const HistoryResponseTailTimer');
   const end = source.indexOf('const openTerminalHistoryPreviewContextMenu', start);
   assert.ok(start >= 0 && end > start);

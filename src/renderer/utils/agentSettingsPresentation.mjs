@@ -1,5 +1,12 @@
 const intentKeys = ['codexSettingsIntentModel', 'codexSettingsIntentEffort', 'codexSettingsIntentRevision',
-  'codexSettingsIntentAppliedRevision', 'codexSettingsIntentAppliedOwnerId', 'codexSettingsIntentControl', 'codexSettingsIntentError', 'codexSettingsIntentStateVersion'];
+  'codexSettingsIntentAppliedRevision', 'codexSettingsIntentAppliedOwnerId', 'codexSettingsIntentControl', 'codexSettingsIntentError',
+  'codexSettingsIntentActionSequence', 'codexSettingsIntentCancelled', 'codexSettingsIntentStateVersion'];
+
+export function codexSettingsIntentCancelled(state) {
+  return !!state?.codexSettingsIntentCancelled
+    && state.codexSettingsIntentCancelled.revision === Number(state.codexSettingsIntentRevision || 0)
+    && state.codexSettingsIntentCancelled.actionSequence === Number(state.codexSettingsIntentActionSequence || 0);
+}
 
 export function mergeTabProviderSnapshot(previous, tabId, next) {
   if (!next || typeof next !== 'object') return previous;
@@ -40,7 +47,7 @@ export function projectTabProviderSnapshot(openProjects, tabId, next) {
 
 export function codexSettingsIntentIsWaiting({ isCodex, isCommandRunning, providerState } = {}) {
   const revision = Number(providerState?.codexSettingsIntentRevision || 0);
-  return !!isCodex && !!isCommandRunning && revision > 0
+  return !!isCodex && !!isCommandRunning && revision > 0 && !codexSettingsIntentCancelled(providerState)
     && revision !== Number(providerState?.codexSettingsIntentAppliedRevision || 0)
     && !providerState?.codexSettingsIntentError;
 }
@@ -50,7 +57,7 @@ export function codexSettingsIntentIsWaiting({ isCodex, isCommandRunning, provid
 // choice while the same revision is still waiting for the native picker.
 export function codexSettingsSelection({ isCommandRunning, providerState, effectiveSettings,
   persistentModel, persistentEffort } = {}) {
-  const desired = !providerState?.codexSettingsIntentError
+  const desired = !providerState?.codexSettingsIntentError && !codexSettingsIntentCancelled(providerState)
     && (!isCommandRunning || codexSettingsIntentIsWaiting({ isCodex: true, isCommandRunning, providerState }))
     && Number(providerState?.codexSettingsIntentRevision || 0) > 0
     && providerState?.codexSettingsIntentModel && providerState?.codexSettingsIntentEffort;

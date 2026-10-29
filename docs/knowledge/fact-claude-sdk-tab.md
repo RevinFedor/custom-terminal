@@ -150,11 +150,24 @@ Window-level handler (Escape / Ctrl+[ / Ctrl+C) на стороне ClaudeSDKTab
 
 ## Markdown inline-code: цвет permission-blue + strip backtick
 
-`AssistantTextPart` рендерит markdown через react-markdown с классами `prose prose-invert` (`@tailwindcss/typography`). Inline `` `code` `` стилизуется **только цветом** — `#b1b9f9` (это значение `permission` из dark-темы Claude Code, `packages/claude-code-src/utils/markdown.ts::codespan` → `color('permission')` = `rgb(177,185,249)`). Никакого фона, рамки, скруглений. Раньше был серый pill `bg-[#0d0d0d] border border-white/5` — юзер: *«убрать плашку, чистый синий, скопируй цвета из исходников Claude Code»*. Разворот прежнего принципа inset-фона — см. `methodology/дизайн-принципы.md::Inset content на dark theme`.
+`AssistantTextPart` теперь делегирует общему `CBMarkdown`/`.cb-prose` из
+`@noted/claude-blocks`; прежние `prose prose-invert`/typography-классы ниже относятся
+к истории решения, не второму renderer. Inline `` `code` `` стилизуется **только
+цветом** — `#b1b9f9` (значение `permission` из dark-темы Claude Code,
+`packages/claude-code-src/utils/markdown.ts::codespan` → `color('permission')` =
+`rgb(177,185,249)`). Никакого фона, рамки, скруглений. Раньше был серый pill
+`bg-[#0d0d0d] border border-white/5` — юзер: *«убрать плашку, чистый синий,
+скопируй цвета из исходников Claude Code»*. Разворот прежнего принципа inset-фона
+— см. `methodology/дизайн-принципы.md::Inset content на dark theme`.
 
 **Обратные кавычки видны из-за typography plugin, не из markdown.** `@tailwindcss/typography` инжектит `` ` `` через CSS `code::before { content: "\`" }` + `code::after` (см. `node_modules/@tailwindcss/typography/src/styles.js`). react-markdown сам кавычки strip'ает — они приходили от prose-класса. Симптом: *«в блоках кода всё равно отображаются обратные кавычки, синие»*. Лечение — `[&_code]:before:content-none [&_code]:after:content-none` в className обёртки. Без знания что источник — typography-плагин, а не наш renderer, дебаг уходит в неправильную сторону (правка `code` компонента react-markdown ничего не даёт).
 
 **Body-текст `#e8e8e8` (не `#d4d4d4`).** Подняли яркость основного текста — юзер: *«текст менее чёткий, фон сделать белее»*. Заголовки наследуют (`prose-headings:text-inherit`), иерархия только через `font-bold` + `mt`-зазоры. Калибровка отступов: `prose-p:my-0.5` (плотно внутри секции) + `prose-h*:mt-3/mt-4` (зазор между секциями), таблицы `[&_th/td]:px-3 py-1.5`.
+
+Отдельное принятое26.10 исключение — смысловые `**strong**`: общий package даёт
+им винно-розовый `--cb-prose-strong`, не цвет ошибки. Заголовки, даже с strong
+внутри, остаются нейтральными, code — permission-blue. Это Source оформление,
+не изменение raw Markdown; мотив и границы — `fact-claude-blocks-package.md`.
 
 ## Paste-chip: распаковать в композер vs удалить — две affordance
 

@@ -165,7 +165,7 @@ function hookHarness(source = patched) {
   ];
   return {
     events, batches, states, gaps, observers, frames, rows, scroller, list,
-    render({ opt, track = true, skipFrame = false, horizontal = false, customParent, renderState = {} } = {}) {
+    render({ opt, track = true, skipFrame = false, horizontal = false, customParent, renderState = {},commitToken } = {}) {
       phase = 'render';
       cursor = 0;
       layoutEffects = [];
@@ -174,7 +174,7 @@ function hookHarness(source = patched) {
       currentArgs[6] = customParent;
       currentArgs[7] = horizontal;
       currentArgs[8] = skipFrame;
-      if (opt !== undefined) currentArgs.push(opt, renderState);
+      if (opt !== undefined) currentArgs.push(opt, renderState,commitToken);
       rendered = Mn(...currentArgs);
       expectedHooks ??= cursor;
       assert.equal(cursor, expectedHooks, 'hook count changed');
@@ -211,27 +211,28 @@ function hookHarness(source = patched) {
   };
 }
 
-test('pinned distribution changes only Mn and the Hn call; other callers stay byte-identical', () => {
+test('pinned distribution changes only Mn and Hn; other callers stay byte-identical', () => {
   assert.equal(HISTORY_VIRTUOSO_VERSION, '4.18.7');
   assert.equal(hash(upstream), HISTORY_VIRTUOSO_UPSTREAM_SHA256);
   assert.equal(patched.split(HISTORY_VIRTUOSO_PATCH_MARKER).length - 1, 1);
-  assert.equal(
-    upstream.replace(extractFunction(upstream, 'Mn', 'Lo'), extractFunction(patched, 'Mn', 'Lo'))
-      .replace(extractCall(upstream, 'Hn'), extractCall(patched, 'Hn')),
-    patched,
-  );
+  const component = source => {const start=source.indexOf('Hn = /* @__PURE__ */ E.memo(');
+    return source.slice(start,source.indexOf('\n}), hr =',start)+3);};
+  assert.equal(upstream.replace(extractFunction(upstream,'Mn','Lo'),extractFunction(patched,'Mn','Lo'))
+    .replace(component(upstream),component(patched)),patched);
   assert.equal(extractCall(patched, 'Or'), extractCall(upstream, 'Or'));
   assert.equal(patchHistoryVirtuoso(upstream), patched, 'pure transform is deterministic');
 });
 
-test('actual Hn call forwards only the optional predicate; Table still passes nine arguments', () => {
+test('actual Hn call forwards predicate and optional body commit token; Table keeps nine arguments', () => {
   const opt = () => true;
+  const commit = () => {};
   const originalArgs = callArguments(upstream, 'Hn', { historyMeasureBeforePaint: opt });
-  const args = callArguments(patched, 'Hn', { historyMeasureBeforePaint: opt });
+  const args = callArguments(patched, 'Hn', { historyMeasureBeforePaint: opt,historyOnPrimaryWindowCommit:commit });
   assert.deepEqual(args.slice(0, 9), originalArgs);
-  assert.equal(args.length, 11);
+  assert.equal(args.length, 12);
   assert.equal(args[9], opt);
   assert.equal(args[10], 'list-state');
+  assert.equal(args[11],commit);
   for (const context of [null, undefined, {}, 'ordinary-context']) {
     assert.equal(callArguments(patched, 'Hn', context)[9], undefined);
   }
@@ -548,4 +549,32 @@ test('esbuild refuses drift and double patch rather than falling back to an unpa
     await assert.rejects(registration.callback({ path: moduleFile }), message);
     assert.equal(await readFile(moduleFile, 'utf8'), source);
   }
+});
+
+test('new body commit token measures changed bodies even when range numbers did not change',()=>{
+ const h=hookHarness(),opt=()=>true,state={};h.render({opt,renderState:state,commitToken:'A'});h.attach();h.layout();
+ const before=h.batches.length;
+ h.rows[0].offsetHeight=53;h.render({opt,renderState:state,commitToken:'B'});h.attach();h.layout();
+ assert.deepEqual(h.batches.at(-1),[{startIndex:5,endIndex:5,size:53}]);assert.equal(h.batches.length,before+1);
+});
+
+test('actual pinned list commit reports real count/range and rejects a measurement-superseded state',()=>{
+ const start=patched.indexOf('  E.useLayoutEffect(() => {\n    if (e || typeof m?.historyOnPrimaryWindowCommit');
+ const end=patched.indexOf('  return !e && n.totalCount',start);assert(start>=0&&end>start);
+ const body=patched.slice(start,end),events=[];
+ const commit=new Function('E','e','n','N','m','latestListState','z','primaryAdmission = null',body);
+ const state={totalCount:15,items:[{index:11},{index:12},{index:13},{index:14}]};
+ const E={useLayoutEffect:fn=>fn()},m={historyOnPrimaryWindowCommit:value=>events.push(value)},latest={current:{totalCount:15}};
+ commit(E,false,state,true,m,latest);assert.equal(events.at(-1).stable,false);
+ latest.current=state;commit(E,false,state,true,m,latest);
+ assert.deepEqual(events.at(-1),{totalCount:15,startIndex:11,endIndex:14,itemCount:4,stable:true});
+ latest.current={...state,items:state.items.map(item=>({...item}))};commit(E,false,state,true,m,latest);
+ assert.equal(events.at(-1).stable,true,'equal re-publication is not a new layout');
+ latest.current={...state,items:state.items.map((item,index)=>({...item,size:index?undefined:99}))};
+ commit(E,false,state,true,m,latest);assert.equal(events.at(-1).stable,false,'different measured size requires next commit');latest.current=state;
+ commit(E,false,state,false,m,latest);assert.equal(events.at(-1).stable,false,'initial location must commit first');
+ commit(E,false,state,true,m,latest,true);assert.equal(events.at(-1).stable,false,'scroll seek placeholder is not a body commit');
+ const before=events.length;commit(E,true,state,true,m,latest);commit(E,false,state,true,undefined,latest);assert.equal(events.length,before);
+ const empty={totalCount:0,items:[]};commit(E,false,empty,false,m,{current:empty});assert.equal(events.at(-1).stable,true);
+ assert(!('items' in events.at(-1)),'no retained full list-state graph');
 });

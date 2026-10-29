@@ -35,6 +35,7 @@ async function resolveHistorySession({ sessionId, cwd = null, provider = null },
   const sources = (lookup.results || []).map(row => ({
     provider: row.provider, state: row.state, reason: row.reason, location: row.location,
     filePath: row.filePath || null,
+    ...(row.representation ? { representation: row.representation } : {}),
   }));
   if (expected !== 'claude' && !sources.some(row => row.provider === 'codex' && row.filePath) && resolveLegacyCodexFile) {
     const legacy = await resolveLegacyCodexFile(sessionId, cwd);

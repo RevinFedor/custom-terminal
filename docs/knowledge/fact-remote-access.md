@@ -124,7 +124,21 @@ Workaround был таким: добавить в vhost'ы дополнител�
 
 Streamer mode скрывает этот chip с публичным/локальным URL на desktop toolbar и в companion-клиентах, но не меняет сам remote-access pipeline. Autossh, nginx, web-server, SSE и bearer-token продолжают работать; меняется только отображение sensitive endpoint на screen-share/screenshot surface. Если пользователь жалуется «адрес всё ещё видно при стриме», проверяй не туннель, а все UI-поверхности redaction: StatusBar, mobile-web settings, native iOS host label, README/assets screenshots. Переносимый принцип — `methodology/дизайн-принципы.md::Privacy-toggle скрывает sensitive surface`.
 
-Если нужно протестировать dev-сборку с телефона через публичный URL — нужен второй tunnel `-R 7979:127.0.0.1:7979` + второй nginx-vhost `dev.remote-control.f9922.tech` + второй TLS-сертификат. Сейчас не настроено.
+Для отдельной native iOS приёмки23Oct настроен дополнительный public ingress:
+`dev.remote-control.f9922.tech` → nginx/TLS на том же VPS → loopback`:17998` →
+принадлежащий тесту reverse SSH → собственный packaged Noted API`:7998`.
+Он не перенаправляет рабочий `remote-control`:7878 и не меняет обычный LAN-dev`:7979`.
+Vhost — `/etc/nginx/sites-available/remote-control-dev` с symlink в sites-enabled;
+cert — `/etc/letsencrypt/live/dev.remote-control.f9922.tech/`, renewal через webroot
+`/var/www/letsencrypt`. HTTP сохраняет ACME challenge, остальные пути переводит на443;
+WS upgrade и отключённая proxy buffering сохранены для actual SSE/NDJSON.
+
+Backend и reverse tunnel принадлежат конечному тестовому запуску, а не постоянному
+production LaunchAgent. У выключенного стенда API может давать502. Отдельный
+`/__ios_dev_ingress` подтверждает только TLS/vhost и не выдаётся за готовность API,
+доставку каталога или native paint. Собственные данные/CLI homes/discovery/token
+готовятся отдельно; рабочая DB/auth/history в стенд не копируются. Dev public PASS
+не заменяет последующую проверку рабочего host и физического iPhone.
 
 ## VPN-агностика на стороне Mac
 

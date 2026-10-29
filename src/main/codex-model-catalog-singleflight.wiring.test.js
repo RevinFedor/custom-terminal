@@ -12,8 +12,8 @@ test('concurrent model catalog consumers join one child-process request', () => 
   assert.ok(start >= 0 && end > start);
   assert.match(source, /let modelCacheInflight = null;/);
   assert.match(body, /if \(modelCacheInflight\)[\s\S]*return modelCacheInflight;/);
-  assert.match(body, /modelCacheInflight = new Promise/);
-  assert.match(body, /modelCacheInflight = null;[\s\S]*resolve\(value\)/);
-  assert.equal((body.match(/execFile\('codex'/g) || []).length, 2,
+  assert.match(body, /modelCacheInflight = \(async \(\) =>/);
+  assert.match(body, /\.finally\(\(\) => \{ modelCacheInflight = null; \}\)/);
+  assert.equal((body.match(/codexModelCatalogLifecycle\.request\(/g) || []).length, 2,
     'only live + bundled fallback commands may exist inside the shared request');
 });

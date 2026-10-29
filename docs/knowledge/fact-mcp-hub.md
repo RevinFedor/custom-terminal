@@ -65,6 +65,13 @@ Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──s
   одноразовый IPC ready от нового detached-хаба, затем отпускает IPC; shutdown
   старого подтверждается закрытием его HTTP-соединения перед повторным bind.
 
+`configurationMatches` в `/_status` сравнивает ожидаемый fingerprint из заголовка
+клиента с fingerprint текущего хаба. Обычный диагностический GET без этого
+заголовка получает `false` даже при работающих шести серверах: это не отдельное
+доказательство неверного профиля или причина для restart. Отдельно сверяются
+`up/initialized/recovering/pendingRequests/lastError`; нулевой pending не означает
+drain долговечных владельцев Browser/Research или право повторить UNKNOWN.
+
 ### SOURCE19.10: host-owned Browser maintenance
 
 Hub перечитывает SC file fence до всех Browser spawn paths и прямо перед stdin.
@@ -101,6 +108,21 @@ host wire/authority protocol как отдельный configured Browser MCP-к
 новое звено Noted External Research и не смена владельца hub. Его positive/negative
 private checks не покрывают старые VR/bridge/loaded-CS или installed handover.
 Enrolled receipt по-прежнему не объявляет историческое UNKNOWN известным.
+
+SOURCE24.10: ошибка чтения maintenance authority не превращает успешный HTTP
+status хаба в `null/servers:[]`. Controller сохраняет фактические PID/initialize
+всех configured children и возвращает отдельный typed `browserMaintenance.held`.
+UI исключает held Browser из ready count, обозначает его янтарным и блокирует
+его/global restart; доступность остальных пяти серверов сохраняется. Это важно
+при несовместимом wire reader: живой hub не равен доступному Browser, а ошибка
+Browser fence не доказывает падение Terminal/knowledge/electron/ios/SC.
+Формат нового authority digest, включая optional `profileUpdatePlan`, обязан
+совпадать у writer и всех реально загруженных readers. Source SHA и успешная
+сборка этого не доказывают; detached hub/native bridge и independent VR parent
+обновляются отдельно с прежними ingress epoch/basis и UNKNOWN carry. Не удалять
+старый fence ради совместимости. При штатном reconnect сохраняются instanceUUID
+и SW runtime, connectionId меняется; offline runtime-cache нового bridge может
+быть unknown, без запуска отсутствующего Chrome.
 
 ### 19.09.2026: все серверы красные, перезапуск ничего не меняет
 
@@ -182,9 +204,9 @@ Actual private Luna roundtrip выполнен через общий hub, без
 ## UI
 
 `McpHubButton.tsx` в шапке рядом с ResourceUsageButton: точка-статус
-(зелёная 6/6 / янтарная часть / красная 0 готовых или хаб недоступен), панель со списком серверов
+(зелёная 6/6 / янтарная часть или неизвестный статус / красная 0 готовых в прочитанном списке), панель со списком серверов
 (pid, аптайм, счётчик рестартов), кнопка рестарта per-server, кнопка
-«Перезапустить MCP хаба» всегда; при недоступном хабе — «Восстановить хаб».
+«Перезапустить MCP хаба» при открытом maintenance; при недоступном хабе — «Восстановить хаб».
 Во время запроса виден процесс, повторные клики заблокированы. Ошибка IPC/HTTP или
 `ok:false` показывается целиком, частичный успех не выдаётся за полный; длинный
 lastError в строке доступен по hover. При недоступном хабе UI не обещает stdio-
@@ -203,6 +225,27 @@ MCP установленных плагинов появляются/исчез�
 выдуманного PID, uptime, зелёного connected или кнопки рестарта хаба. Счётчик и
 зелёная точка по-прежнему подтверждают initialize только детей хаба. Popup скроллится,
 поэтому большой каталог не выдавливает строки за viewport.
+
+Старый installed Main при `research_ingress_storage_invalid` мог вернуть в UI
+fallback `{servers:[],down:true}` после успешного HTTP ответа хаба. Нижний список
+тогда ошибочно подписывал все configured hub URLs «нет в хабе». Это один разрыв
+чтения служебного статуса, не независимое отсутствие шести registrations; проверка
+actual `_status` с expected header отделяет его от настоящего missing binding.
+Сырая ошибка под Restore берётся из `restartError` предыдущего действия, не из
+native config. Иконка только раскрывает popup; Restore/Restart вызывает общий
+MCP restart/ensure, не app build/install и не reload native MCP у всех AI-клиентов.
+
+SOURCE25.10: renderer отдельно проверяет наличие прочитанного списка через
+`hasHubInventory`: `down:true`, отсутствующий/неправильный `servers` и первый
+непрочитанный статус не доказывают missing routes. В этих состояниях шапка и
+hub registrations показывают «статус неизвестен», точка янтарная; предупреждения
+«все отсутствуют» и заявления о недоступности инструментов не выводятся.
+Успешно прочитанный пустой/частичный список по-прежнему позволяет показать
+настоящие «нет в хабе». Disabled и external/plugin configuration не получают
+выдуманный connected. Сохранённая ошибка restart подписана «Последняя попытка».
+Проверены7 конечных presentation controls,4 actual-JSX SSR snapshots и1 controller
+storage-error control без spawn/POST. Эффекты/IPC в SSR управляемые; это не
+production Electron E2E и не доказательство загрузки исправления старым Main.
 
 `mcp-hub:codex-catalog` читает native `config/read`, `plugin/installed` и
 `plugin/read` через отдельный metadata app-server без threads/tool calls.
@@ -223,6 +266,12 @@ installedAt; новые/удалённые plugins меняют список п�
 Ошибка сохраняет последнюю полезную конфигурацию своего scope и видимый статус;
 поздний ответ другого cwd не заполняет новую панель. Headers/env/args/instructions,
 credentials и секреты URL не передаются renderer; HTTP display показывает origin.
+
+Наблюдение25Oct на Codex0.164: `plugin/installed` успешно вернул4marketplaces,
+а9remote `plugin/read` получили HTTP404 `Plugin not found`. Reader оставил полезные
+config/builtin rows и `plugins_unavailable/stale`. Такое предупреждение означает
+неполный metadata refresh, не failure живых MCP. Из одного404 нельзя определить,
+удалён plugin или недоступен этому аккаунту, и нельзя автоматически удалять записи.
 
 Приёмка: 47 профильных checks, actual React/Electron+IPC/private hub (add/remove,
 partial failure/retry, late cwd, прежний all/single restart), native Codex0.159.2
@@ -269,6 +318,23 @@ Missing enabled hub route остаётся видимым в native catalog, а 
 успешно merged alias. Например, прямой remote Figma HTTP/OAuth остаётся отдельным
 подключением Codex; локальный процесс Figma не нужен, OAuth не переносится в хаб.
 
+`cua_repl`/`node_repl` — внешние клиенты, не два новых ребёнка shared6. Их enabled
+metadata не проверяет наличие executable/runtime. В macOS-срезе25Oct удалённый
+desktop bundle оставил enabled entries с отсутствующими `cua_node` paths. Штатный
+`codex app` восстановил signed ChatGPT26.1021 в `/Applications/Codex.app` и сам
+обновил эти paths; legacy `computer-use` остался отдельной disabled записью.
+DisplayName ChatGPT и имя папки Codex.app здесь не являются разными runtime.
+
+Наличие runtime-файлов и постоянно открытый desktop GUI — разные требования.
+В этом же срезе после normal Quit и подтверждённого исчезновения GUI/process tree
+НОВЫЙ MCP-клиент успешно прочитал native inventory19apps и дошёл до стандартной
+MCP form elicitation на доступ к Finder. Разрешение не выдавалось: оконные input/
+capture этим не объявлены проверенными. Диагностический клиент без form capability
+получал `nodeRepl.createElicitation is unavailable` — это не доказательство, что
+нужен запущенный desktop GUI. Runtime-helper может работать отдельно; удаление
+bundle снова ломает clients, которые ссылаются на его файлы. Этот операционный
+proof не обещает live reload старых каталогов CLI и не заменяет per-app approvals.
+
 Шрам14.10 после Build Install: live `_status` hub21424 содержал только два
 initialized child; installed defaultServerDefs совпал с тогдашним CURRENT. Отсутствие
 Browser/SC в таком случае — не просто stale tools/list одной вкладки. Children
@@ -283,7 +349,14 @@ terminal/knowledge он не переопределяет. Старые6/6 proof
 
 Живой и желаемый profile snapshots сравниваются private fingerprint; наружу
 возвращается только `configurationApplied`, без argv/ENV/digest. Оно не означает
-актуальность executable bytes, ambient ENV или client catalog. При смене файла
+актуальность executable bytes, ambient ENV или client catalog.
+
+Прямой `GET /mcp/_status` без private `x-noted-mcp-configuration` header возвращает
+`configurationMatches:false`: ожидаемая конфигурация не была передана. Это само
+по себе не доказательство расхождения. Для проверки совпадения controller
+передаёт fingerprint текущего resolver; в лог/ответ выводится только boolean.
+
+При смене файла
 между Main read и spawn исходный fingerprint проверяется до listener/children;
 нельзя сначала исполнить замену, а затем лишь сообщить mismatch. Изменение
 профиля живого hub не вызывает автоматический restart: нужен owner-drain,

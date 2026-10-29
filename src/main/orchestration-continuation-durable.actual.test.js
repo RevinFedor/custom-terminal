@@ -70,7 +70,7 @@ async function fixture(t) {
     context = vm.createContext({ require, path, srcMainDir: __dirname, console: quiet,
       ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
       ...require('./agent-send-preparation'),
-      agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: receipts,
+      agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: receipts, buildContinueOperations: null,
       agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
       promptAuditFingerprint, classifyAgentSendReceipt, crypto: require('node:crypto'), shortId: value => value,
       compactSendReceiptPresentation: require('./compact-send-settlement').compactSendReceiptPresentation,

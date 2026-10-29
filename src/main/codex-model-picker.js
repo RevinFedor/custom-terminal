@@ -5,6 +5,8 @@ const {
   parseCodexVerifiedComposerFooter,
 } = require('./codex-tui-readiness');
 const { inspectCodexResumeGoalPrompt } = require('./codex-resume-goal-prompt');
+const { CODEX_PICKER_FOOTER_RE, resolveCodexDisplayModelIdentity,
+  stripCodexTerminalControls, parseCodexModelChangeAcknowledgement } = require('../shared/codex-native-picker-proof.cjs');
 
 const CODEX_ALL_MODELS_VALUE = 'all-models';
 const CODEX_MORE_REASONING_VALUE = 'more-reasoning';
@@ -22,7 +24,6 @@ const STANDARD_EFFORT_VALUES = new Set([
 const ADVANCED_EFFORT_VALUES = new Set(['max', 'ultra']);
 const CODEX_EFFORT_APPLICATION_PERSISTENT = 'persistent-default';
 const CODEX_EFFORT_APPLICATION_CONVERSATION = 'conversation-only';
-const CODEX_PICKER_FOOTER_RE = /Press enter to confirm or esc to go back/i;
 const CODEX_CLIPPED_HEADER_HINT_RE = /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i;
 
 function normalizeCodexPickerValue(value) {
@@ -42,6 +43,18 @@ function normalizeCodexMigrationModelLabel(value) {
     .replace(/^-|-$/g, '');
 }
 
+function resolveCodexMigrationModelIdentity(value, catalog = []) {
+  const token = String(value || '').trim().replace(/[\t ]+/g, ' ').toLowerCase();
+  if (!token) return '';
+  const catalogHasTarget = (Array.isArray(catalog) ? catalog : []).some(row =>
+    [row?.id, row?.label].some(item => String(item || '').trim().replace(/[\t ]+/g, ' ').toLowerCase() === token));
+  const resolved = resolveCodexDisplayModelIdentity(value, catalog);
+  if (catalogHasTarget && !resolved) return '';
+  // Existing clipped/startup migration paths can run before any live catalog.
+  // Keep their previous normalization only when the catalog has no matching row.
+  return normalizeCodexMigrationModelLabel(resolved || value);
+}
+
 /**
  * A fresh Codex conversation can paint its concrete model/effort/FAST state in
  * the bordered launch card before the bottom composer footer becomes
@@ -50,7 +63,7 @@ function normalizeCodexMigrationModelLabel(value) {
  * composer-footer parser so an old welcome card can never become a later
  * conversation proof by itself.
  */
-function parseCodexVerifiedLaunchCardSettings(frameText) {
+function parseCodexVerifiedLaunchCardSettings(frameText, catalog = []) {
   const clean = String(frameText || '')
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1bP[\s\S]*?\x1b\\/g, '')
@@ -58,13 +71,18 @@ function parseCodexVerifiedLaunchCardSettings(frameText) {
     .replace(/\x1b[@-_]/g, '')
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     .replace(/\u00a0/g, ' ');
-  const rowPattern = /^\s*[│|]\s*model:\s+([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+\/model\b.*[│|]\s*$/i;
+  const rowPattern = /^\s*[│|]\s*model:\s+([^\r\n]{1,128}?)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+\/model\b.*[│|]\s*$/i;
   let latest = null;
   for (const line of clean.split(/\r?\n/)) {
     const match = String(line || '').match(rowPattern);
-    if (!match) continue;
+    if (!match) {
+      if (/^\s*[│|]\s*model:/i.test(String(line || ''))) latest = null;
+      continue;
+    }
+    const model = resolveCodexDisplayModelIdentity(match[1], catalog);
+    if (!model) { latest = null; continue; }
     latest = {
-      model: String(match[1] || '').trim(),
+      model,
       effort: String(match[2] || '').trim().toLowerCase(),
       fast: !!match[3],
       proof: 'verified-launch-card',
@@ -88,7 +106,7 @@ function isCodexModelPromotionFrame(cleanText) {
   return text.slice(latest.index + latest[0].length).trim() === '';
 }
 
-function inspectCodexModelMigrationPrompt(cleanText) {
+function inspectCodexModelMigrationPrompt(cleanText, catalog = []) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const chooserPattern = /Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed/gi;
   const chooserMatches = Array.from(text.matchAll(chooserPattern));
@@ -104,10 +122,10 @@ function inspectCodexModelMigrationPrompt(cleanText) {
   const targetModel = intro ? intro[1].trim() : null;
   const existingModel = intro ? intro[2].trim() : null;
   const switchTargetModel = intro ? intro[3].trim() : null;
-  const modelMetadataValid = !!targetModel
-    && !!existingModel
-    && normalizeCodexMigrationModelLabel(targetModel)
-      === normalizeCodexMigrationModelLabel(switchTargetModel);
+  const targetIdentity = resolveCodexMigrationModelIdentity(targetModel, catalog);
+  const switchIdentity = resolveCodexMigrationModelIdentity(switchTargetModel, catalog);
+  const modelMetadataValid = !!targetIdentity && !!switchIdentity
+    && !!resolveCodexMigrationModelIdentity(existingModel, catalog) && targetIdentity === switchIdentity;
   // Only the latest chooser can own Enter. A complete old chooser can remain
   // in the viewport above a newer composer after a redraw; parsing the whole
   // buffer would then submit the user's draft instead of confirming migration.
@@ -171,14 +189,17 @@ function decideCodexModelMigrationAutoEnter({
   cleanText = '',
   expectedSourceModel = null,
   expectedTargetModel = null,
+  catalog = [],
 } = {}) {
   if (!sameTerminal) return { allowed: false, reason: 'terminal-generation-changed' };
   if (!sameRunSeq) return { allowed: false, reason: 'command-generation-changed' };
   if (!sameInputRevision) return { allowed: false, reason: 'input-revision-changed' };
   if (!screenAvailable) return { allowed: false, reason: 'current-screen-unavailable' };
-  const prompt = inspectCodexModelMigrationPrompt(cleanText);
-  const fallbackMetadataValid = !!normalizeCodexMigrationModelLabel(expectedSourceModel)
-    && !!normalizeCodexMigrationModelLabel(expectedTargetModel);
+  const prompt = inspectCodexModelMigrationPrompt(cleanText, catalog);
+  const hasExplicitMetadata = !!prompt.targetModel && !!prompt.existingModel && !!prompt.switchTargetModel;
+  const fallbackMetadataValid = !hasExplicitMetadata
+    && !!resolveCodexMigrationModelIdentity(expectedSourceModel, catalog)
+    && !!resolveCodexMigrationModelIdentity(expectedTargetModel, catalog);
   const selectionStillCurrent = prompt.visible
     && prompt.firstOptionSelected
     && !prompt.secondOptionSelected
@@ -202,7 +223,7 @@ function decideCodexModelMigrationAutoEnter({
   };
 }
 
-function parseCodexModelMigrationAcknowledgement(output) {
+function parseCodexModelMigrationAcknowledgement(output, catalog = []) {
   const clean = String(output || '')
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1bP[\s\S]*?\x1b\\/g, '')
@@ -217,15 +238,19 @@ function parseCodexModelMigrationAcknowledgement(output) {
   // write succeeds. Resume transcript can replay a user line with identical
   // words as `› Model changed...`; anchoring to the bullet prevents that text
   // from becoming false persistence proof.
-  const pattern = /^[\t ]*•[\t ]+Model[\t ]+changed[\t ]+to[\t ]+([a-z0-9][a-z0-9_.-]*)[\t ]+(none|minimal|low|medium|high|xhigh|max|ultra)([\t ]+for[\t ]+this[\t ]+conversation)?[\t ]*[.!]?[\t ]*$/gim;
+  const marker = [...clean.matchAll(/^[\t ]*•[\t ]+Model[\t ]+changed[\t ]+to[\t ]+/gim)].at(-1);
+  const pattern = /^[\t ]*•[\t ]+Model[\t ]+changed[\t ]+to[\t ]+([^\r\n]{1,128}?)[\t ]+(none|minimal|low|medium|high|xhigh|max|ultra)([\t ]+for[\t ]+this[\t ]+conversation)?[\t ]*[.!]?[\t ]*$/gim;
   let latest = null;
   for (const match of clean.matchAll(pattern)) {
+    if (!marker || match.index !== marker.index) continue;
     // The startup migration writes the persistent Codex default. A
     // conversation-only acknowledgement belongs to the separate Ultra flow
     // and cannot settle this startup contract.
     if (match[3]) continue;
+    const model = resolveCodexDisplayModelIdentity(match[1], catalog);
+    if (!model) continue;
     latest = {
-      model: String(match[1] || '').trim(),
+      model,
       effort: String(match[2] || '').trim().toLowerCase(),
       applicationMode: CODEX_EFFORT_APPLICATION_PERSISTENT,
       proof: 'startup-model-migration-ack',
@@ -241,6 +266,7 @@ function decideCodexModelMigrationAcknowledgement({
   sameInputRevision = false,
   expectedTargetModel = null,
   output = '',
+  catalog = [],
 } = {}) {
   if (!sameTerminal) return { allowed: false, settled: true, reason: 'terminal-generation-changed' };
   if (!sameRunSeq) return { allowed: false, settled: true, reason: 'command-generation-changed' };
@@ -248,9 +274,11 @@ function decideCodexModelMigrationAcknowledgement({
   // The acknowledgement belongs to the exact Enter already made durable above.
   // Later typing is not evidence that a different chooser accepted that Enter;
   // only terminal/run/launch generations can make the retained output stale.
-  const applied = parseCodexModelMigrationAcknowledgement(output);
+  const applied = parseCodexModelMigrationAcknowledgement(output, catalog);
   if (!applied) return { allowed: false, settled: false, reason: 'migration-ack-not-observed' };
-  const normalizedTarget = normalizeCodexMigrationModelLabel(expectedTargetModel);
+  const normalizedTarget = resolveCodexMigrationModelIdentity(expectedTargetModel, catalog);
+  if (expectedTargetModel && !normalizedTarget) return { allowed: false, settled: false,
+    reason: 'migration-target-identity-ambiguous', applied };
   if (normalizedTarget
     && normalizeCodexMigrationModelLabel(applied.model) !== normalizedTarget) {
     return { allowed: false, settled: false, reason: 'migration-ack-target-mismatch', applied };
@@ -258,7 +286,7 @@ function decideCodexModelMigrationAcknowledgement({
   return { allowed: true, settled: true, reason: 'migration-ack-observed', applied };
 }
 
-function latestCodexPickerSection(cleanText) {
+function latestCodexPickerSection(cleanText, catalog = []) {
   const text = String(cleanText || '').trimEnd();
   const headerKinds = [
     ['all-model', /Select Model and Effort[^\r\n]*/gi],
@@ -300,7 +328,10 @@ function latestCodexPickerSection(cleanText) {
     )
     : '';
   const modelBlockRows = parseCodexNumberedPicker(modelBlockSection);
-  const modelBlockValues = modelBlockRows.map(item => parseModelValue(item));
+  // Classifying the screen is not permission to choose an ambiguous model.
+  // Keep its physical model-shaped rows even if the display-name mapping is
+  // unavailable; target selection below still requires a unique catalog id.
+  const modelBlockValues = modelBlockRows.map(item => parseModelValue(item, { catalog, classifyOnly: true }));
   const strongHeaderlessModelBlock = !!footer
     && modelBlockRows.length >= 2
     && modelBlockRows.some(item => item.selected)
@@ -417,11 +448,26 @@ function finalizePickerItems(items, resolveValue) {
   };
 }
 
-function parseModelValue(item, { allowAllModels = false } = {}) {
+function parseModelValue(item, { allowAllModels = false, catalog = [], classifyOnly = false } = {}) {
   const label = normalizeCodexPickerValue(item.label);
   if (allowAllModels && /^all models(?:\s|$)/.test(label)) {
     return CODEX_ALL_MODELS_VALUE;
   }
+  // Newer TUI lists a display name rather than the model slug (for example,
+  // "GPT-6.1 Terra" versus "gpt-6.1-terra"). The columns are separated by
+  // at least two spaces; an exact catalog label owns the corresponding id.
+  // A partial first token must never be promoted to a different model.
+  const rawFirst = String(item.firstLabel || '');
+  const cell = rawFirst.split(/[\t ]{2,}/)[0].replace(/\s*\((?:current|default)\)\s*$/i, '').trim();
+  const normalizedCell = normalizeCodexPickerValue(cell);
+  const matches = (Array.isArray(catalog) ? catalog : []).filter(model =>
+    normalizeCodexPickerValue(model?.label) === normalizedCell
+    && /^[a-z0-9][a-z0-9_.-]*$/i.test(String(model?.id || '')));
+  const ids = [...new Set(matches.map(model => normalizeCodexPickerValue(model.id)))];
+  if (ids.length === 1) return ids[0];
+  const displayNameWithSeparatedVariant = /^gpt-\d+(?:\.\d+)*[\t ]+[a-z][a-z0-9_.-]*(?:[\t ]+[a-z][a-z0-9_.-]*)*$/i.test(cell);
+  if (!classifyOnly && (ids.length > 1 || (displayNameWithSeparatedVariant
+    && /[\t ]{2,}/.test(rawFirst)))) return null;
   const firstLabel = normalizeCodexPickerValue(item.firstLabel);
   const match = firstLabel.match(/^([a-z0-9][a-z0-9_.-]*)/);
   return match ? match[1] : null;
@@ -431,34 +477,34 @@ function isConcreteCodexModelValue(value) {
   return /^(?:gpt-|codex-|chatgpt-|o\d)/i.test(String(value || ''));
 }
 
-function parseCodexTopModelPicker(cleanText) {
-  const active = latestCodexPickerSection(cleanText);
+function parseCodexTopModelPicker(cleanText, catalog = []) {
+  const active = latestCodexPickerSection(cleanText, catalog);
   if (!active || !['top-model', 'headerless'].includes(active.kind)) {
     return { items: [], selectedIndex: -1 };
   }
   const numbered = parseCodexNumberedPicker(active.section);
   if (active.headerless) {
     const looksLikeTopMenu = numbered.some((item) => {
-      const value = parseModelValue(item, { allowAllModels: true });
+      const value = parseModelValue(item, { allowAllModels: true, catalog });
       return value === CODEX_ALL_MODELS_VALUE || String(value || '').startsWith('codex-auto-');
     });
     if (!looksLikeTopMenu) return { items: [], selectedIndex: -1 };
   }
   return finalizePickerItems(
     numbered,
-    item => parseModelValue(item, { allowAllModels: true })
+    item => parseModelValue(item, { allowAllModels: true, catalog })
   );
 }
 
-function parseCodexAllModelPicker(cleanText) {
-  const active = latestCodexPickerSection(cleanText);
+function parseCodexAllModelPicker(cleanText, catalog = []) {
+  const active = latestCodexPickerSection(cleanText, catalog);
   if (!active || !['all-model', 'headerless'].includes(active.kind)) {
     return { items: [], selectedIndex: -1 };
   }
   const numbered = parseCodexNumberedPicker(active.section);
   if (active.headerless) {
     const modelValues = numbered.map((item) => {
-      const value = parseModelValue(item);
+      const value = parseModelValue(item, { catalog, classifyOnly: true });
       return value;
     });
     if (modelValues.length < 2 || !modelValues.every(isConcreteCodexModelValue)) {
@@ -467,7 +513,7 @@ function parseCodexAllModelPicker(cleanText) {
   }
   return finalizePickerItems(
     numbered,
-    item => parseModelValue(item)
+    item => parseModelValue(item, { catalog })
   );
 }
 
@@ -635,13 +681,14 @@ function isCodexModelEffortConfirmationObserved(
   currentFrameText,
   model,
   effort,
+  catalog = [],
 ) {
   // Ink may paint the acknowledgement and the restored composer in separate
   // synchronized renders. The acknowledgement must come from the accumulated
   // post-Enter delta, while composer proof may come from the independently
   // flushed current screen. Requiring both in one render loses a real Ultra
   // acknowledgement and turns successful selection into a timeout.
-  return isCodexModelEffortAppliedMessage(postEnterText, model, effort)
+  return isCodexModelEffortAppliedMessage(postEnterText, model, effort, catalog)
     && isCodexPickerFrameComposer(currentFrameText);
 }
 
@@ -733,13 +780,25 @@ function codexEffortCanUsePlanScope(value) {
   return normalizeCodexPickerValue(value) !== 'ultra';
 }
 
-function codexModelEffortAppliedMessageCount(cleanText, model, effort) {
+function codexModelEffortAppliedMessageCount(cleanText, model, effort, catalog = []) {
   const normalizedModel = normalizeCodexPickerValue(model);
   const normalizedEffort = normalizeCodexPickerValue(effort);
   if (!normalizedModel || !normalizedEffort) return 0;
 
   const escapedModel = normalizedModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const escapedEffort = normalizedEffort.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mappedDisplayCount = String(cleanText || '').split(/\r?\n/).filter(line => {
+    const parsed = parseCodexModelChangeAcknowledgement(line, catalog);
+    if (!parsed || parsed.model !== normalizedModel || parsed.effort !== normalizedEffort
+      || (normalizedEffort === 'ultra' && parsed.applicationMode !== 'conversation-only')) return false;
+    // Existing exact-ID matching below already counts this row. Count only
+    // the separate display-label row here, so baselines do not double count.
+    const direct = normalizedEffort === 'ultra'
+      ? new RegExp('^[\\t ]*•[\\t ]+Model[\\t ]+changed[\\t ]+to[\\t ]+' + escapedModel
+        + '[\\t ]+' + escapedEffort + '[\\t ]+for[\\t ]+this[\\t ]+conversation[\\t ]*[.!]?[\\t ]*$', 'i')
+      : new RegExp('model\\s+changed\\s+to\\s+' + escapedModel + '\\s+' + escapedEffort + '(?=\\s|$)', 'i');
+    return !direct.test(line);
+  }).length;
   if (normalizedEffort === 'ultra') {
     const exactUltraCell = new RegExp(
       '^[\\t ]*•[\\t ]+Model[\\t ]+changed[\\t ]+to[\\t ]+'
@@ -749,7 +808,7 @@ function codexModelEffortAppliedMessageCount(cleanText, model, effort) {
         + '[\\t ]+for[\\t ]+this[\\t ]+conversation[\\t ]*[.!]?[\\t ]*$',
       'gim',
     );
-    return Array.from(
+    return mappedDisplayCount + Array.from(
       String(cleanText || '').replace(/\u00a0/g, ' ').matchAll(exactUltraCell),
     ).length;
   }
@@ -762,7 +821,7 @@ function codexModelEffortAppliedMessageCount(cleanText, model, effort) {
     'model\\s+changed\\s+to\\s+' + escapedModel + '\\s+' + escapedEffort + suffix + '(?=\\s|$)',
     'gi',
   );
-  const exactCount = Array.from(normalized.matchAll(pattern)).length;
+  const exactCount = mappedDisplayCount + Array.from(normalized.matchAll(pattern)).length;
   if (exactCount > 0
     || normalizedEffort === 'ultra'
     || !normalizedModel.startsWith('codex-auto-')) {
@@ -778,12 +837,21 @@ function codexModelEffortAppliedMessageCount(cleanText, model, effort) {
   return Array.from(normalized.matchAll(modelOnlyPattern)).length;
 }
 
-function isCodexModelEffortAppliedMessage(cleanText, model, effort) {
-  if (codexModelEffortAppliedMessageCount(cleanText, model, effort) > 0) {
-    return true;
-  }
+function isCodexModelEffortAppliedMessage(cleanText, model, effort, catalog = []) {
   const normalizedModel = normalizeCodexPickerValue(model);
   const normalizedEffort = normalizeCodexPickerValue(effort);
+  const visible = stripCodexTerminalControls(cleanText);
+  if (/(?:^|\n)[\t ]*•[\t ]*Model[\t ]+changed[\t ]+to[\t ]+/i.test(visible)) {
+    const latest = parseCodexModelChangeAcknowledgement(visible, catalog);
+    if (!latest || latest.model !== normalizedModel
+      || (latest.effort && latest.effort !== normalizedEffort)
+      || (!latest.effort && !normalizedModel.startsWith('codex-auto-'))
+      || (normalizedEffort === 'ultra'
+        && (latest.effort !== 'ultra' || latest.applicationMode !== 'conversation-only'))) return false;
+  }
+  if (codexModelEffortAppliedMessageCount(cleanText, model, effort, catalog) > 0) {
+    return true;
+  }
   // Codex 0.145 intentionally omits the effort label from success messages
   // for codex-auto-* presets. Ultra is never allowed through this fallback:
   // its explicit "for this conversation" acknowledgement is the only proof
@@ -798,7 +866,8 @@ function isCodexModelEffortAppliedMessage(cleanText, model, effort) {
 
 function findPickerItem(picker, value) {
   const target = normalizeCodexPickerValue(value);
-  return picker?.items?.find(item => normalizeCodexPickerValue(item.value) === target) || null;
+  const matches = (picker?.items || []).filter(item => normalizeCodexPickerValue(item.value) === target);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function planCodexModelSelection(targetModel, {
@@ -862,8 +931,8 @@ function isCodexPickerStateReady(picker, targetValue) {
     && !!findPickerItem(picker, targetValue);
 }
 
-function isCodexAllModelPickerFrameReady(cleanText, targetModel) {
-  const picker = parseCodexAllModelPicker(cleanText);
+function isCodexAllModelPickerFrameReady(cleanText, targetModel, catalog = []) {
+  const picker = parseCodexAllModelPicker(cleanText, catalog);
   return Number.isInteger(picker.selectedIndex)
     && picker.selectedIndex >= 0
     && (
@@ -872,9 +941,9 @@ function isCodexAllModelPickerFrameReady(cleanText, targetModel) {
     );
 }
 
-function inspectCodexModelPickerFrame(cleanText, targetModel) {
-  const topPicker = parseCodexTopModelPicker(cleanText);
-  const allModelPicker = parseCodexAllModelPicker(cleanText);
+function inspectCodexModelPickerFrame(cleanText, targetModel, catalog = []) {
+  const topPicker = parseCodexTopModelPicker(cleanText, catalog);
+  const allModelPicker = parseCodexAllModelPicker(cleanText, catalog);
   const plan = planCodexModelSelection(targetModel, {
     topPicker: topPicker.items.length > 0 ? topPicker : null,
     allModelPicker: allModelPicker.items.length > 0 ? allModelPicker : null,
@@ -886,7 +955,7 @@ function inspectCodexModelPickerFrame(cleanText, targetModel) {
       ? allModelPicker
       : null;
   return {
-    ready: isCodexAllModelPickerFrameReady(cleanText, targetModel)
+    ready: isCodexAllModelPickerFrameReady(cleanText, targetModel, catalog)
       || (
         plan.available === true
         && !!nextStep
@@ -1199,6 +1268,7 @@ module.exports = {
   isCodexPickerStateReady,
   normalizeCodexPickerValue,
   normalizeCodexMigrationModelLabel,
+  resolveCodexMigrationModelIdentity,
   parseCodexAdvancedEffortPicker,
   parseCodexModelMigrationAcknowledgement,
   parseCodexVerifiedComposerFooter,

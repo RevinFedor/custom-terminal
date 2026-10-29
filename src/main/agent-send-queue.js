@@ -2,7 +2,8 @@
 
 // The application backlog owns admission only. Existing scenarios still own
 // readiness/settings/composer/PTY and the receipt store owns delivery proof.
-// No timers, text matching, provider turn-completion heuristic or second Enter.
+// No timed readiness, text matching, turn-completion heuristic or second Enter.
+// A retained active-HEAD deadline can only end proven-unwritten preparation.
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { attachmentOwnershipReceipt, validateOwnedAttachmentSnapshot } = require('./owned-mobile-attachments');
 const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadinessWaitReceipt } = require('../shared/prompt-queue-send-intent.cjs');
@@ -11,13 +12,48 @@ const { protectQueueAssets, releaseQueueTransferPin, adoptCompletedQueueTransfer
 const { classifyInputSlotRetirement, sendInputSlot } = require('./agent-send-input-slot');
 const { hiddenSendPresentation, isTabMessageNoInputReceipt, isExternalCompletionNoInputReceipt, isExternalOperationalNoInputReceipt } = require('../shared/agent-send-receipt-control.cjs');
 const { historySendReturnControl } = require('./history-send-return');
+const { capacityRecoveryDeferredReceipt } = require('../shared/run-after-capacity-recovery.cjs');
+const { isSendPreparationDeferred, activeHeadPreparation, PREPARATION_MS, COLD_PREPARATION_MS } = require('./agent-send-preparation');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
+// Web stop/start reuses the Main receipt DB while an old asynchronous
+// executor can still be unwinding. This is the SAME FIFO owner across queue
+// instances, not another PTY mutex or permission to repeat an input.
+const dispatchOwnersByDatabase = new WeakMap();
 const consumed = record => record?.state === 'confirmed'
   && record.auditIdentity?.attemptId === record.attemptId
   && !!record.auditIdentity?.sessionId
   && !!(record.auditIdentity?.entryUuid || record.auditIdentity?.sourceIdentity);
+
+function exactUnattemptedDispatch(record, item) {
+  if (!record || !item || item.state !== 'dispatching' || record.operationKey !== item.operation_key
+    || record.tabId !== item.tab_id || record.attemptId || Number(record.attempt || 0) !== 0
+    || !['reserved', 'preparing'].includes(record.state) || record.deliveryControl?.cancelledAt
+    || record.receipt?.submitted === true || record.receipt?.pasteWritten === true
+    || record.receipt?.enterWritten === true || record.receipt?.deliveryUnknown === true) return false;
+  try { return item.request_hash === fingerprintAgentSendRequest(JSON.parse(item.request_json)); }
+  catch { return false; }
+}
+
+function unattemptedHeadPreparation(record, item) {
+  if (!record || record.attemptId || Number(record.attempt || 0) !== 0
+    || !['reserved', 'preparing'].includes(record.state) || record.receipt?.submitted === true
+    || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true
+    || record.receipt?.deliveryUnknown === true || !item || item.operation_key !== record.operationKey
+    || item.tab_id !== record.tabId) return null;
+  try { if (item.request_hash !== fingerprintAgentSendRequest(JSON.parse(item.request_json))) return null; }
+  catch { return null; }
+  const retained = activeHeadPreparation(record);
+  if (retained) return retained;
+  // Dispatch birth is committed BEFORE Web preparation; a SQLite refusal
+  // before the receipt copy cannot erase this already-running deadline.
+  if (!Number.isFinite(item.preparation_started_at) || !['warm', 'cold-codex'].includes(item.preparation_mode)
+    || item.preparation_mode === 'cold-codex' && record.provider !== 'codex') return null;
+  return { version: 1, operationKey: record.operationKey, tabId: record.tabId, handoffId: record.handoffId,
+    requestFingerprint: record.requestFingerprint, mode: item.preparation_mode, startedAt: item.preparation_started_at,
+    deadlineAt: item.preparation_started_at + (item.preparation_mode === 'cold-codex' ? COLD_PREPARATION_MS : PREPARATION_MS) };
+}
 
 function waitingBeforeInput(record, item, request) {
   return item?.state === 'waiting' && (isAutomaticNoWriteWait(record, request)
@@ -47,9 +83,16 @@ function applicationQueueReceipt(record, item) {
 class AgentSendQueue {
   constructor({ store, execute, publish = () => {}, publishMerge = null, transferMergedContext = null,
     ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null,
-    readInputSlot = null, projectPresentation = null, claimDispatch = null }) {
+    readInputSlot = null, projectPresentation = null, claimDispatch = null, readRecoveryRelease = null, captureRecoveryOwner = null,
+    now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, capturePreparationMode = null }) {
     this.store = store;
     this.db = store.db;
+    this.now = now;
+    this.setTimer = setTimer; this.clearTimer = clearTimer;
+    this.capturePreparationMode = capturePreparationMode;
+    this.preparationExpiries = new Map();
+    this.dispatchOwners = dispatchOwnersByDatabase.get(this.db) || new Map();
+    dispatchOwnersByDatabase.set(this.db, this.dispatchOwners);
     this.execute = execute;
     this.publish = publish;
     this.publishMerge = publishMerge;
@@ -61,6 +104,8 @@ class AgentSendQueue {
     this.readInputSlot = readInputSlot;
     this.projectPresentation = projectPresentation;
     this.claimDispatch = claimDispatch;
+    this.readRecoveryRelease = readRecoveryRelease;
+    this.captureRecoveryOwner = captureRecoveryOwner;
     this.slotObservations = new Map();
     this.slotWakeSignatures = new Map();
     this.runtimeWakeRevisions = new Map();
@@ -96,6 +141,10 @@ class AgentSendQueue {
     if (!columns.has('queue_position')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN queue_position INTEGER');
     if (!columns.has('merge_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN merge_json TEXT');
     if (!columns.has('asset_transfer_ids_json')) this.db.exec("ALTER TABLE agent_send_queue ADD COLUMN asset_transfer_ids_json TEXT NOT NULL DEFAULT '[]'");
+    if (!columns.has('recovery_defer_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN recovery_defer_json TEXT');
+    if (!columns.has('recovery_owner_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN recovery_owner_json TEXT');
+    if (!columns.has('preparation_started_at')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN preparation_started_at INTEGER');
+    if (!columns.has('preparation_mode')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN preparation_mode TEXT');
     this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merges(request_id TEXT PRIMARY KEY,
       request_hash TEXT NOT NULL,response_json TEXT NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merge_sources(operation_key TEXT PRIMARY KEY,
@@ -105,6 +154,15 @@ class AgentSendQueue {
 
   item(operationKey) {
     return this.db.prepare('SELECT * FROM agent_send_queue WHERE operation_key = ?').get(operationKey) || null;
+  }
+
+  inputReservation(operationKey) {
+    // Admission metadata only: never decode a follower's prompt/assets here.
+    const row = this.db.prepare(`SELECT q.tab_id AS tabId,q.state,r.handoff_id AS handoffId,
+      r.attempt_id AS attemptId,r.state AS receiptState,r.delivery_control_json AS control
+      FROM agent_send_queue q JOIN agent_send_receipts r ON r.operation_key=q.operation_key
+      WHERE q.operation_key=?`).get(operationKey);
+    return row ? { ...row, cancelled: !!(row.control && JSON.parse(row.control).cancelledAt), control: undefined } : null;
   }
 
   authoringSnapshot(tabId, handoffId) {
@@ -123,12 +181,23 @@ class AgentSendQueue {
   installBlockers() {
     const blockers = [...this.running].map(tabId => ({ tabId, kind: 'input', status: 'preparing' }));
     // Read only control columns, never every historical prompt/attachment.
+    // Startup can retain an old delivery outcome without restoring any FIFO or
+    // physical-input owner. That legacy outcome is not an executor in this Main.
+    // Keep every current/leased/queued attempt and the independent Main physical
+    // input guards; neither delivery nor its no-replay/asset ownership is changed.
     const rows = this.db.prepare(`SELECT r.operation_key, r.tab_id, r.state, r.handoff_id, r.attempt_id, r.provider, r.session_id,
       q.slot_release_json, q.release_json FROM agent_send_receipts r
       LEFT JOIN agent_send_queue q ON q.operation_key=r.operation_key
       WHERE q.state IN ('dispatching','awaiting-receipt') OR
         (r.attempt_id IS NOT NULL AND r.state IN
-          ('preparing','in-flight','enter-armed','audit-pending','delivery-unknown','evicted-unknown'))`).all();
+          ('preparing','in-flight','enter-armed','audit-pending','delivery-unknown','evicted-unknown')
+          AND NOT (q.operation_key IS NULL AND r.state='delivery-unknown'
+            AND r.input_lease_json IS NULL
+            AND CASE WHEN json_valid(r.receipt_json) THEN
+              COALESCE(json_extract(r.receipt_json,'$.startupReconciliation.source'),'')='startup'
+              AND COALESCE(json_extract(r.receipt_json,'$.startupReconciliation.decision'),'')='unknown'
+              AND json_type(r.receipt_json,'$.providerQueue.evidence.lifecycleGeneration') IS NULL
+            ELSE 0 END))`).all();
     for (const row of rows) {
       if (sendInputSlot(null, row).state === 'retired') continue;
       blockers.push({ tabId: row.tab_id, kind: 'input', status: row.state, operationKey: row.operation_key,
@@ -138,7 +207,62 @@ class AgentSendQueue {
   }
 
   receipt(operationKey) {
-    return applicationQueueReceipt(this.store.get(operationKey), this.item(operationKey));
+    const item = this.item(operationKey), record = this.store.get(operationKey);
+    if (item?.state === 'recovery-deferred') return capacityRecoveryDeferredReceipt(this.projectRecord(record));
+    return applicationQueueReceipt(record, item);
+  }
+
+  // Called only by the Main typed-outcome consumer, with a fresh exact owner
+  // bookend. Never skip a manual request or an attempted/UNKNOWN physical slot.
+  deferUnattemptedForRecovery(tabId, recovery, isCurrent) {
+    if (this.disposed || recovery?.kind !== 'model-capacity' || recovery.tabId !== tabId
+      || !recovery.sessionId || !recovery.lifecycleGeneration || !recovery.failedTurnId
+      || !Number.isFinite(recovery.failedAt) || isCurrent?.() !== true) return false;
+    const deferred = this.db.transaction(() => {
+      if (isCurrent() !== true) return null;
+      const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id=? AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
+      const record = item && this.store.get(item.operation_key);
+      const refuse = reason => { if (item) console.log('[RunAfterCapacity] order wait tab=' + tabId
+        + ' operation=' + item.operation_key + ' reason=' + reason); return null; };
+      if (!item || item.state !== 'waiting' || !record || record.attemptId || record.deliveryControl?.cancelledAt
+        || !['reserved', 'preparing'].includes(record.state) || record.receipt?.submitted === true
+        || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true
+        || record.receipt?.deliveryUnknown === true || record.receipt?.auditPending === true) return refuse('head-not-proven-unattempted');
+      const request = JSON.parse(item.request_json);
+      const bornOwner = JSON.parse(item.recovery_owner_json || 'null');
+      const pinnedGeneration = request.expectedTarget?.lifecycleGeneration
+        || (bornOwner?.version === 1 && bornOwner.sessionId === recovery.sessionId
+          && bornOwner.requestHash === item.request_hash ? bornOwner.lifecycleGeneration : null);
+      const source = require('./prompt-queue-source');
+      if (!(isAutomaticPromptQueueRequest(request) || source.isPromptLoopAutomationSource(request.source))
+        || request.provider !== 'codex' || record.provider !== 'codex') return refuse('head-not-automatic-codex');
+      if (request.expectedTarget?.sessionId !== recovery.sessionId
+        || pinnedGeneration !== recovery.lifecycleGeneration
+        || item.request_hash !== fingerprintAgentSendRequest(request)) return refuse('head-owner-pin-or-fingerprint-mismatch');
+      const proof = { version: 1, ...recovery, operationKey: record.operationKey, handoffId: record.handoffId, requestHash: item.request_hash };
+      const changed = this.db.prepare("UPDATE agent_send_queue SET state='recovery-deferred', recovery_defer_json=?, updated_at=? WHERE operation_key=? AND state='waiting'")
+        .run(JSON.stringify(proof), Date.now(), item.operation_key);
+      return changed.changes === 1 ? record : null;
+    })();
+    if (!deferred) return false;
+    console.log('[RunAfterCapacity] order deferred tab=' + tabId + ' operation=' + deferred.operationKey
+      + ' turn=' + recovery.failedTurnId + ' generation=' + recovery.lifecycleGeneration);
+    this.resolveWaiters(deferred.operationKey);
+    this.publishRecord(deferred);
+    this.wake(tabId);
+    return true;
+  }
+
+  observeRecoveryRelease(tabId) {
+    if (this.disposed || !this.readRecoveryRelease) return;
+    for (const item of this.db.prepare("SELECT * FROM agent_send_queue WHERE tab_id=? AND state='recovery-deferred'").all(tabId)) {
+      const proof = JSON.parse(item.recovery_defer_json || 'null');
+      if (!proof || proof.releasedBy) continue;
+      const releasedBy = this.readRecoveryRelease(proof);
+      if (!releasedBy) continue;
+      this.db.prepare("UPDATE agent_send_queue SET recovery_defer_json=? WHERE operation_key=? AND state='recovery-deferred' AND recovery_defer_json=?")
+        .run(JSON.stringify({ ...proof, releasedBy }), item.operation_key, item.recovery_defer_json);
+    }
   }
 
   queueInfo(operationKey) {
@@ -279,7 +403,7 @@ class AgentSendQueue {
   // wrote nothing. Never infer this permission from a renderer error/timeout.
   certifyAutomaticReadinessWait({ tabId, handoffId, operationKey, attemptId }, receipt) {
     const item = this.item(operationKey), record = this.store.get(operationKey);
-    if (!item || item.state !== 'dispatching' || !this.running.has(tabId)
+    if (!item || item.state !== 'dispatching' || (!this.running.has(tabId) && !this.dispatchOwners.has(tabId))
       || record?.state !== 'in-flight' || record.provider !== 'codex' || !attemptId || record.attemptId !== attemptId
       || record.tabId !== tabId || record.handoffId !== handoffId
       || !isAutomaticPromptQueueRequest(JSON.parse(item.request_json))) return receipt;
@@ -307,14 +431,17 @@ class AgentSendQueue {
     const prior = replay();
     if (prior) return prior;
     if (this.disposed || typeof this.reconcile !== 'function') fail('send_queue_release_unavailable', 503);
-    await this.reconcile({ tabId: request.tabId, operationKey: request.operationKey, attemptId: request.attemptId });
+    const audited = await this.reconcile({ tabId: request.tabId, operationKey: request.operationKey, attemptId: request.attemptId });
     const result = this.db.transaction(() => {
       const repeated = replay();
       if (repeated) return repeated;
       const record = this.store.get(request.operationKey);
       if (consumed(record)) return { released: false, confirmed: true, record };
-      if (record.state !== 'delivery-unknown') fail('send_queue_release_requires_unknown');
-      if (this.running.has(request.tabId)) fail('send_queue_release_executor_running');
+      const unresolvedNativeQueue = record.state === 'audit-pending' && record.receipt?.submitted === true
+        && ['unknown', 'absent'].includes(audited?.reconciliation?.decision)
+        && audited.reconciliation.confirmed !== true;
+      if (record.state !== 'delivery-unknown' && !unresolvedNativeQueue) fail('send_queue_release_requires_unknown');
+      if (this.running.has(request.tabId) || this.dispatchOwners.has(request.tabId)) fail('send_queue_release_executor_running');
       const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ? AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(request.tabId);
       if (head?.operation_key !== request.operationKey || head.state !== 'awaiting-receipt') fail('send_queue_release_not_head');
       const release = { requestId: request.requestId, operationKey: request.operationKey, attemptId: request.attemptId,
@@ -347,6 +474,20 @@ class AgentSendQueue {
       if (existing) {
         if (existing.request_hash !== requestHash) return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict' };
         const record = this.store.get(identity.operationKey);
+        if (existing.state === 'recovery-deferred') {
+          const proof = JSON.parse(existing.recovery_defer_json || 'null');
+          const released = proof && this.readRecoveryRelease?.(proof);
+          if (!record?.attemptId && !record?.deliveryControl?.cancelledAt
+            && ['reserved', 'preparing'].includes(record?.state) && proof?.requestHash === requestHash && released) {
+            const position = this.db.prepare('SELECT MAX(COALESCE(queue_position,id)) n FROM agent_send_queue WHERE tab_id=?').get(existing.tab_id).n + 1;
+            // Re-admit the SAME immutable request only after Main's natural
+            // proof and a new current Root demand; never auto-rearm on release.
+            this.db.prepare("UPDATE agent_send_queue SET state='waiting',queue_position=?,updated_at=? WHERE operation_key=? AND state='recovery-deferred'")
+              .run(position, Date.now(), identity.operationKey);
+            return { ok: true, item: this.item(identity.operationKey), record, replayed: true, retryQueued: true };
+          }
+          return { ok: true, item: existing, record, replayed: true };
+        }
         if (existing.state === 'failed' && (retryNoInputAttemptId
           && record?.attemptId === retryNoInputAttemptId && isTabMessageNoInputReceipt(record)
           || retryCompletionNoInput === true && isExternalCompletionNoInputReceipt(record, snapshot)
@@ -406,6 +547,24 @@ class AgentSendQueue {
         (operation_key,tab_id,request_hash,request_json,asset_ids_json,predecessor_key,state,created_at,updated_at)
         VALUES (?,?,?,?,?,?, 'waiting',?,?)`).run(identity.operationKey, identity.tabId,
         requestHash, JSON.stringify(snapshot), JSON.stringify(assetIds), predecessor?.operation_key || null, now, now);
+      // A warm Loop/queue may carry only a session expectation. Capture its
+      // original physical owner ONCE at admission, never by retargeting replay.
+      // This read-side pin grants no write/readiness/Stop authority.
+      let recoveryOwner = null;
+      if (identity.provider === 'codex' && (isAutomaticPromptQueueRequest(snapshot)
+        || require('./prompt-queue-source').isPromptLoopAutomationSource(snapshot.source))) {
+        try { recoveryOwner = this.captureRecoveryOwner?.(snapshot); }
+        catch (error) { console.warn('[AgentSendQueue] recovery birth pin unavailable tab='
+          + String(identity.tabId).slice(-12) + ' reason=' + String(error?.code || error?.message)); }
+      }
+      if (recoveryOwner?.known === true && recoveryOwner.toolType === identity.provider
+        && recoveryOwner.sessionId === snapshot.expectedTarget?.sessionId
+        && recoveryOwner.runtime?.writerConfirmed === true && recoveryOwner.runtime.liveLifecycle === true
+        && recoveryOwner.runtime.lifecycleGeneration) {
+        this.db.prepare('UPDATE agent_send_queue SET recovery_owner_json=? WHERE operation_key=?')
+          .run(JSON.stringify({ version: 1, sessionId: recoveryOwner.sessionId,
+            lifecycleGeneration: recoveryOwner.runtime.lifecycleGeneration, requestHash }), identity.operationKey);
+      }
       const insertAsset = this.db.prepare('INSERT INTO agent_send_queue_assets '
         + '(operation_key, occurrence, source_key, source_path, asset_id, ref_json) VALUES (?,?,?,?,?,?)');
       for (const [index, ref] of (snapshot.ownedAttachments?.refs || []).entries()) {
@@ -480,13 +639,44 @@ class AgentSendQueue {
       ...(waitingBeforeInput(record, item, request)
         ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
       ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
+      ...(item.recovery_defer_json ? { capacityRecovery: JSON.parse(item.recovery_defer_json) } : {}),
     } };
+  }
+
+  armPreparationExpiry(item, record, clock = unattemptedHeadPreparation(record, item)) {
+    if (!clock || record.attemptId || !['reserved', 'preparing'].includes(record.state)
+      || !['waiting', 'dispatching'].includes(item?.state) || record.deliveryControl?.cancelledAt) return;
+    const key = record.operationKey, existing = this.preparationExpiries.get(key);
+    if (existing?.deadlineAt === clock.deadlineAt) return;
+    if (existing) this.clearTimer(existing.timer);
+    const entry = { deadlineAt: clock.deadlineAt, timer: null };
+    entry.timer = this.setTimer(() => {
+      if (this.disposed || this.preparationExpiries.get(key) !== entry) return;
+      this.preparationExpiries.delete(key);
+      try {
+        const current = this.store.get(key), queued = this.item(key), currentClock = unattemptedHeadPreparation(current, queued);
+        if (!current || current.attemptId || !['reserved', 'preparing'].includes(current.state)
+          || current.deliveryControl?.cancelledAt || !['waiting', 'dispatching'].includes(queued?.state)
+          || !currentClock || currentClock.deadlineAt !== entry.deadlineAt || this.now() < entry.deadlineAt) return;
+        // Failure-only deadline. It cannot call a producer or grant ready;
+        // later store publication merely releases the terminal no-input row.
+        this.store.settleQueuedNoWrite(key, { success: false, submitted: false,
+          pasteWritten: false, enterWritten: false, code: 'agent_send_preparation_expired', error: 'agent_send_preparation_expired' });
+      } catch (error) {
+        this.parked.add(item.tab_id);
+        console.warn('[AgentSendQueue] preparation expiry storage unavailable tab=' + String(item.tab_id).slice(-12)
+          + ' code=' + (error.code || 'unknown'));
+      }
+    }, Math.max(0, clock.deadlineAt - this.now()));
+    entry.timer?.unref?.();
+    this.preparationExpiries.set(key, entry);
   }
 
   observe(record) {
     if (!record || this.admitting > 0 || this.disposed) return;
     const item = this.item(record.operationKey);
     if (!item) return;
+    this.armPreparationExpiry(item, record);
     const request = JSON.parse(item.request_json);
     if (!record.deliveryControl?.cancelledAt
       && (waitingBeforeInput(record, item, request)
@@ -532,8 +722,10 @@ class AgentSendQueue {
   }
 
   finish(item, state) {
+    const expiry = this.preparationExpiries.get(item.operation_key);
+    if (expiry) { this.clearTimer(expiry.timer); this.preparationExpiries.delete(item.operation_key); }
     this.db.prepare(`UPDATE agent_send_queue SET state = ?, updated_at = ? WHERE operation_key = ?
-      AND (state IN ${OPEN}${state === 'completed' ? " OR state = 'released-unknown'" : ''})`)
+      AND (state IN ${OPEN} OR state='recovery-deferred'${state === 'completed' ? " OR state = 'released-unknown'" : ''})`)
       .run(state, Date.now(), item.operation_key);
     this.executors.delete(item.operation_key);
     // Failed/Stop-cancelled drafts remain recoverable until explicit dismissal.
@@ -557,7 +749,7 @@ class AgentSendQueue {
   }
 
   retireObsoleteInputSlot(tabId) {
-    if (this.disposed || this.running.has(tabId)) return Promise.resolve(false);
+    if (this.disposed || this.running.has(tabId) || this.dispatchOwners.has(tabId)) return Promise.resolve(false);
     const existing = this.slotObservations.get(tabId);
     if (existing) return existing;
     const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
@@ -569,13 +761,13 @@ class AgentSendQueue {
     let retired = false;
     const work = Promise.resolve().then(async () => {
       const observation = cancellationRetires ? null : await this.readInputSlot(record);
-      if (this.disposed || this.running.has(tabId)) return false;
+      if (this.disposed || this.running.has(tabId) || this.dispatchOwners.has(tabId)) return false;
       const result = this.db.transaction(() => {
         const current = this.store.get(item.operation_key);
         const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
           AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
         if (head?.operation_key !== item.operation_key || current?.attemptId !== record.attemptId
-          || consumed(current) || this.running.has(tabId)) return false;
+          || consumed(current) || this.running.has(tabId) || this.dispatchOwners.has(tabId)) return false;
         if (!classifyInputSlotRetirement(current, null).retire
           && (typeof observation?.isCurrent !== 'function' || observation.isCurrent() !== true)) return false;
         const decision = classifyInputSlotRetirement(current, observation);
@@ -657,19 +849,57 @@ class AgentSendQueue {
 
   async pump(tabId) {
     if (this.disposed || this.running.has(tabId) || !this.ready()) return;
-    const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
+    let item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
       AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
     if (!item) return;
     const record = this.store.get(item.operation_key);
     if (!record) return; // Losing a receipt is not proof that input was untouched.
+    const oldDispatch = this.dispatchOwners.get(tabId);
+    if (oldDispatch) { oldDispatch.waiters.add(this); this.parked.add(tabId); return; }
     if (record.deliveryControl?.cancelledAt && !record.attemptId) {
-      this.finish(item, 'cancelled');
-      this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
-        code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+      try {
+        this.finish(item, 'cancelled');
+        this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+          code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+      } catch (error) {
+        if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
+        this.parked.add(tabId); return;
+      }
       this.wake(tabId);
       return;
     }
+    // A terminated Main or a failed parking CAS may leave only pre-attempt
+    // preparation dispatching. With no live executor and no possible input,
+    // restore its original waiting position; never touch attempted/UNKNOWN.
+    if (item.state === 'dispatching' && !record.attemptId && ['reserved', 'preparing'].includes(record.state)) {
+      if (!exactUnattemptedDispatch(record, item)) { this.parked.add(tabId); return; }
+      try {
+        const changed = this.db.transaction(() => {
+          if (!exactUnattemptedDispatch(this.store.get(item.operation_key), this.item(item.operation_key))) return false;
+          return this.db.prepare("UPDATE agent_send_queue SET state='waiting',updated_at=? WHERE operation_key=? AND state='dispatching' AND request_hash=?")
+            .run(Date.now(), item.operation_key, item.request_hash).changes === 1;
+        })();
+        if (!changed) return;
+        item = this.item(item.operation_key);
+      } catch (error) {
+        if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
+        this.parked.add(tabId);
+        console.warn('[AgentSendQueue] pre-attempt parking storage unavailable tab=' + String(tabId).slice(-12));
+        return; // Existing runtime wake retries only this guarded storage cut.
+      }
+    }
     const request = JSON.parse(item.request_json);
+    const headClock = unattemptedHeadPreparation(record, item);
+    if (headClock && this.now() >= headClock.deadlineAt) {
+      try { this.store.settleQueuedNoWrite(item.operation_key, { success: false, submitted: false,
+        pasteWritten: false, enterWritten: false, code: 'agent_send_preparation_expired', error: 'agent_send_preparation_expired' }); }
+      catch (error) {
+        if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
+        this.parked.add(tabId); return;
+      }
+      this.wake(tabId); return;
+    }
+    this.armPreparationExpiry(item, record, headClock);
     const retryWaiting = !record.deliveryControl?.cancelledAt && waitingBeforeInput(record, item, request);
     if (consumed(record) || (FAILED.has(record.state) && !retryWaiting)) {
       this.observe(record);
@@ -682,19 +912,20 @@ class AgentSendQueue {
     // Claim synchronously before calling any asynchronous scenario. An event or
     // a second client cannot launch another physical sender in this tab.
     this.running.add(tabId);
+    const dispatchOwner = { queue: this, waiters: new Set() };
+    this.dispatchOwners.set(tabId, dispatchOwner);
     const runtimeRevisionAtStart = this.runtimeWakeRevisions.get(tabId) || 0;
-    const predecessor = item.predecessor_key ? this.store.get(item.predecessor_key) : null;
-    const pinnedLaunch = !!request.expectedTarget?.terminalInstanceId && !!request.expectedTarget?.launchId;
-    const inheritedSession = !request.expectedTarget?.sessionId && !pinnedLaunch && consumed(predecessor)
-      ? predecessor.auditIdentity.sessionId : null;
-    const executionScope = { requestFingerprint: record.requestFingerprint,
-      ...(inheritedSession ? { expectedTarget: { ...request.expectedTarget,
-        toolType: record.provider, sessionId: inheritedSession } } : {}),
-    };
     let parked = false;
-    let executorInvoked = false, storageBlockedBeforeExecutor = false;
+    let executorInvoked = false, storageBlockedBeforeExecutor = false, preparationDeferredBeforeAttempt = false;
     let releaseDispatch = null;
     try {
+      const predecessor = item.predecessor_key ? this.store.get(item.predecessor_key) : null;
+      const pinnedLaunch = !!request.expectedTarget?.terminalInstanceId && !!request.expectedTarget?.launchId;
+      const inheritedSession = !request.expectedTarget?.sessionId && !pinnedLaunch && consumed(predecessor)
+        ? predecessor.auditIdentity.sessionId : null;
+      const executionScope = { requestFingerprint: record.requestFingerprint,
+        ...(inheritedSession ? { expectedTarget: { ...request.expectedTarget,
+          toolType: record.provider, sessionId: inheritedSession } } : {}) };
       if (this.admit) {
         this.parked.add(tabId);
         const admission = await this.admit(request);
@@ -709,7 +940,9 @@ class AgentSendQueue {
         this.parked.delete(tabId);
       }
       if (this.disposed || !this.ready()) { parked = true; return; }
-      if (this.item(item.operation_key)?.state === 'cancelled') return;
+      // A typed capacity event can park this proven-unwritten item while the
+      // admission await is in flight. Its old positive result cannot revive it.
+      if (this.item(item.operation_key)?.state !== 'waiting') return;
       // Recheck synchronously AFTER asynchronous admission. A History intent
       // can reserve this tab while that await is pending. Keep this SAME item
       // waiting, with no attempt/PTY input, instead of failing or re-enqueuing.
@@ -717,15 +950,46 @@ class AgentSendQueue {
         releaseDispatch = this.claimDispatch(request);
         if (!releaseDispatch) { this.parked.add(tabId); parked = true; return; }
       }
-      this.db.prepare('UPDATE agent_send_queue SET state = ?, updated_at = ? WHERE operation_key = ?')
-        .run('dispatching', Date.now(), item.operation_key);
+      let preparationMode = item.preparation_mode;
+      if (!preparationMode) {
+        // The budget choice and start have the same durable birth. A write
+        // failure inside Web must not let a later inspection upgrade warm
+        // to cold (or shorten an already selected cold preparation).
+        preparationMode = 'warm';
+        if (item.preparation_started_at == null) try {
+          if (request.provider === 'codex' && this.capturePreparationMode?.(request) === 'cold-codex') {
+            preparationMode = 'cold-codex';
+          }
+        } catch (error) {
+          console.warn('[AgentSendPreparation] HEAD classification unavailable tab='
+            + String(tabId).slice(-12) + ' code=' + String(error?.code || 'inspection-unavailable'));
+        }
+      }
+      this.db.prepare('UPDATE agent_send_queue SET state = ?, updated_at = ?, preparation_started_at = COALESCE(preparation_started_at, ?), preparation_mode = COALESCE(preparation_mode, ?) WHERE operation_key = ?')
+        .run('dispatching', Date.now(), this.now(), preparationMode, item.operation_key);
+      this.armPreparationExpiry(this.item(item.operation_key), record);
       this.publishRecord(record);
       console.log('[AgentSendQueue] dispatch tab=' + String(tabId).slice(-12)
         + ' id=' + item.id + ' operation=' + item.operation_key.slice(0, 90));
       const executor = this.executors.get(item.operation_key);
       executorInvoked = true;
       const result = await (executor ? executor(executionScope) : this.execute(request, executionScope));
+      preparationDeferredBeforeAttempt = isSendPreparationDeferred(result);
       const current = this.store.get(item.operation_key);
+      if (preparationDeferredBeforeAttempt && exactUnattemptedDispatch(current, this.item(item.operation_key))) {
+        const changed = this.db.prepare("UPDATE agent_send_queue SET state='waiting',updated_at=? WHERE operation_key=? AND state='dispatching' AND request_hash=?")
+          .run(Date.now(), item.operation_key, item.request_hash);
+        if (changed.changes === 1) {
+          parked = true;
+          this.parked.add(tabId);
+          this.publishRecord(current, false);
+          this.rerun.delete(tabId); // own publication is not a readiness wake
+          if ((this.runtimeWakeRevisions.get(tabId) || 0) !== runtimeRevisionAtStart) this.rerun.add(tabId);
+          console.log('[AgentSendQueue] preparation deferred tab=' + String(tabId).slice(-12)
+            + ' id=' + item.id + ' reason=' + result.reason + ' attempt=none');
+          return;
+        }
+      }
       if (!current?.attemptId && result?.submitted === false) {
         this.store.settleQueuedNoWrite(item.operation_key, result);
       }
@@ -748,45 +1012,52 @@ class AgentSendQueue {
         parked = true;
       }
     } catch (error) {
+      if (/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) {
+        // Storage uncertainty is never a no-input receipt. Retain the item;
+        // only a fresh zero-attempt CAS may later return it to admission.
+        storageBlockedBeforeExecutor = true;
+        console.warn('[AgentSendQueue] storage blocked tab=' + String(tabId).slice(-12)
+          + ' id=' + item.id + ' executorInvoked=' + executorInvoked);
+        return;
+      }
       // No attempt was begun: the existing executor has not crossed its durable
       // write boundary. Otherwise retain the receipt's uncertainty, never retry.
       const current = this.store.get(item.operation_key);
-      if (!executorInvoked && current && !current.attemptId
-        && /^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) {
-        // Admission already committed this immutable request. A continuing
-        // writer can still block dispatch; trying to persist a failure under
-        // that same lock would throw again and self-schedule the pump forever.
-        // Keep the SAME unwritten executor for the existing external wake.
-        storageBlockedBeforeExecutor = true;
-        console.warn('[AgentSendQueue] dispatch storage unavailable tab=' + String(tabId).slice(-12)
-          + ' id=' + item.id + ' sqliteCode=' + error.code + ' executorInvoked=false');
-        return;
-      }
       if (current && !current.attemptId) this.store.settleQueuedNoWrite(item.operation_key,
         { error: error.message, code: error.code || 'agent_send_queue_prepare_failed' });
       else if (current) this.publishRecord(current);
       console.warn('[AgentSendQueue] dispatch failed tab=' + String(tabId).slice(-12)
         + ' id=' + item.id + ' error=' + error.message);
     } finally {
-      releaseDispatch?.();
-      this.running.delete(tabId);
-      const rerun = this.rerun.delete(tabId);
-      if (storageBlockedBeforeExecutor) {
-        this.parked.add(tabId); // No timer, SQL retry loop or global ready gate.
-      } else if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
-        this.parked.delete(tabId);
-        this.runtimeWakeRevisions.delete(tabId);
-        this.executors.delete(item.operation_key);
-        this.resolveWaiters(item.operation_key);
-        this.wake(tabId);
-      } else if (rerun) this.wake(tabId);
+      try {
+        releaseDispatch?.();
+        this.running.delete(tabId);
+        const rerun = this.rerun.delete(tabId);
+        if (storageBlockedBeforeExecutor) {
+          this.parked.add(tabId); // No timer, SQL retry loop or global ready gate.
+          if ((this.runtimeWakeRevisions.get(tabId) || 0) !== runtimeRevisionAtStart) this.wake(tabId);
+        } else if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
+          this.parked.delete(tabId);
+          this.runtimeWakeRevisions.delete(tabId);
+          this.executors.delete(item.operation_key);
+          this.resolveWaiters(item.operation_key);
+          this.wake(tabId);
+        } else if (rerun) this.wake(tabId);
+      } finally {
+        this.running.delete(tabId);
+        if (this.dispatchOwners.get(tabId) === dispatchOwner) {
+          this.dispatchOwners.delete(tabId);
+          for (const waiter of dispatchOwner.waiters) if (!waiter.disposed) waiter.wake(tabId);
+          dispatchOwner.waiters.clear();
+        }
+      }
     }
   }
 
   cancelWaiting(tabId, handoffId = null, { dismiss = false, reason = 'user-cancel' } = {}) {
     const items = this.db.prepare(`SELECT q.* FROM agent_send_queue q
       JOIN agent_send_receipts r ON r.operation_key = q.operation_key
-      WHERE q.tab_id = ? AND q.state = 'waiting'`
+      WHERE q.tab_id = ? AND q.state IN ('waiting','recovery-deferred')`
       + (handoffId ? ' AND r.handoff_id = ?' : '')).all(...(handoffId ? [tabId, handoffId] : [tabId]))
       .map(item => ({ item, record: this.store.get(item.operation_key) }))
       .filter(({ item, record }) => record && (!record.attemptId
@@ -915,6 +1186,9 @@ class AgentSendQueue {
 
   dispose() {
     this.disposed = true; this.unsubscribe(); this.executors.clear();
+    for (const owner of this.dispatchOwners.values()) owner.waiters.delete(this);
+    for (const expiry of this.preparationExpiries.values()) this.clearTimer(expiry.timer);
+    this.preparationExpiries.clear();
     this.runtimeWakeRevisions.clear();
     for (const operationKey of this.waiters.keys()) this.resolveWaiters(operationKey);
   }

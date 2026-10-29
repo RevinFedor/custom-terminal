@@ -93,6 +93,10 @@ renderer: {
       codeInspectorPlugin({
         bundler: 'vite',
         dev: () => true,
+        // The plugin's HTML injection probes a cwd-relative main.js, which
+        // may be a leftover build artifact. Inject once into the real entry.
+        injectTo: resolve(__dirname, 'src/renderer/main.tsx'),
+        skipSnippets: ['htmlScript'],
         // Quirk: plugin checks `server !== "close"` (string!), not boolean.
         // Passing `false` here still starts the TCP listener on :5678 and
         // hangs `vite build` because event loop never exits.

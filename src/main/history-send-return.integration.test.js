@@ -12,12 +12,13 @@ const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const panel = fs.readFileSync(path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx'), 'utf8');
 const handoffsPath = path.join(__dirname, '../renderer/utils/historyPromptHandoffs.ts');
 const handoffsSource = fs.readFileSync(handoffsPath, 'utf8');
-const modules = new Map(); let restore, coordinator;
+const modules = new Map(); let restore, coordinator, preparation;
 test.before(async () => {
   for (const match of handoffsSource.matchAll(/from\s+['"]([^'"]+\.mjs)['"]/g)) modules.set(match[1],
     await import(pathToFileURL(path.resolve(path.dirname(handoffsPath), match[1])).href));
   restore = await import('../renderer/utils/historySendReturn.mjs');
   coordinator = await import('../renderer/utils/agentActionCoordinator.mjs');
+  preparation = await import('../renderer/utils/historyComposerReturnPreparation.mjs');
 });
 function declaration(source, name) {
   const ast = ts.createSourceFile('actual.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX); let text;
@@ -65,8 +66,10 @@ async function harness(t, { provider = 'codex', active = false, failSave = false
   const web = { cancelQueuedAgentSends: (tab, h, options) => queue.cancelWaiting(tab, h, options),
     readQueuedSendAuthoring: (tab, h) => queue.authoringSnapshot(tab, h),
     releaseQueuedSendPresentation: key => queue.releasePresentation(key) };
-  const context = vm.createContext({ ...hs, ...restore, ...coordinator, useRef: value => ({ current: value }),
-    useCallback: fn => fn, tabId: 'T', toolType: provider, console, path, srcMainDir: __dirname,
+  let preparationState = [];
+  const context = vm.createContext({ ...hs, ...restore, ...coordinator, ...preparation, useRef: value => ({ current: value }),
+    useCallback: fn => fn, tabId: 'T', sessionId: 'S', toolType: provider, console, path, srcMainDir: __dirname,
+    setComposerReturnPreparations: update => { preparationState = update(preparationState); },
     historySendReturnControl, agentSendReceiptStore: store,
     LOCAL_PROMPT_PREFIX: 'local-prompt-',
     mainWindow: { isDestroyed: () => false, webContents: { send: (channel, control) => {

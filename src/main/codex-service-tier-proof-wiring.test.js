@@ -133,7 +133,7 @@ test('fresh launch card can prove FAST only for the exact launch generation befo
   );
   assert.match(resolveSource, /parseCodexVerifiedComposerFooter\(frameText \|\| ''\)/);
   assert.match(resolveSource, /if \(footerSettings\) return footerSettings/);
-  assert.match(resolveSource, /parseCodexVerifiedLaunchCardSettings\(frameText \|\| ''\)/);
+  assert.match(resolveSource, /parseCodexVerifiedLaunchCardSettings\(frameText \|\| '', getCodexModelIdentityCatalog\(\)\)/);
   assert.match(resolveSource, /getCodexWriterProofSnapshot\(tabId\)/);
   assert.match(resolveSource, /getCurrentCodexServiceTierLaunchCandidate\(tabId/);
   assert.match(resolveSource, /launch\?\.terminalToken !== terminalToken/);

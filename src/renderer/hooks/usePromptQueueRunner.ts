@@ -4,6 +4,7 @@ import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEna
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { interruptionContinuesWithQueuedTurn, isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption, normalizeAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import { createRunAfterCapacityRecovery, isCapacitySurfaceOnlyOutcome, isModelCapacityWorkflowOutcome } from '../utils/runAfterCapacityRecovery.mjs';
 import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../utils/agentScenarios';
@@ -20,12 +21,15 @@ import {
 } from '../utils/agentLocalCommand.mjs';
 import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
+import { buildQueuedPromptTransport } from '../store/usePromptQueueStore';
+import { collectLegacyPromptImageRanges } from '../utils/promptImageAttachments.mjs';
 import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
 import { buildRunAfterIncidentReport } from '../utils/runAfterIncidentReport.mjs';
 import { LOOP_TASK_COMPLETION_PROTOCOL, LOOP_AWAIT_TASK_COMPLETION_PROTOCOL } from '../../shared/task-completion-protocol.mjs';
 import { loopPromptMode } from '../store/usePromptQueueStore';
 import { initializeLoopDependencies, loopDependenciesBlock, loopDependencyEntry,
   loopDependencyResumeText, subscribeLoopDependencies } from '../utils/loopDependencies.mjs';
+import { initializeMessageLoopWaits, messageLoopWaitsBlock, subscribeMessageLoopWaits } from '../utils/messageLoopWaits.mjs';
 import {
   initializeOrchestrationStore,
   isOrchestrationCompletionBlocked,
@@ -73,6 +77,8 @@ import { buildInstallContinuationBlocks, buildInstallContinuationFloor, subscrib
 import { deferredGoalCompletionKey } from '../utils/restartAfterCoordinator.mjs';
 import { hasPromptQueueContextConditionKey, promptQueueContextConditionKeysEqual } from '../../shared/prompt-queue-send-intent.cjs';
 import { buildContinueDeferredReceipt } from '../../shared/build-continue-automation.cjs';
+import { messageLoopDeferredReceipt } from '../../shared/message-loop-waits.cjs';
+import { capacityRecoveryDeferredReceipt } from '../../shared/run-after-capacity-recovery.cjs';
 
 const { ipcRenderer } = window.require('electron');
 // A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
@@ -84,6 +90,17 @@ let queueShutdownPending = false;
 const observedWorkflowStarts = new Set<string>();
 const autoCompactTurnStarts = new Map<string, number>();
 let autoCompactCoordinator: ReturnType<typeof createAutoCompactCoordinator> | null = null;
+const capacityWorkflowRecovery = createRunAfterCapacityRecovery();
+
+function capacityWorkflowSession(tabId: string): string | null {
+  const provider = getPromptQueueAgent(tabId);
+  return provider === 'codex' ? getPromptQueueSessionId(tabId, provider) : null;
+}
+
+function capacityWorkflowBlocked(tabId: string): boolean {
+  return getPromptQueueAgent(tabId) === 'codex'
+    && capacityWorkflowRecovery.blocks(tabId, capacityWorkflowSession(tabId));
+}
 
 export function getAutoCompactTarget(tabId: string): AutoCompactTarget | null {
   const state = useWorkspaceStore.getState();
@@ -406,6 +423,7 @@ function sendQueueCommand(
     expectedTarget?: import('../utils/historyAgentRuntimes').AgentSendTarget;
     presentationSnapshot: {
       historySessionId: string | null;
+      authoringTransport?: { sourceHash: string; imageRanges: Array<{ start: number; end: number; path: string }> };
       imagePaths?: NonNullable<QueuedPrompt['imagePaths']>;
       promptChips: Array<{
         id?: string;
@@ -490,7 +508,7 @@ function shortPromptFingerprint(value: string): string {
 function getLoopPrompt(queue: TabQueue, tabId?: string): QueuedPrompt | null {
   if (queue.loopRestartPending && (!tabId || loopDependencyEntry(tabId, queue)?.state !== 'ready')) return null;
   if (!isLoopPromptActive(queue)) return null;
-  const text = queue.loopPromptText.trim();
+  const text = [queue.loopPromptText.trim(), queue.localLoopPromptText?.trim()].filter(Boolean).join('\n\n');
   return {
     id: 'loop-' + (queue.loopPromptEpoch || queue.loopPromptArmedAt || 'legacy') + '-' + shortPromptFingerprint(text),
     text: text + '\n\n' + (loopPromptMode(queue) === 'own-turn'
@@ -656,11 +674,14 @@ function isTabWorkflowBlocked(tabId: string, waitingItem?: QueuedPrompt | null, 
     && promptTabTriggerReady(waitingItem.trigger)) return false;
   if (hasPriorWorkflowInput(tabId)) return true;
   return queueShutdownPending || queueManualStopping.has(tabId) || autoCompactCoordinator?.has(tabId) === true
+    || capacityWorkflowBlocked(tabId)
     || prevBusyRef.get(tabId) === true
     || (kind === 'loop' && loopPromptMode(usePromptQueueStore.getState().getQueue(tabId)) === 'own-turn'
       ? isLoopOrchestrationBlocked(tabId)
       || loopDependenciesBlock(tabId, usePromptQueueStore.getState().getQueue(tabId), loopNaturalCausesByOwner.get(tabId))
       : isOrchestrationCompletionBlocked(tabId))
+    || (kind === 'loop' && loopPromptMode(usePromptQueueStore.getState().getQueue(tabId)) === 'all-work' && messageLoopWaitsBlock(tabId,
+      usePromptQueueStore.getState().getQueue(tabId), loopNaturalCausesByOwner.get(tabId)))
     || Array.from(useWorkspaceStore.getState().openProjects.values()).some(workspace =>
       hasPendingAgentGoalWork({ goalWork: workspace.tabs.get(tabId)?.codexGoalWork }));
 }
@@ -742,7 +763,7 @@ export async function reconcilePromptQueuePendingDelivery(ownerTabId: string): P
       ? result.records.find((r: any) => r.tabId === ownerTabId && r.handoffId === pending.handoffId
         && r.operationKey === pending.operationKey) : null;
     if (!record) return false; // missing/unavailable is not a no-submit proof
-    const outcome = buildContinueDeferredReceipt(record) ? 'not-submitted' : record.state === 'confirmed' ? 'transferred'
+    const outcome = buildContinueDeferredReceipt(record) || messageLoopDeferredReceipt(record) || capacityRecoveryDeferredReceipt(record) ? 'not-submitted' : record.state === 'confirmed' ? 'transferred'
       : ['reserved', 'preparing', 'in-flight'].includes(record.state) && record.receipt?.submitted !== true
         ? 'unknown' : queueSendOutcome(record.receipt);
     if (outcome === 'unknown') return false;
@@ -946,6 +967,7 @@ function clearDeferredOwnerSend(ownerTabId: string, reason: string, release = tr
   queueReadinessWakePending.delete(ownerTabId);
   const attempt = deferredOwnerSends.get(ownerTabId);
   if (!deferredOwnerSends.delete(ownerTabId)) return;
+  if (reason === 'committed') capacityWorkflowRecovery.settled(ownerTabId);
   if (reason !== 'committed') attempt?.preparationController?.abort();
   if (attempt?.handoffId && reason !== 'committed') {
     // Revoke only this pending automatic input, never Stop the Goal/provider.
@@ -962,8 +984,10 @@ function clearDeferredOwnerSend(ownerTabId: string, reason: string, release = tr
 // Stop. Future deadlines/dependencies still enter the usual Resume/send path.
 function cancelPreparationsForManualStop(tabId: string): void {
   autoCompactCoordinator?.stop(tabId);
+  capacityWorkflowRecovery.forget(tabId);
   deferredGoalNaturalOutcomes.delete(tabId);
   deferredOrchestrationNaturalOutcomes.delete(tabId);
+  deferredCapacityNaturalOutcomes.delete(tabId);
   deferredContinuationPivotReleases.delete(tabId);
   processedNaturalOutcomes.delete(tabId);
   latestLoopCauseByOwner.delete(tabId);
@@ -1046,6 +1070,9 @@ function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
       + ' source=' + source + ' attempt=' + deferred.attemptId);
     return false;
   }
+  // A proven Continue final is waiting for the old no-input ACK. Replay that
+  // retained natural cause first; in particular do not resend an obsolete Loop.
+  if (deferredCapacityNaturalOutcomes.has(ownerTabId)) return false;
   const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
   const prompt = getContinuationPrompt(queue, deferred.kind, ownerTabId);
   if (isPromptQueueEditorLocked(ownerTabId)) {
@@ -1720,6 +1747,7 @@ function beginValidatedQueueSend(
   notifyPromptQueueRuntime(ownerTabId, 'preparing-send');
   let pendingDelivery: PromptQueuePendingDelivery | null = null;
   let sendDispatched = false;
+  let sendPhase = 'preparation';
   const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
   console.log('[PromptQueueRunner] ' + label + ' validate owner=' + ownerTabId.slice(-8)
     + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8)
@@ -1832,7 +1860,8 @@ function beginValidatedQueueSend(
       return;
     }
     queueAwaitingBusyStart.add(ownerTabId);
-    const rawPayload = buildQueuedPromptPayload(validation.item);
+    const rawTransport = buildQueuedPromptTransport(validation.item);
+    const rawPayload = rawTransport.prompt;
     const rawPresentationText = serializeComposerDraft({
       text: validation.item.text,
       chips: validation.item.chips || [],
@@ -1875,7 +1904,11 @@ function beginValidatedQueueSend(
     attemptedHandoffId = handoffId;
     attempt.handoffId = handoffId;
     if (kind === 'queue') attempt.payloadKey = payload;
-    const contextPrepared = await prepareTabWorkContext(ownerTabId, handoffId, payload);
+    const sourceTransport = { sourceHash: window.require('node:crypto').createHash('sha256').update(payload).digest('hex'),
+      imageRanges: [...rawTransport.imageRanges, ...(kind === 'queue'
+        ? collectLegacyPromptImageRanges(payload.slice(rawPayload.length)).map(range => ({ ...range,
+          start: range.start + rawPayload.length, end: range.end + rawPayload.length })) : [])] };
+    const contextPrepared = await prepareTabWorkContext(ownerTabId, handoffId, payload, sourceTransport);
     payload = contextPrepared.prompt;
     presentationText = contextPrepared.prefix + presentationText;
     if (!await refreshQueueAttemptContext(ownerTabId, attempt)) {
@@ -1939,6 +1972,7 @@ function beginValidatedQueueSend(
       requiresAuditIdentity: !localCommandCandidate,
     });
     sendDispatched = true;
+    sendPhase = 'scenario-call';
     const res: any = await sendQueueCommand(ownerTabId, payload, {
       handoffId,
       ...(kind === 'queue' ? { promptQueueIntent: { version: 1, kind: 'queue', itemId: head.id,
@@ -1947,6 +1981,7 @@ function beginValidatedQueueSend(
         expectedTarget: attempt.expectedTarget } : {}),
       presentationSnapshot: {
         historySessionId: sessionIdHint,
+        authoringTransport: contextPrepared.authoringTransport || sourceTransport,
         promptChips,
         imagePaths: validation.item.imagePaths || [],
         ...(kind === 'loop'
@@ -1954,6 +1989,7 @@ function beginValidatedQueueSend(
           : {}),
       },
     }, kind === 'loop' ? 'prompt-loop' : 'prompt-queue', scenarioStatusAtSend);
+    sendPhase = 'handling-send-result';
     if (promptQueueReceiptReplayNeedsNoBusyStart(res)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       console.log('[PromptQueueRunner] ' + label + ' durable replay owner='
@@ -1982,7 +2018,8 @@ function beginValidatedQueueSend(
       }
       pauseUnresolvedQueueDelivery(ownerTabId, pendingDelivery);
       console.warn('[PromptQueueRunner] retain unknown automatic send owner=' + ownerTabId.slice(-8)
-        + ' handoff=' + handoffId + ' code=' + (res?.code || 'missing-send-proof'));
+        + ' handoff=' + handoffId + ' phase=' + sendPhase + ' code=' + (res?.code || 'missing-send-proof')
+        + ' error=' + String(res?.error || '').slice(0, 1500));
       return;
     }
     usePromptQueueStore.getState().setPendingDelivery(ownerTabId, null, handoffId);
@@ -2001,6 +2038,11 @@ function beginValidatedQueueSend(
       }
       if (res?.deferred === true || res?.error === 'codex_input_not_ready') {
         retractHistoryPromptHandoff(ownerTabId, handoffId, 'send-deferred-before-submit');
+        if (kind === 'loop' && res.causeInvalidated === true && res.submitted === false
+          && res.pasteWritten === false && res.enterWritten === false) {
+          if (latestLoopCauseByOwner.get(ownerTabId) === attempt.causeKey) latestLoopCauseByOwner.delete(ownerTabId);
+          clearDeferredOwnerAttempt(ownerTabId, attempt, 'native-input-invalidated-cause');
+        }
         console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
           + ' → WAIT main readiness admission error=' + (res?.error || 'not-ready'));
         return;
@@ -2079,7 +2121,8 @@ function beginValidatedQueueSend(
     queueAwaitingBusyStart.delete(ownerTabId);
     if (sendDispatched && pendingDelivery) {
       pauseUnresolvedQueueDelivery(ownerTabId, pendingDelivery);
-      console.error('[PromptQueueRunner] retain interrupted automatic send owner=' + ownerTabId, error);
+      console.error('[PromptQueueRunner] retain interrupted automatic send owner=' + ownerTabId
+        + ' handoff=' + pendingDelivery.handoffId + ' phase=' + sendPhase, error);
       return;
     }
     if (pendingDelivery) usePromptQueueStore.getState().setPendingDelivery(ownerTabId, null, pendingDelivery.handoffId);
@@ -2142,6 +2185,7 @@ function beginValidatedQueueSend(
 }
 
 type BusyStatePayload = {
+  loopInputBoundary?: string | null;
   goalWork?: any;
   goalMetadataOnly?: boolean;
   goalCompletionOffset?: number | null;
@@ -2153,6 +2197,9 @@ type BusyStatePayload = {
   localCommand?: string;
   localCommandReason?: string;
   completionKind?: string;
+  capacitySurfaceOnly?: boolean;
+  workflowOutcomeTimestampKnown?: boolean;
+  workflowSnapshotCurrentTurnId?: string | null;
   outcomeKnown?: boolean;
   catchUpPending?: boolean;
   outcomeTs?: number | null;
@@ -2185,6 +2232,12 @@ const deferredOrchestrationNaturalOutcomes = new Map<string, {
   outcomeTs: number;
   liveOwnArmAt?: number | null;
 }>();
+const deferredCapacityNaturalOutcomes = new Map<string, {
+  data: BusyStatePayload;
+  source: string;
+  outcomeTs: number;
+  liveOwnArmAt: number | null;
+}>();
 const deferredGoalNaturalOutcomes = new Map<string, {
   data: BusyStatePayload;
   key: string;
@@ -2207,7 +2260,7 @@ function notifyPromptQueueRuntime(tabId: string, reason: string): void {
 }
 const processedNaturalOutcomes = new Map<string, { latestTs: number; keys: Set<string> }>();
 const latestLoopCauseByOwner = new Map<string, string>();
-const loopNaturalCausesByOwner = new Map<string, { provider: string; sessionId: string; turnId: string }>();
+const loopNaturalCausesByOwner = new Map<string, { provider: string; sessionId: string; turnId: string; outcomeTs?: number; inputBoundary?: string | null }>();
 const workflowRestoreReconciliationListeners = new Set<() => void>();
 let workflowRestoreReconciled = false;
 let workflowRestoreReconcilePromise: Promise<void> | null = null;
@@ -2234,7 +2287,8 @@ function isAbnormalWorkflowOutcome(data: BusyStatePayload): boolean {
 
 function rememberDeferredWorkflowOutcome(data: BusyStatePayload): void {
   const receivedAt = liveOutcomeTimestamp(data);
-  const deferred = { ...data, outcomeTs: receivedAt, receivedAt };
+  const deferred = { ...data, outcomeTs: receivedAt, receivedAt,
+    workflowOutcomeTimestampKnown: data.workflowOutcomeTimestampKnown ?? explicitOutcomeTimestamp(data) !== null };
   const current = deferredWorkflowOutcomes.get(data.tabId) ?? { latest: null, abnormal: null };
   if (!current.latest || receivedAt >= current.latest.receivedAt) current.latest = deferred;
   if (isAbnormalWorkflowOutcome(data)
@@ -2254,15 +2308,26 @@ function applyAbnormalQueueOutcome(
   outcomeTs: number | null = explicitOutcomeTimestamp(data),
 ): string[] {
   if (queueShutdownPending) return [];
+  if (getPromptQueueAgent(data.tabId) === 'codex' && isModelCapacityWorkflowOutcome(data)) {
+    capacityWorkflowRecovery.observeCapacity(data, capacityWorkflowSession(data.tabId));
+    console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+      + ' reason=model_capacity outcomeTs=' + outcomeTs + ' source=' + source
+      + ' → PRESERVE queue/arm; WAIT Main continuation natural outcome');
+    return [];
+  }
   // Stopping the agent is not Pause in Run After and is not a successful turn.
   // Keep authored promises, including Loop, timers and foreign dependencies,
   // unchanged for their next real trigger. Applies to live AND restored Stop.
   if (normalizeAgentTurnEndReason(data.reason) === 'manual-stop') {
+    capacityWorkflowRecovery.forget(data.tabId);
+    deferredCapacityNaturalOutcomes.delete(data.tabId);
     console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
       + ' reason=manual-stop outcomeTs=' + outcomeTs + ' source=' + source
       + ' → PRESERVE queue configuration; no completion or notification');
     return [];
   }
+  capacityWorkflowRecovery.forget(data.tabId);
+  deferredCapacityNaturalOutcomes.delete(data.tabId);
   const queueState = usePromptQueueStore.getState();
   for (const ownerTabId of queueState.queues.keys()) {
     if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
@@ -2643,6 +2708,12 @@ export function usePromptQueueRunner() {
 
     const continuationReleaseListener = (tabId: string, source: string) => {
       const queue = usePromptQueueStore.getState().getQueue(tabId);
+      const recovery = deferredCapacityNaturalOutcomes.get(tabId);
+      if (recovery && !queueSendInflight.has(tabId) && !queueAwaitingBusyStart.has(tabId)
+        && !queue.pendingDelivery && !isTabWorkflowBlocked(tabId)) {
+        deferredCapacityNaturalOutcomes.delete(tabId);
+        processSuccessfulWorkflowOutcome(recovery.data, recovery.source + '-input-release', recovery.outcomeTs, false, recovery.liveOwnArmAt);
+      }
       const outcomeTs = processedNaturalOutcomes.get(tabId)?.latestTs;
       if (source === 'conditions-skipped' && latestLoopCauseByOwner.has(tabId)
         && (queue.loopPromptArmedAt === null || (outcomeTs !== undefined && queue.loopPromptArmedAt <= outcomeTs))) {
@@ -2891,6 +2962,12 @@ export function usePromptQueueRunner() {
           + ' status=' + data.goalWork.status + ' turn=' + data.goalWork.turnId);
         return;
       }
+      if (getPromptQueueAgent(data.tabId) === 'codex'
+        && !capacityWorkflowRecovery.acceptNatural(data, capacityWorkflowSession(data.tabId)).accepted) {
+        console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+          + ' source=' + source + ' → WAIT exact post-capacity natural outcome');
+        return;
+      }
       if (!Number.isFinite(explicitTs)) {
         console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
           + ' reason=' + (data.reason || 'natural')
@@ -2901,7 +2978,7 @@ export function usePromptQueueRunner() {
       const loopProvider = getPromptQueueAgent(data.tabId);
       const loopCause = { provider: loopProvider,
         sessionId: data.sessionId || (loopProvider ? getPromptQueueSessionId(data.tabId, loopProvider) : null),
-        turnId: data.turnId || data.lastOutcomeTurnId };
+        turnId: data.turnId || data.lastOutcomeTurnId, outcomeTs, inputBoundary: data.loopInputBoundary || null };
       if (loopCause.provider && loopCause.sessionId && loopCause.turnId) loopNaturalCausesByOwner.set(data.tabId, loopCause as any);
       if (isOrchestrationCompletionBlocked(data.tabId)) {
         const current = deferredOrchestrationNaturalOutcomes.get(data.tabId);
@@ -2931,6 +3008,18 @@ export function usePromptQueueRunner() {
       if (prevBusyRef.get(data.tabId) === true) {
         console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
           + ' source=' + source + ' has a newer busy turn → WAIT');
+        return;
+      }
+      if (capacityWorkflowRecovery.isRecoveryNatural(data)
+        && (queueSendInflight.has(data.tabId) || queueAwaitingBusyStart.has(data.tabId)
+          || usePromptQueueStore.getState().getQueue(data.tabId).pendingDelivery)) {
+        // Main can finish Continue before the pre-capacity Send's known-no-input
+        // disposition reaches this renderer. Keep the REAL final unconsumed;
+        // its exact receipt release retries this cause, never busy:false/ACK.
+        const old = deferredCapacityNaturalOutcomes.get(data.tabId);
+        if (!old || old.outcomeTs <= outcomeTs) {
+          deferredCapacityNaturalOutcomes.set(data.tabId, { data, source, outcomeTs, liveOwnArmAt });
+        }
         return;
       }
       if (!compactChecked && coordinator.intercept(data.tabId, {
@@ -3090,6 +3179,16 @@ export function usePromptQueueRunner() {
           return;
         }
 
+        if (channel === 'codex' && !busy && isNaturalAgentTurnEndReason(reason)
+          && !capacityWorkflowRecovery.matchesCurrent(data, capacityWorkflowSession(tabId))) return;
+
+        if (channel === 'codex' && isCapacitySurfaceOnlyOutcome(data)) {
+          capacityWorkflowRecovery.observeCapacity(data, capacityWorkflowSession(tabId));
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+            + ' ch=' + channel + ' → IGNORE capacity presentation; WAIT typed outcome');
+          return;
+        }
+
         const goalDeferred = data.goalMetadataOnly === true ? deferredGoalNaturalOutcomes.get(tabId) : null;
         if (data.goalMetadataOnly === true) {
           if (!goalDeferred || goalDeferred.key !== deferredGoalCompletionKey(data)
@@ -3105,6 +3204,7 @@ export function usePromptQueueRunner() {
         prevBusyRef.set(tabId, busy);
 
         if (busy) {
+          if (channel === 'codex') capacityWorkflowRecovery.observeStart(data, capacityWorkflowSession(tabId));
           deferredGoalNaturalOutcomes.delete(tabId);
           setPromptQueueContextSkipped(usePromptQueueStore.getState().getQueue(tabId), false);
           for (const [ownerTabId, check] of queueConditionChecks) {
@@ -3117,6 +3217,7 @@ export function usePromptQueueRunner() {
           }
           queueAwaitingBusyStart.delete(tabId);
           deferredOrchestrationNaturalOutcomes.delete(tabId);
+          deferredCapacityNaturalOutcomes.delete(tabId);
           deferredContinuationPivotReleases.delete(tabId);
         }
 
@@ -3133,6 +3234,7 @@ export function usePromptQueueRunner() {
               ...data,
               reason: normalizeAgentTurnEndReason(data.reason) || data.reason,
               outcomeTs: liveOutcomeTimestamp(data),
+              workflowOutcomeTimestampKnown: explicitOutcomeTimestamp(data) !== null,
             }
           : data;
 
@@ -3182,7 +3284,11 @@ export function usePromptQueueRunner() {
         // A normal live completion still requires the real busy→idle edge.
         // Replayed restore outcomes bypass this edge check in reconciliation,
         // where their persisted timestamps are the correlation proof.
-        if (!(wasBusy && !busy) && !goalDeferred) { if (!busy) coordinator.wake(tabId); return; }
+        const capacityNatural = !busy && channel === 'codex' && !hasPendingAgentGoalWork(classifiedData)
+          ? capacityWorkflowRecovery.acceptNatural(classifiedData, capacityWorkflowSession(tabId))
+          : { accepted: true, released: false };
+        if (!capacityNatural.accepted) return;
+        if (!(wasBusy && !busy) && !goalDeferred && !capacityNatural.released) { if (!busy) coordinator.wake(tabId); return; }
         if (compactLocalCommandDone) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
@@ -3203,11 +3309,17 @@ export function usePromptQueueRunner() {
           + ' source=' + source + ' → WAIT pending/unknown catch-up');
         return;
       }
+      if (state.hasWatcher && state.sessionId) {
+        capacityWorkflowRecovery.observeStart({ ...state, tabId }, capacityWorkflowSession(tabId));
+      }
       if (state.hasWatcher) prevBusyRef.set(tabId, state.busy === true);
 
       if (state.lastAbnormalOutcomeReason) {
         const abnormal = {
           tabId,
+          sessionId: state.sessionId || null,
+          lifecycleGeneration: state.lifecycleGeneration || null,
+          capacitySurfaceOnly: state.lastAbnormalOutcomeCapacitySurfaceOnly === true,
           busy: false,
           reason: state.lastAbnormalOutcomeReason,
           outcomeTs: Number.isFinite(state.lastAbnormalOutcomeTs)
@@ -3237,8 +3349,13 @@ export function usePromptQueueRunner() {
 
       if (!state.outcomeKnown || !state.lastOutcomeReason) return;
       const latest: BusyStatePayload = {
+        loopInputBoundary: state.loopInputBoundary || null,
         goalWork: state.goalWork || null,
         tabId,
+        sessionId: state.sessionId || null,
+        lifecycleGeneration: state.lifecycleGeneration || null,
+        capacitySurfaceOnly: state.lastOutcomeCapacitySurfaceOnly === true,
+        workflowSnapshotCurrentTurnId: state.currentTurnId || null,
         busy: false,
         reason: state.lastOutcomeReason,
         outcomeTs: Number.isFinite(state.lastOutcomeTs) ? Number(state.lastOutcomeTs) : null,
@@ -3246,7 +3363,7 @@ export function usePromptQueueRunner() {
       };
       if (isNaturalAgentTurnEndReason(latest.reason)) {
         processSuccessfulWorkflowOutcome(latest, source + '-latest');
-      } else if (!state.lastAbnormalOutcomeReason) {
+      } else if (!state.lastAbnormalOutcomeReason || state.lastAbnormalOutcomeCapacitySurfaceOnly === true) {
         applyAbnormalQueueOutcome(latest, source + '-latest', explicitOutcomeTimestamp(latest));
       }
     };
@@ -3336,6 +3453,9 @@ export function usePromptQueueRunner() {
         for (const snapshot of codexSnapshots) {
           if (!snapshot?.state || snapshot.state.catchUpPending) continue;
           const { tabId, state } = snapshot;
+          if (state.hasWatcher && state.sessionId) {
+            capacityWorkflowRecovery.observeStart({ ...state, tabId }, capacityWorkflowSession(tabId));
+          }
           if (state.hasWatcher) prevBusyRef.set(tabId, state.busy === true);
           if (state.lastAbnormalOutcomeReason) {
             const timestamp = Number.isFinite(state.lastAbnormalOutcomeTs)
@@ -3343,6 +3463,9 @@ export function usePromptQueueRunner() {
               : null;
             const abnormalData = {
                 tabId,
+                sessionId: state.sessionId || null,
+                lifecycleGeneration: state.lifecycleGeneration || null,
+                capacitySurfaceOnly: state.lastAbnormalOutcomeCapacitySurfaceOnly === true,
                 busy: false,
                 reason: state.lastAbnormalOutcomeReason,
                 outcomeTs: timestamp,
@@ -3367,6 +3490,10 @@ export function usePromptQueueRunner() {
           const latest: BusyStatePayload = {
             goalWork: state.goalWork || null,
             tabId,
+            sessionId: state.sessionId || null,
+            lifecycleGeneration: state.lifecycleGeneration || null,
+            capacitySurfaceOnly: state.lastOutcomeCapacitySurfaceOnly === true,
+            workflowSnapshotCurrentTurnId: state.currentTurnId || null,
             busy: false,
             reason: state.lastOutcomeReason,
             outcomeTs: timestamp,
@@ -3374,7 +3501,7 @@ export function usePromptQueueRunner() {
           };
           if (isNaturalAgentTurnEndReason(latest.reason)) {
             rememberNatural(latest, 'hydration-codex-latest', timestamp);
-          } else if (!state.lastAbnormalOutcomeReason) {
+          } else if (!state.lastAbnormalOutcomeReason || state.lastAbnormalOutcomeCapacitySurfaceOnly === true) {
             abnormalEvidence.push({
               data: latest,
               source: 'hydration-codex-latest-abnormal',
@@ -3450,6 +3577,29 @@ export function usePromptQueueRunner() {
       }
     };
     const unsubscribeLoopDependencies = subscribeLoopDependencies(refreshLoopOutcome);
+    const releaseBuildContinue = (_event: unknown, release: any) => {
+      const tabId = release?.tabId;
+      if (release?.version !== 1 || !release.operationId || !release.handoffId || !tabId
+        || queueShutdownPending || !canProcessWorkflowOutcomes() || prevBusyRef.get(tabId) !== false) return;
+      // Removing recovery authority is not a new final. Retry the already
+      // pinned natural cause/preparation through ordinary arm/FIFO/Goal guards.
+      if (deferredOwnerSends.has(tabId)) retryDeferredOwnerSend(tabId, 'build-continue-released');
+      else if (latestLoopCauseByOwner.has(tabId)) fireLoopOwner(tabId);
+    };
+    ipcRenderer.on('build-continue:released', releaseBuildContinue);
+    const releaseMessageLoop = (entry: any) => {
+      const tabId = entry?.source?.tabId;
+      if (!tabId || !canProcessWorkflowOutcomes() || queueShutdownPending || prevBusyRef.get(tabId) === true) return;
+      const q = usePromptQueueStore.getState().getQueue(tabId);
+      if (loopPromptMode(q) !== 'all-work' || !isLoopPromptActive(q)) return;
+      // Retry only an already-observed natural cause. A reply ACK or timeout
+      // journal event never invents busy:false or finishes the source turn.
+      if (latestLoopCauseByOwner.has(tabId)) fireLoopOwner(tabId);
+    };
+    const unsubscribeMessageLoop = subscribeMessageLoopWaits(releaseMessageLoop);
+    void initializeMessageLoopWaits().then(() => {
+      for (const [tabId] of latestLoopCauseByOwner) releaseMessageLoop({ source: { tabId } });
+    }).catch(error => console.warn('[PromptQueueRunner] message wait restore pending: ' + String(error.message)));
     void initializeLoopDependencies().then(() => {
       for (const [tabId, deferred] of deferredOrchestrationNaturalOutcomes) {
         processSuccessfulWorkflowOutcome(deferred.data, deferred.source + '-loop-wait-ready', deferred.outcomeTs);
@@ -3458,7 +3608,7 @@ export function usePromptQueueRunner() {
     }).catch(error => console.warn('[PromptQueueRunner] Loop wait restore pending: ' + String(error.message)));
     const unsubscribeBuildInstall = subscribeBuildInstallContinuations((entry: any) => {
       const tabId = entry?.source?.tabId;
-      if (!tabId || !['continued', 'ended-without-callback'].includes(entry.state) || buildInstallContinuationBlocks(tabId)) return;
+      if (!tabId || !['continued', 'ended-without-callback', 'cancelled'].includes(entry.state) || buildInstallContinuationBlocks(tabId)) return;
       const floor = buildInstallContinuationFloor(tabId);
       if (isPromptQueueStoreHydrated()) usePromptQueueStore.getState().applyBuildInstallContinuationFloor(tabId, floor);
       const deferred = deferredOrchestrationNaturalOutcomes.get(tabId);
@@ -3467,6 +3617,10 @@ export function usePromptQueueRunner() {
       if (deferred && deferred.outcomeTs >= floor) {
         deferredOrchestrationNaturalOutcomes.delete(tabId);
         processSuccessfulWorkflowOutcome(deferred.data, deferred.source + '-install-continuation', deferred.outcomeTs);
+      }
+      if (entry.state === 'cancelled' && prevBusyRef.get(tabId) === false) {
+        if (deferredOwnerSends.has(tabId)) retryDeferredOwnerSend(tabId, 'install-request-cancelled');
+        else if (latestLoopCauseByOwner.has(tabId)) fireLoopOwner(tabId);
       }
       if (getPromptQueueAgent(tabId) === 'codex') {
         void ipcRenderer.invoke('codex:get-turn-state', tabId).then((state: any) => {
@@ -3504,6 +3658,11 @@ export function usePromptQueueRunner() {
         return;
       }
 
+      // Cancel only removes the dependency. It supplies neither parent idle
+      // nor a successful outcome: revalidate only an existing natural outcome
+      // or prepared continuation, after the normal hydration/runtime barriers.
+      if (change.releaseKind === 'dependency-cancelled'
+        && (!canProcessWorkflowOutcomes() || prevBusyRef.get(tabId) !== false)) return;
       if (prevBusyRef.get(tabId) === true) return;
       const deferred = deferredOrchestrationNaturalOutcomes.get(tabId);
       if (deferred) {
@@ -3595,6 +3754,8 @@ export function usePromptQueueRunner() {
       unsubscribeOrchestrationHydration();
       unsubscribeBuildInstall();
       unsubscribeLoopDependencies();
+      ipcRenderer.removeListener('build-continue:released', releaseBuildContinue);
+      unsubscribeMessageLoop();
       unsubscribeOrchestration();
       unsubscribeContinuationQueue();
       continuationReleaseListeners.delete(continuationReleaseListener);
@@ -3730,6 +3891,9 @@ export function usePromptQueueRunner() {
         if (res?.lastAbnormalOutcomeReason) {
           applyAbnormalQueueOutcome({
             tabId: triggerTabId,
+            sessionId: res.sessionId || null,
+            lifecycleGeneration: res.lifecycleGeneration || null,
+            capacitySurfaceOnly: res.lastAbnormalOutcomeCapacitySurfaceOnly === true,
             busy: false,
             reason: res.lastAbnormalOutcomeReason,
             outcomeTs: Number.isFinite(res.lastAbnormalOutcomeTs)
@@ -3739,6 +3903,22 @@ export function usePromptQueueRunner() {
           }, 'cold-start-codex-state', Number.isFinite(res.lastAbnormalOutcomeTs)
             ? Number(res.lastAbnormalOutcomeTs)
             : null);
+        }
+        if (res?.outcomeKnown === true && isNaturalAgentTurnEndReason(res.lastOutcomeReason)) {
+          capacityWorkflowRecovery.acceptNatural({
+            tabId: triggerTabId, busy: false, reason: res.lastOutcomeReason,
+            sessionId: res.sessionId || null, lifecycleGeneration: res.lifecycleGeneration || null,
+            workflowSnapshotCurrentTurnId: res.currentTurnId || null,
+            turnId: res.lastOutcomeTurnId || null, outcomeTs: res.lastOutcomeTs,
+          }, capacityWorkflowSession(triggerTabId));
+        } else if (res?.outcomeKnown === true && res.lastOutcomeReason
+          && res.lastAbnormalOutcomeCapacitySurfaceOnly === true) {
+          applyAbnormalQueueOutcome({
+            tabId: triggerTabId, busy: false, reason: res.lastOutcomeReason,
+            sessionId: res.sessionId || null, lifecycleGeneration: res.lifecycleGeneration || null,
+            turnId: res.lastOutcomeTurnId || null, outcomeTs: res.lastOutcomeTs,
+            capacitySurfaceOnly: res.lastOutcomeCapacitySurfaceOnly === true,
+          }, 'cold-start-codex-latest');
         }
         if (res?.hasWatcher) {
           prevBusyRef.set(triggerTabId, !!res.busy);

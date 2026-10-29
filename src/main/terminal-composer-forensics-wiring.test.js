@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
@@ -38,11 +39,11 @@ test('only authoritative committed frames become composer observations', () => {
 });
 
 test('paste, Enter, manual input, and Ctrl+G leave causal input boundaries', () => {
-  assert.match(main, /kind:\s*'programmatic-paste'[\s\S]{0,420}term\.write\(payload\)/);
+  assert.match(main, /kind:\s*'programmatic-paste'[\s\S]{0,420}writeHistorySendPayload\(term, payload/);
   const programmaticEnter = main.indexOf("? 'programmatic-enter'");
-  const submitWrite = main.indexOf('term.write(submitSequence)', programmaticEnter);
+  const submitWrite = main.indexOf('writeHistorySendEnter(term, submitSequence,', programmaticEnter);
   assert.ok(
-    programmaticEnter > 0 && submitWrite > programmaticEnter && submitWrite - programmaticEnter < 900,
+    programmaticEnter > 0 && submitWrite > programmaticEnter,
     'the final safe-paste submit boundary must record its exact input before writing it',
   );
   const submitTraceStart = main.lastIndexOf(
@@ -54,14 +55,48 @@ test('paste, Enter, manual input, and Ctrl+G leave causal input boundaries', () 
   assert.match(submitBoundary, /const forensicSubmitInput = recordComposerForensicPtyInput/);
   assert.match(submitBoundary, /stagedClaudeAudit\.forensicEnterInputId = forensicSubmitInput\.id/);
   assert.match(submitBoundary, /stagedClaudeAudit\.forensicEnterAt = forensicSubmitInput\.at/);
+  assert.doesNotMatch(submitBoundary, /\bawait\b/,
+    'the forensic input must precede the shared physical writer without an async gap');
   assert.match(main, /phase:\s*'renderer-received'[\s\S]{0,280}source:\s*'terminal:input'/);
-  assert.match(main, /source:\s*'manual-terminal-enter'[\s\S]{0,300}term\.write\(data\)/);
+  assert.match(main, /source:\s*'manual-terminal-enter'[\s\S]{0,300}writeTerminalInputObserved\(inputDiagnostic, term, data/);
   const ctrlGTrace = main.indexOf("kind: 'ctrl-g'");
   const ctrlGWrite = main.indexOf("term.write('\\x07')", ctrlGTrace);
   assert.ok(
     ctrlGTrace > 0 && ctrlGWrite > ctrlGTrace && ctrlGWrite - ctrlGTrace < 420,
     'the exact-editor shortcut must be recorded before Ctrl+G crosses the PTY',
   );
+});
+
+test('shared Send writers forward the same physical bytes once and preserve the pre-write fence', () => {
+  const writes = [];
+  let fenced = false;
+  const context = {
+    agentSendReceiptStore: {}, mainWindow: null,
+    historySendReturnControl: () => ({ beforeWrite() {
+      if (fenced) throw new Error('synthetic write fence');
+      return { newlyStarted: false };
+    } }),
+    publishHistorySendReturn() {}, queueMicrotask() {}, console: { log() {} },
+    writeWithSendPayloadTiming: (write, observe) => { observe(123); return write(); },
+    writeWithSendEnterTiming: (write, observe) => { observe(124); return write(); },
+  };
+  const load = name => {
+    const begin = main.indexOf('function ' + name + '(');
+    const end = main.indexOf('\n}', begin + 1) + 2;
+    assert.ok(begin >= 0 && end > begin, 'the actual shared writer must be present');
+    return vm.runInNewContext('(' + main.slice(begin, end) + ')', context);
+  };
+  const payload = load('writeHistorySendPayload'), enter = load('writeHistorySendEnter');
+  const term = { write: bytes => { writes.push(bytes); return 'written'; } };
+  assert.equal(payload(term, 'plain', 'T', 'H'), 'written');
+  assert.equal(payload(term, 'timed', 'T', 'H', {
+    sendOperationKey: 'O', sendAttemptId: 'A',
+  }), 'written');
+  assert.equal(enter(term, '\r', { tabId: 'T', handoffId: 'H' }), 'written');
+  assert.equal(enter(term, 'other', {}), 'written');
+  fenced = true;
+  assert.throws(() => payload(term, 'refused', 'T', 'H'), /synthetic write fence/);
+  assert.deepEqual(writes, ['plain', 'timed', '\r', 'other']);
 });
 
 test('a screen-versus-exact-input contradiction persists one latest JSON artifact', () => {

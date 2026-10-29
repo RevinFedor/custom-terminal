@@ -28,6 +28,7 @@ test('Loop ON survives context-bound install restart; actual Main natural final 
   const outfile = path.join(root, 'queue.cjs'), persisted = new Map();
   const { choosePromptQueueContinuationForOutcome } = await import('./promptQueueReconciliation.mjs');
   const { normalizeAgentTurnEndReason, isNaturalAgentTurnEndReason } = await import('./agentCompletionOutcome.mjs');
+  const { createRunAfterCapacityRecovery } = await import('./runAfterCapacityRecovery.mjs');
   await esbuild.build({ entryPoints: [path.resolve(__dirname, '../store/usePromptQueueStore.ts')], outfile,
     bundle: true, platform: 'node', format: 'cjs', target: 'node18', logLevel: 'silent' });
   global.window = { require: () => ({ ipcRenderer: { on() {}, removeListener() {},
@@ -63,6 +64,8 @@ test('Loop ON survives context-bound install restart; actual Main natural final 
     isOrchestrationCompletionBlocked: () => held, buildInstallContinuationFloor: () => floor,
     hasPendingAgentGoalWork: data => data.goalWork?.pending === true,
     normalizeAgentTurnEndReason, isNaturalAgentTurnEndReason, choosePromptQueueContinuationForOutcome,
+    capacityWorkflowRecovery: createRunAfterCapacityRecovery(), capacityWorkflowSession: () => 'S',
+    deferredCapacityNaturalOutcomes: new Map(),
     deferredOrchestrationNaturalOutcomes: deferred, processedNaturalOutcomes: processed,
     prevBusyRef: prevBusy, autoCompactTurnStarts: new Map(), latestLoopCauseByOwner: new Map(),
     queueSendInflight: new Set(), queueAwaitingBusyStart: new Set(), deferredContinuationPivotReleases: new Map(),

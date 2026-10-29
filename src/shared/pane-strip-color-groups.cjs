@@ -35,6 +35,7 @@ function mergePaneStripColorGroups(current,requested,edit,isMember=()=>true) {
   if(edit===undefined)return current;
   if(!edit||typeof edit.basis!=='string'||edit.basis!==paneStripColorGroupsBasis(current))fail('revision_changed');
   const before=current===undefined?blank():current,next=validatePaneStripColorGroups(requested);
+  if(Object.hasOwn(edit,'add'))return mergePaneStripGroupAdd(before,next,edit,isMember);
   if(paneStripColorGroupsBasis(before)===paneStripColorGroupsBasis(next))return current;
   if(next.revision!==before.revision+1)fail('revision_changed');
   const previous=new Map(before.groups.map(group=>[group.id,group]));
@@ -54,14 +55,46 @@ function mergePaneStripColorGroups(current,requested,edit,isMember=()=>true) {
   }
   return next;
 }
+function paneStripGroupAddIntent(edit) {
+  const add=edit?.add,gather=edit?.gather,owner=gather?.owner;
+  if(!add||typeof add!=='object'||Array.isArray(add)||Object.keys(add).some(key=>!['groupId','tabIds'].includes(key))
+    ||typeof add.groupId!=='string'||!add.groupId||!Array.isArray(add.tabIds)||!add.tabIds.length
+    ||add.tabIds.some(id=>typeof id!=='string'||!id)||new Set(add.tabIds).size!==add.tabIds.length
+    ||!gather||typeof gather!=='object'||Array.isArray(gather)||Object.keys(gather).some(key=>!['owner','beforeSlots'].includes(key))
+    ||!owner||typeof owner!=='object'||Array.isArray(owner)||Object.keys(owner).some(key=>!['windowId','paneIndex','centerKey'].includes(key))
+    ||!Array.isArray(gather.beforeSlots)||gather.beforeSlots.some(slot=>!paneStripAddSlot(slot))
+    ||!(owner.paneIndex===null||Number.isSafeInteger(owner.paneIndex)&&owner.paneIndex>=0)
+    ||owner.paneIndex===null&&(owner.windowId!=null||typeof owner.centerKey!=='string'||!owner.centerKey)
+    ||owner.paneIndex!==null&&(owner.centerKey!=null||owner.windowId!=null&&(typeof owner.windowId!=='string'||!owner.windowId))
+    ||Object.hasOwn(edit,'arrange'))fail('basis_invalid');
+  return add;
+}
+const paneStripAddSlot=slot=>slot&&typeof slot==='object'&&!Array.isArray(slot)
+  &&(slot.tabId?typeof slot.tabId==='string'&&typeof slot.projectId==='string'&&!!slot.projectId
+    :typeof slot.slotId==='string'&&!!slot.slotId);
+/** Only explicit Add may extend one existing definition. Raw provenance and
+ * every extension stay byte-for-byte semantic equals; its live order is a
+ * separate gather proof. Ordinary CREATE/recolor admission above is unchanged. */
+function mergePaneStripGroupAdd(before,next,edit,isMember) {
+  const {groupId,tabIds}=paneStripGroupAddIntent(edit),group=before.groups.find(value=>value.id===groupId);
+  if(!group||tabIds.some(id=>before.groups.some(value=>value.tabIds.includes(id))))fail('membership_changed');
+  if(group.tabIds.some(id=>{const value=isMember(id);return value!==true&&value?.member!==true;})
+    ||tabIds.some(id=>{const value=isMember(id);return value!==true&&!(value?.member===true&&value?.active===true);}))fail('membership_changed');
+  if(next.revision!==before.revision+1||next.groups.find(value=>value.id===groupId)?.revision!==group.revision+1)fail('revision_changed');
+  const expected={...before,revision:before.revision+1,groups:before.groups.map(value=>value.id===groupId
+    ?{...value,revision:value.revision+1,tabIds:[...value.tabIds,...tabIds]}:value)};
+  if(stableJson(next)!==stableJson(expected))fail('add_changed');
+  return next;
+}
 function paneStripColorGroupEdits(requested,raw) {
   if(raw===undefined)return new Map();
   if(!Array.isArray(raw))fail('basis_invalid');
   const result=new Map();
   for(const edit of raw) {
     if(!edit||typeof edit.workflowId!=='string'||!requested.has(edit.workflowId)||result.has(edit.workflowId)
-      ||typeof edit.basis!=='string'||Object.keys(edit).some(key=>!['workflowId','basis','gather','arrange'].includes(key))
+      ||typeof edit.basis!=='string'||Object.keys(edit).some(key=>!['workflowId','basis','gather','arrange','add'].includes(key))
       ||edit.gather&&edit.arrange)fail('basis_invalid');
+    if(Object.hasOwn(edit,'add'))paneStripGroupAddIntent(edit);
     result.set(edit.workflowId,edit);
   }
   return result;
@@ -87,8 +120,31 @@ function gatherPaneStripSlots(slots,selectedIds) {
   const next=[...rest.slice(0,first),...incoming,...rest.slice(first)];
   return next.every((slot,index)=>slot===slots[index])?slots:next;
 }
+/** Preserve the coherent existing group's visual order, then append only
+ * selected free roots in their visual order. Closed raw IDs need no slot.
+ * Unrelated/chooser slots and all canonical slot extensions keep their order. */
+function addPaneStripGroupSlots(slots,groupIds,addedIds) {
+  if(!Array.isArray(slots)||slots.some(slot=>!paneStripAddSlot(slot))||!Array.isArray(groupIds)||!Array.isArray(addedIds)
+    ||[...groupIds,...addedIds].some(id=>typeof id!=='string'||!id))fail('order_changed');
+  const group=new Set(groupIds),added=new Set(addedIds);
+  if(!group.size||!added.size||added.size!==addedIds.length||addedIds.some(id=>group.has(id)))fail('order_changed');
+  const positions=[],incoming=[];
+  for(let index=0;index<slots.length;index++) {
+    const slot=slots[index];
+    if(group.has(slot.tabId))positions.push(index);
+    if(added.has(slot.tabId))incoming.push(slot);
+  }
+  if(!positions.length||new Set(positions.map(index=>slots[index].tabId)).size!==positions.length
+    ||positions.at(-1)-positions[0]+1!==positions.length||incoming.length!==added.size
+    ||stableJson(incoming.map(slot=>slot.tabId))!==stableJson(addedIds))fail('order_changed');
+  const rest=slots.filter(slot=>!added.has(slot.tabId));
+  const last=rest.findLastIndex(slot=>group.has(slot.tabId));
+  const next=[...rest.slice(0,last+1),...incoming,...rest.slice(last+1)];
+  return next.every((slot,index)=>slot===slots[index])?slots:next;
+}
 const paneStripSlotOrder=slots=>slots.map(slot=>slot.tabId?['tab',slot.projectId,slot.tabId]:['chooser',slot.slotId]);
 function assertPaneStripGather(beforeLayout,afterLayout,beforeGroups,afterGroups,edit) {
+  if(edit&&Object.hasOwn(edit,'add'))return assertPaneStripGroupAddGather(beforeLayout,afterLayout,beforeGroups,afterGroups,edit);
   if(edit?.arrange)return assertPaneStripAnchorArrangement(beforeLayout,afterLayout,beforeGroups,afterGroups,edit.arrange);
   const previous=new Set((beforeGroups?.groups||[]).map(group=>group.id));
   const created=(afterGroups?.groups||[]).filter(group=>!previous.has(group.id));
@@ -119,6 +175,24 @@ function assertPaneStripGather(beforeLayout,afterLayout,beforeGroups,afterGroups
   if(stableJson(paneStripSlotOrder(slots))!==stableJson(paneStripSlotOrder(after.slots)))fail('order_changed');
   if(before.pane&&['tabId','projectId','selectedSlotId'].some(key=>before.pane[key]!==after.pane?.[key]))fail('order_changed');
   return {...after,slots}; // preserve Main's canonical chooser/unknown slot fields
+}
+
+function assertPaneStripGroupAddGather(beforeLayout,afterLayout,beforeGroups,afterGroups,edit) {
+  const {groupId,tabIds}=paneStripGroupAddIntent(edit),gather=edit.gather,owner=gather.owner;
+  const group=beforeGroups?.groups?.find(value=>value.id===groupId);
+  if(!group||!afterGroups?.groups?.some(value=>value.id===groupId))fail('basis_invalid');
+  const before=paneStripLayoutOwner(beforeLayout,owner),after=paneStripLayoutOwner(afterLayout,owner);
+  if(!before||!after||!Array.isArray(before.slots)||!Array.isArray(after.slots)
+    ||before.slots.some(slot=>!paneStripAddSlot(slot))||after.slots.some(slot=>!paneStripAddSlot(slot))
+    ||before.pane&&((before.pane.windowId||null)!==(owner.windowId||null)
+    ||(after.pane?.windowId||null)!==(owner.windowId||null)||before.paneIndex!==owner.paneIndex||after.paneIndex!==owner.paneIndex)
+    ||stableJson(paneStripSlotOrder(before.slots))!==stableJson(paneStripSlotOrder(gather.beforeSlots)))fail('order_changed');
+  const slots=addPaneStripGroupSlots(before.slots,group.tabIds,tabIds);
+  if(stableJson(paneStripSlotOrder(slots))!==stableJson(paneStripSlotOrder(after.slots)))fail('order_changed');
+  if(before.pane&&['tabId','projectId','selectedSlotId'].some(key=>before.pane[key]!==after.pane?.[key]))fail('order_changed');
+  if(['activeProjectId','focusedProjectId','splitFocusedIndex','activeSpaceTab'].some(key=>
+    stableJson(beforeLayout?.[key]??null)!==stableJson(afterLayout?.[key]??null)))fail('order_changed');
+  return {...after,slots};
 }
 
 /** OPEN may move only the representative among its own group. This is the
@@ -162,5 +236,5 @@ function adoptPaneStripColorGroups(currentSpaces,publishedSpaces) {
   });
 }
 module.exports={validatePaneStripColorGroups,paneStripColorGroupsBasis,mergePaneStripColorGroups,paneStripColorGroupEdits,
-  adoptPaneStripColorGroups,paneStripLayoutOwner,gatherPaneStripSlots,assertPaneStripGather,paneStripSlotOrder};
+  adoptPaneStripColorGroups,paneStripLayoutOwner,gatherPaneStripSlots,addPaneStripGroupSlots,assertPaneStripGather,paneStripSlotOrder};
 module.exports.projectActivePaneStripGroups=projectActivePaneStripGroups;

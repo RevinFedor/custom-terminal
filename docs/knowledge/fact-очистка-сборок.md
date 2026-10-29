@@ -26,6 +26,16 @@ backup и retired целиком; повторение фаз давало не�
 retired, остаются rollback и receipts. Это structural install proof, не UX acceptance:
 backup нужен и при renderer-crash нового пакета.
 
+Preserving ASAR overlay тоже может накапливать мусор: добавление очередных
+hashed JS/CSS без удаления старых имён переносит предыдущие поколения assets
+в каждый следующий пакет. В owned stream-overlay удаление объявляется отдельно
+и только для старых generated renderer assets: полный fresh compiler output,
+index/manifest/import/auxiliary-dependency closure и path/size/SHA proof должны
+согласоваться. Candidate и activation повторно проверяют тот же список удалений;
+обычный overlay по умолчанию всё ещё запрещает baseline deletion. Source,
+native/unpacked/link entries, текущая `.app` и rollback не удаляются этой операцией.
+Меньший новый ASAR не доказывает runtime speedup и не разрешает выкинуть откат.
+
 `prepared` отмечается до тяжёлого копирования, `verified` — после install proof;
 маркер публикуется атомарно. Старое имя каталога не разрешает удалить новый stage
 внутри него. Без installed receipt/verified marker возраст не доказывает завершение:
@@ -36,6 +46,35 @@ backup нужен и при renderer-crash нового пакета.
 новейших rollback bundles каждого продукта по CFBundleIdentifier через все roots,
 а не один backup в каждой исторической фазе. `.app` mtime наследуется при копировании;
 свежесть определяется generation marker/именем группы, не старой датой бинарника.
+
+Исходная диагностика23.10: новый SC `scripts/install-built-sc-desktop.cjs` сохранял предыдущую
+`.app` в `sc-desktop/app-backups/SC Desktop-<timestamp>.app`, а receipt пишет
+в `install-runs/<nonce>.json`. Общий post-hook ожидает verified marker либо
+`installed.json` прежнего deployment format; в обследованном app-backups их
+нет. Поэтому21 bundle/~13.1GB оставались, хотя Noted auto-delete enabled и
+его retention успешно удалял старые сессии. Это не один общий переключатель.
+При согласовании этих путей нельзя просто пометить весь root verified:
+rollbackWalk распознаёт backup/retired/before в relative name, но timestamp-only
+имена этого installer не попадают в keeper-set. Требуются совместимые exact
+completion и два проверенных rollback/pending guards, не снятие safety checks.
+Следующим поручением пользователь разрешил cleanup и исправление installer.
+
+SOURCE23.10: `sc-desktop/scripts/sc-backup-retention.cjs` читает его exact
+install receipts без глобального verified marker. Installer вызывает helper
+после durable receipt и только coherent full activation (`ok/complete/activated`),
+включая завершение того же barrier через resume-activation. Main health,
+bootstrap/UNKNOWN/failed не разрешают cleanup. Retention48h и два newest
+подписанных rollback определяются по install generation; pending/failed receipts
+сохраняются. Старые legacy copies без completion proof требуют отдельного
+явного cutoff, это не автоматический fallback. Helper заимствует тот же
+install/publication lock, проверяет current installed ASAR/keeper pins, свежие
+open-file/process refs, receipt/inventory revisions после awaited audit и
+удаляет exact app leaves общим applyTargets, не следуя symlink targets.
+Ошибка housekeeping не превращает успешную установку в failure/retry. Scripts
+читаются из checkout, отдельный app reinstall ради этого изменения не нужен.
+Проверка46 focused controls (часть signatures/runtime substitution), реальная
+разовая очистка15 old SC bundles сохранила2 verified latest +3 pending/failed;
+наблюдаемый net free +9386381312B (~9.39GB). Полный новый install не запускался.
 
 ## Когда срабатывает
 

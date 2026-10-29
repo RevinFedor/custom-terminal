@@ -48,8 +48,8 @@ async function fixture(t) {
     send: async request => {
       await request.prepareSend(); inputs.push(request); const frozen = JSON.parse(JSON.stringify(request));
       const identity = { operationKey: request.sendOperationKey, tabId: 'W', provider: 'codex', sessionId: 'W-A',
-        handoffId: request.handoffId, surface: 'desktop-history', promptHash: promptAuditFingerprint('continue'),
-        promptLength: 8, requestFingerprint: fingerprintAgentSendRequest(frozen) };
+        handoffId: request.handoffId, surface: 'desktop-history', promptHash: promptAuditFingerprint(request.prompt),
+        promptLength: request.prompt.length, requestFingerprint: fingerprintAgentSendRequest(frozen) };
       assert.equal(queue.enqueue({ identity, request: frozen }).ok, true);
       const attempt = native.beginAttempt(identity);
       assert.equal(native.stageAttemptContext(identity.operationKey, attempt.attemptId, { sessionId: 'W-B' }).ok, true);

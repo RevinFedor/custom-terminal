@@ -1,3 +1,7 @@
+import webImages from './prompt-web-images.cjs';
+const { collectPromptWebImageReferences, mapPromptImageAuthoringText, maskPromptWebImageReferences, collectLegacyPromptImageRanges } = webImages;
+export { collectPromptWebImageReferences, maskPromptWebImageReferences, collectLegacyPromptImageRanges };
+
 const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
 const IMAGE_ERROR_MARKER_SOURCE = String.raw`\[imageError(?:\s*:\s*[^\]\r\n]+)?\]`;
 
@@ -24,6 +28,14 @@ function createImageErrorMarkerRegex() {
   return new RegExp(IMAGE_ERROR_MARKER_SOURCE, 'gi');
 }
 
+export function hasPromptPendingImageMarker(text) {
+  return maskPromptWebImageReferences(text).includes('[Image saving…]');
+}
+
+export function replacePromptPendingImageMarkers(text, replacement) {
+  return mapPromptImageAuthoringText(text, value => value.replaceAll('[Image saving…]', replacement));
+}
+
 export function getPromptImageErrorTokenLabel(marker = '') {
   const value = String(marker || '');
   if (!/^\[imageError\b/i.test(value)) return value;
@@ -40,10 +52,11 @@ export function getPromptImageErrorTokenLabel(marker = '') {
  */
 export function getPromptImageStatusTokenRanges(text = '') {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const statusPattern = /\[Image saving…\]|\[imagePath:\s*[^\]\r\n]+\]|\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/gi;
   const result = [];
   let match;
-  while ((match = statusPattern.exec(value)) !== null) {
+  while ((match = statusPattern.exec(authoring)) !== null) {
     const marker = match[0];
     const explicitError = /^\[imageError\b/i.test(marker);
     result.push({
@@ -94,13 +107,14 @@ function promptImageIssueExcerpt(value, start, end, radius = 36) {
  */
 export function inspectPromptImageAttachments(text = '', imagePaths = []) {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const refsById = new Map((imagePaths || []).map((ref) => [Number(ref?.id), ref]));
   const issues = [];
   const unknownIds = new Set();
 
   const markerRe = createValidImageMarkerRegex();
   let match;
-  while ((match = markerRe.exec(value)) !== null) {
+  while ((match = markerRe.exec(authoring)) !== null) {
     const id = Number(match[1]);
     const ref = refsById.get(id);
     if (!ref) {
@@ -134,7 +148,7 @@ export function inspectPromptImageAttachments(text = '', imagePaths = []) {
   }
 
   const errorRe = createImageErrorMarkerRegex();
-  while ((match = errorRe.exec(value)) !== null) {
+  while ((match = errorRe.exec(authoring)) !== null) {
     const rawId = /#(\d+)/.exec(match[0]);
     const rawPath = /\bpath=([^\]\r\n]+?)\s*\]$/i.exec(match[0]);
     issues.push({
@@ -154,7 +168,7 @@ export function inspectPromptImageAttachments(text = '', imagePaths = []) {
   // generic issue would only duplicate the warning. Any remaining malformed
   // shape is a cut/missing bracket or an unnumbered authoring marker.
   if (hasMalformedPromptImageMarker(value, imagePaths) && unknownIds.size === 0) {
-    const masked = value
+    const masked = authoring
       .replace(createValidImageMarkerRegex(), (marker) => ' '.repeat(marker.length))
       .replace(createImageErrorMarkerRegex(), (marker) => ' '.repeat(marker.length));
     const malformedMatch = /\[\s*Image\b[^\r\n]*?(?:\]|$)|(?:^|[^\[])\bImage\s+#?\d+\s*\]/i.exec(masked);
@@ -191,9 +205,10 @@ export function collectPromptImageRefIds(text) {
 
 export function collectPromptImageOccurrences(text) {
   const occurrences = [];
+  const authoring = maskPromptWebImageReferences(text);
   const re = createValidImageMarkerRegex();
   let match;
-  while ((match = re.exec(String(text || ''))) !== null) {
+  while ((match = re.exec(authoring)) !== null) {
     const id = Number(match[1]);
     if (Number.isFinite(id)) occurrences.push({ id, start: match.index, end: match.index + match[0].length });
   }
@@ -203,9 +218,10 @@ export function collectPromptImageOccurrences(text) {
 export function getPromptImageMarkerHighlightRanges(text, imagePaths = []) {
   const refsById = new Map((imagePaths || []).map((ref) => [Number(ref?.id), ref]));
   const ranges = [];
+  const authoring = maskPromptWebImageReferences(text);
   const re = createValidImageMarkerRegex();
   let match;
-  while ((match = re.exec(String(text || ''))) !== null) {
+  while ((match = re.exec(authoring)) !== null) {
     const id = Number(match[1]);
     const ref = refsById.get(id);
     if (!ref?.path || ref.availability === 'missing') continue;
@@ -215,7 +231,7 @@ export function getPromptImageMarkerHighlightRanges(text, imagePaths = []) {
 }
 
 export function hasMalformedPromptImageMarker(text, imagePaths = []) {
-  const value = String(text || '');
+  const value = maskPromptWebImageReferences(text);
   const refs = imagePaths || [];
   const knownIds = new Set(refs.map((ref) => Number(ref?.id)));
   const validIds = collectPromptImageRefIds(value);
@@ -260,7 +276,7 @@ export function buildPromptImagePayload(text, imagePaths = [], {
   const byId = new Map();
   for (const ref of imagePaths || []) byId.set(Number(ref?.id), ref);
 
-  return String(text || '')
+  return mapPromptImageAuthoringText(text, value => value
     .replace(createValidImageMarkerRegex(), (_match, rawId) => {
       const id = Number(rawId);
       const resolved = byId.get(id);
@@ -269,7 +285,7 @@ export function buildPromptImagePayload(text, imagePaths = [], {
       }
       return `[imagePath: ${resolved.path}]`;
     })
-    .replace(/\[Image\s*\]/gi, `[imageError: ${missingCode} #unknown]`);
+    .replace(/\[Image\s*\]/gi, `[imageError: ${missingCode} #unknown]`));
 }
 
 export function getPromptImageAttachmentState({
@@ -280,9 +296,9 @@ export function getPromptImageAttachmentState({
 } = {}) {
   if (attachmentState === 'materializing') return 'materializing';
   if (attachmentState === 'missing') return 'missing';
-  if (/\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(String(text || ''))) return 'missing';
+  if (/\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(maskPromptWebImageReferences(text))) return 'missing';
   if (hasMalformedPromptImageMarker(text, imagePaths)) return 'missing';
-  if (/\[Image\s*\]/i.test(String(text || ''))) return 'missing';
+  if (/\[Image\s*\]/i.test(maskPromptWebImageReferences(text))) return 'missing';
   const ids = collectPromptImageRefIds(text);
   if (ids.size === 0) return 'ready';
   const byId = new Map((imagePaths || []).map((ref) => [Number(ref?.id), ref]));
@@ -324,7 +340,7 @@ export function insertPromptImageAttachments({
   const remappedBySourceId = new Map();
   const addedRefs = [];
   const missingSourceIds = [];
-  const remappedText = String(insertedText || '').replace(createValidImageMarkerRegex(), (marker, rawId) => {
+  const remappedText = mapPromptImageAuthoringText(insertedText, value => value.replace(createValidImageMarkerRegex(), (marker, rawId) => {
     const sourceId = Number(rawId);
     const sourceRef = sourceById.get(sourceId);
     if (!sourceRef?.path) {
@@ -341,7 +357,7 @@ export function insertPromptImageAttachments({
       addedRefs.push(remapped);
     }
     return `[Image #${remapped.id}]`;
-  });
+  }));
 
   const nextText = currentText.slice(0, from) + remappedText + currentText.slice(to);
   const nextRefs = retainPromptImageRefsForText(nextText, [...currentRefs, ...addedRefs]);
@@ -383,10 +399,10 @@ export function remapPromptImageSelectionAfterReplacement({
 }
 
 export function normalizePromptImageIdentity(text) {
-  return String(text || '')
+  return mapPromptImageAuthoringText(text, value => value
     .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
     .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
-    .replace(/\[Image(?:\s+#?\d+)?\]/gi, ' [Image] ')
+    .replace(/\[Image(?:\s+#?\d+)?\]/gi, ' [Image] '))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -405,6 +421,7 @@ export function normalizePromptImageIdentity(text) {
  */
 export function buildImageAwareClipboardText(text = '', selectionStart = 0, selectionEnd = 0) {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const start = Math.max(0, Math.min(Number(selectionStart) || 0, value.length));
   const end = Math.max(start, Math.min(Number(selectionEnd) || 0, value.length));
   const selected = value.slice(start, end);
@@ -414,7 +431,7 @@ export function buildImageAwareClipboardText(text = '', selectionStart = 0, sele
   const wholeInSelection = [];
   const re = createValidImageMarkerRegex();
   let match;
-  while ((match = re.exec(value)) !== null) {
+  while ((match = re.exec(authoring)) !== null) {
     const from = match.index;
     const to = from + match[0].length;
     if (from >= start && to <= end) {

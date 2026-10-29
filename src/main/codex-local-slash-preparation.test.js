@@ -8,7 +8,9 @@ const ts = require('typescript');
 const { EventEmitter } = require('node:events');
 const { createCodexSettingsMutationQueue } = require('./codex-settings-mutation-queue');
 const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
-const source = process.env.CODEX_LOCAL_SLASH_BASELINE
+const source = process.env.CODEX_LOCAL_SLASH_SOURCE
+  ? fs.readFileSync(process.env.CODEX_LOCAL_SLASH_SOURCE, 'utf8')
+  : process.env.CODEX_LOCAL_SLASH_BASELINE
   ? require('node:child_process').execFileSync('git', ['show', process.env.CODEX_LOCAL_SLASH_BASELINE + ':src/main/main.js'],
     { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 })
   : fs.readFileSync(require.resolve('./main'), 'utf8');
@@ -17,7 +19,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function fixture() {
   const events = new EventEmitter(), writes = [];
-  const reservations = [];
+  const reservations = [], observationBudgets = [];
   const term = { write: bytes => writes.push(bytes) };
   const state = { runSeq: 1, isRunning: true };
   let input = 1, stopped = false, ready = false, lifecycle = 'G';
@@ -71,7 +73,8 @@ function fixture() {
       writes.push(request.command, 'Enter');
       return { success: true, submitted: true, compactStartConfirmed: true };
     },
-    createMainAgentInputObservation() {
+    createMainAgentInputObservation(_tabId, _provider, timeoutMs) {
+      observationBudgets.push(timeoutMs);
       const initial = { input, lifecycle, runSeq: state.runSeq };
       return createAgentInputObservation({ timeoutMs: 120,
         isCurrent: () => !stopped && context.terminals.get('T') === term
@@ -87,11 +90,11 @@ function fixture() {
     if (node) vm.runInContext(node.getText(ast), context);
   }
   const wake = () => events.emit('change');
-  return { context, term, writes, queue, events, wake, reservations,
-    sendImage: () => context.safePasteAndSubmit(term, 'original prompt [Image #1]', {
+  return { context, term, writes, queue, events, wake, reservations, observationBudgets,
+    sendImage: (options = {}) => context.safePasteAndSubmit(term, 'original prompt [Image #1]', {
       source: 'codex-history-panel', handoffId: 'IMAGE', presentationSnapshot: {
         text: 'original prompt [Image #1]', imagePaths: [{ id: 1, path: '/fixture/original.png' }],
-      },
+      }, ...options,
     }),
     send: (options = {}) => context.executeCodexLiveSlashCommandRequest({ tabId: 'T', command: '/compact', handoffId: 'H', source: 'history-panel', ...options }),
     async finishSettings() {
@@ -99,6 +102,15 @@ function fixture() {
       return context.withPtyWriteLock(term, async () => {
         queue.releaseUnsubmittedInput(term, receipt);
         ready = true; intent = { ...intent, appliedRevision: 5 }; wake();
+      });
+    },
+    async finishSettingsDeferred() {
+      // The real settings owner publishes its terminal error only after the
+      // owned slash was cleared. The requested pair is NOT falsely applied.
+      return context.withPtyWriteLock(term, async () => {
+        queue.releaseUnsubmittedInput(term, receipt);
+        intent = { ...intent, providerState: { codexSettingsIntentError: 'Codex slash input frame timed out' } };
+        ready = true; wake();
       });
     },
     change(kind) {
@@ -137,6 +149,37 @@ test('actual normal Send with image waits outside the writer queue without reser
   assert.equal(h.writes[0].text, 'original prompt [Image #1]');
   assert.equal(h.writes[0].images[0].path, '/fixture/original.png');
   assert.deepEqual(h.reservations, [2]);
+});
+
+for (const method of ['sendImage', 'send']) {
+  test(method + ': a finished, safely-cleared settings failure releases the SAME waiting request', async () => {
+    const h = fixture();
+    const result = h[method](); await tick();
+    assert.deepEqual(h.writes, []);
+    await h.finishSettingsDeferred();
+    assert.equal((await result).submitted, true,
+      'the first Send must not fail while a fresh identical Send could already pass');
+    assert.equal(h.context.getCodexModelEffortIntentRecord().appliedRevision, 4,
+      'sending does not claim the requested setting was applied');
+    assert.equal(h.events.listenerCount('change'), 0);
+    assert.equal(h.writes.length, method === 'sendImage' ? 1 : 2);
+  });
+}
+
+test('addressed Send joins settings using its existing Main HEAD deadline, not a new30s sub-timeout', async t => {
+  const h=fixture(), Database=require('better-sqlite3'), db=new Database(':memory:');t.after(()=>db.close());
+  const store=require('./agent-send-receipt-store').createAgentSendReceiptStore(db);
+  const identity={operationKey:'history:T:IMAGE',tabId:'T',handoffId:'IMAGE',provider:'codex',surface:'desktop-history',
+    requestFingerprint:'frozen-image-request',promptHash:'image-hash',promptLength:26};
+  const begun=store.beginAttempt(identity);
+  const scope=require('./agent-send-preparation').createSendPreparationScope({...identity,attemptId:begun.attemptId});
+  store.stageAttemptContext(identity.operationKey,begun.attemptId,{preflightScope:scope});
+  h.context.agentSendReceiptStore=store;
+  const pending=h.sendImage({sendOperationKey:identity.operationKey,sendAttemptId:begun.attemptId});
+  await tick();
+  assert(h.observationBudgets[0]>50000,'no separate30s truncation of the same accepted Send');
+  await h.finishSettings();assert.equal((await pending).submitted,true);
+  assert.equal(store.get(identity.operationKey).receipt.preflightScope.id,scope.id);
 });
 
 for (const kind of ['input', 'stop', 'run', 'lifecycle', 'terminal', 'intent', 'intent-action']) {

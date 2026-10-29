@@ -17,6 +17,12 @@ Incidental полный snapshot сохраняет более свежий Main
 уже принял latest organization revision. Unknown/null/future basis не означает
 пустой набор; потерянный ACK восстанавливается тем же mutation ID.
 
+После синхронной проверки локального lease/raw/order snapshot не уступает
+управление перед freeze/send: иначе уже поставленная microtask навигации может
+отозвать UI authority между проверкой и отправкой, не меняя Main organization
+revision. Настоящий async snapshot по-прежнему ожидается. Отзыв UI после admission
+не отменяет durable ACK/adoption и не разрешает повтор UNKNOWN под новым key.
+
 CREATE gather и цвет принимаются одной transaction. Main сверяет exact window и
 исходный порядок до применения; stale source отвергает оба изменения без journal
 или сдвига clocks. ACK применяет metadata и slots одной публикацией, без focus/
@@ -26,6 +32,14 @@ activate/remount; более новая локальная перестанов�
 definition/basis. Recolor сохраняет прежних закрытых участников того же workflow;
 CREATE требует active membership, unknown/foreign не превращаются в ready-empty.
 Эта authority не разрешает Send/Stop/Full и не меняет общий global-group CAS.
+
+Explicit Add в strip-группу использует ту же transaction и exact field+mixed-slot
+proof: выбранные свободные roots дополняют одну старую definition и собираются
+после её live block. Closed raw provenance и невыбранные участники сохраняются;
+recolor не получает это право. Другие owners и saved profiles не переставляются.
+Перед Add released B5 должен стать canonical: одинаковый raw+placement двух IN
+не подтверждает их membership phase. Retirement читает уже готовый canonical
+membership projection той же публикации, без нового read/writer/journal.
 
 Поздняя публикация A не заменяет синхронно принятую local release pair B.
 Неизвестный preflush, ещё не submitted command и submitted UNKNOWN различаются;
@@ -38,6 +52,14 @@ request/key. Оба session writers сохраняют recovery envelope, но q
 Успех U в таком случае не означает durable успех B. Номинальный согласованный
 B+U сохраняется полностью. Проверка допуска читает directory identity profile,
 без извлечения чужих `record_json`; это не общий предел памяти каталога.
+
+Собственный B5 ACK может перевести captured pending record в canonical, не меняя
+намерение настроек группы. Source сверяет recognized released pair/command,
+точный raw field/nextState и owner order, затем точное равенство resulting record
+без transport flags и retirement matching pair. Простое совпадение workflow ID
+или revision>=captured не заменяет этот proof. Membership копируется при capture:
+изменение исходного объекта после await не должно переписать сам fence. Несколько
+очередных IN/OUT/IN проверяет прежний lane/Main; canonical не обязан быть pending−1.
 
 Source21Oct optional `group.collapsed` — часть того же field/group CAS; toggle
 повышает definition revision, не меняя raw tabIds/color/unknown fields. Incidental

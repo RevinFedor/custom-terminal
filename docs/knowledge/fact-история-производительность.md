@@ -16,6 +16,27 @@
 
 ## Экономика переключения: пять слоёв
 
+Проверка доступности сессий не должна каждые30с будить все retained panels,
+если изменился только `checkedAt`. SOURCE29Oct сохраняет свежий полный verdict
+для imperative getters, а React подписывает на стабильный UI-view без этого
+верхнеуровневого времени. Owner/source/deletion/count, присутствие полей и
+инвалидация продолжают публиковаться; nested checkedAt не выкидывается.
+Контроль66подписок дал0уведомлений при смене одного probe clock и4при изменении
+двух владельцев. Это доказанный лишний fanout; его вклад в конкретный native
+лаг нельзя назначить по одному совпадению с периодом30с без профиля.
+
+На живом Send возможен отдельный feedback без большой истории: durable receipt
+прочитан → локальная карточка опубликована → entries изменились → receipt
+прочитан снова. Частный native28.10 показал407 LOCAL_APPEND одного handoff за
+6.55с. Store клонировал frozen audit proof и затем сравнивал ссылку, поэтому
+идентичные значения никогда не считались unchanged. SOURCE сравнивает
+нормализованные scalar-поля proof до копирования handoff и сохраняет исходный
+объект без notify при полном равенстве статуса/причины/времени/identity.
+Настоящее optional enrichment публикуется один раз; чужой writer/hash/attempt
+не получает authority. Это presentation-idempotence, не изменение Main ACK,
+отправки, FIFO или права повторить неизвестный Send. Проверять нужно повторный
+read при том же подтверждении и число уведомлений, а не только итоговый SENT.
+
 Порог ощущения — непрерывность ввода, не одна большая задача. Браузер вставляет ввод МЕЖДУ коммитами React; цепочка коммитов по 150-250мс даёт среднюю задержку ховера в полкоммита — «залипание» без единого крупного фриза. Поэтому приёмка меряет гистограмму задержек каждого события при непрерывном движении, а не один точечный замер (см. Приёмочный флоу ниже).
 
 1. **«Не изменилось» не перекладывает строки.** Ответ unchanged при совпадении показанного с кэшем не трогает presentation вовсе (`LOAD_UNCHANGED keptPresentation=1`); старый код пересобирал ~1100 строк в кадре клика (301мс).
@@ -65,11 +86,32 @@ lane, пока пользователь продолжал печатать и �
 commit. Поэтому пользовательский ввод не блокируется, но уже подтверждённый
 результат больше не зависит от того, перестал ли человек двигать мышь.
 
+28.10 SOURCE начальная автоматическая загрузка скрытой primary History ждёт
+реального presentation. Deferred-сигнал освобождает parent prewarm admission,
+но не объявляет данные готовыми и не будит скрытый Timeline. Если панель скрыли
+между двумя warm rAF, первоначальное намерение снова ждёт показ. Явные фоновые
+Rewind/read/live-flush сохраняются: deferred initial load их не запрещает.
+
+Первое заполнение default settings-cache раньше само меняло composition input
+и запускало второй полный semantic open неизменной History. Теперь повтор
+пропускается только для тех же исходных frozen prepared rows и unchanged merge,
+с исходным полным caller witness и повторной owner/generation проверкой после
+возможного reentry. Настоящие изменения aliases/settings/CURRENT/suppression
+по-прежнему требуют своей публикации. Быстрый skip по одному равному count
+или «похожим настройкам» недопустим.
+
+Число строк между worker checkpoints не ограничивает длительность работы:
+при пороге32 список из16строк мог целиком строиться без уступки event loop.
+В SOURCE Timeline view/layout теперь сверяют также прошедшее время между
+синхронными шагами. Await находится вне SQL transaction, cancellation/source
+proof остаётся прежним. Один неделимый шаг всё ещё может превысить целевой
+интервал; этот механизм не является гарантией wall-clock latency или RSS.
+
 ## Mount wave: тёплый монтаж по строкам
 
 Проблема, которую волна решает: 3 видимые markdown-карточки монтировались одним коммитом 726мс (замер на 2618-строчной сессии; профиль показал — дорогие ТЕЛА видимых строк: markdown+подсветка+diff, не хуки/индексы — те стоят 1-2мс на 8411 записей). Отклонённые альтернативы: `content-visibility` на строках (видимые строки браузер обязан строить; в Chromium подтверждён jitter на виртуализированных лентах), keep-alive пул `<Activity>` (смена контракта по памяти — отдельное будущее решение), batch=3 фиксированный (именно 3 строки и дали 726мс).
 
-Механика (`HistoryPanel.tsx`, module-level арбитр + per-visit state):
+Механика legacy payload-hydration (`HistoryPanel.tsx`, module-level арбитр + per-visit state; direct-root pending admission ниже имеет отдельную границу):
 
 - Первый коммит визита рендерит каждую строку заглушкой ТОЧНОЙ высоты из measured-геометрии (`createHistoryRowHeightLookup` по ranges; fallback — средневзвешенная высота владельца). Virtuoso видит те же размеры, что сохранял — позиция не дрожит. Внешняя обёртка строки настоящая (`data-uuid`, onContextMenu, red-tint) — правый клик по заглушке открывает то же меню; заглушен только тяжёлый контент.
 - Шаги апгрейда: 1 строка за шаг, рост до 3 только пока шаг < 24мс, шаг > 50мс сбрасывает в 1. Каждый шаг в startTransition, но следующий выдаётся ТОЛЬКО после layout-effect-подтверждения, что именно этот upgrade-set закоммичен (`pendingStepUuids ⊆ realUuids`) + кадр арбитра — **React батчит одновременные transitions**, свободный цикл слил бы шаги обратно в один гигантский коммит.
@@ -135,6 +177,52 @@ Cold prewarm, явная hydration поиска/прыжка и background trans
 видимый refresh ждал renderer lane 22.6с. Completion-serial cold queue сама по
 себе не ограничивает подобные refresh-запросы. Реальный scheduler и поздний
 paint wake проверяются `historyRangeHydration.test.mjs`.
+
+С малым ordinary окном fast seek выявил две отдельные границы. Проверка
+range-idle, отложенная пока seek активен, должна снова запускаться по его
+существующему exit-событию даже без следующего rangeChanged. Иначе человек
+останавливается на stubs, а History вообще не запрашивает данные. Второй сбой:
+hydration apply мог заменить ожидающий seek geometry settlement, унаследовав
+скрывающую real rows маску, но не её cleanup. Данные уже были получены, а текст
+оставался невидимым. Successor теперь наследует снятие существующей маски;
+новый настоящий seek сохраняет её при передаче ownership. Проверять надо
+данные, visible row и отсутствие оставшейся mask отдельно, включая отмену.
+
+Если новая область стала видимой во время предыдущей hydration, её проверка
+не исчезает вместе с idle timer. Остаётся один owner/generation/visit wake;
+после settlement и обычного guarded debounce он читает текущую область заново.
+Старые row/centre не сохраняются. Смена owner/visit снимает wake, а explicit
+Timeline jump сохраняет приоритет. Ошибка загрузки сама по себе не запускает
+бесконечный retry: wake появляется только от реально отложенной проверки.
+
+У negotiated History root та же граница показа передаётся отдельно в небольшой
+`HistoryPrimaryRootSurface`: ref текущего presentation proof и прежнее событие
+`history-panel:external-presentation`. Значение `presented` в props retained
+панели может быть только начальным seed и не подтверждает текущую видимость.
+Surface сверяет ref после обработки события всеми владельцами, запускает bounded
+bootstrap при новом показе и синхронно отзывает connector при скрытии. Полный
+HistoryPanel при этом не перерисовывается ради одного сигнала. Данные ещё не
+снимают viewport loader: нужен прежний matching measured commit. Source-регрессии
+actual TSX consumer — `historyPrimaryExternalPresentation.actual.test.mjs`;
+native acceptance этой правки ведётся отдельно в рабочем плане.
+
+SOURCE27.10 root-row admission начинается до настоящих Virtuoso key/content
+callbacks: upstream Hn вычисляет key раньше body. Неизвестная строка получает
+отдельный pending key/DOM без UUID и row/measurement markers; Lo не измеряет её
+как готовую. Covered receipt требует exact текущий cut/body/address, состав
+Panel, admittedCount=itemCount и matching stable measured commit. Геометрия сама
+не является proof содержимого; scalar/physical key не заменяет layout certificate.
+
+Полный content fingerprint текущих local/live/results проверяется один раз за
+синхронную render/commit транзакцию, даже при прежних object references. Внутри
+стека строки сверяют exact root/body и версию proof с малыми imperative bindings;
+return/throw/thenable/nested transaction отзывает proof. Следующий commit заново
+проверяет полные данные. Постоянный reference-only cache либо удаление stale guard
+недопустимы: первоначальный per-row вариант умножал полный hash на число строк
+(96 hashes/16rows в конечном контрпримере). Source регрессия исполняет actual
+Surface/Hn/admission/connector с1MiB input; это не native latency/global-memory PASS.
+Отменённый awaited jump завершает собственный flight/hydration через прежний
+generation-guarded finish; завершение старого A не очищает уже начатый B.
 
 Перед публикацией новых payload mid-list semantic anchor вооружается до React
 mutation и переживает estimate→measurement как одну presentation-транзакцию.
@@ -275,14 +363,38 @@ Desktop History намеренно НЕ укорачивает позицион�
 
 Главный инвариант: `grouping(stubbed projection) === grouping(full projection)`. Display-группировка имеет право читать только поля, существующие и у stub, и у полной строки. Центр гидрации задаётся UUID записи, а не индексом display-unit: одна свёрнутая серия представляет несколько raw rows, и смешение этих координат уже давало «прыжок → skeleton → второй прыжок». Производная карта групп кэшируется по данным сессии и переживает сон панели; результат append также записывается в кэш. Срок жизни производного совпадает со сроком жизни snapshot'а, а не React-компонента, который его показывает.
 
-View-only cycling подписи не пересобирает топологию и не открывает группу.
-Caption candidates — ссылки на те же короткие raw rows, выбор — bounded owner
-metadata. Explicit selected caption задаёт прежний hydration UUID и заменяет
-default caption в materialized-window protection, не увеличивая512-row budget
-или отменяя physical-revision guard. Число/commentary phase одинаковы на actual
-Main stubs и полных строках; выбор не читает/хэширует скрытые тела.
+По решению29.10 основная History вновь использует группы с одной многострочной
+подписью (`responseWork:false`), без внешней группы всего ответа. Три caller-а
+HistoryPanel — primary presentation, renderer build и append-baseline — выбирают
+один режим. Primary header получает полный выбранный caption и тонкие metadata
+остальных членов; hidden bodies ради него не читаются. `grp:<first call>` и
+внутренний `sub:…` сохраняют семантическую identity, скрытый UUID остаётся адресом
+участника. Caption90% меняет только measured shape:
+`caption-markdown:v4:one-comment:90pct`; старые размеры82% не переиспользуются.
+Кэш различает прежний opt-in response-work и текущий режим. Конечный synthetic
+test не доказывает production latency или глобальный memory bound.
+View-only cycling остаётся для nested/legacy multi-caption представлений. Caption candidates — ссылки на
+короткие raw rows, выбор — bounded owner metadata. Explicit selected caption
+задаёт прежний hydration UUID и materialized-window protection без увеличения
+512-row budget или отмены physical-revision guard; выбор не читает скрытые тела.
 
-`hasContent` недостаточно для этого инварианта: короткая подпись перед вызовом
+Обычный Codex сохраняет уже прочитанные тела ещё в48 соседних единицах
+представления с каждой стороны диапазона. Для закрытой группы это выбранная
+подпись, не скрытые tool bodies. Прежний предел512 UUID, совпадение physical
+revision и приоритет новой полной записи сохраняются; дальние страницы
+вытесняются. Это устраняет повторное чтение соседнего текста при развороте
+scroll, не увеличивая SSD/RAM Settings и не устраняя all-N metadata отдельно.
+Primary/другие клиенты сохраняют свой прежний способ удержания.
+
+Готовая догрузка видимого участка может пройти мимо фонового wheel hold только
+как ограниченная ordinary delta: до512 изменённых строк, оценка памяти до256KiB,
+восстановленный список до4096 строк. При каждом допуске повторно проверяются
+owner/visit/request, отмена, отсутствие ожидающего ввода/чужого interaction и
+реальная недостающая строка текущего viewport. Крупные и фоновые refresh остаются
+в прежней очереди. Оценка памяти не является размером JSON или гарантией CPU;
+логи `LOAD_APPLY_PRIORITY` отделяют допуск от времени самого чтения/применения.
+
+В caption-грамматике `hasContent` недостаточно для этого инварианта: короткая подпись перед вызовом
 входит в группу, длинный ответ остаётся границей. Stub хранит точную длину
 текста после trim (`contentLength`), не сам текст. Иначе обычный completion
 refresh сдвигает окно гидрации, старые подписи становятся самостоятельными
@@ -324,6 +436,16 @@ Actual React callback regression — `scripts/history-retained-paint-regression.
 восстановление прежнего договора готовности, не разрешение снять loader по таймеру.
 Resize onFinish имеет и свой путь публикации, поэтому дефект отдельного callback
 сам по себе не доказывает вечное ожидание всей поверхности.
+
+То же правило действует между готовым DOM и текущим measured-window coverage:
+probe завершается только после принятия publisher. Явный отказ сохраняет одну
+проверку того же owner/generation до следующей frame/paint границы; поздний
+coverage может прийти без нового rangeChanged. Перед повтором заново проверяются
+visit, текущие входы, отмена и resize; Promise не является boolean proof.
+Сначала проверяется дешёвое coverage, затем полный input fingerprint. Иначе
+ожидание измерения само многократно хеширует ещё неготовый payload. Source-контроль
+воспроизводит отказ→поздний coverage для обычного и rewrite publishers; native75
+прошёл прежний readiness gate, но точный interleaving прежнего74 не восстановлен.
 
 После перехода к постоянно живым окнам скрытая History законно продолжает получать данные и измерять DOM, но её reflow не является действием читателя. Отдельный `presented` и монотонный `presentationVisit` дают право сохранять reading anchor, запускать tail-pin/seek и публиковать viewport proof только реально видимой панели. Отложенные save/pin/paint callbacks захватывают visit и отбрасываются после hide/show; при новом показе используется общий restore. Фокус намеренно не является proof: все одновременно видимые split-панели имеют право хранить своё место.
 

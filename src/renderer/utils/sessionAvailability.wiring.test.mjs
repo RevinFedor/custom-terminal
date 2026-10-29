@@ -23,8 +23,16 @@ test('every tab-card surface renders the shared missing-history marker', () => {
     'renderer/components/Workspace/RunAfterTabPicker.tsx',
   ]) {
     const source = read(relative);
-    assert.match(source, /TabSessionAvailabilityMarker/, relative);
-    assert.match(source, /data-tab-session-availability/, relative);
+    if (/<TabCard\b/.test(source)) {
+      // Pane chips and Run After now reuse the whole shared card. Requiring a
+      // second inline marker here would reintroduce duplicate UI ownership.
+      const card = read('renderer/components/Workspace/TabCard.tsx');
+      assert.match(card, /<TabSessionAvailabilityMarker\b/, relative + ' via TabCard');
+      assert.match(card, /data-tab-session-availability/, relative + ' via TabCard');
+    } else {
+      assert.match(source, /TabSessionAvailabilityMarker/, relative);
+      assert.match(source, /data-tab-session-availability/, relative);
+    }
   }
 });
 

@@ -6,6 +6,8 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 const ts = require('typescript');
+// Electron's renderer has Web Crypto; Electron28 RUN_AS_NODE does not.
+global.crypto ||= require('node:crypto').webcrypto;
 const { agentSendTargetPreconditionFailure } = require('../../main/agent-send-target-precondition');
 
 function parsed(name) {

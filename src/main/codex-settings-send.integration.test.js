@@ -61,6 +61,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   const context = vm.createContext({
     ...require('./agent-send-preparation'), agentSendReceiptStore: null,
     ...runtimeContract, ...writerTransition, ...require('./agent-send-target-precondition'),
+    ...require('./codex-resume-goal-prompt'),
     resolveConfiguredAgentModel,
     projectManager: { db: { getAppState: () => ({ models: [] }) } },
     codexModelEffortIntentReconcileInflight: new Map(),

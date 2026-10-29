@@ -58,6 +58,45 @@ async function drained(service) {
   while (service.lanes.size) await Promise.all([...service.lanes.values()]);
 }
 
+test('unchanged numeric receipt timestamps do not republish a cancelled FIFO message on wake', async t => {
+  const receipt = { state: 'not-submitted', updatedAt: 1792879080000,
+    receipt: { submitted: false, code: 'agent_send_queue_cancelled' } };
+  const h = await fixture(t, { send: async () => receipt, getReceipt: () => receipt });
+  const q = (await h.question()).message;
+  await drained(h.service);
+  const before = h.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId);
+  assert.equal(before.deliveryState, 'failed');
+  assert.equal(typeof before.receiptUpdatedAt, 'string', 'SQLite TEXT affinity is part of the real round trip');
+  assert.equal(Number(before.receiptUpdatedAt), receipt.updatedAt);
+  const published = h.changes.length;
+  for (let i = 0; i < 3; i++) await h.service.wake('B');
+  await h.service.reconcile();
+  assert.equal(h.changes.length, published, 'identical transport evidence must not publish a new UI revision');
+  assert.deepEqual(h.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId), before);
+  assert.equal(h.calls.length, 1, 'an unchanged cancelled FIFO operation is never replayed');
+});
+
+test('stable receipt timestamps preserve revisions while newer evidence and canonical acceptance still publish', async t => {
+  let receipt = { state: 'audit-pending', attemptId: 'attempt', attempt: 1, updatedAt: 1792879080000,
+    receipt: { submitted: true } };
+  const h = await fixture(t, { send: async () => receipt, getReceipt: () => receipt });
+  const q = (await h.question()).message;
+  await drained(h.service);
+  assert.equal(h.message(q.messageId).deliveryState, 'unconfirmed');
+  const initial = h.changes.length;
+  h.service.observeReceipt(q.operationKey, { ...receipt });
+  assert.equal(h.changes.length, initial, 'same numeric timestamp must be an actual no-op');
+  receipt = { ...receipt, updatedAt: receipt.updatedAt + 1 };
+  h.service.observeReceipt(q.operationKey, receipt);
+  assert.equal(h.changes.length, initial + 1, 'genuinely newer receipt evidence is preserved');
+  h.service.observeReceipt(q.operationKey, { ...receipt, updatedAt: receipt.updatedAt - 1, state: 'confirmed' });
+  assert.equal(h.message(q.messageId).deliveryState, 'unconfirmed', 'older same-attempt evidence cannot win');
+  h.service.observeReceipt(q.operationKey, { ...receipt, state: 'confirmed' });
+  assert.equal(h.message(q.messageId).deliveryState, 'sent');
+  assert.equal(h.changes.length, initial + 2, 'positive canonical state still publishes once');
+  assert.equal(h.calls.length, 1);
+});
+
 test('cancelled application FIFO message is terminal across wakes, retry and reopen', async t => {
   const db = new Database(':memory:');
   t.after(() => db.close());
@@ -773,8 +812,9 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   const first = await fixture(t, { db });
   assert.deepEqual(db.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(),
     legacyRows.map((row) => ({ ...row, sourceDismissedAt: null, targetDismissedAt: null,
-      sourceAddressJson: null, targetAddressJson: null, cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null })));
-  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 7);
+      sourceAddressJson: null, targetAddressJson: null, cancelledAt: null, cancelledByTabId: null,
+      sourceRestartBindingId: null, loopWaitRequiredAt: null, cancelOrigin: null, replyToIdsJson: null })));
+  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 10);
   assert.equal(first.calls.length, 0);
   assert.equal(first.changes.length, 0);
   const source = first.service.dismissMessage({ tabId: 'A', messageId: 'legacy-reply' }).message;
@@ -821,9 +861,9 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   assert.deepEqual(finalDb.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(), [
     { ...legacyRows[0], sourceDismissedAt: target.sourceDismissedAt,
       targetDismissedAt: target.targetDismissedAt, updatedAt: target.updatedAt, sourceAddressJson: null, targetAddressJson: null,
-      cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null },
+      cancelledAt: null, cancelledByTabId: null, cancelOrigin: null, replyToIdsJson: null, sourceRestartBindingId: null, loopWaitRequiredAt: null },
     { ...legacyRows[1], sourceDismissedAt: null, targetDismissedAt: null, sourceAddressJson: null, targetAddressJson: null,
-      cancelledAt: null, cancelledByTabId: null, sourceRestartBindingId: null },
+      cancelledAt: null, cancelledByTabId: null, cancelOrigin: null, replyToIdsJson: null, sourceRestartBindingId: null, loopWaitRequiredAt: null },
   ]);
   assert.equal(final.calls.length, 0);
   assert.equal(final.changes.length, 0);

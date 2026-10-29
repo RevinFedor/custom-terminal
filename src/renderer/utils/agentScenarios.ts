@@ -295,6 +295,8 @@ async function runAgentPromptScenario({
       : { complete: false },
     proveComposer: async (_context: AgentSendFlowContext, ready: AgentSendReadyContext) => {
       const composer = await adapter.proveComposer({
+        prompt,
+        presentationSnapshot,
         statusForSend: ready.status,
         source,
         returnDraftOnConflict,

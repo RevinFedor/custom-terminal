@@ -30,6 +30,20 @@ const defaultHasPendingInput = () => {
 
 export const HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_ROWS = 8;
 export const HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES = 128 * 1024;
+export const HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES = 256 * 1024;
+export const HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_ROWS = 512;
+export const HISTORY_VIEWPORT_HYDRATION_MAX_TOTAL_ROWS = 4096;
+
+// Only a bounded, already returned row-window delta may be promoted. Current
+// visible demand, owner/visit and input ownership are checked by the caller at
+// every admission decision; these bytes are not a new read or cache budget.
+export const isHistoryViewportHydrationDelta = ({ delta, rowWindowApplied, changedEntries, estimatedBytes, totalRows } = {}) => (
+  delta === true && rowWindowApplied === true && Array.isArray(changedEntries)
+  && changedEntries.length > 0 && changedEntries.length <= HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_ROWS
+  && Number.isSafeInteger(totalRows) && totalRows > 0 && totalRows <= HISTORY_VIEWPORT_HYDRATION_MAX_TOTAL_ROWS
+  && Number.isFinite(estimatedBytes) && estimatedBytes >= 0
+  && estimatedBytes <= HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES
+);
 
 const IMMEDIATE_HISTORY_SERVICE_ROLES = new Set([
   'compact',
@@ -81,11 +95,12 @@ export const shouldBypassHistoryApplyPriority = ({
   presented,
   ownerCurrent,
   lightweightServiceDelta = false,
+  visibleHydrationDelta = false,
 }) => (
   !ownerCurrent
   || (presented === true && (
     phase === 'cold'
-    || (phase === 'refresh' && lightweightServiceDelta === true)
+    || (phase === 'refresh' && (lightweightServiceDelta === true || visibleHydrationDelta === true))
   ))
 );
 
@@ -217,6 +232,7 @@ export const createHistoryForegroundPriority = ({
 
   return {
     active,
+    hasPendingInput,
     beginInteraction,
     endInteraction,
     interactionCount: () => activeInteractions.size,

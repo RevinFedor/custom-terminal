@@ -34,12 +34,17 @@ function fixture(t, options = {}) {
   const h = base(t, { capturedDraft: options.capturedDraft === true });
   const { ctx, term, clock, settingsQueue: queue } = h;
   const raw = new Set(), events = [], captures = [];
-  const requested = { model: 'gpt-5.6-sol', effort: 'high' };
+  const requested = options.requested || { model: 'gpt-5.6-sol', effort: 'high' };
   let current = options.samePair ? { ...requested } : { model: 'gpt-5.6-luna', effort: 'medium' };
   let writerId = 'S', targetCurrent = true, screen = '', serviceEnters = 0, promptCalls = 0;
+  let selectedModel = 0;
   let runtime;
   const settingsActivity = createAgentSettingsActivity();
   const emit = text => { screen = text; for (const onData of [...raw]) onData(text); };
+  const modelMenu = () => options.displayModelRows
+    ? ['Select Model and Effort', ...options.displayModelRows.map((row, index) =>
+      (index === selectedModel ? '› ' : '  ') + (index + 1) + '. ' + row), '', 'enter select · esc back'].join('\n')
+    : 'Select Model and Effort\n› 1. gpt-5.6-sol (current)\n  2. gpt-5.6-luna\nPress enter to confirm or esc to go back';
   term.onData = onData => { raw.add(onData); captures.push({ at: clock.now() });
     return { dispose: () => raw.delete(onData) }; };
   term.write = bytes => {
@@ -51,10 +56,16 @@ function fixture(t, options = {}) {
     } else if (bytes === '\r' && operation?.phase === 'slash-command-enter') {
       serviceEnters++;
       if (options.throwServiceEnter) throw Error('controlled service Enter throw');
-      queueMicrotask(() => emit('Select Model and Effort\n› 1. gpt-5.6-sol (current)\n  2. gpt-5.6-luna\nPress enter to confirm or esc to go back'));
+      if (!options.holdModelMenu) queueMicrotask(() => emit(modelMenu()));
+    } else if (options.displayModelRows && bytes === '\x1b[B' && String(operation?.phase).startsWith('picker-navigation-')) {
+      selectedModel++; queueMicrotask(() => emit(modelMenu()));
+    } else if (options.displayModelRows && bytes === '\x1b[A' && String(operation?.phase).startsWith('picker-navigation-')) {
+      selectedModel--; queueMicrotask(() => emit(modelMenu()));
     } else if (bytes === '\r' && operation?.phase === 'picker-confirm-model') {
       current = { ...requested };
-      queueMicrotask(() => emit('• Model changed to gpt-5.6-sol high\n› Ask Codex to do anything\ngpt-5.6-sol high · Context 42% used'));
+      const paintedModel = options.displayAckModel || requested.model;
+      queueMicrotask(() => emit('• Model changed to ' + paintedModel + ' ' + requested.effort
+        + '\n› Ask Codex to do anything\n' + paintedModel + ' ' + requested.effort + ' · Context 42% used'));
     } else if (bytes === '\x01\x0b') queueMicrotask(() => h.frame(''));
   };
   Object.assign(ctx, settings, require('../codex-settings-writer-transition'), {
@@ -89,6 +100,10 @@ function fixture(t, options = {}) {
     emitAgentReadinessChanged: () => h.notifyFrame(),
     scheduleCodexModelEffortIntentReconcile: () => events.push({ kind: 'intent-reconcile-wake' }),
   });
+  if (options.modelCatalog) ctx.codexDataModule = { _api: {
+    getCachedCodexPickerCatalog: () => options.modelCatalog,
+    listCodexModels: () => { throw Error('a fresh cached catalog must not start a new CLI'); },
+  } };
   vm.runInContext(actual, ctx);
   vm.runInContext('globalThis.modelTestOperation = () => ptyActiveWriteOperation.get(terminals.get("T"));', ctx);
   const opts = { handoffId: 'H', sendOperationKey: h.identity.operationKey,

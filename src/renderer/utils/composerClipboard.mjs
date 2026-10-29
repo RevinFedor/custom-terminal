@@ -7,6 +7,7 @@ import {
   serializeComposerDraft,
   shouldCreatePasteChip,
 } from './composerChips.mjs';
+import { maskPromptWebImageReferences } from './promptImageAttachments.mjs';
 
 export const NOTED_COMPOSER_SNAPSHOT_FLAVOR = 'application/x-noted-terminal-composer-snapshot';
 
@@ -190,7 +191,14 @@ export function normalizeHistoryMessageComposerSnapshot(value) {
 /** Plain text remains useful outside Noted Terminal, while the paired snapshot
  * restores all attachment identities when pasted back into its composer. */
 export function buildHistoryMessageClipboardPayload(input = {}) {
-  const snapshot = buildHistoryMessageComposerSnapshot(input);
+  // Failed accepted intents still own their exact editor snapshot. Display
+  // text may be trimmed/serialized and cannot reconstruct its whitespace/IDs.
+  const original = input.authoringSnapshot;
+  const snapshot = original && typeof original.editorText === 'string'
+    && Array.isArray(original.chips) && Array.isArray(original.imagePaths)
+    ? { version: 1, text: original.editorText,
+      chips: original.chips.map(chip => ({ ...chip })), imagePaths: original.imagePaths.map(ref => ({ ...ref })) }
+    : buildHistoryMessageComposerSnapshot(input);
   const body = buildComposerClipboardText({
     text: snapshot.text,
     selectionStart: 0,
@@ -239,6 +247,7 @@ export function buildComposerClipboardText({
   }
 
   const replacements = [];
+  const authoring = maskPromptWebImageReferences(value);
   const refsById = availableImageRefById(imagePaths);
 
   let imageResolved = 0;
@@ -246,7 +255,7 @@ export function buildComposerClipboardText({
   let imagePartial = 0;
   const imageRe = createImageMarkerRegex();
   let imageMatch;
-  while ((imageMatch = imageRe.exec(value)) !== null) {
+  while ((imageMatch = imageRe.exec(authoring)) !== null) {
     const from = imageMatch.index;
     const to = from + imageMatch[0].length;
     if (from >= start && to <= end) {
@@ -339,10 +348,11 @@ export function buildComposerClipboardText({
  */
 export function collectPortableImagePathMarkers(text = '') {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const markers = [];
   const re = createPortableImagePathRegex();
   let match;
-  while ((match = re.exec(value)) !== null) {
+  while ((match = re.exec(authoring)) !== null) {
     const filePath = String(match[1] || '').trim();
     if (!filePath.startsWith('/')) continue;
     markers.push({
@@ -410,6 +420,7 @@ export function collapsePortableImageImportSnapshot({
   createdAt = Date.now(),
 } = {}) {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const tokenRe = /(?<!\\)\[Image\s+#?\d+\]|\[imageError:\s*[^\]\r\n]+\]/gi;
   const chips = [];
   let output = '';
@@ -434,7 +445,7 @@ export function collapsePortableImageImportSnapshot({
   };
 
   let match;
-  while ((match = tokenRe.exec(value)) !== null) {
+  while ((match = tokenRe.exec(authoring)) !== null) {
     appendPlain(value.slice(cursor, match.index));
     output += match[0];
     cursor = match.index + match[0].length;

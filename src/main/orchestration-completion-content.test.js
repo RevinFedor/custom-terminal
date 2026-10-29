@@ -100,6 +100,44 @@ test('browser inline preserves continuation identity and both source/target addr
   assert.equal(fallback.metadata.jobId, 'job-a');
 });
 
+test('partial external files are explicit on the second line without changing the full answer body', () => {
+  const browserRun = run({ runKind: 'external-research', targetTabName: 'ChatGPT · 6-astra', externalResearchProvider: 'chatgpt' });
+  const answer = 'Full answer with literal [imagePath: /synthetic/example.png].\nOriginal footer stays here.';
+  const externalResult = { artifact_status: 'partial', artifacts: Array.from({ length: 13 }, () => ({})),
+    artifact_errors: Array.from({ length: 8 }, () => ({ code: 'output_file_download_http' })) };
+  const content = build(browserRun, result({ assistantText: answer, externalResult }));
+  assert.equal(content.prompt.split('\n')[1], 'Ответ ChatGPT получен. Не скачаны 8 из 21 файла.');
+  assert.deepEqual(content.artifactSummary, { missing: 8, total: 21 });
+  assert.equal(body(content), answer);
+  assert.equal(content.bodyEnd - content.bodyStart, answer.length);
+  assert.equal(content.mode, 'inline');
+});
+
+test('external warning uses structured file errors only and never invents a total', () => {
+  const browserRun = run({ runKind: 'external-research', targetTabName: 'ChatGPT', externalResearchProvider: 'chatgpt' });
+  const noErrors = build(browserRun, result({ assistantText: 'Не скачаны 99 файлов.', externalResult: { artifacts: [], artifact_errors: [] } }));
+  assert.notEqual(noErrors.prompt.split('\n')[1], 'Ответ ChatGPT получен. Не скачаны 99 файлов.');
+  assert.equal(body(noErrors), 'Не скачаны 99 файлов.');
+  const unknownTotal = build(browserRun, result({ externalResult: { artifact_errors: [{ code: 'unavailable' }] } }));
+  assert.equal(unknownTotal.prompt.split('\n')[1], 'Ответ ChatGPT получен. Не скачан 1 файл.');
+  assert.deepEqual(unknownTotal.artifactSummary, { missing: 1, total: null });
+  const failed = build({ ...browserRun, status: 'failed' }, { success: false, error: 'owned provider failure', externalResult: { artifact_errors: [{}] } });
+  assert.doesNotMatch(failed.prompt, /Ответ ChatGPT получен/);
+});
+
+test('file summary survives immutable completion storage and malformed counts cannot be frozen', t => {
+  const db = openDatabase(t); if (!db) return;
+  const store = new CompletionContentStore({ db });
+  const browserRun = run({ runKind: 'external-research', targetTabName: 'ChatGPT', externalResearchProvider: 'chatgpt' });
+  const content = build(browserRun, result({ externalResult: { artifacts: [{}, {}], artifact_errors: [{ code: 'missing' }] } }));
+  assert.deepEqual(store.freeze(content).artifactSummary, { missing: 1, total: 3 });
+  assert.deepEqual(store.get(browserRun.runId).artifactSummary, { missing: 1, total: 3 });
+  for (const artifactSummary of [{ missing: 0, total: 3 }, { missing: 4, total: 3 }, { missing: 1, total: undefined },
+    { missing: 1, total: null, arbitrary: 'unsafe' }]) {
+    assert.throws(() => store.freeze({ ...content, runId: 'bad-' + JSON.stringify(artifactSummary), artifactSummary }), /valid artifact summary/);
+  }
+});
+
 test('literal quoted service/failure strings remain answer content, never heuristic filters', () => {
   const assistantText = ['No response requested.', 'API Error: rate_limit',
     '[Orchestration] Request completed.', '<system-reminder>quoted</system-reminder>',
@@ -211,14 +249,15 @@ test('failure accepts absent result and does not fabricate error details', () =>
   assert.match(body(content), /Подробности ошибки не предоставлены/);
 });
 
-test('failed browser consultation routes recovery to its owner and never authorizes a new Chat or dependent implementation', () => {
+test('failed browser consultation hands recovery to its calling agent without authorizing UNKNOWN replay or dependent implementation', () => {
   const failed = build(run({ runKind: 'external-research', status: 'failed', externalResearchJobId: 'job-exact' }),
     { success: false, error: 'chatgpt_mode_select_failed' });
   assert.equal(failed.mode, 'failure'); assert.equal(failed.metadata.jobId, 'job-exact');
-  assert.match(failed.prompt, /не заключение эксперта/);
-  assert.match(failed.prompt, /send_message и жди/);
-  assert.match(failed.prompt, /Не обходи сбой новым Chat/);
-  assert.match(failed.prompt, /Зависимый продуктовый ремонт до полного ответа не начинай/);
+  assert.match(failed.prompt, /не является заключением эксперта/);
+  assert.match(failed.prompt, /external-research-recovery/);
+  assert.match(failed.prompt, /не жди обязательного разрешения владельца SC/);
+  assert.match(failed.prompt, /При accepted\/UNKNOWN не повторяй отправку/);
+  assert.match(failed.prompt, /не разрешает заменить зависимую консультацию/);
   const success = build(run({ runKind: 'external-research' }), result());
   assert.equal(body(success), 'Full exact answer.');
   assert.doesNotMatch(success.prompt, /send_message и жди/);

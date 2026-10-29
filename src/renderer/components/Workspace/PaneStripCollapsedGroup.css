@@ -1,6 +1,10 @@
 .pane-strip-collapsed-group { position:relative; display:inline-flex; vertical-align:top; word-spacing:normal; }
 .pane-strip-collapsed-group[data-group-open="1"] { z-index:100050; }
+.pane-strip-group-backdrop { position:absolute; top:0; z-index:-1; pointer-events:none; }
 [data-split-attach-row]:has([data-pane-strip-collapsed-group][data-group-open="1"]) { z-index:1000 !important; }
+/* The chrome host is its own stacking context; lift it with the open peek
+   so a later vacant pane cannot cover members outside the host's rectangle. */
+[data-terminal-pane-chrome-host][data-pane-focus-isolated="0"]:has([data-pane-strip-collapsed-group][data-group-open="1"]) { z-index:1000 !important; }
 .pane-strip-collapsed-group:has(.pane-strip-group-count:hover) { z-index:100060; }
 .pane-strip-group-count { position:absolute; top:-1px; right:-1px; z-index:30;
   display:inline-flex; align-items:center; justify-content:center; width:var(--tab-group-count-width,20px); min-width:18px;
@@ -9,5 +13,10 @@
   cursor:pointer; background:var(--tab-card-surface-background,#252528); user-select:none;
   transform-origin:center; transition:transform var(--noted-chip-hover-ms) linear; font-variant-numeric:tabular-nums; }
 .pane-strip-group-count:hover { transform:scale(var(--noted-chip-hover-scale)); z-index:100060; }
+.pane-strip-group-count[data-group-badge-opening="1"] { animation:pane-strip-badge-hover-intent var(--noted-chip-hover-ms) linear; }
+@keyframes pane-strip-badge-hover-intent {
+  from { transform:scale(1); }
+  to { transform:scale(var(--noted-chip-hover-scale)); }
+}
 .pane-strip-group-count:focus-visible { outline:1px solid #eee; outline-offset:2px; }
 .pane-strip-group-count[data-group-unread="1"] { box-shadow:0 0 0 1px #e45454; }

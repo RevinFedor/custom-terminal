@@ -16,6 +16,17 @@ export function externalMcpServers(catalog, activeServers = null) {
     || (activeServers !== null && !activeServers.some(active => active.name === server.hubServer)));
 }
 
+export function hasHubInventory(status) {
+  return status?.down !== true && Array.isArray(status?.servers);
+}
+
+export function mcpRegistrationLabel(server, status) {
+  if (!server.enabled) return 'отключён';
+  if (!server.hubServer) return 'настроен';
+  if (!hasHubInventory(status)) return 'статус неизвестен';
+  return status.servers.some(active => active.name === server.hubServer) ? 'в хабе' : 'нет в хабе';
+}
+
 export function hubConfigurationNotice(status, catalog) {
   const desired = status?.desiredConfiguration;
   const messages = [];
@@ -24,11 +35,13 @@ export function hubConfigurationNotice(status, catalog) {
   if (unresolved.length) messages.push('Проверьте привязки: ' + unresolved.map(entry =>
     entry.name + (entry.error ? ' (' + entry.error + ')' : '')).join(', ') + '.');
   if (desired?.needsReview) messages.push('В ~/.noted-terminal/mcp-hub.json укажите точные команды или enabled:false; дополнительные пакеты не обязательны.');
-  if (desired && !status?.down && status.configurationApplied !== true) {
+  if (desired && hasHubInventory(status) && status.configurationApplied !== true) {
     messages.push('Применение профиля к текущему поколению хаба не подтверждено. Перезапуск children не применяет профиль; смена поколения — только после согласованного завершения работ.');
   }
-  const missing = [...new Set((catalog?.servers || []).filter(server => server.enabled && server.hubServer
-    && !status?.servers?.some(active => active.name === server.hubServer)).map(server => server.hubServer))];
+  // A failed status read is not an observed empty inventory. Only a successful
+  // hub snapshot can establish that a configured route is absent.
+  const missing = hasHubInventory(status) ? [...new Set((catalog?.servers || []).filter(server => server.enabled && server.hubServer
+    && !status.servers.some(active => active.name === server.hubServer)).map(server => server.hubServer))] : [];
   if (missing.length) messages.push('Клиент запрашивает отсутствующие в хабе: ' + missing.join(', ') + '. URL не содержит команды запуска.');
   return messages.join(' ') || null;
 }

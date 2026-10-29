@@ -442,12 +442,18 @@ test('a navigation write without a newer frame does not permit another arrow or 
   const h = fixture({ selected: 2, noSelectionFrame: true }); await h.manual();
   h.apply(); await tick();
   const state = h.controller.readGoalAction('T', { requestId: 'request-1' });
-  assert.equal(state.reason, 'option-selection-not-confirmed');
+  assert.equal(state.reason, 'waiting-committed-selection');
+  assert.equal(state.status, 'pending');
   assert.equal(state.keyWritten, true);
   assert.equal(state.actionWritten, false);
   assert.deepEqual(state.availableActions, []);
   h.apply(); h.apply('resume', 'another-request'); await tick();
   assert.deepEqual(h.writes, ['\x1b[A']);
+  await h.expire(100);
+  const expired = h.controller.readGoalAction('T', { requestId: 'request-1' });
+  assert.equal(expired.reason, 'policy-action-deadline');
+  assert.equal(expired.choiceConfirmed, false);
+  assert.deepEqual(h.writes, ['\x1b[A'], 'deadline is not a retry');
 });
 
 test('Stop or a different Goal after navigation cannot receive Enter', async () => {

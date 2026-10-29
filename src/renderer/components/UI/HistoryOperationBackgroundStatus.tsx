@@ -1,6 +1,7 @@
 import React from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
+import { useUIStore } from '../../store/useUIStore';
 import { getHistoryOperationActivities, subscribeHistoryOperationActivities,
   dismissHistoryOperationActivity, historyOperationOwnerView, openHistoryOperationOwner,
 } from '../../utils/historyOperationActivity.mjs';
@@ -20,12 +21,30 @@ export default function HistoryOperationBackgroundStatus() {
     ...op, ...historyOperationOwnerView(state, op.tabId),
   }))));
   const views = React.useMemo(() => JSON.parse(viewKey), [viewKey]);
+  const announcedSuccessIds = React.useRef(new Set<string>());
   React.useEffect(() => {
+    const liveIds = new Set(views.map(view => view.id));
+    for (const id of announcedSuccessIds.current) {
+      if (!liveIds.has(id)) announcedSuccessIds.current.delete(id);
+    }
     for (const view of views) {
-      if (view.visible && view.status !== 'running') dismissHistoryOperationActivity(view.id);
+      if (view.status !== 'done') continue;
+      if (!announcedSuccessIds.current.has(view.id)) {
+        announcedSuccessIds.current.add(view.id);
+        // Reuse the common success-toast lifetime (2500ms), not a second,
+        // indefinitely retained "ready" card. Visible owners already toast.
+        if (!view.visible) useUIStore.getState().showToast(
+          view.kind === 'delete' ? 'Удаление выполнено —' : 'Rewind выполнен —',
+          'success', undefined, false, undefined, view.tabName,
+          () => { void openHistoryOperationOwner(useWorkspaceStore.getState(), view.tabId); },
+        );
+      }
+      // This registry is presentation only. Do not clear the native operation
+      // store or let notification expiry change runtime/rewind authority.
+      dismissHistoryOperationActivity(view.id);
     }
   }, [viewKey]);
-  return <>{views.filter(view => !view.visible).map(view => {
+  return <>{views.filter(view => !view.visible && view.status !== 'done').map(view => {
     const pending = view.status === 'running';
     const failed = view.status === 'failed';
     const label = view.kind === 'delete'
@@ -36,7 +55,7 @@ export default function HistoryOperationBackgroundStatus() {
       pending={pending} failed={failed} details={view.message || view.phase}
       onOpen={async event => {
         event.stopPropagation();
-        if (await openHistoryOperationOwner(useWorkspaceStore.getState(), view.tabId) && !pending) dismiss();
+        await openHistoryOperationOwner(useWorkspaceStore.getState(), view.tabId);
       }}
       onDismiss={!pending && jsonl.some(op => op.id === view.id) ? dismiss : undefined} />;
   })}</>;

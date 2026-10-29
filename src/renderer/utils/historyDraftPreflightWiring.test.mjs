@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(
-  path.join(here, '../components/Workspace/HistoryPanel.tsx'),
+  process.env.HISTORY_PREFLIGHT_SOURCE || path.join(here, '../components/Workspace/HistoryPanel.tsx'),
   'utf8',
 );
 
@@ -30,8 +30,8 @@ test('History carries exact empty evidence through the scenario to the physical 
 });
 
 test('History send clears the mounted editor and persistent draft at the same handoff boundary', () => {
-  const start = source.indexOf('if (sourceStillCurrent) {', source.indexOf("historyDiag('SEND_CLICK"));
-  const end = source.indexOf('\n        } else {', start);
+  const start = source.indexOf('saveHistorySendRecovery(earlyHandoff);');
+  const end = source.indexOf("markSendPreparation('handoff-published');", start);
   assert.ok(start >= 0 && end > start);
   const body = source.slice(start, end);
   assert.match(body, /applyHistoryComposerSnapshot\(\{[\s\S]*text: ''[\s\S]*history: 'external'/);

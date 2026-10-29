@@ -14,13 +14,33 @@ const rowSource = fs.readFileSync(new URL('./RequestTrackerRow.tsx', import.meta
 const evaluate = (code, require) => {
   const module = { exports: {} };
   vm.runInNewContext(transformSync(code, { loader: 'tsx', format: 'cjs' }).code,
-    { module, exports: module.exports, require, React, window: { require: () => ({
+    { module, exports: module.exports, require, React, scDesktopIcon: 'sc-desktop.png', window: { require: () => ({
       ipcRenderer: { invoke: () => { throw Error('Display must not invoke IPC'); } },
     }) } });
   return module.exports;
 };
 const rows = evaluate(rowSource, name => {
   if (name === 'react') return React;
+  throw Error(name);
+});
+const actionSource = fs.readFileSync(new URL('./TabMessageSourceChip.tsx', import.meta.url), 'utf8');
+const navigation = evaluate(`import React, { useState, useRef } from 'react';
+  import { ArrowUpRight, Globe } from 'lucide-react';
+  const { ipcRenderer } = window.require('electron');
+  ${actionSource.slice(actionSource.indexOf('export function ResearchSourceAction'),
+    actionSource.indexOf('export function HistoryPromptSource'))}`, name => {
+  if (name === 'react') return React;
+  if (name === 'lucide-react') return icons;
+  throw Error(name);
+});
+const continuationRows = evaluate(fs.readFileSync(new URL('./BuildContinueTracker.tsx', import.meta.url), 'utf8'), name => {
+  if (name === 'react') return React;
+  if (name === 'lucide-react') return icons;
+  if (name === './RequestTrackerRow') return rows;
+  if (name === './TabMessageSourceChip') return navigation;
+  if (name.endsWith('/useWorkspaceStore')) return { useWorkspaceStore: { getState: () => ({ openTabById: () => { throw Error('Display must not navigate'); } }) } };
+  if (name.endsWith('/Tooltip')) return { __esModule: true, default: ({ children, content, actionBar, side, align }) => React.createElement('section',
+    { 'data-tooltip-side': side, 'data-tooltip-align': align }, children, React.createElement('aside', null, content), actionBar) };
   throw Error(name);
 });
 const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', sourceTabId: 'source',
@@ -31,7 +51,7 @@ const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', s
 
 // Execute the whole component and real row/icon markup. Only retained hook state,
 // dock placement, message transport and Tooltip's overlay host are controlled.
-function render(run, { history = false, tabId = 'source' } = {}) {
+function render(run, { history = false, tabId = 'source', recoveryTargets = [] } = {}) {
   let state = 0;
   const hooks = { ...React,
     useState: initial => {
@@ -48,8 +68,15 @@ function render(run, { history = false, tabId = 'source' } = {}) {
       default: ({ children, content, actionBar }) => React.createElement('section', null,
         children, React.createElement('aside', { 'data-test-tooltip': true }, content, actionBar)) };
     if (name === './RequestTrackerRow') return rows;
+    if (name === './TabMessageSourceChip') return navigation;
     if (name === './TabMessageTracker') return { TabMessageTracker: () => null };
     if (name.endsWith('/useTabMessages')) return { useTabMessages: () => ({ threads: [], listError: null }) };
+    if (name.endsWith('/useBuildInstallStatus')) return { useBuildInstallStatus: () => ({ jobs: [] }) };
+    if (name.endsWith('/useBuildContinueStatus')) return { useBuildContinueStatus: () => ({ targets: recoveryTargets, error: null,
+      cancel: () => { throw Error('Display must not cancel recovery'); } }) };
+    if (name.endsWith('/buildInstallPresentation.mjs')) return { buildInstallVisibleInDock: () => false };
+    if (name === './BuildInstallTracker') return { BuildInstallTracker: () => null };
+    if (name === './BuildContinueTracker') return continuationRows;
     if (name.endsWith('/useRequestDockLayout')) return { useRequestDockLayout: () => ({ visible: true }) };
     if (name.endsWith('/tabMessageProjection')) return { tabMessageVisibleInTracker: () => false };
     if (name.endsWith('/requestTrackerVisibility.mjs')) return { isRequestSuccessPresentation: () => false };
@@ -60,6 +87,51 @@ function render(run, { history = false, tabId = 'source' } = {}) {
   }).OrchestrationStatusChip;
   return renderToStaticMarkup(React.createElement(component, { tabId, panelOpen: true, effectiveWidth: 320 }));
 }
+
+test('outgoing Research details expose exact-run SC and browser buttons in fixed icon slots', () => {
+  for (const [status, history] of [['running', false], ['queued', false], ['completed', true], ['cancelled', true]]) {
+    const run = { ...base, status, resultComplete: status === 'completed', notificationSuppressed: status === 'cancelled' };
+    const before = JSON.stringify(run), html = render(run, { history });
+    const buttons = html.match(/<button\b[^>]*data-external-research-source="saved-run"[^>]*>/g) || [];
+    assert.ok(buttons.length >= 2, 'the tooltip must offer navigation separately from the linked name');
+    assert.ok(buttons.some(button => button.includes('data-external-research-destination="desktop"')));
+    assert.ok(buttons.some(button => button.includes('data-external-research-destination="browser"')));
+    for (const button of buttons) {
+      assert.match(button, /width:24px;height:24px/);
+      assert.match(button, /title="[^"]+"/);
+    }
+    assert.match(html, /Открыть разговор в браузере/);
+    assert.equal(JSON.stringify(run), before);
+  }
+});
+
+test('the real request dock renders saved recovery before History content or a confirmed native turn exists', () => {
+  const recovery = { operationId: 'capture-one', capturedAt: 1, tabId: 'source', phase: 'restoring', state: 'pending',
+    active: true, reason: 'runtime-input-pending', handoffId: 'same-H', operationKey: 'same-O', route: { kind: 'local' } };
+  const before = JSON.stringify(recovery), html = render({ ...base, status: 'completed', resultComplete: true }, { recoveryTargets: [recovery] });
+  assert.match(html, /data-request-kind="continuation"/); assert.match(html, /Продолжение задачи после обновления/);
+  assert.match(html, /Автопродолжение ждёт проверки сессии/); assert.match(html, /Отменить автопродолжение/);
+  assert.doesNotMatch(html, /Продолжение доставлено/); assert.equal(JSON.stringify(recovery), before);
+});
+
+test('the real recovery dock retains a completed Research identity and its existing SC/browser actions', () => {
+  const recovery = { operationId: 'capture-one', capturedAt: 1, tabId: 'source', phase: 'restoring', state: 'pending',
+    active: true, reason: 'runtime-input-pending', handoffId: 'same-H', operationKey: 'same-O', route: { kind: 'local' },
+    source: { tabId: 'source', name: 'чаты с hh' }, taskId: 'original-task' };
+  const html = render({ ...base, status: 'completed', resultComplete: true, notificationStatus: 'sent' }, { recoveryTargets: [recovery] });
+  assert.match(html, /чаты с hh/); assert.match(html, /original-task/); assert.match(html, /noted_saved-run/);
+  assert.match(html, /Research завершён · результат сохранён/); assert.match(html, /Ответ отправлен во вкладку/);
+  assert.match(html, /data-external-research-source="saved-run"/); assert.match(html, /data-external-research-destination="browser"/);
+  assert.match(html, /alt="SC Desktop"/); assert.match(html, /data-tooltip-side="left"/);
+});
+
+test('native/observed and incoming requests do not acquire Research browser actions', () => {
+  for (const run of [{ ...base, runKind: 'agent', targetTabId: 'target' },
+    { ...base, runKind: 'response-observation', targetTabId: 'target' },
+    { ...base, sourceTabId: 'different-source', targetTabId: 'source' }]) {
+    assert.doesNotMatch(render(run), /data-external-research-destination/);
+  }
+});
 
 for (const [model, effort, expected] of [
   ['6-astra', 'pro', 'ChatGPT · 6 Pro'],

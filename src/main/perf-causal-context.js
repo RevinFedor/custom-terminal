@@ -5,9 +5,10 @@ const { createHash } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, compactWorkSummary, sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
 
-const ID_FIELDS = new Set(['tabId', 'sessionId', 'actionId', 'readId', 'requestId', 'fileIdentity']);
+const ID_FIELDS = new Set(['tabId', 'sessionId', 'actionId', 'readId', 'requestId', 'initAttemptId', 'cwdHash', 'fileIdentity']);
 const TEXT_FIELDS = new Set(['caller', 'mode', 'reason', 'threadCpuSource', 'threadCpuUnavailableReason', 'gcCoverage']);
 const NUMBER_FIELDS = new Set(['sourceBytes', 'deltaBytes', 'recordsBefore', 'recordsAfter', 'snapshotRecords', 'rows', 'bytes',
+  'framingCopiedBytes', 'framingMaxCarryBytes', 'framingMaxCarryBlocks', 'framingLineAssemblies',
   'syncMs', 'durationMs', 'threadCpuMs', 'processCpuUserMs', 'processCpuSystemMs', 'gcObservedOverlapMs', 'gcEntries', 'gcDropped']);
 function opaqueId(value) {
   if (typeof value !== 'string' && !(typeof value === 'number' && Number.isFinite(value))) return undefined;

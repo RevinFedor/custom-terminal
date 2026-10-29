@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { classifyQueuedCodexSettingsIntent } from './promptQueueCodexSettingsIntent.mjs';
 
+test('explicit cancellation settles an exact pending settings wait without success', () => {
+  const result = classifyQueuedCodexSettingsIntent({ codexSettingsIntentRevision: 21,
+    codexSettingsIntentActionSequence: 8, codexSettingsIntentModel: 'gpt-6.1-terra',
+    codexSettingsIntentEffort: 'max', codexSettingsIntentCancelled: { revision: 21, actionSequence: 8 } },
+  { revision: 21, model: 'gpt-6.1-terra', effort: 'max' });
+  assert.equal(result.kind, 'failed'); assert.match(result.error, /отменено/);
+});
+
 const expected = { revision: 8, model: 'gpt-6-astra', effort: 'max' };
 const state = (patch = {}) => ({
   codexSettingsIntentRevision: 8,

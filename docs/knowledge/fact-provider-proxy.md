@@ -203,6 +203,13 @@ App-controlled Codex получает per-tab `openai_base_url` только п�
 stream помечается gap и не засчитывается как parity, даже если успел прислать
 внешне полный финальный event.
 
+Native Codex `/model` может показывать warning об overridden OpenAI base URL
+именно из-за этого локального маршрута. Сам warning не проверяет соединение и
+не доказывает ошибку proxy или недоступность модели. 27.10 в расследованном
+случае `/models` прошёл через локальный proxy с HTTP 200; зависший выбор был
+отдельным mismatch display-label picker и ID. Успешный `/models` не доказывает
+успех streaming `/responses` или отсутствие более раннего разрыва.
+
 `response.completed` и последующее закрытие соединения — независимые факты:
 04.10 completed-request291 больше не передавал close1006 в preview observer,
 потому что уже считался finished. Отдельное уведомление о неизвестной доставке

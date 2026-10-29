@@ -14,7 +14,11 @@ function fixture() {
   let root = { ready: true }, status = { status: 'active', inputReady: true, busy: false,
     writerConfirmed: false, writerStatus: 'provisional-source', sessionId: null }, frame = { ready: true };
   const logs = [], calls = [], queue = [];
-  const ctx = { console: { log: value => logs.push(value) }, isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey,
+  const ctx = { require, path, srcMainDir: __dirname,
+    getBuildContinueOperations: () => ({ capturing: () => false }),
+    buildInstallAutomationBlocked: () => false, historyMutationInput: null,
+    isPromptLoopAutomationSource: require('./prompt-queue-source').isPromptLoopAutomationSource,
+    console: { log: value => logs.push(value) }, isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey,
     automaticSendAdmissionDiagnostics: new Map(), bridgeRequest: async () => { calls.push('root'); return root; },
     coherentPublicRuntimeSnapshot: async () => { calls.push('coherent'); return status; },
     resolveAgentSessionInfo: async () => { throw Error('legacy reader must not gate automatic Sends'); },

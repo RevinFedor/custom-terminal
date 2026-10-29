@@ -136,7 +136,9 @@ function codexProjection({ settings, providerState, stored, runtime, capture }) 
   const appliedOwner = clean(providerState.codexSettingsIntentAppliedOwnerId);
   const requestedModel = choice(providerState.codexSettingsIntentModel);
   const requestedEffort = choice(providerState.codexSettingsIntentEffort);
-  const intentKnown = Number.isInteger(revision) && revision > 0 && !!requestedModel && !!requestedEffort;
+  const cancelled = providerState.codexSettingsIntentCancelled?.revision === revision
+    && providerState.codexSettingsIntentCancelled?.actionSequence === Number(providerState.codexSettingsIntentActionSequence || 0);
+  const intentKnown = !cancelled && Number.isInteger(revision) && revision > 0 && !!requestedModel && !!requestedEffort;
   const desiredFast = providerState.codexFastIntent;
   const fastIntentKnown = typeof desiredFast === 'boolean';
   const tierProof = settings.serviceTierProof;

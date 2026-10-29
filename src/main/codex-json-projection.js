@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const { currentReadControl } = require('./history-read-control');
 const { createJsonStringDecoder, SOURCE_LEAF_VERSION } = require('./history-source-leaf');
+const { createJsonNumber } = require('./history-json-number');
 
 // true retains a scalar; an object schema selects keys; ITEMS selects array
 // elements. PRESENCE keeps the JSON type/nullness, DEFER keeps an exact byte
@@ -17,6 +18,9 @@ const RANGE = Symbol('physical JSON value');
 // JSON string. A public full response must resolve it through streamSourceLeaf;
 // it must never serialize the locator in place of text.
 const LEAF = Symbol('bounded selected JSON string');
+// Explicit sink mode for the rooted file reducer. ALL does not change the
+// existing selective schemas or their DTO return values.
+const ALL = Symbol('all values into an explicit paged sink');
 
 const CHUNK_BYTES = 1024 * 1024;
 const TOKEN_FRAGMENT_BATCH = 1024;
@@ -34,8 +38,21 @@ const range = (from, to) => ({ [RANGE]: true, from, to });
 // Latin1 here is a byte-preserving transport; retained JSON strings are decoded
 // from UTF-8 only when complete, including a code point split across reads.
 function createJsonProjection(rootSchema, options = {}) {
-  const stack = [];
+  const sink = options.valueSink || null;
+  if (rootSchema === ALL && !sink) throw new TypeError('history_all_projection_requires_sink');
+  let sinkFailure = null;
+  const backed = fn => {
+    try { return fn(); } catch (error) { sinkFailure = error; throw error; }
+  };
+  const suppliedStack = options.frameStack;
+  const stack = suppliedStack ? {
+    get length() { return suppliedStack.length; },
+    at: index => backed(() => suppliedStack.at(index)),
+    push: frame => backed(() => suppliedStack.push(frame)),
+    pop: () => backed(() => suppliedStack.pop()),
+  } : [];
   let maxTokenBytes = 0, maxChunkBytes = 0, maxBufferedBytes = 0, maxParserFrames = 0, chunkBytes = 0;
+  let maxNumericTokenChars = 0, maxNumericScratchChars = 0;
   let token = null, value, complete = false, invalid = false, seen = false, edgePrefix = '';
   const locatedProjection = schema => schema && typeof schema === 'object' && Object.hasOwn(schema, DEFER);
   const keyLimitFor = schema => {
@@ -48,6 +65,7 @@ function createJsonProjection(rootSchema, options = {}) {
   const wanted = () => {
     const parent = stack.at(-1);
     if (!parent) return rootSchema;
+    if (parent.schema === ALL) return ALL;
     if (parent.kind === 'array') return parent.schema?.[ITEMS];
     return parent.key !== null && Object.hasOwn(parent.schema || {}, parent.key)
       ? parent.schema[parent.key] : undefined;
@@ -58,7 +76,11 @@ function createJsonProjection(rootSchema, options = {}) {
     const parent = stack.at(-1);
     if (!parent) { value = result; complete = true; return; }
     if (schema !== undefined) {
-      if (parent.kind === 'array') parent.value.push(result);
+      if (sink && parent.schema === ALL) backed(() => {
+        if (parent.kind === 'array') sink.append(parent.value, result);
+        else sink.field(parent.value, parent.key, result);
+      });
+      else if (parent.kind === 'array') parent.value.push(result);
       else Object.defineProperty(parent.value, parent.key, {
         value: result, enumerable: true, configurable: true, writable: true,
       });
@@ -126,25 +148,37 @@ function createJsonProjection(rootSchema, options = {}) {
       else throw Error('number');
       index++;
     }
+    if (token.number) {
+      token.number.write(text);
+      const stats = token.number.stats();
+      maxNumericTokenChars = Math.max(maxNumericTokenChars, stats.tokenChars);
+      maxNumericScratchChars = Math.max(maxNumericScratchChars, stats.maxConversionChars);
+    }
     append(text);
   };
   const finishToken = end => {
     if (token.key) {
       const parent = stack.at(-1);
-      parent.key = token.capture
-        ? JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8')) : null;
+      if (token.writer) {
+        token.decoder.finish();
+        parent.key = backed(() => token.writer.finish());
+      } else parent.key = token.capture
+          ? JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8')) : null;
       parent.state = 'colon';
     } else {
       let result;
       if (token.kind === 'atom') {
         if (token.word ? token.wordIndex !== token.word.length
           : !['zero', 'int', 'fraction', 'exponent'].includes(token.numberState)) throw Error('atom');
-        if (token.capture) result = JSON.parse(tokenText());
+        if (token.number) result = token.number.finish();
+        else if (token.capture) result = JSON.parse(tokenText());
         else if (token.schema === PRESENCE) result = token.word === 'null' ? null : 0;
+        if (sink && token.schema === ALL) result = backed(() => sink.scalar(result));
       } else if (token.decoder) {
         const decoded = token.decoder.finish();
-        result = Object.freeze({ $historySourceLeaf: SOURCE_LEAF_VERSION,
-          from: token.from, to: end, totalChars: decoded.totalChars, contentHash: decoded.contentHash });
+        result = token.writer ? backed(() => token.writer.finish())
+          : Object.freeze({ $historySourceLeaf: SOURCE_LEAF_VERSION,
+              from: token.from, to: end, totalChars: decoded.totalChars, contentHash: decoded.contentHash });
       } else if (token.capture) {
         result = JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8'));
       } else if (token.schema === PRESENCE) result = '';
@@ -195,13 +229,13 @@ function createJsonProjection(rootSchema, options = {}) {
           continue;
         }
         const char = source[index];
-        if (!stack.length && (edgePrefix || char.charCodeAt(0) >= 128)) {
+        if (!options.jsonWhitespaceOnly && !stack.length && (edgePrefix || char.charCodeAt(0) >= 128)) {
           edgePrefix += char; index++;
           if (EDGE_WHITESPACE.includes(edgePrefix)) edgePrefix = '';
           else if (!EDGE_WHITESPACE.some(text => text.startsWith(edgePrefix))) throw Error('edge whitespace');
           continue;
         }
-        if (!stack.length && (char === '\v' || char === '\f')) { index++; continue; }
+        if (!options.jsonWhitespaceOnly && !stack.length && (char === '\v' || char === '\f')) { index++; continue; }
         if (char === ' ' || char === '\t' || char === '\r' || char === '\n') { index++; continue; }
         seen = true;
         const parent = stack.at(-1);
@@ -218,7 +252,8 @@ function createJsonProjection(rootSchema, options = {}) {
           if (!parent || char !== (parent.kind === 'object' ? '}' : ']')
             || !['empty', 'comma'].includes(parent.state)) throw Error('end');
           stack.pop(); index++;
-          put(parent.value, parent.originalSchema, parent.from, offset + index);
+          const result = sink && parent.schema === ALL ? backed(() => sink.finish(parent.value)) : parent.value;
+          put(result, parent.originalSchema, parent.from, offset + index);
           continue;
         }
         const key = parent?.kind === 'object' && ['empty', 'key'].includes(parent.state);
@@ -229,7 +264,14 @@ function createJsonProjection(rootSchema, options = {}) {
             keyLimit: parent?.keyLimit,
             capture: key || (schema !== undefined && schema !== DEFER && schema !== PRESENCE && schema !== LEAF && !locatedProjection(schema)),
             parts: [], length: 0 };
-          if (!key && schema === LEAF) token.decoder = createJsonStringDecoder({
+          if (sink && (schema === ALL || key && parent.schema === ALL)) {
+            token.capture = false;
+            token.writer = backed(() => sink.text());
+            token.decoder = createJsonStringDecoder({
+              chunkChars: Math.max(1, Math.floor((Number(options.selectedTokenBytes) || 64 * 1024) / 2)),
+              onChunk: text => backed(() => token.writer.write(text)),
+            });
+          } else if (!key && schema === LEAF) token.decoder = createJsonStringDecoder({
             chunkChars: Math.max(1, Math.floor((Number(options.selectedTokenBytes) || 64 * 1024) / 2)),
           });
           append('"'); index++; continue;
@@ -237,27 +279,31 @@ function createJsonProjection(rootSchema, options = {}) {
         if (char === '{' || char === '[') {
           const selected = locatedProjection(schema) ? schema[DEFER] : schema;
           stack.push({ kind: char === '{' ? 'object' : 'array', state: 'empty',
-            originalSchema: schema, schema: typeof selected === 'object' ? selected : undefined,
+            originalSchema: schema, schema: selected === ALL ? ALL : typeof selected === 'object' ? selected : undefined,
             keyLimit: char === '{' ? keyLimitFor(schema) : 0,
             from: offset + index, value: schema === undefined || schema === DEFER
-              ? undefined : char === '{' ? {} : [] });
+              ? undefined : sink && selected === ALL
+                ? backed(() => sink.container(char === '{' ? 'object' : 'array')) : char === '{' ? {} : [] });
           maxParserFrames = Math.max(maxParserFrames, stack.length);
           index++; continue;
         }
         if (!'-0123456789tfn'.includes(char)) throw Error('value');
         token = { kind: 'atom', schema, from: offset + index,
-          capture: schema !== undefined && schema !== DEFER && schema !== PRESENCE && !locatedProjection(schema), parts: [], length: 0 };
+          capture: !(sink && schema === ALL) && schema !== undefined && schema !== DEFER && schema !== PRESENCE && !locatedProjection(schema),
+          number: sink && schema === ALL ? createJsonNumber() : null, parts: [], length: 0 };
       }
-    } catch { invalid = true; }
+    } catch (error) { if (error === sinkFailure) throw error; invalid = true; }
   };
   const finish = end => {
-    try { if (token?.kind === 'atom') finishToken(end); } catch { invalid = true; }
+    try { if (token?.kind === 'atom') finishToken(end); }
+    catch (error) { if (error === sinkFailure) throw error; invalid = true; }
     return { value, valid: !invalid && complete && !token && !edgePrefix && stack.length === 0,
       empty: !invalid && !seen && !token && !edgePrefix };
   };
   // Encoded token + current write input only; excludes selected decoded values
   // and container/depth state. Ignored bodies never contribute token storage.
-  return { write, finish, stats: () => ({ maxTokenBytes, maxChunkBytes, maxBufferedBytes, maxParserFrames }) };
+  return { write, finish, stats: () => ({ maxTokenBytes, maxChunkBytes, maxBufferedBytes, maxParserFrames,
+    maxNumericTokenChars, maxNumericScratchChars }) };
 }
 
 function readControl(options) {
@@ -332,7 +378,7 @@ async function readProjectedJsonlRange(filePath, startByte, endByte, options = {
       if (metrics) metrics.maxRecordBytes = Math.max(metrics.maxRecordBytes, offset + end - start);
       if (result.valid) {
         parsed++;
-        const record = { ...result.value, __line: line, __byteOffset: start };
+        const record = options.valueSink ? result.value : { ...result.value, __line: line, __byteOffset: start };
         if (metrics) metrics.maxConsumerRecords = 1;
         await options.onRecord?.(record, { filePath, fromByte: start, toByte: offset + end + 1, startLine: line });
         control.assertCurrent();
@@ -351,6 +397,6 @@ async function readProjectedJsonlRange(filePath, startByte, endByte, options = {
     partial: { filePath, fromByte: start, toByte: offset, startLine: line } };
 }
 
-module.exports = { DEFER, PRESENCE, ITEMS, RANGE, LEAF, createJsonProjection,
+module.exports = { DEFER, PRESENCE, ITEMS, RANGE, LEAF, ALL, createJsonProjection,
   readProjectedValue, readProjectedJsonlRange };
 

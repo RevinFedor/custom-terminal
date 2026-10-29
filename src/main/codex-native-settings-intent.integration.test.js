@@ -54,6 +54,7 @@ async function harness() {
   const context = vm.createContext({
     ...intent, ...picker, ...effective, createCodexNativeSettingsIntentTracker,
     console: { log() {}, warn: (...values) => warnings.push(values.join(' ')) },
+    codexDataModule: { _api: { getCachedCodexPickerCatalog: () => state.modelCatalog || [] } },
     providerStates, terminals: terms, setImmediate,
     ipcMain: { emit() {} },
     getProviderState: () => providerStates.get('T'),
@@ -92,7 +93,8 @@ async function harness() {
         applicationProofSource: 'config:verified-write', codexSettingsProofSessionId: state.ownerId };
     },
   });
-  vm.runInContext(part(main, '// Native selections have a dedicated business owner in main.', "ipcMain.handle('codex:set-model-effort-intent'")
+  vm.runInContext(declaration('getCodexModelIdentityCatalog') + '\n'
+    + part(main, '// Native selections have a dedicated business owner in main.', "ipcMain.handle('codex:set-model-effort-intent'")
     + declaration('tryHandleManualCodexActivePickerEnter')
     + declaration('confirmCodexIntentFromCurrentLaunchSettings'), context);
 
@@ -189,6 +191,50 @@ test('Codex 0.156.1 display-cased footer confirms the exact lowercase native mod
   await h.acknowledge('gpt-6-astra', 'max', 'persistent-default', true, 'GPT-6-Astra');
   assert.equal(h.durable.settings.model, 'gpt-6-astra');
   assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-6-astra');
+});
+
+test('manual exact Terra ACK and multiword footer persist the real model and effort', async () => {
+  const h = await harness();
+  assert.equal(h.enter().handled, true);
+  await h.acknowledge('gpt-6.1-terra', 'max', 'persistent-default', true, 'GPT-6.1 Terra');
+  assert.equal(h.durable.settings.model, 'gpt-6.1-terra');
+  assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-6.1-terra');
+});
+
+test('manual future display label is resolved by the actual cached-catalog reader', async () => {
+  const h = await harness();
+  h.state.modelCatalog = [{ id: 'gpt-7.2-artemis', label: 'GPT-7.2 Artemis' }];
+  assert.equal(h.enter().handled, true);
+  await h.acknowledge('gpt-7.2-artemis', 'high', 'persistent-default', true, 'GPT-7.2 Artemis');
+  assert.equal(h.durable.settings.model, 'gpt-7.2-artemis');
+  assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-7.2-artemis');
+});
+
+test('new compact picker footer preserves manual model Enter and exact native settings proof', async () => {
+  const h = await harness();
+  h.state.frame = ['Select Model and Effort', '› 1. GPT-6.1-Sol (current)',
+    '  2. GPT-6.1 Terra', 'enter select · esc back'].join('\n');
+  assert.equal(h.enter().handled, true);
+  assert.equal(vm.runInContext("codexNativeSettingsIntentTracker.hasPending('T')", h.context), true);
+  await h.acknowledge('gpt-6.1-terra', 'max');
+  assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-6.1-terra');
+  assert.equal(h.durable.settings.model, 'gpt-6.1-terra');
+});
+
+test('cancelling the app picker does not revoke an already-armed manual native choice', async () => {
+  const h = await harness();
+  h.state.frame = ['Select Model and Effort', '› 1. GPT-6.1-Sol (current)',
+    '  2. GPT-6.1 Terra', 'enter select · esc back'].join('\n');
+  assert.equal(h.enter().handled, true);
+  const before = h.context.getCodexModelEffortIntentRecord('T');
+  h.providerStates.set('T', { ...before.providerState, codexSettingsIntentCancelled: {
+    revision: before.revision, actionSequence: before.actionSequence,
+  } });
+  assert.equal(h.context.getCodexModelEffortIntentRecord('T').cancelled, true);
+  await h.acknowledge('gpt-6.1-terra', 'max');
+  const after = h.context.getCodexModelEffortIntentRecord('T');
+  assert.equal(after.model, 'gpt-6.1-terra'); assert.equal(after.cancelled, false);
+  assert.equal(h.durable.settings.model, 'gpt-6.1-terra');
 });
 
 test('a footer or programmatic Enter alone cannot supersede an app intent', async () => {

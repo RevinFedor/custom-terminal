@@ -8,6 +8,7 @@ import { isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason } from '../ren
 import { choosePromptQueueContinuationForOutcome } from '../renderer/utils/promptQueueReconciliation.mjs';
 import { deferredGoalCompletionKey } from '../renderer/utils/restartAfterCoordinator.mjs';
 import { hasPendingAgentGoalWork } from '../shared/agent-work-completion.mjs';
+import { createRunAfterCapacityRecovery, isCapacitySurfaceOnlyOutcome } from '../renderer/utils/runAfterCapacityRecovery.mjs';
 
 const require = createRequire(import.meta.url);
 const { TaskCompletionIntentRegistry, taskCompletionOutcomeMeta } = require('./task-completion-intent');
@@ -30,7 +31,8 @@ function declarations(source, names) {
 }
 const mainCode = declarations(main, ['currentCodexProviderSemanticOwnerContext', 'publishCodexProviderTurnActivity',
   'settleCodexProviderActivityFromWatcherOutcome', 'codexOutcomeTimestampMs', 'applyCodexWatcherAbnormalOutcome',
-  'applyCodexWatcherOutcome', 'codexTurnStateSnapshot', 'registerTaskCompletionIntent', 'emitCodexBusy']);
+  'applyCodexWatcherOutcome', 'codexTurnStateSnapshot', 'registerTaskCompletionIntent', 'captureLoopInputBoundary',
+  'observeLoopCanonicalInput', 'emitCodexBusy']);
 const queueContextCode = declarations(queueStore, ['skippedContextQueues', 'setPromptQueueContextSkipped'])
   .replace(/^export /gm, '');
 const rendererCode = ts.transpileModule(queueContextCode + '\n' + declarations(runner, ['explicitOutcomeTimestamp', 'liveOutcomeTimestamp',
@@ -40,7 +42,8 @@ const rendererCode = ts.transpileModule(queueContextCode + '\n' + declarations(r
 function harness({ eligible = true, ordinaryQueue = false, providerActive = true, queueArmedAt = 1, runtimeOwnArm = false, holdCompact = false } = {}) {
   const terminal = {}, generation = 'launch-1', tabId = 'T', turnId = 'turn-1';
   const watcher = { tabId, sessionId: 'S', currentTurnId: turnId, busy: true, processGeneration: generation,
-    lifecycleGeneration: generation, activeTaskCompletionProtocol: { eligible, source: eligible ? 'prompt-loop' : null } };
+    lifecycleGeneration: generation, sourceObservationTerminal: terminal, processGenerationBoundaryOffset: 0,
+    activeTaskCompletionProtocol: { eligible, source: eligible ? 'prompt-loop' : null } };
   const owner = { sourceId: 'provider-1', terminalToken: terminal, runSeq: 1, launchId: 'launch',
     lifecycleGeneration: generation, turnActive: providerActive, turnId, phase: 'provider-response' };
   const queue = { loopPromptEnabled: true, loopPromptText: 'check', loopPromptArmedAt: 1,
@@ -51,6 +54,9 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
   const prevBusyRef = new Map([[tabId, true]]);
   let compactContinuation;
   const renderer = vm.createContext({ console, Map, Set, Date, Number, JSON,
+    capacityWorkflowRecovery: createRunAfterCapacityRecovery(), capacityWorkflowSession: () => 'S',
+    deferredCapacityNaturalOutcomes: new Map(),
+    isCapacitySurfaceOnlyOutcome, isModelCapacityWorkflowOutcome: data => data.reason === 'model_capacity',
     queueShutdownPending: false, getPromptQueueAgent: () => 'codex', getWorkspaceCommandType: () => 'codex',
     prevBusyRef, autoCompactTurnStarts: new Map(), observedWorkflowStarts: new Set(), queueAwaitingBusyStart: new Set(),
     deferredGoalCompletionKey, deferredGoalNaturalOutcomes: new Map(), deferredOrchestrationNaturalOutcomes: new Map(), deferredContinuationPivotReleases: new Map(),
@@ -63,6 +69,8 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
       compactContinuation = continuation; return true;
     }, wake() {}, cancel() {} }, canProcessWorkflowOutcomes: () => true,
     isOrchestrationCompletionBlocked: () => false, isSuccessfulCompactLocalCommandEnd: () => false,
+    loopNaturalCausesByOwner: new Map(), getPromptQueueSessionId: () => 'S',
+    buildInstallContinuationFloor: () => 0, loopPromptMode: () => 'all-work',
     isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason, hasPendingAgentGoalWork, signalQueueOwnerReadiness() {},
     interruptionContinuesWithQueuedTurn: () => false, applyAbnormalQueueOutcome() {},
     queueManualStopping: new Set(),
@@ -77,6 +85,9 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
   vm.runInContext(rendererCode, renderer);
   const context = vm.createContext({ console, Date, Number, Map, Set,
     taskCompletionIntents: registry, taskCompletionOutcomeMeta,
+    isLocalSlashCommandPrompt: require('./agent-history-send-receipt').isLocalSlashCommandPrompt,
+    captureConversationOwner: () => ({ known: true, provider: 'codex', sessionId: 'S' }),
+    bridgeKnownSessions: new Map(), claudeHookLastEvent: new Map(),
     codexProviderPreviewOwnerVerdict, codexProviderTerminalOutcomeVerdict,
     terminals: new Map([[tabId, terminal]]), terminalCommandState: new Map([[tabId, { runSeq: 1 }]]),
     codexLastRunCommandPayload: new Map([[tabId, { launchId: 'launch' }]]),
@@ -85,6 +96,7 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
     recordActivity: (...args) => activity.push(args), publishCodexRuntimeProjection: (...args) => projected.push(args),
     shouldCreateHistoryResponseTiming: () => true, terminalHistoryPreviewController: { finish() {} },
     codexRuntimePolicies: null, replayDeferredCodexPromptAuditExecutionContext() {}, discardDeferredCodexPromptAuditExecutionContexts() {},
+    workingDirectoryOperations: null,
     clearCodexMcpStartupWatchdog() {}, getCodexPublicRuntimeProjection: () => ({ inputReady: true, sessionStatus: 'active' }),
     emitAgentReadinessChanged() {}, getCodexRuntimeSessionId: () => 'S', getCombinedTabBackgroundWorkCount: () => 0,
     getCodexPublicWriterFields: () => ({}), _webBroadcast() {},
@@ -159,6 +171,55 @@ test('no explicit signal continues Loop once; manual turns cannot call completio
   const h = harness({ eligible: false }); assert.equal(h.request('completed').code, 'completion_protocol_not_active');
   h.finish(); assert.deepEqual(h.fired, ['loop']); assert.equal(h.queue.loopPromptEnabled, true);
   assert.equal(h.events.length, 1);
+});
+
+test('generic canonical-input fence invalidates an old natural cause before any next busy edge, without changing busy', () => {
+  const h = harness({ eligible: false }); h.finish();
+  const old = h.events[0].loopInputBoundary;
+  assert.ok(old); assert.equal(h.context.captureLoopInputBoundary('T'), old);
+  h.context.observeLoopCanonicalInput(h.watcher, { __byteOffset: 100 }, false);
+  assert.notEqual(h.context.captureLoopInputBoundary('T'), old);
+  assert.equal(h.watcher.busy, false, 'no synthetic busy is published for canonical input');
+  h.finish();
+  assert.equal(h.events.at(-1).loopInputBoundary, old, 'same parent final cannot refresh its input authority');
+  assert.equal(h.context.codexTurnStateSnapshot(h.watcher).loopInputBoundary, old, 'snapshot returns frozen outcome, not current input');
+  h.context.emitCodexBusy('T', true, 'task_started', { turnId: 'turn-2', outcome: { busy: true }, timestamp: 200 });
+  h.context.emitCodexBusy('T', false, 'task_complete', { turnId: 'turn-2',
+    outcome: { busy: false, reason: 'task_complete', hasFinalResult: true }, timestamp: 300 });
+  assert.equal(h.events.at(-1).loopInputBoundary, h.context.captureLoopInputBoundary('T'));
+  assert.notEqual(h.events.at(-1).loopInputBoundary, old);
+});
+for (const patch of [{ catchUpPending: true }, { publicTurnStateSuppressed: true }, { deferredUntilComposer: true },
+  { manualBindingConflict: true }, { processGeneration: 'replaced' }, { sourceObservationTerminal: {} },
+  { processGenerationBoundaryOffset: 1000 }]) {
+  test('generic input fence ignores historical/unadmitted canonical record: ' + JSON.stringify(patch), () => {
+    const h = harness(); Object.assign(h.watcher, patch);
+    h.context.observeLoopCanonicalInput(h.watcher, { __byteOffset: 100 }, false);
+    assert.equal(h.watcher.loopCanonicalInputOffset, undefined);
+  });
+}
+test('generic input fence ignores suppressed/missing-offset or replaced watcher records', () => {
+  const h = harness();
+  h.context.observeLoopCanonicalInput(h.watcher, { __byteOffset: 100 }, true);
+  h.context.observeLoopCanonicalInput(h.watcher, {}, false);
+  h.context.observeLoopCanonicalInput(h.watcher, { __byteOffset: 100, payload: { message: '/fast' } }, false);
+  h.context.codexTurnWatchers.set('T', {});
+  h.context.observeLoopCanonicalInput(h.watcher, { __byteOffset: 100 }, false);
+  assert.equal(h.watcher.loopCanonicalInputOffset, undefined);
+});
+test('Claude generic input boundary uses its existing admitted turn generation and lifecycle, not Reply processing', () => {
+  const h = harness();
+  h.context.captureConversationOwner = () => ({ known: true, provider: 'claude', sessionId: 'C' });
+  h.context.bridgeKnownSessions.set('T', 'C');
+  h.registry.beginTurn({ tabId: 'T', provider: 'claude', sessionId: 'C', turnId: 'C1' });
+  const before = h.context.captureLoopInputBoundary('T'); assert.ok(before);
+  const done = h.registry.finishTurn({ tabId: 'T', provider: 'claude', sessionId: 'C', turnId: 'C1', success: true });
+  assert.equal(h.context.captureLoopInputBoundary('T', done.turn), before, 'admitted hook carries its finished registry turn');
+  h.context.claudeHookLastEvent.set('T', { sessionId: 'C', loopInputGeneration: done.turn.generation });
+  assert.equal(h.context.captureLoopInputBoundary('T'), before);
+  h.registry.beginTurn({ tabId: 'T', provider: 'claude', sessionId: 'C', turnId: 'C2' });
+  assert.notEqual(h.context.captureLoopInputBoundary('T'), before);
+  h.context.bridgeKnownSessions.set('T', 'replacement'); assert.equal(h.context.captureLoopInputBoundary('T'), null);
 });
 
 test('interrupt cancels the intent, and a different turn cannot consume it', () => {

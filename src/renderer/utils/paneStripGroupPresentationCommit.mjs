@@ -2,6 +2,7 @@ import {readPaneStripGroupState,readPaneStripActiveGroups} from './paneStripGrou
 import {paneStripColorGroupsBasis,paneStripLayoutOwner,paneStripSlotOrder} from '../../shared/pane-strip-color-groups.cjs';
 import {captureSpaceLayout} from './workspaceSpacesModel.mjs';
 import {organizationSnapshot} from './workflowOrganizationClient.mjs';
+import {capturePaneStripSettingsMembership} from './paneStripSettingsMembership.mjs';
 import {stableJson} from '../../shared/workflow-organization.cjs';
 const fail=code=>{throw Object.assign(Error(code),{code,disposition:'not-applied'});};
 const same=(a,b)=>stableJson(a)===stableJson(b);
@@ -27,11 +28,13 @@ function recoveredArrangementMatches(recovered,{workflowId,groupId,owner,basis,b
 
 /** One explicit field intent in the existing serial organization owner. All
  * captured membership is a fence, never a definition to restore after await. */
-export async function commitPaneStripGroupPresentation({getState,committer,lease,groupId,collapsed,order,representative,selectedTabId,selectionReady}) {
+export async function commitPaneStripGroupPresentation({getState,committer,lease,groupId,collapsed,order,representative,selectedTabId,selectionReady,ungroup=false}) {
   const initial=getState();if(!initial.organizationReady||initial.isRestoring||!lease.isCurrent())fail('strip_selection_changed');
   const raw=readPaneStripGroupState(initial,lease.workflowId),group=raw.groups.find(group=>group.id===groupId);
   if(!group)fail('strip_group_selection_changed');
   if(collapsed!==undefined&&typeof collapsed!=='boolean')fail('strip_group_selection_changed');
+  if(typeof ungroup!=='boolean'||ungroup&&(collapsed!==undefined||order!==undefined||representative!==undefined
+    ||selectedTabId!==undefined||selectionReady!==undefined))fail('strip_group_selection_changed');
   const selecting=selectedTabId!==undefined;
   if(selecting&&(typeof selectedTabId!=='string'||!selectedTabId||order!==undefined||representative!==undefined||collapsed!==undefined
     ||!group.collapsed))fail('strip_group_selection_changed');
@@ -45,12 +48,16 @@ export async function commitPaneStripGroupPresentation({getState,committer,lease
   const basis=paneStripColorGroupsBasis(raw);
   const active=readPaneStripActiveGroups(initial,lease.workflowId).find(value=>value.id===groupId);
   if(!active||active.tabIds.some(id=>!beforeSlots.some(slot=>slot.tabId===id)))fail('strip_group_selection_changed');
-  const members=new Set(active.tabIds),membership=state=>active.tabIds.map(id=>[
-    state.tabWorkflowMembership?.[id]??null,state.pendingTabWorkflowMembership?.[id]??null]);
-  const membershipBasis=stableJson(membership(initial));
+  if(ungroup&&(lease.entries.length!==active.tabIds.length
+    ||active.tabIds.some(id=>!lease.entries.some(entry=>entry.tabId===id))))fail('strip_group_selection_changed');
+  const removedBasis=ungroup?paneStripColorGroupsBasis({...raw,revision:raw.revision+1,groups:raw.groups.filter(value=>value.id!==groupId)}):null;
+  const members=new Set(active.tabIds);
+  const membershipWitness=capturePaneStripSettingsMembership(initial,{workflowId:lease.workflowId,owner,
+    tabIds:active.tabIds,assignments:active.tabIds.map(()=>groupId),basis,beforeOrder});
+  const membershipCurrent=state=>membershipWitness.isCurrent(state);
   const checkActive=state=>{
     const current=readPaneStripActiveGroups(state,lease.workflowId).find(value=>value.id===groupId);
-    if(!current||!same(current.tabIds,active.tabIds)||stableJson(membership(state))!==membershipBasis
+    if(!current||!same(current.tabIds,active.tabIds)||!membershipCurrent(state)
       ||selecting&&(!current.tabIds.includes(selectedTabId)||state.tabCatalog?.[selectedTabId]?.active===false))fail('strip_group_selection_changed');
     if(selecting&&active.tabIds.some(id=>(state.pendingTabWorkflowMembership?.[id]||state.tabWorkflowMembership?.[id])?.workflowId!==lease.workflowId))
       fail('strip_group_selection_changed');
@@ -90,12 +97,19 @@ export async function commitPaneStripGroupPresentation({getState,committer,lease
   } else if(order)order=[...order];
   if(order&&(!group.collapsed||order.length!==active.tabIds.length||new Set(order).size!==order.length
     ||active.tabIds.some(id=>!order.includes(id))||!order.includes(representative)))fail('strip_group_selection_changed');
-  if(collapsed===undefined&&!order||collapsed!==undefined&&!!group.collapsed===collapsed&&!order)return {revision:initial.organizationRevision,unchanged:true};
+  if(!ungroup&&(collapsed===undefined&&!order||collapsed!==undefined&&!!group.collapsed===collapsed&&!order))return {revision:initial.organizationRevision,unchanged:true};
   await getState().commitOrganization();
   return committer.commit(()=>{
     const state=getState();if(!lease.isCurrent())fail('strip_selection_changed');
     const current=readPaneStripGroupState(state,lease.workflowId),live=current.groups.find(value=>value.id===groupId);
     const at=paneStripLayoutOwner(captureSpaceLayout(state),owner);
+    if(ungroup) {
+      if(!at||!same(paneStripSlotOrder(at.slots),beforeOrder))fail('workflow_strip_groups_order_changed');
+      if(!membershipCurrent(state))fail('strip_group_selection_changed');
+      // Recovery may have just adopted this exact deletion from its original
+      // mutation. It cannot remove a new group or rebase onto another basis.
+      if(!live&&paneStripColorGroupsBasis(current)===removedBasis)return organizationSnapshot(state);
+    }
     if(!live||paneStripColorGroupsBasis(current)!==basis) {
       if(!order&&live&&collapsed!==undefined&&!!live.collapsed===collapsed)return organizationSnapshot(state);
       fail('workflow_strip_groups_revision_changed');
@@ -103,8 +117,9 @@ export async function commitPaneStripGroupPresentation({getState,committer,lease
     checkActive(state);
     if(!at||!same(paneStripSlotOrder(at.slots),beforeOrder))fail('workflow_strip_groups_order_changed');
     let candidate=state;
-    if(collapsed!==undefined&&!!live.collapsed!==collapsed) {
-      const groups=current.groups.map(value=>value.id===groupId?{...value,collapsed,revision:value.revision+1}:value);
+    if(ungroup||collapsed!==undefined&&!!live.collapsed!==collapsed) {
+      const groups=ungroup?current.groups.filter(value=>value.id!==groupId)
+        :current.groups.map(value=>value.id===groupId?{...value,collapsed,revision:value.revision+1}:value);
       candidate={...candidate,spaces:state.spaces.map(space=>space.id===lease.workflowId?
         {...space,stripColorGroups:{...current,revision:current.revision+1,groups}}:space)};
     }

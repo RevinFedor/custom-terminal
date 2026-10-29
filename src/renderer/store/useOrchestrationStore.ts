@@ -161,7 +161,7 @@ export type OrchestrationRun = {
   error?: string | null;
 };
 
-export type OrchestrationRunReleaseKind = 'handoff-started' | 'success' | 'abnormal';
+export type OrchestrationRunReleaseKind = 'handoff-started' | 'success' | 'dependency-cancelled' | 'abnormal';
 
 export type OrchestrationRunChange = {
   run: OrchestrationRun;
@@ -210,6 +210,12 @@ function releaseKindForRun(
 ): OrchestrationRunReleaseKind {
   if (!previousRun?.sourceFollowupStartedAt && run.sourceFollowupStartedAt) {
     return 'handoff-started';
+  }
+  // Deliberately removing this dependency says nothing about the parent's
+  // native turn. Keep the app-owned cancellation distinct from execution failure.
+  if (run.status === 'cancelled' && run.outcome === 'interrupted' && run.completionReason === 'cancelled-by-api'
+    && run.notificationSuppressed === true && run.notificationStatus === 'suppressed') {
+    return 'dependency-cancelled';
   }
   if (run.status === 'completed'
     && (run.notificationDismissedAt

@@ -1,10 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { mergeBuildInstallJobs } from '../utils/buildInstallPresentation.mjs';
 const { ipcRenderer } = window.require('electron');
 
 export type BuildInstallJob = {
   id: string; requestId: string; revision?: number; startedAt: number; phase: string; stage?: string;
-  force?: boolean; running: boolean; ok: boolean | null; cancelled?: boolean; error?: string | null;
+  force?: boolean; running: boolean; ok: boolean | null; cancelled?: boolean; requestCancelledAt?: number | null; error?: string | null;
   installOutcomeUnknown?: boolean; returnTo?: { tabId: string; sessionId?: string };
   callback?: { status: string; error?: string }; wait?: { blockers?: { tabId: string; name?: string; kind?: string }[]; preservedExternalWaits?: unknown[] };
   interruptionReport?: { tabs: unknown[]; mcp: unknown[]; unknown: string[] };
@@ -13,6 +13,7 @@ export type BuildInstallJob = {
 };
 export function useBuildInstallStatus(tabId: string) {
   const [state, setState] = useState<{ jobs: BuildInstallJob[]; stale: boolean; error: string | null }>({ jobs: [], stale: true, error: null });
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
   useEffect(() => {
     let alive = true, epoch: string | null = null, publication = -1;
     let projectionEpoch: string | null = null, projectionRevision = -1;
@@ -31,17 +32,43 @@ export function useBuildInstallStatus(tabId: string) {
         return jobs === previous.jobs && stale === previous.stale && error === previous.error ? previous : { jobs, stale, error };
       });
     };
+    const refresh = async () => {
+      const snapshot = await ipcRenderer.invoke('build-install:status-for-tab', tabId);
+      if (!alive) return;
+      if (snapshot?.version !== 1) throw new Error('installer status snapshot unavailable');
+      apply(snapshot);
+    };
+    refreshRef.current = refresh;
     const changed = (_event: unknown, snapshot: any) => apply(snapshot);
     ipcRenderer.on('build-install:status', changed);
-    void ipcRenderer.invoke('build-install:status-for-tab', tabId).then(apply)
+    void refresh()
       .catch((error: Error) => { if (alive) setState(previous => ({ ...previous, stale: true, error: error.message })); });
-    return () => { alive = false; ipcRenderer.removeListener('build-install:status', changed); };
+    return () => {
+      alive = false;
+      if (refreshRef.current === refresh) refreshRef.current = null;
+      ipcRenderer.removeListener('build-install:status', changed);
+    };
   }, [tabId]);
   const cancel = useCallback(async (job: BuildInstallJob) => {
-    try { await ipcRenderer.invoke('build-install:cancel', { tabId, id: job.id, requestId: job.requestId,
-      ...(!job.running && job.continuation?.canCancelContinuation ? {
-        action: 'cancel-continuation', fingerprint: job.continuation.fingerprint } : {}) }); }
-    catch (error) { setState(previous => ({ ...previous, error: String((error as Error).message) })); }
+    const refresh = refreshRef.current;
+    if (!refresh) return false;
+    let cancellationError: string | null = null;
+    try {
+      const result = await ipcRenderer.invoke('build-install:cancel', { tabId, id: job.id, requestId: job.requestId,
+        ...(job.continuation?.fingerprint ? { fingerprint: job.continuation.fingerprint } : {}) });
+      if (result?.ok !== true) throw new Error(result?.error || 'installer cancel not confirmed');
+    } catch (error) { cancellationError = String((error as Error).message); }
+    if (refreshRef.current !== refresh) return false;
+    try { await refresh(); }
+    catch (error) {
+      if (refreshRef.current === refresh) setState(previous => ({ ...previous, stale: true,
+        error: cancellationError || String((error as Error).message) }));
+      return false;
+    }
+    if (cancellationError && refreshRef.current === refresh) {
+      setState(previous => ({ ...previous, error: cancellationError }));
+    }
+    return !cancellationError;
   }, [tabId]);
   return { ...state, cancel };
 }

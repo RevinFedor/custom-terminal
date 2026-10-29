@@ -5,7 +5,7 @@ const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { createSendPreparationScope } = require('./agent-send-preparation');
 const { actualFunction, createCodexDraftRequestHarness, createFakeClock, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 
-function fixture(t, { now = 1000 } = {}) {
+function fixture(t, { now = 1000, cold = false } = {}) {
   let proof = { success: true, hasDraft: null, preview: '', source: 'headless-main:open',
     frameBlocker: 'synchronized-output-open' };
   const h = createCodexDraftRequestHarness({ rendererAvailable: false, getDraft: () => proof,
@@ -14,7 +14,7 @@ function fixture(t, { now = 1000 } = {}) {
   const identity = { operationKey: 'history:T:H', tabId: 'T', handoffId: 'H', surface: 'desktop-history',
     provider: 'codex', requestFingerprint: 'frozen', promptHash: 'hash', promptLength: 6 };
   const begun = store.beginAttempt(identity);
-  const scope = createSendPreparationScope({ ...identity, attemptId: begun.attemptId }, h.clock.now());
+  const scope = createSendPreparationScope({ ...identity, attemptId: begun.attemptId }, h.clock.now(), cold ? 'cold-codex' : 'warm');
   assert.equal(store.stageAttemptContext(identity.operationKey, begun.attemptId, { preflightScope: scope,
     authoring: { text: 'frozen', images: ['same-owned-asset'] } }).ok, true);
   h.context.agentSendReceiptStore = store;
@@ -35,6 +35,46 @@ function fixture(t, { now = 1000 } = {}) {
 
 // The public readiness signal is controlled; the startup projector, retained
 // receipt, accepted HEAD scope, SQLite owner and Main frame reader are actual.
+test('cold120 actual Main frame proof survives61.4s without changing H/O/A', async t => {
+  const h = fixture(t, { cold: true });
+  const pending = h.read(); await drainMicrotasks(30);
+  h.clock.advance(61400); h.frame();
+  const r = await pending;
+  assert.equal(r.hasDraft, false); assert.equal(r.observation.status, 'settled');
+  assert.equal(r.observation.budgetMs, 120000);
+  assert.equal(h.store.get(h.identity.operationKey).attemptId, h.begun.attemptId);
+  assert.equal(h.store.get(h.identity.operationKey).receipt.preflightScope.id, h.scope.id);
+});
+
+test('cold120 actual Main exact expiry refuses late empty proof and another read', async t => {
+  const h = fixture(t, { cold: true });
+  const pending = h.read(); await drainMicrotasks(30);
+  h.clock.advance(120000); await drainMicrotasks(30);
+  const r = await pending;
+  assert.equal(r.observation.status, 'expired');
+  assert.equal(r.preparationFailure?.code, 'agent_send_preparation_expired');
+  h.frame(); const late = await h.read();
+  assert.notEqual(late.hasDraft, false);
+  assert.equal(h.scope.preparation.deadlineAt, 121000);
+});
+
+for (const change of ['input', 'stop', 'cancel', 'owner']) test('cold120 actual Main still revokes after61.4s on ' + change, async t => {
+  const h = fixture(t, { cold: true });
+  const pending = h.read(); await drainMicrotasks(30); h.clock.advance(61400);
+  if (change === 'input') h.setOwner({ inputRevision: 2 });
+  if (change === 'stop') h.setOwner({ terminalStopRevision: 1 });
+  if (change === 'owner') h.setOwner({ terminalLifecycleGeneration: 'foreign' });
+  if (change === 'cancel') h.store.cancelDelivery({ ...h.identity, attemptId: h.begun.attemptId, reason: 'manual-stop' });
+  h.frame(); const r = await pending;
+  assert.notEqual(r.hasDraft, false); assert.notEqual(r.observation.status, 'settled');
+});
+
+test('cold120 actual Main still protects real draft after the old60s boundary', async t => {
+  const h = fixture(t, { cold: true });
+  const pending = h.read(); await drainMicrotasks(30); h.clock.advance(61400); h.frame(true);
+  const r = await pending; assert.equal(r.hasDraft, true); assert.equal(r.preview, 'foreign');
+});
+
 function installNearlyExpiredLaunch(h) {
   const terminal = {}, launchId = 'previous-launch';
   let ready = false, established = false;

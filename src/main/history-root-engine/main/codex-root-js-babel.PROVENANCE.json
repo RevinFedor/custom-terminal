@@ -1,0 +1,13 @@
+{
+  "upstream": "@babel/parser",
+  "version": "7.29.3",
+  "upstreamFile": "lib/index.js",
+  "upstreamBytes": 512666,
+  "upstreamSHA256": "201724d1415df7749087d9d6e88af50f2bcafe2eb68dfbe9347f49d3361ff426",
+  "license": "codex-root-js-babel.LICENSE",
+  "copiedIdentifierBlockSHA256": "ec4fb74a6ee22ef9b7dc06968792a63c01107a89575db57fd0353950e67c573f",
+  "identifierModule": "codex-root-js-identifiers.js",
+  "adaptedAlgorithm": "CommentsParser/processComment/finalizeComment/takeSurroundingComments; native lists and aliases replaced by existing arena owners",
+  "grammar": "Explicit paged productions; no source execution. Unsupported productions retain measured exact upstream compatibility parser. Whole producer remains INCOMPLETE.",
+  "bundle": "Static CommonJS require chain; existing package.json build.files src/main/**/* admits new modules and license. No build config mutation. Installed ASAR acceptance remains parent-owned."
+}

@@ -49,12 +49,12 @@ function fixture(t) {
       }
       return { ok: true }; }, getRun: async id => copy(runs.find(r => r.runId === id)),
     readReceipt: key => records.get(key), readQueued: key => queued.get(key),
-    changed: value => { changes.push(value); controls.changed?.(value); }, now: () => 1000, instanceId: 'source-instance' };
+    changed: value => { changes.push(value); controls.changed?.(value); }, now: () => controls.now || 1000, instanceId: 'source-instance' };
   let service = createBuildContinueOperations({ ...options, pid: 11 });
   const opId = 'continue-test-operation';
   return { views, runs, states, snapshot, records, queued, sends, runCalls, controls, changes, opId,
     get service() { return service; }, capture: () => service.capture(opId, 11),
-    boot: () => { service.dispose(); service = createBuildContinueOperations({ ...options, pid: 22 }); },
+    boot: (pid = 22) => { service.dispose(); service = createBuildContinueOperations({ ...options, pid }); },
     activate: async () => { service.activate(opId); await service.reconcile(opId); },
     confirm: tabId => { const target = service.get(opId).targets.find(t => t.source.tabId === tabId),
       request = JSON.parse(queued.get(target.operationKey).request_json), promptHash = promptAuditFingerprint(request.prompt);
@@ -75,7 +75,7 @@ test('capture freezes own vs inherited before build; external-only0/mixed1, same
   h.views[1].busy = true;
   assert.deepEqual((await h.capture()).targets.map(t => t.source.tabId), ['own', 'mixed'], 'duplicate capture never moves the cut');
   h.boot(); await h.activate(); assert.deepEqual(h.sends.map(s => s.tabId), ['own', 'mixed']);
-  assert.equal(h.sends.every(s => s.prompt === 'continue'), true);
+  assert.equal(h.sends.every(s => s.prompt === require('./build-continue-prompt').RESTART_PROMPT), true);
   h.confirm('own'); h.confirm('mixed'); await h.service.reconcile(h.opId);
   assert.equal(h.service.get(h.opId).phase, 'settled');
   h.boot(); await h.activate(); assert.equal(h.sends.length, 2, 'reopen cannot submit a second continuation');
@@ -119,6 +119,60 @@ test('lost ACK/restart reads the same operation; unknown is not resent; late exa
   h.boot(); await h.activate(); assert.equal(h.sends.length, 1);
   h.confirm('own'); await h.service.reconcile(h.opId);
   assert.equal(h.service.get(h.opId).targets[0].state, 'confirmed'); assert.equal(h.sends.length, 1);
+});
+
+test('a subsequent install captures now while an earlier restoration is pending; same work retains its sole H/O', async t => {
+  const h = fixture(t); h.views.length = 1;
+  await h.capture(); h.boot(); h.states.get('own').busy = true; await h.activate();
+  assert.equal(h.service.get(h.opId).phase, 'restoring'); assert.equal(h.sends.length, 0);
+  const oldTarget = h.service.get(h.opId).targets[0], nextId = 'second-install-operation';
+  h.controls.now = 2000;
+  const next = await h.service.capture(nextId, 22);
+  assert.equal(next.sourceMainPid, 22); assert.equal(next.targets.length, 0, 'same captured subject has an existing continuation owner');
+  assert.equal(next.carriedTargets.length, 1); assert.equal(next.carriedTargets[0].operationId, h.opId);
+  assert.equal(next.carriedTargets[0].handoffId, oldTarget.handoffId);
+  assert.equal(h.service.get(h.opId).targets[0].operationKey, oldTarget.operationKey);
+  assert.equal(h.service.get(h.opId).phase, 'restoring', 'new capture never relabels the old outcome');
+  assert.equal(h.service.capturing('idle-late-tab'), true);
+  h.snapshot.shutdownPid = 22; h.snapshot.capturedAt = 2001; h.boot(33);
+  h.states.get('own').busy = false;
+  h.service.activate(nextId); await h.service.reconcile(nextId); await h.service.reconcile(h.opId);
+  assert.equal(h.sends.length, 1); assert.equal(h.sends[0].handoffId, oldTarget.handoffId);
+  h.boot(44); h.service.restore(); await h.service.reconcile(h.opId); await h.service.reconcile(nextId);
+  assert.equal(h.sends.length, 1, 'repeated restart cannot create a second continue');
+});
+
+test('accepted/UNKNOWN old continuation is carried across another install without replay or replacement ID', async t => {
+  const h = fixture(t); h.views.length = 1; h.controls.lostAck = true;
+  await h.capture(); h.boot(); await h.activate(); assert.equal(h.sends.length, 1);
+  const before = h.service.get(h.opId).targets[0]; h.controls.now = 2000;
+  const next = await h.service.capture('unknown-second-install', 22);
+  assert.equal(next.targets.length, 0); assert.equal(next.carriedTargets[0].operationKey, before.operationKey);
+  assert.equal(h.service.get(h.opId).targets[0].state, 'unknown');
+  h.snapshot.shutdownPid = 22; h.snapshot.capturedAt = 2001; h.boot(33);
+  h.service.activate(next.id); await h.service.reconcile(next.id); await h.service.reconcile(h.opId);
+  assert.equal(h.sends.length, 1); assert.equal(h.service.get(h.opId).targets[0].state, 'unknown');
+  assert.equal(h.service.get(next.id).phase, 'restoring', 'carried UNKNOWN is not reported as finished restoration');
+});
+
+test('distinct own work waits for its prior continuation owner before its separate exact admission', async t => {
+  const h = fixture(t); h.views.length = 1; await h.capture(); h.boot();
+  h.states.get('own').busy = true; await h.activate();
+  const previous = h.service.get(h.opId).targets[0];
+  h.views[0].executionContext.turnId = 'new-user-turn'; h.views[0].subject.targetExecutionContext.turnId = 'new-user-turn';
+  h.controls.now = 2000; const next = await h.service.capture('distinct-second-install', 22);
+  assert.equal(next.targets.length, 1); assert.equal(next.carriedTargets.length, 0);
+  assert.deepEqual(next.targets[0].priorOperationIds, [h.opId]);
+  h.snapshot.shutdownPid = 22; h.snapshot.capturedAt = 2001; h.boot(33);
+  h.service.activate(next.id); await h.service.reconcile(next.id);
+  assert.equal(h.sends.length, 0); assert.equal(h.service.get(next.id).targets[0].reason, 'prior-continuation-pending');
+  assert.equal(h.service.get(h.opId).targets[0].handoffId, previous.handoffId);
+});
+
+test('a cut that has not closed its original Main still prevents a second concurrent install', async t => {
+  const h = fixture(t); await h.capture();
+  await assert.rejects(h.service.capture('premature-second-install', 11), error => error.code === 'build_continue_operation_pending' && error.operationId === h.opId);
+  assert.equal(h.service.list().length, 1);
 });
 
 test('startup restores the durable captured intent even when the CLI lost its capture ACK', async t => {

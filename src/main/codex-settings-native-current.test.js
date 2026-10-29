@@ -12,7 +12,10 @@ function variable(name,id){const {ast}=source(name);let found;function visit(n){
 function span(name,start,end){const {text}=source(name);const a=text.indexOf(start),b=text.indexOf(end,a+start.length);assert.ok(a>=0&&b>a,start);return text.slice(a,b);}
 const compile=code=>ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
 const file=path.join(root,'src/main/codex-settings-send.integration.test.js');const text=fs.readFileSync(file,'utf8'),end=text.indexOf("test('actual picker measures");assert.ok(end>0);
-const fixture=new Module(file,module);fixture.filename=file;fixture.paths=Module._nodeModulePaths(path.dirname(file));fixture._compile(text.slice(0,end)+'\nmodule.exports=harness;',file);
+const fixture=new Module(file,module);fixture.filename=file;fixture.paths=Module._nodeModulePaths(path.dirname(file));
+const loadFixture=fixture.require.bind(fixture);
+fixture.require=name=>name==='node:test'?()=>{}:loadFixture(name);
+fixture._compile(text.slice(0,end)+'\nmodule.exports=harness;',file);
 const {createCodexLiveSettingsObserver}=require(root+'/src/main/codex-live-settings');
 async function run(movement){
  const h=await fixture.exports();const main='src/main/main.js';
@@ -34,22 +37,24 @@ async function run(movement){
  Object.assign(h.context,{
    // Fake native UI/capture and on-disk config leaves; real orchestration function below.
    codexEffortApplicationMode:()=> 'persistent-default',CODEX_EFFORT_APPLICATION_CONVERSATION:'conversation-only',CODEX_ALL_MODELS_VALUE:'all-models',
-   captureCodexFrame:async()=>({clean:'model-menu',raw:'',timedOut:false}),sendCodexSlashCommand:async()=>({success:true}),
+   captureCodexFrame:async()=>({clean:'model-menu',raw:'',timedOut:false}),
+   sendCodexSlashCommand:async(_term,_command,_log,options)=>{options.onBeforeEnter();return {success:true};},
    parseCodexTopModelPicker:()=>({items:[{value:'gpt-6-astra'}]}),parseCodexAllModelPicker:()=>({items:[]}),
    planCodexModelSelection:()=>({available:true,complete:true,route:'top-model-direct'}),
    currentCodexPickerFrameText:clean=>clean,parseCodexPlanReasoningScopePicker:()=>({items:[]}),codexModelEffortConfirmationObservedInFrame:()=>true,
    selectCodexPickerItem:async(_term,request)=>{assert.equal(request.writeGuard('native-fixture-model-confirm').allowed,true);h.set({model:request.target,effort:'high'});observe(request.target,'high');h.events.push({kind:'native-selection-ack',model:request.target,effort:'high'});return {success:true,selected:request.target,frame:{clean:'confirmed-A/high',raw:''}};},
    waitForCodexModelEffortConfig:async(expected)=>{configWaits++;assert.equal(expected.model,'gpt-6-astra');await new Promise(r=>setImmediate(r));if(movement){h.set({model:'gpt-reserve',effort:'high'});observe('gpt-reserve','high');}liveAtConfigReturn=observer.read('tab');return {success:true,source:'fixture-root-config'};},
+   closeCodexPickerToComposer:async()=>({success:true}),
  });
  vm.runInContext(fn(main,'selectCodexModelEffort'),h.context);
  const result=await h.direct({model:'gpt-6-astra',effort:'high'});
  return {result,observationSequence,liveAtConfigReturn,liveAfter:observer.read('tab'),effectiveAfter:effective.resolveCodexEffectiveSettings(rendererTab),rendererTab,saves,configWaits,events:h.events};
 }
 test('NS-control: actual native selection orchestration and combined caller keep stable pair',async()=>{
- const e=await run(false);assert.equal(e.result.submitted,true);assert.equal(e.configWaits,1);assert.equal(e.events.find(x=>x.kind==='prompt').model,'gpt-6-astra');assert.equal(e.effectiveAfter.model,'gpt-6-astra');
+ const e=await run(false);assert.equal(e.result.submitted,true,JSON.stringify(e.result));assert.equal(e.configWaits,1);assert.equal(e.events.find(x=>x.kind==='prompt').model,'gpt-6-astra');assert.equal(e.effectiveAfter.model,'gpt-6-astra');
 });
 test('NS-race: newer B during actual config-proof await is not overwritten or used to send an explicit A prompt',async()=>{
- const e=await run(true);assert.equal(e.configWaits,1);assert.equal(e.liveAtConfigReturn.model,'gpt-reserve');assert.equal(e.liveAfter.model,'gpt-reserve');
+ const e=await run(true);assert.equal(e.configWaits,1,JSON.stringify(e.result));assert.equal(e.liveAtConfigReturn.model,'gpt-reserve');assert.equal(e.liveAfter.model,'gpt-reserve');
  if(process.env.CODEX_SETTINGS_EXPECT_OLD_RACE==='1'){assert.equal(e.result.submitted,true);assert.equal(e.events.find(x=>x.kind==='prompt').model,'gpt-reserve');assert.equal(e.effectiveAfter.model,'gpt-6-astra');return;}
  assert.equal(e.result.submitted,false);assert.equal(e.result.settingsResult.code,'codex_settings_observation_changed');assert.equal(e.events.filter(x=>x.kind==='prompt').length,0);assert.equal(e.events.filter(x=>x.channel==='codex:model-effort-intent-applied').length,0);assert.equal(e.effectiveAfter.model,'gpt-reserve');
 });
@@ -67,6 +72,7 @@ test('actual chunk and Enter gates retain the settings guard, including refusal 
   let allowed=true;
   const env=vm.createContext({options:{settingsWriteGuard:()=>({allowed,reason:'codex_settings_observation_changed'})},
    knownEmptyDestination:false,handoffId:null,pasteWritten,assertKnownEmptySend(){},broadcastTabId:'T',
+   preparation:null,submitAttempted:false,codexStartupFrameWait:null,
    expectedDestination:null,expectedTarget:null,sendOperationKey:null,sendAttemptId:null,
    term:{},writeExecutionIdentity:{},agentSendExecutionFailure:()=>null});
   env.destinationFailure=vm.runInContext('('+destination+')',env);

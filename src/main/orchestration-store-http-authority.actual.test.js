@@ -38,6 +38,7 @@ async function fixture(t) {
   const context = vm.createContext({ http, url, process, Date, sdkSessions: {},
     webServerInstanceId: 'owned-web', webServerLastRequestAt: null, webServerLastRequest: null, webServerRequestCount: 0,
     httpReadDiagnostics: { run: (_req, _res, run) => run(), phase() {} },
+    runHttpHistoryRead: (_req, _res, run) => run(), isHistoryReadCancelled: () => false,
     getOrchestrationRunStore: () => store, withOrchestrationUrls: value => value, decId: decodeURIComponent,
     sendJson: (res, code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); },
     console: { error() {} }, serveStatic: () => assert.fail('API never serves static data'),

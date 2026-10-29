@@ -61,6 +61,15 @@ file/browser без процесса и archived provenance не получаю�
 subject, token/generation/run/input и process identity. Unknown lookup и поздний
 replacement сохраняют процесс; частичный отказ возвращается отдельно по цели.
 
+SOURCE Full Close произвольного selection пишет body-free
+`[SelectionAction] close-guard-refused`: первый несовпавший компонент и границу
+`before_process_observation`/`after_process_observation`, флаг `threw` и допустимый
+error code. Значения, пути, ID и черновики в этот diagnostic не входят; predicates,
+порядок проверок и прежний `selection_close_execution_changed` не меняются.
+`selection-close-state success/started:false` подтверждает сохранённый guard token
+и отсутствие archive-started, но не повторяет current-owner comparison и не
+означает завершённое закрытие. Сам ответ не разрешает повтор неизвестной операции.
+
 Для native Claude/Codex дочерняя работа включает собственный Main background
 registry, не только MCP inherited projection: `turnBusy=false` родителя при
 положительном `getCombinedTabBackgroundWorkCount` не разрешает `idle` Stop.
@@ -86,9 +95,27 @@ origin workflow/window в `workflow:selection-begin`. Это произволь�
 не весь workflow и не полная global group. Main сам фиксирует active subject,
 namespace, membership/generation и runtime owner; caller не приносит proof.
 `workflow-selection-runtime.js` использует прежний action/step SQL journal,
-без скрытых групп и новых tables. `selection-step/ack/receipt` относятся только
+без скрытых групп и второго журнала действий. `selection-step/ack/receipt` относятся только
 к этому mutationId. Durable started до эффекта запрещает второй Stop после
 lost ACK/restart; caller success/отсутствие процесса не создают receipt.
+
+Успешный helper Stop ещё не является selection-квитанцией. Main повторно
+проверяет полный target/source scope и launch epoch/write после последнего
+await. Для native v2 публикация чужого workflow допустима только при неизменном
+target footprint; до admission и для legacy прежний global fence сохраняется.
+SID/cwd/subject/placement/provider и native storage identity защищены отдельным
+source clock: две observer-таблицы и три SQL triggers на фактические identity
+изменения в `tabs`. A→B→A меняет clock, context/stats/model preferences и no-op
+не меняют его. Clock не выдаёт Stop/Close authority и не восстанавливает прошлое;
+его missing/future/changed schema отказывает до нового эффекта.
+
+Если Main уже доказал положительную квитанцию, но completion transaction
+откатилась, тот же runtime удерживает exact receipt и original `step/ack`
+повторяет только commit, не process observation/Stop. После restart доступен
+лишь durable результат; новый shell, graceful exit или quit не превращают
+старый started/UNKNOWN в completed и не снимают его Close reservation.
+Отказы сохраняют bounded stage/reason и имена изменившихся полей без текста
+исключений/переписки. Новая Full всегда захватывает собственный текущий scope.
 
 Stop переиспользует обычный manual-stop owner (SDK hard Stop, AI serialized Stop,
 ordinary shell deterministic Stop), не Pause Run After. Full использует прежние

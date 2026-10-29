@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {beginNavigationDwell,TAB_DRAG_NAVIGATION_DWELL_MS} from './navigationDwell.mjs';
-import {createPaneStripBadgeHover} from './paneStripBadgeHover.mjs';
+import {createPaneStripBadgeHover,PANE_STRIP_BADGE_HOVER_ANIMATION} from './paneStripBadgeHover.mjs';
+import {CHIP_HOVER_MS} from './chipHoverIntent.mjs';
 import {paneStripHoverInside,paneStripHoverMenu} from './paneStripHoverScope.mjs';
 import {ownPaneStripGroupMetaHover} from './paneStripGroupMetaHover.mjs';
 import {registerPaneStripOutsideSelection} from './paneStripOutsideSelection.mjs';
@@ -14,7 +15,7 @@ function windowPort() {
     setTimeout(fn,ms){const id=++sequence;timers.set(id,{fn,ms});return id;},clearTimeout(id){timers.delete(id);},
     deadline(){const pending=[...timers];timers.clear();for(const [,timer]of pending)timer.fn();}};
 }
-test('workflow and badge share one finite500ms deadline; cancelled and superseded work cannot fire',()=>{
+test('workflow drag keeps its finite500ms deadline; cancelled and superseded work cannot fire',()=>{
   const target=windowPort();let calls=0,current=true;
   const start=()=>beginNavigationDwell({schedule:target.setTimeout,cancel:target.clearTimeout,isCurrent:()=>current,onComplete:()=>calls++});
   const cancel=start(),old=[...target.timers.values()][0];assert.equal(old.ms,TAB_DRAG_NAVIGATION_DWELL_MS);assert.equal(old.ms,500);
@@ -22,15 +23,21 @@ test('workflow and badge share one finite500ms deadline; cancelled and supersede
   start();current=false;target.deadline();assert.equal(calls,1);assert.equal(target.timers.size,0);
 });
 function badgeFixture(instant=false) {
-  const target=windowPort(),progress=[],node={isConnected:true,hovered:true,matches(){return this.hovered;}};
+  let clock=0;const attributes=new Map();
+  const target=windowPort(),progress=[],node={isConnected:true,hovered:true,matches(){return this.hovered;},
+    setAttribute:(key,value)=>attributes.set(key,value),removeAttribute:key=>attributes.delete(key)};
   const control={groupId:'g',revision:1,count:3,open:false,busy:false,hover(){calls++;}};let calls=0;
-  const hover=createPaneStripBadgeHover({target,getControl:()=>control,isInstant:()=>instant,publish:value=>progress.push(value)});
-  return {target,control,node,hover,progress,get calls(){return calls;}};
+  const hover=createPaneStripBadgeHover({target,getControl:()=>control,isInstant:()=>instant,publish:value=>progress.push(value),now:()=>clock});
+  const finish=(event={})=>hover.finish({target:node,currentTarget:node,animationName:PANE_STRIP_BADGE_HOVER_ANIMATION,...event});
+  return {target,control,node,hover,progress,attributes,finish,advance:()=>{clock+=CHIP_HOVER_MS;},get calls(){return calls;}};
 }
-test('ordinary badge hover fills once then opens; quick crossing, stale generation and invisible target cancel it',()=>{
+test('badge opens only at its own finite scale endpoint; cancelled, stale and invisible targets cannot open',()=>{
   const f=badgeFixture();f.hover.enter(f.node);assert.deepEqual(f.progress,[true]);assert.equal(f.calls,0);
-  const old=[...f.target.timers.values()][0];f.hover.cancel();old.fn();assert.equal(f.calls,0);
-  f.hover.enter(f.node);f.target.deadline();assert.equal(f.calls,1);assert.equal(f.progress.at(-1),false);
+  assert.equal(f.attributes.get('data-group-badge-opening'),'1');assert.equal(f.target.timers.size,0);
+  f.advance();f.hover.cancel();f.finish();assert.equal(f.calls,0);assert.equal(f.attributes.size,0);
+  f.hover.enter(f.node);f.finish();assert.equal(f.calls,0,'late old endpoint cannot shorten the new scale');
+  f.advance();f.finish({animationName:'foreign'});f.finish({target:{}});assert.equal(f.calls,0);
+  f.finish();f.finish();assert.equal(f.calls,1);assert.equal(f.progress.at(-1),false);assert.equal(f.attributes.size,0);
   for(const cancel of ['revision','availability','hover','connection','blur','Escape','pointerdown']) {
     const f=badgeFixture();f.hover.enter(f.node);
     if(cancel==='revision')f.control.revision++;
@@ -39,7 +46,8 @@ test('ordinary badge hover fills once then opens; quick crossing, stale generati
     else if(cancel==='connection')f.node.isConnected=false;
     else if(cancel==='Escape')f.target.emit('keydown',{key:'Escape'});
     else f.target.emit(cancel);
-    f.target.deadline();assert.equal(f.calls,0,cancel);assert.equal(f.progress.at(-1),false,cancel);
+    f.advance();f.finish();assert.equal(f.calls,0,cancel);assert.equal(f.progress.at(-1),false,cancel);
+    assert.equal(f.attributes.size,0,cancel);
     assert.equal([...f.target.listeners.values()].reduce((sum,set)=>sum+set.size,0),0,cancel);
   }
 });
@@ -51,6 +59,19 @@ function menu(owner) {
   const node={dataset:{tabMenuOwnerId:owner},closest(){return this;}};
   return {closest(selector){return selector.includes('data-tab-context-menu')?node:null;}};
 }
+function fileBridge(owner) {
+  const bridge={dataset:typeof owner==='string'?{tabMenuOwnerId:owner}:{},
+    closest:selector=>selector==='[data-tab-menu-owner-id]'&&typeof owner==='string'?bridge:null};
+  return {closest:selector=>selector.includes('[data-linked-files-hover-bridge]')?bridge:null};
+}
+test('the exact linked-file bridge keeps a group open outside its cached card bounds',()=>{
+  const boxes=[{left:10,right:100,top:20,bottom:56}];
+  assert.equal(paneStripHoverInside({root:{contains:()=>false},target:fileBridge('a'),memberIds:['a','b'],boxes,open:true,x:50,y:63}),true);
+});
+test('a foreign or unowned file bridge cannot borrow the rectangle of another group',()=>{
+  const boxes=[{left:10,right:100,top:20,bottom:56}];
+  for(const owner of ['foreign',undefined])assert.equal(paneStripHoverInside({root:{contains:()=>false},target:fileBridge(owner),memberIds:['a','b'],boxes,open:true,x:50,y:30}),false);
+});
 test('only own actual menu is hover; foreign menu cannot borrow the group rectangle; same-row gaps stay inside',()=>{
   const boxes=[{left:10,right:30,top:10,bottom:30},{left:36,right:56,top:10,bottom:30}],root={contains:target=>!!target?.inside};
   assert.equal(paneStripHoverMenu(menu('a'),['a','b']).owned,true);

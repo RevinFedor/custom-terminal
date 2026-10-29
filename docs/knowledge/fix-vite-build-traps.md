@@ -181,3 +181,21 @@ Actual Vite transformRequest regression воспроизвёл raw browser impor
 подтвердил visible Home/App bootstrap; создание native-question fixture затем
 отказало по отдельному private catalog guard до Send. NEW04 evidence:
 `docs/tmp/native-question-3951-20261015/e2e/retake04/main-selected.log`.
+
+## Часть 8: одинаковый source cut даёт разные Tailwind assets
+
+При сравнении private и установленной сборок CSS может отличаться, даже когда
+проверенные исходники приложения совпали. Tailwind discovery по всему checkout
+видит соседние пакеты вне renderer; явный широкий `src` без исключения также
+подхватывает Rust build outputs. JS dependency graph не является перечнем
+файлов scanner. Дополнительные utilities способны добавлять общие `@property`
+и универсальные начальные значения, поэтому это не обязательно только мёртвый CSS.
+
+`globals.css` теперь задаёт согласованные runtime roots и исключения через
+`source(none)`/`@source`; детали — [источники классов](fact-rendering-styles.md#решение-vite-plugin-и-явные-источники-классов).
+Сверять нужно список и hashes фактически просканированных файлов, dependencies
+компилятора и CSS-артефакты обеих сборок. Поиск классов в compiled JS — полезная
+дополнительная проверка, но scanner также принимает имена функций, языковые
+keywords и CSS property values за кандидаты; их нельзя объявлять пропавшими
+DOM-классами без просмотра caller. Smaller CSS не заменяет реальный замер
+переключения/scroll и проверку доступных UI-поверхностей.

@@ -1,8 +1,16 @@
+import { registerExplicitLegacyTimelineOwner } from '../../utils/timelineViewReadModel.mjs';
+import { TimelineCodexUsageBreakdown, codexTimelineUsageTotal } from './TimelineCodexUsage';
+import { publishTimelineRootStatus, clearTimelineRootStatus } from '../../store/useTimelineRootStatusStore';
+import historyPrimaryRollout from '../../../shared/history-primary-rollout.cjs';
+import { TimelineRootSurface } from './TimelineRootSurface';
+import { TimelineSemanticGroupHeader } from './TimelineSemanticGroupHeader';
 import { getGeminiApiKey } from '../../utils/geminiApiKey.mjs';
+import {isTimelineAttributeEntry as isAttributeEntry} from '../../../shared/timeline-entry-facts.mjs';
 import {useHistorySearchMarkers} from '../../utils/historySearchMarkers';
 import {historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { recordTimelineModifierOwner } from '../../utils/timelineModifierDiagnostics.mjs';
+import { createTimelineViewportSource, type TimelineViewportSource } from '../../utils/timelineViewport.mjs';
 import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import { resolveTimelineFullResponse, resolveTimelinePromptImages, timelineFinalNavigationIdentity } from '../../utils/timelineEntryPreview.mjs';
@@ -13,7 +21,8 @@ import { useResearchRunModels } from '../../utils/useResearchRunModels';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, ChevronRight, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
-import scDesktopIcon from '../../assets/sc-desktop.png';
+import { ResearchTimelineIcon } from './ResearchTimelineIcon';
+import { isFailedResearchPresentation } from '../../utils/researchResultPresentation.mjs';
 import { projectTimelineNoteAnchors } from '../../utils/timelineNoteIdentity.mjs';
 import { projectTimelineWorkingFileMarkers } from '../../utils/timelineWorkingFileMarkers.mjs';
 import { useTabWorkContext } from '../../utils/tabWorkContext';
@@ -192,12 +201,7 @@ function truncateTimelinePreviewText(text: string, maxChars: number): string {
 // True when an entry is NOT a regular user prompt. `isCompactSummary` can still
 // arrive as type:"user" in Claude JSONL, but it is the visible compact body,
 // not a terminal prompt with its own scroll/boundary position.
-// If a new attribute-style entry type is ever added, update this ONE place.
-function isAttributeEntry(entry: { type?: string; isCompactSummary?: boolean }): boolean {
-  if (entry.isCompactSummary) return true;
-  return entry.type === 'compact' || entry.type === 'continued'
-    || entry.type === 'docs_edit' || entry.type === 'docs_search';
-}
+// Shared classification lives in timeline-entry-facts for the reader too.
 
 const DOCS_TIMELINE_COLORS = {
   edited: {
@@ -596,7 +600,6 @@ interface TimelineProps {
   presentationExternallyManaged?: boolean;
   isOpen?: boolean; // CMD+\ toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
-  pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
   readOnly?: boolean; // Home preview: Timeline only navigates HistoryPanel
   historySurfaceVisible?: boolean; // Primary History replaces xterm without opening the legacy side panel
   // Hidden pane admission may hydrate Timeline only after its History source
@@ -890,7 +893,29 @@ interface TimelineRowApi {
   onForkMarkerLeave: (e: React.MouseEvent, index: number) => void;
 }
 
+function TimelineBeginningViewportMarker({ viewportSource, legacyInViewport, kind }: {
+  viewportSource?: TimelineViewportSource;
+  legacyInViewport: boolean;
+  kind: 'fork' | 'plan';
+}) {
+  const binding = React.useMemo(() => viewportSource?.bind(0)
+    || { subscribe: () => () => {}, getSnapshot: () => false }, [viewportSource]);
+  const historyInViewport = React.useSyncExternalStore(binding.subscribe, binding.getSnapshot, binding.getSnapshot);
+  const active = viewportSource ? historyInViewport : legacyInViewport;
+  return <div style={{
+    width: active ? '10px' : '12px',
+    height: active ? '3px' : '2px',
+    borderRadius: '1px',
+    backgroundColor: kind === 'plan' ? (active ? '#5eada3' : '#48968c') : (active ? '#60a5fa' : '#3b82f6'),
+    boxShadow: active ? (kind === 'plan' ? '0 0 6px rgba(72, 150, 140, 0.25)' : '0 0 6px rgba(59, 130, 246, 0.25)') : 'none',
+    transition: 'background-color 0.2s, box-shadow 0.2s',
+  }} />;
+}
+
 interface TimelineSegmentRowProps {
+  viewportSource?: TimelineViewportSource;
+  atomPart?: string;
+  presentationCounts?: { edited: number; searched: number; subagents: number };
   searchMatch?: boolean;
   searchCurrent?: boolean;
   entry: TimelineEntry;
@@ -945,6 +970,9 @@ interface TimelineSegmentRowProps {
 }
 
 const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
+  viewportSource,
+  atomPart,
+  presentationCounts,
   searchMatch = false,
   searchCurrent = false,
   entry,
@@ -963,7 +991,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   active,
   forkMarkerVisible,
   isPlanModeBoundary,
-  isInViewport,
+  isInViewport: legacyInViewport,
   isResponseOnly,
   isUnreachable,
   dotClickState,
@@ -988,6 +1016,13 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   timelineLineClamp,
   intrinsicPreviewFontSize,
 }: TimelineSegmentRowProps) {
+  const viewportBinding = React.useMemo(() => viewportSource?.bind(index,
+    groupInfo?.isGroupHeader && !isGroupExpanded ? groupInfo.groupSize : 1)
+    || { subscribe: () => () => {}, getSnapshot: () => false },
+  [viewportSource, index, groupInfo, isGroupExpanded]);
+  const historyInViewport = React.useSyncExternalStore(viewportBinding.subscribe,
+    viewportBinding.getSnapshot, viewportBinding.getSnapshot);
+  const isInViewport = viewportSource ? historyInViewport : legacyInViewport;
   const isCompacted = entry.type === 'compact';
   const isCompactSummaryMarker = !!entry.isCompactSummary;
   const displaysAsCompact = isCompacted || isCompactSummaryMarker;
@@ -1037,9 +1072,9 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const cornerBadges = buildTimelineCornerBadges({
     isLoop: isLoopPrompt,
     hasPromptChip,
-    docsEditedCount: markerEdited.length,
-    docsSearchCount: markerSearched.length,
-    subagentCount: entry.subAgents?.length || 0,
+    docsEditedCount: presentationCounts?.edited ?? markerEdited.length,
+    docsSearchCount: presentationCounts?.searched ?? markerSearched.length,
+    subagentCount: presentationCounts?.subagents ?? (entry.subAgents?.length || 0),
     compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
   });
   const hasDenseCornerBadges = cornerBadges.items
@@ -1134,10 +1169,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     </div>
   );
 
+  if (atomPart === 'note-before' || atomPart === 'note-after') return noteStrip;
+
   return (
     <React.Fragment>
-      {isGroupCollapsed && hasNote && notePos === 'before' && noteStrip}
-      {groupInfo?.isGroupHeader && (
+      {!atomPart && isGroupCollapsed && hasNote && notePos === 'before' && noteStrip}
+      {(!atomPart || atomPart === 'automatic-header') && groupInfo?.isGroupHeader && (
         <div data-timeline-group-header={groupInfo.groupId}
           data-timeline-entry-uuid={isGroupCollapsed ? entry.uuid : undefined}
           data-segment={isGroupCollapsed ? '' : undefined}
@@ -1167,9 +1204,9 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           </button>
         </div>
       )}
-      {!isGroupCollapsed && <>
+      {(!atomPart || atomPart === 'entry') && !isGroupCollapsed && <>
       {/* Note indicator strip — before dot */}
-      {hasNote && notePos === 'before' && noteStrip}
+      {!atomPart && hasNote && notePos === 'before' && noteStrip}
       <div
         ref={(el) => api.setSegmentRef(index, el)}
         data-segment
@@ -1227,8 +1264,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           overflow: isExpandedLayout ? 'hidden' : undefined,
           // Perf: skip rendering off-screen entries; refs/hit-boxes still attach.
           // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
-          contentVisibility: isExpandedLayout ? 'auto' : undefined,
-          containIntrinsicSize: isExpandedLayout
+          contentVisibility: isExpandedLayout && !atomPart ? 'auto' : undefined,
+          containIntrinsicSize: isExpandedLayout && !atomPart
             ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
             : undefined,
           backgroundColor: active
@@ -1255,7 +1292,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           <span className="flex items-center justify-center shrink-0" data-timeline-sc-icon-slot
             style={{ width: 14, height: isExpandedLayout ? undefined : 14,
               alignSelf: isExpandedLayout ? 'stretch' : undefined }}>
-            <img src={scDesktopIcon} alt="" data-timeline-sc-desktop
+            <ResearchTimelineIcon failed={isFailedResearchPresentation(orchestrationTag)}
               title={`SC Desktop · ${orchestrationTag.targetTabName || 'External Research'}`}
               style={{ width: scDesktopIconSize, height: scDesktopIconSize, maxWidth: 'none', flexShrink: 0, objectFit: 'contain', borderRadius: 3,
                 opacity: isUnreachable ? 0.45 : 1, boxShadow: dotGlow,
@@ -1411,11 +1448,11 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         )}
       </div>
       {/* Note indicator strip — after dot */}
-      {hasNote && notePos === 'after' && noteStrip}
+      {!atomPart && hasNote && notePos === 'after' && noteStrip}
       </>}
-      {isGroupCollapsed && hasNote && notePos === 'after' && noteStrip}
+      {!atomPart && isGroupCollapsed && hasNote && notePos === 'after' && noteStrip}
       {/* Last boundary separator — "session starts below"; click → red X flash. */}
-      {isLastBoundary && (
+      {(!atomPart || atomPart === 'last-boundary') && isLastBoundary && (
         <Tooltip content="Current session starts below">
         <div
           className="flex-shrink-0 w-full flex items-center justify-center relative"
@@ -1437,11 +1474,11 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         </Tooltip>
       )}
       {/* Fork marker — not navigable; Cmd+hover opens the fork tooltip. */}
-      {forkMarkerVisible && (
+      {(!atomPart || atomPart === 'fork' || atomPart === 'fork-beginning') && forkMarkerVisible && (
         <div
-          data-timeline-fork-marker="boundary"
+          data-timeline-fork-marker={atomPart === 'fork-beginning' ? 'beginning' : 'boundary'}
           className="flex-shrink-0 w-full flex items-center justify-center relative"
-          style={{ height: '8px', cursor: forkCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
+          style={{ height: '8px', cursor: forkCmdHeld ? 'pointer' : 'default', padding: atomPart === 'fork-beginning' ? 0 : '6px 0', boxSizing: 'content-box' }}
           onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'fork'); }}
           onMouseEnter={() => api.onForkMarkerEnter(index)}
           onMouseLeave={(e) => api.onForkMarkerLeave(e, index)}
@@ -1470,7 +1507,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         </div>
       )}
       {/* Plan mode marker — not navigable, click → X. */}
-      {isPlanModeBoundary && (
+      {(!atomPart || atomPart === 'plan-boundary' || atomPart === 'plan-beginning') && isPlanModeBoundary && (
         <Tooltip content="Plan mode - context was cleared here">
         <div
           className="flex-shrink-0 w-full flex items-center justify-center relative"
@@ -1515,7 +1552,6 @@ function Timeline({
   presentationExternallyManaged = false,
   isOpen = true,
   toolType = 'claude',
-  pinned = false,
   readOnly = false,
   historySurfaceVisible = false,
   backgroundPrewarmAdmitted = false,
@@ -1526,7 +1562,7 @@ function Timeline({
   const historySearchMatches = useCallback((entry:any, current = false) => {
     if (!historySearchMarkers || historySearchMarkers.sessionId !== (sessionId || '')) return false;
     const keys = current ? historySearchMarkers.currentKeys : historySearchMarkers.keys;
-    return historySearchEntryKeys(entry).some((key:string) => keys.has(key));
+    return historySearchEntryKeys(entry).some((key:string) => keys?.has(key));
   }, [historySearchMarkers, sessionId]);
   const onInitialSourceSignalRef = useRef(onInitialSourceSignal);
   onInitialSourceSignalRef.current = onInitialSourceSignal;
@@ -2536,13 +2572,6 @@ function Timeline({
     const raf = requestAnimationFrame(() => setWidthTransitionTabKey(tabId));
     return () => cancelAnimationFrame(raf);
   }, [tabId, widthTransitionTabKey]);
-  const handlePinnedSlotTransitionEnd = useCallback((event: React.TransitionEvent<HTMLDivElement>) => {
-    if (event.target !== event.currentTarget || event.propertyName !== 'width') return;
-    if (!pinned) return;
-    window.dispatchEvent(new CustomEvent('timeline:pinned-layout-settled', {
-      detail: { tabId, expanded: isExpandedLayout },
-    }));
-  }, [isExpandedLayout, pinned, tabId]);
   const intrinsicPreviewFontSize = Math.max(timelineFontSize, timelineSummaryFontSize);
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
@@ -2696,7 +2725,6 @@ function Timeline({
       ? 'legacy-panel'
       : 'closed';
   const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
-  const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const rewindPreviewOwnerRef = useRef({ tabId, sessionId });
   useEffect(() => {
     const previousOwner = rewindPreviewOwnerRef.current;
@@ -2730,6 +2758,23 @@ function Timeline({
     }
     return false;
   });
+  // History/SDK range updates go straight to the mounted markers. Keeping this
+  // subscription out of Timeline prevents Virtuoso's synchronous scroll frame
+  // from re-running the historical entries.map and every row's memo comparison.
+  const timelineViewportSource = useMemo(() => (historyTargetVisible || isSdkTab)
+    ? createTimelineViewportSource({
+      entries,
+      active: isVisible,
+      read: () => useUIStore.getState().historyVisibleUuids[tabId],
+      subscribe: notify => useUIStore.subscribe(notify),
+    }) : undefined,
+  [timelineOwnerKey, tabId, entries, historyTargetVisible, isSdkTab]);
+  // Hide/show pauses the one connection without changing every row's source
+  // prop. Reconcile the latest viewport before the returning panel can paint.
+  React.useLayoutEffect(() => {
+    timelineViewportSource?.setActive(isVisible);
+    return () => timelineViewportSource?.setActive(false);
+  }, [timelineViewportSource, isVisible]);
   const isTabAiBusy = useWorkspaceStore(state => {
     for (const [, ws] of state.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -4720,7 +4765,8 @@ function Timeline({
   // SECTION: VISIBILITY + REACHABILITY — computePositions/checkVisibility/checkReachability tied to terminal viewport
   // ════════════════════════════════════════════════════════════
 
-  // effect: tabId/entries/isVisible/isGemini/isHistoryOpen/historyVisibleUuids → setVisibleEntryIndices, setResponseOnlyIndices, setUnreachableIndices, setLastBoundaryIndex (history-panel mode uses UUID set; non-history runs computePositions/checkVisibility/checkReachability + terminalRegistry.onViewportChange debounced 100/500ms)
+  // History/SDK viewport highlighting is row-local; this effect retains the
+  // terminal visibility/reachability path and mode-transition resets only.
   useEffect(() => {
     if (!isVisible || entries.length === 0) {
       setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
@@ -4742,19 +4788,7 @@ function Timeline({
       // clear the boundary so `clickIsOldHistory` doesn't gate clicks.
       setLastBoundaryIndex(-1);
 
-      const uuidSet = historyVisibleUuids ? new Set(historyVisibleUuids) : new Set<string>();
-      const newVisible = new Set<number>();
-      entries.forEach((entry, index) => {
-        if (uuidSet.has(entry.uuid)) {
-          newVisible.add(index);
-        } else if (entry.isCompactSummary && index > 0 && uuidSet.has(entries[index - 1].uuid)) {
-          newVisible.add(index);
-        }
-      });
-      setVisibleEntryIndices(prev => {
-        if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
-        return newVisible;
-      });
+      setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
       return;
     }
 
@@ -4980,7 +5014,7 @@ function Timeline({
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, isGemini, isCodex, usesTextSearchAnchors, historyTargetVisible, isSdkTab, historyVisibleUuids, toolType]);
+  }, [tabId, entries, isVisible, isGemini, isCodex, usesTextSearchAnchors, historyTargetVisible, isSdkTab, toolType]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -7514,14 +7548,7 @@ function Timeline({
 
   if (!sessionId) return null;
 
-  const getCodexUsageTotal = (entry: TimelineEntry): number | null => {
-    const u = entry.codexUsage;
-    if (!u) return null;
-    return Math.max(0, u.inputUncached)
-      + Math.max(0, u.inputCached)
-      + Math.max(0, u.outputAnswer)
-      + Math.max(0, u.outputReasoning);
-  };
+  const getCodexUsageTotal = codexTimelineUsageTotal;
 
   const hasCodexBreakdown = (entry: TimelineEntry): boolean => {
     return isCodex && !!(entry.codexUsage || entry.codexLimits);
@@ -7581,82 +7608,9 @@ function Timeline({
 
   // Codex usage stays out of the main entry tooltip: it is secondary detail behind
   // the small token chip, matching Claude's JSONL/API breakdown popover.
-  const renderCodexBreakdownBody = (entry: TimelineEntry) => {
-    const u = entry.codexUsage;
-    const lim = entry.codexLimits;
-    const inputTotal = u ? u.inputUncached + u.inputCached : 0;
-    const total = getCodexUsageTotal(entry);
-    const TabBtn = ({ mode, children }: { mode: 'jsonl' | 'api'; children: React.ReactNode }) => (
-      <button
-        onClick={(e) => { e.stopPropagation(); setBreakdownMode(mode); }}
-        className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded transition-colors cursor-pointer"
-        style={{
-          color: breakdownMode === mode ? '#e8a955' : 'rgba(255,255,255,0.4)',
-          backgroundColor: breakdownMode === mode ? 'rgba(232,169,85,0.08)' : 'transparent',
-        }}
-      >{children}</button>
-    );
-    const Row = ({ label, value, dim }: { label: string; value: string; dim?: boolean }) => (
-      <div className="flex items-center justify-between text-[11px]">
-        <span style={{ color: dim ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.6)' }}>{label}</span>
-        <span className="font-mono" style={{ color: dim ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.8)' }}>{value}</span>
-      </div>
-    );
-    const limitRows = lim && (lim.fiveHourPct != null || lim.weeklyPct != null) ? (
-      <div className="mt-1.5 pt-1 border-t border-white/10 flex flex-col gap-0.5">
-        {lim.fiveHourPct != null && (
-          <Row
-            label="5-hour limit"
-            value={`${Math.round(lim.fiveHourPct)}%${lim.fiveHourResetsAt ? ` · ${formatCodexReset(lim.fiveHourResetsAt)}` : ''}`}
-            dim
-          />
-        )}
-        {lim.weeklyPct != null && (
-          <Row
-            label="Weekly limit"
-            value={`${Math.round(lim.weeklyPct)}%${lim.weeklyResetsAt ? ` · ${formatCodexReset(lim.weeklyResetsAt)}` : ''}`}
-            dim
-          />
-        )}
-      </div>
-    ) : null;
-
-    return (
-      <>
-        <div className="flex items-center gap-0.5 mb-1.5">
-          <TabBtn mode="jsonl">JSONL</TabBtn>
-          <TabBtn mode="api">API</TabBtn>
-        </div>
-        {u ? (
-          breakdownMode === 'jsonl' ? (
-            <>
-              <div className="flex flex-col gap-0.5">
-                <Row label="Input" value={formatTokenCount(inputTotal)} />
-                {u.inputCached > 0 && <Row label="↳ cached" value={formatTokenCount(u.inputCached)} dim />}
-                <Row label="Codex · answer" value={formatTokenCount(u.outputAnswer)} />
-                {u.outputReasoning > 0 && <Row label="Codex · reasoning" value={formatTokenCount(u.outputReasoning)} dim />}
-              </div>
-              <div className="mt-1.5 pt-1 border-t border-white/10 flex items-center justify-between text-[11px]">
-                <span className="text-white/50">В JSONL</span>
-                <span className="font-mono font-semibold" style={{ color: '#e8a955' }}>{formatTokenCount(total || 0)}</span>
-              </div>
-            </>
-          ) : (
-            <div className="flex flex-col gap-0.5">
-              <Row label="Input billed" value={formatTokenCount(u.inputUncached)} />
-              {u.inputCached > 0 && <Row label="↳ cached" value={formatTokenCount(u.inputCached)} dim />}
-              <Row label="Input (total)" value={formatTokenCount(inputTotal)} dim />
-              <Row label="Output" value={formatTokenCount(u.outputAnswer)} />
-              {u.outputReasoning > 0 && <Row label="↳ reasoning" value={formatTokenCount(u.outputReasoning)} dim />}
-            </div>
-          )
-        ) : (
-          <div className="text-[11px] text-white/40">No token usage sample</div>
-        )}
-        {limitRows}
-      </>
-    );
-  };
+  const renderCodexBreakdownBody = (entry: TimelineEntry) => (
+    <TimelineCodexUsageBreakdown entry={entry} breakdownMode={breakdownMode} setBreakdownMode={setBreakdownMode} />
+  );
 
   // Shared body renderer for the JSONL/API breakdown popovers. Same shape in both range
   // and single-entry mode — only the estimate object varies. Top row is a JSONL/API
@@ -7849,83 +7803,19 @@ function Timeline({
   })() : null;
 
   const renderSemanticGroupHeader = (group: TimelineSemanticGroup, expanded: boolean) => (
-    <div
-      key={`semantic-header:${group.id}`}
-      data-history-search-match={group.members.some(member=>historySearchMatches(member)) ? 'true' : undefined}
-      ref={(element) => {
-        if (element) semanticGroupHeaderRefs.current.set(group.id, element);
-        else semanticGroupHeaderRefs.current.delete(group.id);
-      }}
-      className="relative w-full flex items-center select-none"
-      style={{
-        position: 'sticky',
-        top: 0,
-        zIndex: 6,
-        flex: '0 0 auto',
-        minHeight: 30,
-        padding: '5px 6px 5px 2px',
-        gap: 4,
-        alignItems: 'flex-start',
-        cursor: 'pointer',
-        borderTop: '1px solid rgba(192,132,252,0.18)',
-        boxShadow: group.members.some(member=>historySearchMatches(member)) ? 'inset 3px 0 #eab308' : undefined,
-        borderBottom: '1px solid rgba(192,132,252,0.12)',
-        background: hoveredSemanticGroupId === group.id
-          ? 'linear-gradient(90deg, rgba(217,70,239,0.18), rgba(139,92,246,0.11)), #18131d'
-          : 'linear-gradient(90deg, rgba(217,70,239,0.11), rgba(139,92,246,0.07)), #18131d',
-      }}
-      title={isCmdHeld ? undefined : '⌘ + hover — описание группы'}
-      onClick={(event) => {
-        event.stopPropagation();
-        setExpandedSemanticGroups((previous) => {
-          const next = new Set(previous);
-          if (next.has(group.id)) next.delete(group.id);
-          else next.add(group.id);
-          return next;
-        });
-      }}
-      onMouseEnter={() => {
-        cmdInteractionRelevantRef.current = true;
-        projectCmdHeld(isCmdHeldRef.current);
-        setHoveredSemanticGroupId(group.id);
-        if (isCmdHeldRef.current) {
-          setActiveSemanticGroupId(group.id);
-          setActiveTooltipIndex(null);
-        }
-      }}
-      onMouseLeave={() => {
-        setHoveredSemanticGroupId(null);
-        if (!isCmdHeldRef.current && !isLockedTooltipRef.current) setActiveSemanticGroupId(null);
-      }}
-    >
-      <ChevronDown
-        size={12}
-        style={{
-          color: '#d8b4fe',
-          flexShrink: 0,
-          marginTop: 1,
-          transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)',
-          transition: 'transform 120ms ease-out',
-        }}
-      />
-      <span
-        className="min-w-0 flex-1"
-        style={{
-          color: '#f5d0fe',
-          fontSize: 11,
-          fontWeight: 700,
-          lineHeight: 1.25,
-          overflow: 'visible',
-          whiteSpace: 'normal',
-          overflowWrap: 'anywhere',
-        }}
-      >
-        {group.title}
-      </span>
-      <span style={{ color: 'rgba(216,180,254,0.7)', fontSize: 9, fontFamily: 'monospace', flexShrink: 0, marginTop: 2 }}>
-        {group.memberUuids.length}
-      </span>
-    </div>
+    <TimelineSemanticGroupHeader key={`semantic-header:${group.id}`} title={group.title}
+      count={group.memberUuids.length} expanded={expanded}
+      searchMatch={group.members.some(member => historySearchMatches(member))}
+      hovered={hoveredSemanticGroupId === group.id} cmdHeld={isCmdHeld}
+      elementRef={element => { if (element) semanticGroupHeaderRefs.current.set(group.id, element);
+        else semanticGroupHeaderRefs.current.delete(group.id); }}
+      onToggle={() => setExpandedSemanticGroups(previous => { const next = new Set(previous);
+        if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })}
+      onMouseEnter={() => { cmdInteractionRelevantRef.current = true; projectCmdHeld(isCmdHeldRef.current);
+        setHoveredSemanticGroupId(group.id); if (isCmdHeldRef.current) {
+          setActiveSemanticGroupId(group.id); setActiveTooltipIndex(null); } }}
+      onMouseLeave={() => { setHoveredSemanticGroupId(null);
+        if (!isCmdHeldRef.current && !isLockedTooltipRef.current) setActiveSemanticGroupId(null); }} />
   );
 
   const contextMenuTop = contextMenu ? (() => {
@@ -7947,12 +7837,10 @@ function Timeline({
 
   return (
     <>
-      {/* ──── OUTER SLOT — unpinned expanded mode reserves only the 32px rail and
-            overlays left; pinned mode reserves the full expanded width. ──── */}
+      {/* Expanded Timeline overlays left; its layout slot stays one 32px rail. */}
       <div
-        onTransitionEnd={handlePinnedSlotTransitionEnd}
         style={{
-          width: slideIn ? (pinned ? `${effectiveWidth}px` : '32px') : '0px',
+          width: slideIn ? '32px' : '0px',
           height: '100%',
           flexShrink: 0,
           position: 'relative',
@@ -7972,17 +7860,15 @@ function Timeline({
           height: '100%',
           // History and Timeline can now be open at the same time (they no
           // longer close each other). Both overlay from the right edge when
-          // unpinned, so the expanded rail must sit ABOVE the History overlay
-          // (z-index 101) instead of being half-covered by it. Pinned mode is
-          // normal flex layout and keeps the ordinary level.
-          zIndex: isExpandedLayout && !pinned ? 110 : 40,
+          // overlaying, so the expanded rail sits ABOVE the History overlay
+          // (z-index 101) instead of being half-covered by it.
+          zIndex: isExpandedLayout ? 110 : 40,
           visibility: timelinePixelsVisible ? 'inherit' : 'hidden',
           overflow: slideIn ? 'visible' : 'hidden',
-          // Expanded layout overlays content from the right unless StatusBar pin
-          // asks Timeline to participate in normal flex layout.
-          position: isExpandedLayout && !pinned ? 'absolute' : 'static',
-          top: isExpandedLayout && !pinned ? 0 : undefined,
-          right: isExpandedLayout && !pinned ? 0 : undefined,
+          // Expansion preserves the chat/terminal width.
+          position: isExpandedLayout ? 'absolute' : 'static',
+          top: isExpandedLayout ? 0 : undefined,
+          right: isExpandedLayout ? 0 : undefined,
           // Font-size root for em-based descendants (chip + preview text).
           fontSize: `${timelineFontSize}px`,
           cursor: queuedRewindTargetRequest ? 'crosshair' : undefined,
@@ -8102,16 +7988,8 @@ function Timeline({
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
             >
-              <div
-                style={{
-                  width: visibleEntryIndices.has(0) ? '10px' : '12px',
-                  height: visibleEntryIndices.has(0) ? '3px' : '2px',
-                  borderRadius: '1px',
-                  backgroundColor: visibleEntryIndices.has(0) ? '#5eada3' : '#48968c',
-                  boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
-                  transition: 'background-color 0.2s, box-shadow 0.2s',
-                }}
-              />
+              <TimelineBeginningViewportMarker viewportSource={timelineViewportSource}
+                legacyInViewport={visibleEntryIndices.has(0)} kind="plan" />
             </div>
             </Tooltip>
           )}
@@ -8123,16 +8001,8 @@ function Timeline({
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
             >
-              <div
-                style={{
-                  width: visibleEntryIndices.has(0) ? '10px' : '12px',
-                  height: visibleEntryIndices.has(0) ? '3px' : '2px',
-                  borderRadius: '1px',
-                  backgroundColor: visibleEntryIndices.has(0) ? '#60a5fa' : '#3b82f6',
-                  boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
-                  transition: 'background-color 0.2s, box-shadow 0.2s',
-                }}
-              />
+              <TimelineBeginningViewportMarker viewportSource={timelineViewportSource}
+                legacyInViewport={visibleEntryIndices.has(0)} kind="fork" />
             </div>
             </Tooltip>
           )}
@@ -8225,9 +8095,9 @@ function Timeline({
             })();
 
             const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
-            const isInViewport = isGroupCollapsed
+            const isInViewport = !timelineViewportSource && (isGroupCollapsed
               ? Array.from({ length: groupInfo!.groupSize }, (_, offset) => index + offset).some(idx => visibleEntryIndices.has(idx))
-              : visibleEntryIndices.has(index);
+              : visibleEntryIndices.has(index));
             const isOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
             const forkMarkerVisible = !!forkMarker && !isOldHistory;
             const groupPresentation = isGroupCollapsed && groupInfo
@@ -8242,6 +8112,7 @@ function Timeline({
               <React.Fragment key={entry.uuid}>
                 {isExpandedLayout && semanticGroup && isSemanticGroupStart && renderSemanticGroupHeader(semanticGroup, true)}
                 <TimelineSegmentRow
+                  viewportSource={timelineViewportSource}
                   searchMatch={historySearchMatches(entry) || (!!isGroupCollapsed && entries.slice(index,index+(groupInfo?.groupSize || 1)).some(item=>historySearchMatches(item)))}
                   searchCurrent={historySearchMatches(entry,true) || (!!isGroupCollapsed && entries.slice(index,index+(groupInfo?.groupSize || 1)).some(item=>historySearchMatches(item,true)))}
                   entry={entry}
@@ -8261,8 +8132,8 @@ function Timeline({
                   forkMarkerVisible={forkMarkerVisible}
                   isPlanModeBoundary={isPlanModeBoundary && !isOldHistory}
                   isInViewport={isInViewport}
-                  isResponseOnly={isGroupCollapsed ? false : responseOnlyIndices.has(index)}
-                  isUnreachable={unreachableIndices.has(index)}
+                  isResponseOnly={timelineViewportSource || isGroupCollapsed ? false : responseOnlyIndices.has(index)}
+                  isUnreachable={!timelineViewportSource && unreachableIndices.has(index)}
                   dotClickState={clickedState?.index === index ? clickedState.status : null}
                   isHovered={hoveredIndex === index || activeTooltipIndex === index}
                   noteHovered={hoveredNoteIndex === index || activeNoteIndex === index}
@@ -10416,4 +10287,22 @@ function Timeline({
 // paint. Memoization is essential here: while the old owner is hidden by the
 // lightweight Workspace boundary, identical props must not make this
 // hundreds-of-rows component render just to disappear one frame later.
-export default React.memo(Timeline);
+const renderRootTimelineRow = (props: TimelineSegmentRowProps) => <TimelineSegmentRow {...props} />;
+function TimelineRouter(props: TimelineProps) {
+  const enabled = historyPrimaryRollout.historyPrimaryRootEnabled(window.require('node:process').env);
+  const [compositeOwner, setCompositeOwner] = useState('');
+  const owner = JSON.stringify([props.tabId, props.sessionId, props.cwd]);
+  const compositeLease = useMemo(() => ({}), []);
+  useEffect(() => {
+    if (compositeOwner !== owner) return;
+    const unregister = registerExplicitLegacyTimelineOwner({ tabId: props.tabId, sessionId: props.sessionId, cwd: props.cwd });
+    publishTimelineRootStatus(props.tabId, { lease: compositeLease, sessionId: props.sessionId || '', legacy: true });
+    return () => { unregister(); clearTimelineRootStatus(props.tabId, compositeLease); };
+  }, [compositeOwner, owner, props.tabId, props.sessionId, compositeLease]);
+  if (enabled && props.toolType === 'codex' && compositeOwner !== owner) {
+    return <TimelineRootSurface key={owner} {...props} renderRow={renderRootTimelineRow}
+      onUnsupportedComposite={() => setCompositeOwner(owner)} />;
+  }
+  return <Timeline {...props} />;
+}
+export default React.memo(TimelineRouter);

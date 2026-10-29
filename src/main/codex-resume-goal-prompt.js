@@ -98,6 +98,90 @@ function inspectCodexResumeGoalPrompt(cleanText) {
   };
 }
 
+function projectCodexResumeGoalPaintedDialog(terminal, snapshot, text) {
+  const unavailable = reason => ({ projected: false, reason });
+  if (!/Resume\s+paused\s+goal\?/i.test(text)) return unavailable('no-goal-dialog');
+  const inspected = inspectCodexResumeGoalPrompt(text);
+  if (!inspected.interactiveVisible || inspected.firstOptionSelected === inspected.secondOptionSelected) {
+    return unavailable('not-complete-goal');
+  }
+  try {
+    const buffer = terminal?.buffer?.active;
+    const rows = snapshot?.lines;
+    if (!buffer || !Array.isArray(rows) || snapshot.cols !== terminal.cols
+      || snapshot.rows !== terminal.rows || snapshot.viewportY !== buffer.viewportY) {
+      return unavailable('snapshot-geometry-unavailable');
+    }
+    const title = rows.findLastIndex(line => /Resume\s+paused\s+goal\?/i.test(line.text));
+    const titleColumn = title < 0 ? -1 : rows[title].text.search(/Resume\s+paused\s+goal\?/i);
+    if (titleColumn < 0 || !/^ *$/.test(rows[title].text.slice(0, titleColumn))) {
+      return unavailable('goal-origin-unproven');
+    }
+    const footer = rows.findLastIndex((line, index) => index > title
+      && RESUME_GOAL_FOOTER_RE.test(line.text.trim()));
+    const options = [1, 2].map(number => rows.flatMap((line, index) => {
+      if (index <= title || index >= footer) return [];
+      const pattern = number === 1
+        ? /^[ ]*(?:[›❯»>][ ]*)?1\.[ ]*Resume\s+goal\b/i
+        : /^[ ]*(?:[›❯»>][ ]*)?2\.[ ]*Leave\s+paused\b/i;
+      return pattern.test(line.text) && line.text.indexOf(number + '.') === titleColumn ? [index] : [];
+    }));
+    if (footer < 0 || options.some(matches => matches.length !== 1) || options[0][0] >= options[1][0]) {
+      return unavailable('goal-controls-unproven');
+    }
+    const physical = new Map();
+    for (let index = title; index <= footer; index++) {
+      const row = rows[index];
+      const line = Number.isSafeInteger(row.row) && buffer.getLine(row.row);
+      if (!line || line.translateToString(true) !== row.text) return unavailable('snapshot-text-changed');
+      physical.set(index, line);
+    }
+    const bg = cell => cell && typeof cell.getBgColorMode === 'function'
+      && cell.getBgColorMode() !== 0 ? cell.getBgColorMode() + ':' + cell.getBgColor() : null;
+    const bands = options.map(([index]) => {
+      const line = physical.get(index), color = bg(line.getCell(titleColumn));
+      if (!color) return null;
+      let left = titleColumn, right = titleColumn + 1;
+      while (left > 0 && bg(line.getCell(left - 1)) === color) left--;
+      while (right < terminal.cols && bg(line.getCell(right)) === color) right++;
+      return { left, right, color };
+    });
+    if (!bands[0] || !bands[1] || bands[0].left !== bands[1].left || bands[0].right !== bands[1].right) {
+      return unavailable('goal-paint-bounds-unproven');
+    }
+    const { left, right } = bands[0];
+    const bodyColor = bands[inspected.firstOptionSelected ? 1 : 0].color;
+    // Both native control rows independently delimit the painted panel. Keep
+    // ALL Goal content inside it, not a guessed width or a whitespace prefix.
+    // The native underlay may remain visible outside either edge during restore.
+    for (let index = title; index < options[0][0]; index++) {
+      const line = physical.get(index);
+      if (!line.translateToString(true, left, right).trim()) continue;
+      for (let x = left; x < right; x++) {
+        if (bg(line.getCell(x)) !== bodyColor) return unavailable('goal-body-paint-unproven');
+      }
+    }
+    const clipped = [];
+    for (let index = title; index <= footer; index++) {
+      const line = physical.get(index);
+      if (line.getCell(left)?.getWidth() === 0
+        || (right < terminal.cols && line.getCell(right)?.getWidth() === 0)) {
+        return unavailable('goal-paint-splits-cell');
+      }
+      clipped.push(line.translateToString(true, left, right));
+    }
+    const projectedText = clipped.join('\n'), projected = inspectCodexResumeGoalPrompt(projectedText);
+    if (!projected.interactiveVisible || projected.firstOptionSelected !== inspected.firstOptionSelected
+      || projected.secondOptionSelected !== inspected.secondOptionSelected) {
+      return unavailable('painted-goal-controls-mismatch');
+    }
+    return { projected: true, text: projectedText,
+      bounds: { left, right, top: rows[title].row, bottom: rows[footer].row + 1 } };
+  } catch {
+    return unavailable('goal-paint-unavailable');
+  }
+}
+
 function decideCodexResumeGoalAutoEnter({
   sameTerminal,
   sameRunSeq,
@@ -149,4 +233,5 @@ module.exports = {
   decideCodexLeaveGoalPausedAutoEnter,
   decideCodexResumeGoalAutoEnter,
   inspectCodexResumeGoalPrompt,
+  projectCodexResumeGoalPaintedDialog,
 };

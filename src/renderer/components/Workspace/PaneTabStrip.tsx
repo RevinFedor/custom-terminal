@@ -137,6 +137,7 @@ export default function PaneTabStrip({
   const baseEntryIds = React.useMemo(() => new Set(entries.map((entry) => entry.tabId)), [entries]);
   const entriesKey = previewEntries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   const baseRowPlacement=normalizePaneStripRowPlacement(storedRowPlacement,{order:baseIds,width:stripWidth});
+  const logicalRowPlacement=normalizePaneStripRowPlacement(storedRowPlacement,{order:logicalIds,width:stripWidth});
   const targetHere=paneDrag.active && paneDrag.source && paneDrag.target?.paneKey===paneKey
     && paneDrag.target?.spaceId===activeSpaceId;
   const projectedRows=targetHere ? projectPaneStripRowPlacement({current:storedRowPlacement,
@@ -152,7 +153,8 @@ export default function PaneTabStrip({
       forgetPaneTabStrip(surfaceOwner.current);return;
     }
     observePaneTabStrip(surfaceOwner.current,{workflowId:activeSpaceId,windowId,centerKey,paneKey,
-      baseEntries:logicalEntries,canonicalEntries:entries,entries:previewEntries,baseRowPlacement,rowPlacement,stripWidth,layoutKey,
+      element:scrollerRef.current,
+      baseEntries:logicalEntries,canonicalEntries:entries,entries:previewEntries,baseRowPlacement,logicalRowPlacement,rowPlacement,stripWidth,layoutKey,
       baseGroupState:groupState,groupState:effectiveGroupState});
   });
   useLayoutEffect(()=>()=>forgetPaneTabStrip(surfaceOwner.current),[]);

@@ -9,6 +9,10 @@ const panelSource = fs.readFileSync(
   path.join(here, '..', 'components', 'Workspace', 'HistoryPanel.tsx'),
   'utf8',
 );
+const transcriptSource = fs.readFileSync(
+  path.join(here, '..', 'components', 'Workspace', 'HistoryTranscriptPresentation.tsx'),
+  'utf8',
+);
 const blocksCss = fs.readFileSync(
   path.join(here, '..', '..', '..', 'packages', 'claude-blocks', 'src', 'blocks.css'),
   'utf8',
@@ -38,7 +42,7 @@ test('ordinary card chevrons are hover-only; group chevrons remain structural', 
     blocksCss,
     /\.cb-tool-head--clickable \.cb-tool-head-inner:hover \.cb-tool-chevron\s*\{\s*opacity:\s*1/,
   );
-  assert.match(panelSource, /expanded\s*\?\s*<ChevronDown[\s\S]*:\s*<ChevronRight/);
+  assert.match(transcriptSource, /expanded\s*\?\s*<ChevronDown[\s\S]*:\s*<ChevronRight/);
 });
 
 test('outer uniform styling cannot erase labels from nested child cards', () => {

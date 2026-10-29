@@ -5834,6 +5834,24 @@ function App() {
         + ' revision=' + Number(data?.revision || 0));
     };
     const handleCodexLiveSettings = (_: any, data: any) => {
+      if (data?.tabId && data?.invalidation) {
+        const state = useWorkspaceStore.getState();
+        const previous = data.invalidation;
+        for (const [, workspace] of state.openProjects) {
+          const tab = workspace.tabs.get(data.tabId);
+          if (!tab) continue;
+          // Clear only the exact prior pair. A delayed event cannot erase a
+          // replacement writer or a newer independently observed setting.
+          if (tab.codexLiveSettingsSessionId === previous.ownerId
+            && tab.codexLiveModel === previous.model && tab.codexLiveEffort === previous.effort
+            && Number(tab.codexLiveSettingsProofAt || 0) === Number(previous.proofAt || 0)) {
+            state.updateCodexLiveState(data.tabId, { codexLiveModel: undefined, codexLiveEffort: undefined,
+              codexLiveSettingsSessionId: undefined, codexLiveSettingsProofAt: undefined });
+          }
+          return;
+        }
+        return;
+      }
       const patch = projectCodexProvisionalSettingsOverlay({ liveLifecycle: true, liveSettings: data?.liveSettings });
       if (data?.tabId && patch) useWorkspaceStore.getState().updateCodexLiveState(data.tabId, patch);
     };
@@ -6054,6 +6072,15 @@ function App() {
           try {
             const s = useWorkspaceStore.getState();
             const startupSnapshot = await ipcRenderer.invoke('app:get-startup-interrupted-snapshot');
+            if (startupSnapshot?.automaticRestoreHold?.version === 1
+              && startupSnapshot.automaticRestoreHold.kind === 'owned-e2e-recovery') {
+              // Main validated the explicit private boot request before UI
+              // restoration. Keep the real targets/wasInterrupted evidence;
+              // this diagnostic boot performs no automatic Resume/Continue.
+              console.warn('[AutoResume] held for owned recovery run=' + startupSnapshot.automaticRestoreHold.runId);
+              completeStartupRestore();
+              return;
+            }
             const resolvedRestore = resolveInterruptedRestoreTargets(
               startupSnapshot,
               Array.from(s.openProjects, ([projectId, ws]) => ({

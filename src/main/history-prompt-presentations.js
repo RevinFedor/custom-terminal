@@ -345,6 +345,9 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
       if (!messageId || !['question', 'reply'].includes(tag.phase)) return [];
       const value = { id: String(tag.id || `durable-tab-message-tag-${index}`),
         kind: 'tab-message', messageId, phase: tag.phase };
+      if (Array.isArray(tag.replyToIds) && tag.replyToIds.length && tag.replyToIds.every(id => typeof id === 'string' && id.trim())) {
+        value.replyToIds = [...new Set(tag.replyToIds)];
+      }
       for (const key of ['replyTo', 'sourceTabId', 'sourceTabName', 'sourceProjectId',
         'targetTabId', 'targetTabName', 'targetProjectId']) {
         if (typeof tag[key] === 'string' && tag[key].trim()) value[key] = tag[key].trim();
@@ -367,10 +370,17 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
       const source = String(tag.source || '').trim();
       const systemSource = source === 'system' ? systemPromptSource(tag.systemSource) : null;
       if (source !== 'loop' && source !== 'terminal-mcp' && !systemSource) return [];
+      const senderText = key => typeof tag[key] === 'string' && tag[key].trim()
+        && tag[key].length <= 1024 && !/[\u0000-\u001f]/.test(tag[key]) ? tag[key].trim() : undefined;
+      const sourceTabId = source === 'terminal-mcp' ? senderText('sourceTabId') : undefined;
       return [{
         id: String(tag.id || `durable-prompt-origin-tag-${index}`),
         kind: 'prompt-origin',
         source,
+        ...(sourceTabId ? { sourceTabId,
+          ...(senderText('sourceTabName') ? { sourceTabName: senderText('sourceTabName') } : {}),
+          ...(senderText('sourceProjectId') ? { sourceProjectId: senderText('sourceProjectId') } : {}),
+        } : {}),
         ...(systemSource ? { systemSource } : {}),
         ...((systemSource || source === 'terminal-mcp') && typeof tag.auditSourceIdentity === 'string' && tag.auditSourceIdentity.trim()
           ? { auditSourceIdentity: tag.auditSourceIdentity.trim() }
@@ -403,6 +413,11 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
       ...(optionalString(tag.sourceProjectId) ? { sourceProjectId: optionalString(tag.sourceProjectId) } : {}),
       ...(optionalString(tag.targetProjectId) ? { targetProjectId: optionalString(tag.targetProjectId) } : {}),
       ...(optionalString(tag.runKind) ? { runKind: optionalString(tag.runKind) } : {}),
+      ...(tag.runKind === 'external-research' && tag.phase === 'completion'
+        && Number.isSafeInteger(tag.artifactSummary?.missing) && tag.artifactSummary.missing > 0
+        && (tag.artifactSummary.total === null || Number.isSafeInteger(tag.artifactSummary.total)
+          && tag.artifactSummary.total >= tag.artifactSummary.missing)
+        ? { artifactSummary: { missing: tag.artifactSummary.missing, total: tag.artifactSummary.total } } : {}),
       ...(optionalString(tag.parentRunId) ? { parentRunId: optionalString(tag.parentRunId) } : {}),
       ...(optionalString(tag.sourceTabId) ? { sourceTabId: optionalString(tag.sourceTabId) } : {}),
       ...(optionalString(tag.targetTabId) ? { targetTabId: optionalString(tag.targetTabId) } : {}),

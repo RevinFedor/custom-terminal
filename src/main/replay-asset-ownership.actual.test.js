@@ -39,7 +39,8 @@ async function fixture(t, { bootstrap = false } = {}) {
   sender.send = () => {}; // registration/wake only; no renderer executor
   const electron = { app: { getPath: () => root, isPackaged: false },
     BrowserWindow: { getAllWindows: () => [{ isDestroyed: () => false, webContents: sender }] },
-    ipcMain: { on: (name, fn) => callbacks.set(name, fn), removeListener: name => callbacks.delete(name) } };
+    ipcMain: { on: (name, fn) => callbacks.set(name, fn), handle: (name, fn) => callbacks.set(name, fn),
+      removeListener: name => callbacks.delete(name) } };
   const load = Module.createRequire(path.join(__dirname, 'web-server.js'));
   const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
   const cjs = { exports: {} }, quiet = { log() {}, warn() {}, error() {} };

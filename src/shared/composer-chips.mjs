@@ -1,6 +1,8 @@
 import localCommand from './agent-local-command.cjs';
 import pastedContent from './pasted-content.cjs';
 import { normalizeTerminalMessageSnapshot } from './terminal-message-reference.mjs';
+import { maskPromptWebImageReferences } from './prompt-image-attachments.mjs';
+import promptWebImages from './prompt-web-images.cjs';
 const { normalizeAgentLocalCommand } = localCommand;
 const { findPastedContentEnvelope } = pastedContent;
 
@@ -482,7 +484,7 @@ export function composerTextFromParts(parts, chips = []) {
   }).join('');
 }
 
-export function serializeComposerDraft({ text = '', chips = [], parts = null, renderImage = null, onBody = null, onImageRange = null, onTextRange = null } = {}) {
+export function serializeComposerDraft({ text = '', chips = [], parts = null, renderImage = null, onBody = null, onImageRange = null, onTextRange = null, onLegacyTextRange = null } = {}) {
   const normalized = normalizeComposerChips(chips);
   // Сохранённый промпт уезжает В СВОЕЙ МЕТКЕ, как и вставка: тогда чип в истории
   // читается из самого текста, а не из отдельной записи, которая может с ним
@@ -511,7 +513,7 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
       else if (part.kind === 'paste') value = buildPasteChipWrapper(byId.get(part.chipId));
       else if (part.kind === 'image') {
         value = renderImage ? renderImage(part.imageId) : `[Image #${part.imageId}]`;
-        onImageRange?.({ id: part.imageId, start: position, end: position + value.length });
+        onImageRange?.({ id: part.imageId, start: position, end: position + value.length, text: value });
       } else throw new Error('Unknown authoring part');
       position += value.length;
       return value;
@@ -527,28 +529,49 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
   const anchored = getPasteMarkerHighlightRanges(editableText, normalized);
   const chipById = new Map(normalized.map((chip) => [chip.id, chip]));
   const anchoredIds = new Set(anchored.map((range) => range.id));
-  let inlinedText = editableText;
-  for (let i = anchored.length - 1; i >= 0; i -= 1) {
-    const range = anchored[i];
-    const chip = chipById.get(range.id);
-    if (!chip) continue;
-    inlinedText = inlinedText.slice(0, range.start)
-      + buildPasteChipWrapper(chip)
-      + inlinedText.slice(range.end);
-  }
-
   // Chips without a marker keep the historical prefix placement: drafts
   // created before anchors existed, and any path that adds a chip without
   // touching the text, must still send their content.
   const pasteParts = normalized
     .filter((chip) => chip.kind === 'paste' && !anchoredIds.has(chip.id))
     .map(buildPasteChipWrapper);
+  const prefix = [...promptParts, ...pasteParts].join('\n\n');
+  const bodyStart = prefix ? prefix.length + 2 : 0;
+  let inlinedText = '', cursor = 0;
+  const appendRaw = value => {
+    onLegacyTextRange?.({ text: value, start: bodyStart + inlinedText.length,
+      end: bodyStart + inlinedText.length + value.length });
+    inlinedText += value;
+  };
+  for (const range of anchored) {
+    const chip = chipById.get(range.id);
+    if (!chip) continue;
+    appendRaw(editableText.slice(cursor, range.start));
+    inlinedText += buildPasteChipWrapper(chip);
+    cursor = range.end;
+  }
+  appendRaw(editableText.slice(cursor));
+  onBody?.({ text: inlinedText, start: bodyStart });
+  return [prefix, ...(inlinedText ? [inlinedText] : [])].filter(Boolean).join('\n\n');
+}
 
-  return [
-    ...promptParts,
-    ...pasteParts,
-    ...(inlinedText ? [inlinedText] : []),
-  ].join('\n\n');
+// Uses the same serializer and byte order as Send. Only actual producer
+// objects are opaque: user-written wrapper tags retain legacy image grammar.
+export function prepareComposerDraftTransport(options = {}) {
+  const imageRanges = [];
+  const prompt = serializeComposerDraft({ ...options, onLegacyTextRange: range => {
+    for (const image of promptWebImages.collectLegacyPromptImageRanges(range.text)) {
+      imageRanges.push({ ...image, start: range.start + image.start, end: range.start + image.end });
+    }
+    options.onLegacyTextRange?.(range);
+  }, onImageRange: range => {
+    const marker = /^\[imagePath:\s*([^\]\r\n]+?)\s*\]$/i.exec(range.text);
+    if (marker) imageRanges.push({ start: range.start, end: range.end, path: marker[1] });
+    options.onImageRange?.(range);
+  } });
+  const trim = options.trim === false ? 0 : prompt.length - prompt.trimStart().length;
+  return { prompt: options.trim === false ? prompt : prompt.trim(), imageRanges: imageRanges.map(range => ({ ...range,
+    start: range.start - trim, end: range.end - trim })) };
 }
 
 /**
@@ -823,6 +846,7 @@ function normalizeHistoryProviderImageMarkup(text, imagePaths = []) {
 
 function splitHistoryImageParts(text, imagePaths = []) {
   const value = String(text || '');
+  const authoring = maskPromptWebImageReferences(value);
   const refs = Array.isArray(imagePaths) ? imagePaths : [];
   const refsById = new Map(refs.map((ref) => [Number(ref?.id), ref]));
   const refsByPath = new Map();
@@ -835,7 +859,7 @@ function splitHistoryImageParts(text, imagePaths = []) {
   const re = createHistoryImageMarkerRegex();
   let cursor = 0;
   let match;
-  while ((match = re.exec(value)) !== null) {
+  while ((match = re.exec(authoring)) !== null) {
     const markerId = match[1] ? Number(match[1]) : null;
     const portablePath = match[2] ? match[2].trim() : '';
     const ref = markerId !== null

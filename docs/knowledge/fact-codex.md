@@ -123,6 +123,26 @@ pre-turn причины сжатия. Дополнительный post-turn п�
 Конкретную причину раннего compact подтверждать отдельно: current config/read
 читает текущие слои на диске, а не доказывает настройки уже запущенного turn.
 
+Видимый prompt перед `Compacting context` ещё не доказывает запись в JSONL.
+Exact29Oct Build Continue3314/CLI0.165.0: Enter06:01:31UTC, compact06:01:32,
+`context_compacted`06:07:02.206 → `user_message`06:07:02.233 → MATCH/SENT06:07:05.
+Около3.2s после записи включали чтение большого compact record, не ожидание final.
+До canonical carrier остаётся CONFIRMING/UNKNOWN, даже если TUI рисует текст.
+Сам compact не дополнительный gate: exact audit подтверждает Send и при held
+public lifecycle. Не объявлять SENT по одному скриншоту.
+
+Процент при seed читается из bounded JSONL tail: последний authoritative
+`token_count` либо более новый `compacted`, который делает прежний процент
+неизвестным. SOURCE26.10 сохраняет этот выбор и прежние byte/chunk/endOffset
+границы, но собирает длинную пересекающую chunks строку блоками по64KiB и
+соединяет один раз. Прежний `Buffer.concat([chunk, carry])` копировал весь
+накопленный хвост при каждом шаге, давая квадратичную работу на длинном record.
+Число удержанных блоков зависит от длины строки, а не количества read calls;
+однобайтовый chunk не создаёт массив из одного элемента на каждый байт.
+Полный JSON-разбор одной готовой строки остаётся отдельной ценой. Source oracle
+сверяет Unicode/CRLF/повреждённые строки/byte cuts и сохранение compact fence;
+это не доказательство причины конкретного installed CPU-интервала.
+
 ## Источник session id
 
 Авторитетный session id Codex берётся не из PTY-вывода, а из первой записи `session_meta.payload.id` в rollout JSONL. Файлы лежат по датам: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Парсер обязан игнорировать битую последнюю строку: Codex пишет append-only JSONL во время работы, и в момент чтения хвост может быть неполным.
@@ -210,6 +230,17 @@ Model/effort остаются launch intent и подтверждаются го
 фактом записи metadata. Процессная активность по-прежнему определяется
 OSC/process-tree proof и не выводится из UUID.
 
+Для native Goal-фикстуры до первого prompt важен тот же класс источника.
+В0.163 `app-server thread/start` с отдельным `clientInfo.name` создал header
+с этим originator и source=vscode. Последующий CLI Resume сохранил первый
+header: ход реально завершился в JSONL/TUI, но user-TUI classifier закономерно
+не допустил writer в Main. Это не основание ослаблять metadata/ownership guards
+или переписывать header после отправки. Проверенный setup: штатная
+`materializeEmptySession` → native `thread/resume` точного нового файла с
+`excludeTurns:true` → explicit paused Goal/set/get/unsubscribe. Первый header
+остаётся codex-tui/cli; provider turn при подготовке не появляется. Сам этот
+preflight не подтверждает writer, готовность PTY или прохождение MCP-сценария.
+
 History-режим «записать без ответа» использует тот же нативный rollout, без
 app-server: после доказанного Stop и проверки revision одним append добавляются
 `thread_settings_applied`, Responses `response_item(role=user)` и canonical
@@ -242,6 +273,26 @@ Desktop History, Timeline и `Cmd+]` используют этот же read ide
 writer adoption. Иначе Resume реально показывает старую историю в TUI, но
 desktop считает session ID пустым, блокирует hotkey и рисует пустую History до
 тестового первого prompt.
+
+### Сжатая история и live-наблюдение
+
+Чтение `.jsonl.zst` может возвращать временный распакованный `filePath` с
+`temporaryReadView:true`. Это заимствованная копия History, не native writer:
+её очистка/вытеснение не должны влиять на наблюдение новых ходов. Main запрашивает
+`findCodexSessionFile(...,{purpose:'live'})` без декодирования контейнера;
+у plain JSONL проверяются bounded root user-TUI metadata и неизменность файла
+во время discovery. Обычный reader по умолчанию сохраняет полное чтение архива.
+
+Если native plain source ещё не существует, его не заменяют временной копией.
+Прежний process-owned discovery продолжает оба пути Resume. После появления
+native source pending-аудитор подключает его от сохранённой exact audit-границы
+(user carrier может предшествовать task_started); без pending-аудита используется
+найденная live-граница. Исходный launch timestamp и удержание публикации до
+writer proof/replay сохраняются. Подключение
+watcher само не подтверждает отправку или завершение. После async lookup заново
+проверяются PTY/run/lifecycle/Stop и прежний watcher. Child Resume по-прежнему
+принимается только по process→writable file→root metadata, не по newest/mtime.
+Шрам754 и границы исторических доказательств — `fix-interrupted-session-lifecycle.md`.
 
 ### Большой догоняющий append после Fork/Resume
 
@@ -424,6 +475,17 @@ Child rollout может скопировать сотни мегабайт sour
 Для `codex-f` cwd-фильтр тоже недостаточен: Codex может спросить «использовать текущую директорию или директорию исходной сессии», и если юзер выбирает директорию исходника, новый файл получает cwd исходного проекта, а вкладка была создана в другом. Поэтому watcher для fork принимает только файл, который реально ссылается на исходный session id (`forked_from_id` или дополнительный `session_meta` с source id); сам исходный id при этом надо пропустить, чтобы не привязать вкладку к старой сессии. Cwd без source-match для fork больше не является достаточным доказательством.
 
 ## Запуск и shell boundary
+
+Шрам26Oct: ordinary Resume/AutoResume/RunAfter launch не обязан иметь Send receipt.
+После добавления общего continuation fence `record?.attemptId === attempt` при
+null record/undefined attempt ошибочно проходило к `record.receipt`. Обе проверки
+запуска ловили TypeError как `agent_launch_target_control_unavailable` ещё на
+intent-begin, до команды Codex. Send с реальной квитанцией мог работать, поэтому
+симптом «все Resume сломаны, но сообщение агенту проходит» не означает повреждение
+сессий или auth. Target guards сохраняют optional receipt reads без нового допуска;
+их тестовая композиция с launch registry использует реальные guards, не null stub.
+Исправление Source не меняет уже загруженный Main: сравнивать exact boot/PID и
+installed code, а не только одинаковый app version или наличие исправления в checkout.
 
 Отказ до команды имеет отдельный `launchWritten:false`, не Send no-paste/no-Enter
 для прежней попытки. Common preparation сохраняет structured `reason/code/
@@ -959,6 +1021,19 @@ Installed/native acceptance и evidence — в рабочем файле Goal.
 Resume подтвердил exact choice и composer после единственного Enter; это не
 приёмка обоих manual UI actions. Текст произвольной реплики не становится Goal proof.
 
+Source23Oct: grammar и identity диалога — разные проверки. В actual MCP cold
+Resume кадры33→38 имели тот же Goal и корректную смену selection, но фон за
+границами inset-панели изменился (`ac…`→`ew` справа). Ключ из всего viewport
+объявлял `goal-dialog-changed` до Enter. Main теперь может дать identity-проекцию
+ТОГО ЖЕ committed snapshot: обе option-строки независимо подтверждают одинаковую
+полосу non-default background, весь Goal body внутри неё сохраняется, а текущие
+ячейки/controls/footer проверяются отдельно. Границы выводятся из ячеек, не из
+фиксированной ширины или обрезания «лишних слов». Projection связана с exact
+seq/mirror/snapshot; при недоказанных границах остаётся прежний полный текст.
+Настоящая смена Goal внутри панели по-прежнему отзывает выбор. Обычный raw frame,
+owner/input/дедлайны/Enter-once/UNKNOWN и обязательное подтверждение результата
+не меняются. Это Source repair; новый packaged/native retake остаётся отдельным.
+
 04.10 добавлен явный recovery через Project API/Terminal MCP поверх этого же
 контроллера: Resume/Leave paused выбирается по exact operationId и requestId.
 GET не действует; unknown не разрешает новый Enter без нового committed
@@ -995,7 +1070,15 @@ rollout — Reserve. Production25.09 12:12:43UTC tab776:
 
 Action принадлежит terminal/lifecycle/run/input и текущему полностью закрытому
 кадру. До записи repaint может отложить выбор до следующего committed frame;
-общий предел10s не продлевается перерисовками. После Enter выполняется одна проверка
+обычный предел10s не продлевается перерисовками. Source22Oct для ещё холодного
+exact launch использует остаток его исходного startup deadline вместо отдельного
+раннего10s отказа; initialized lifecycle не заимствует старый retained clock.
+После навигационной стрелки тот же кадр через2s не доказывает отказ CLI:
+`awaiting-selection` ждёт existing committed frame с ожидаемым выделением, не
+повторяет стрелку/Enter и не меняет Send deadline. Лишь новый same-Goal selected
+frame того же input/terminal/run допускает один Enter. Истечение исходного срока
+даёт ошибку+снимок без повторного ввода. Поздний explicit action сохраняет прежний
+собственный10s budget, не оживляя Send. После Enter выполняется одна проверка
 подтверждения через3s, повторной клавиши нет. Для Goal отсутствие нового целостного
 кадра/ошибка чтения/незавершённая redraw — `provider-result-unobserved`, не доказанный
 manual-action. Policy сохраняет confirming, явный Goal API — unknown без recovery;
@@ -1010,7 +1093,15 @@ operational turn может снять runtime blocker без choiceConfirmed/de
 не Starting-spinner; скрытие плашки не меняет main policy. Source21Oct различает
 информацию ручного выбора и ошибку автоматического действия, как описано ниже.
 
-По прямому Fedor21Oct при не заданной политике обе кнопки Resume Goal/Leave
+По прямому Fedor22Oct unattended MCP (`start_ai` и exact admitted project-api/
+orchestration/tab-message Send) при отсутствии сохранённого/explicit выбора
+использует Leave paused. Это не удаление Goal, не Stop и не глобальная смена
+настройки. Сохранённые Resume/Leave и explicit override имеют прежний приоритет;
+операция не спрашивает пользователя. Main выводит контекст Send только по exact
+O/A/tab/provider receipt, не по renderer hint. Клавиша/меню не означают inputReady:
+готовый composer и physical-owner proof остаются обязательными отдельно.
+
+По прямому Fedor21Oct при не заданной политике в ручном desktop запуске обе кнопки Resume Goal/Leave
 paused доступны сразу по exact Main operation; общий startupPending не прячет
 их при том же Goal blocker. Сохранённые boolean и explicit operation override
 сохраняют прежнее значение. Автоматическое действие и ручной клик показывают
@@ -1260,6 +1351,17 @@ failed turn на следующий будущий turn; старый done/final
 или отправки результата оркестрации. После исчерпания лимита поздний кадр
 того же turn не меняет красное предупреждение обратно на жёлтое.
 
+SOURCE26Oct Run After отдельно сохраняет свои настройки при `model_capacity`,
+не меняя failed-классификацию provider/run и не исполняя собственный Continue.
+Main передаёт уже существующий surface-only признак также в renderer IPC и
+restored turn snapshot: ранний экранный warning не должен выключать очередь.
+Typed final продолжения выпускает обычный шаг только через прежний Root/Main
+executor; если его ACK ещё не пришёл, сохраняется настоящий natural cause,
+а не синтетический конец. Одних policy/runtime тестов Continue недостаточно:
+нужна проверка actual producer→Root/store→следующая карточка, включая FIFO head
+до retry и same-millisecond start/final. См. `fact-prompt-queue.md` и
+`fact-terminal-mcp.md::Main FIFO принятых Send`.
+
 Код: `codex-capacity-retry-{policy,runtime}.js`, live watcher в `main.js`,
 общий send/coordination в `web-server.js`, `orchestration-runs.js`.
 Проверки: policy/runtime + actual main→web/store integration с реальным
@@ -1319,6 +1421,15 @@ composer с точным сохранённым Resume read lease до перв�
 SID, чужой запуск, Fresh/Fork/Stop, новое явное settings-intent и replacement
 таким разрешением не являются. Второй Ctrl+C/launch не пишется, shell guard
 остаётся строгим. Присоединение не подделывает inputReady или writer proof.
+
+Сохранённый `resumePausedGoal:false` у уже идущего Resume — политика первого
+запуска, а не новое Goal-действие второго caller. Caller без явного override
+может присоединиться и к `Leave paused`, и к manual/null; несовместимое явное
+намерение по-прежнему не поглощается. Иначе after-restart Run After запускал CLI,
+а AutoResume получал ложный `foreground_command_running` и создавал rejected
+preparation над продолжающей загружаться сессией. При отказе same-SID join Main
+логирует bounded scalar owner/acceptance/Goal/settings flags в существующий
+`[CodexResumeJoin]`, без History/нового логгера или права повторять запуск.
 
 Ожидание AutoResume привязано к launchId/lifecycleGeneration, не только tabId.
 Stop→Resume другой или той же сессии в новом процессе отменяет старое ожидание;
@@ -1723,7 +1834,7 @@ provider transcript и уже отправленные context wrappers не п�
 
 У proxied Codex есть нетекстовый признак запроса `request_kind=compaction`.
 Он читается `provider-semantic-shadow.js` и попадает в REQUEST-диагностику
-с exact causal writer/session/turn. Шрам08–09.10: emit терял requestKind и
+с request/session/turn и causal verdict; это ещё не writer proof. Шрам08–09.10: emit терял requestKind и
 передавал generic `turn_started`, поэтому Main публиковал `provider-response`,
 а History оставался Working до появления позднего compacted. Теперь typed
 requestKind/sessionId сохраняются; при совпадении живого writer, watcher и
@@ -1740,6 +1851,17 @@ generation не подходят. Она заканчивается на compact
 unknown, app restart не восстанавливает фазу по старой истории. History временно
 показывает `Compacting · mm:ss` от startedAt операции, не переписывая исходный
 response interval/Worked. Screen parsing для этой индикации не требуется.
+
+Шрам29Oct, HH367 после Resume: typed compaction был правильно распознан,
+но отдельная phase не создавалась с `writer-scope-unproven`, пока первый
+canonical input ещё не подтвердил writer. Generic BUSY публиковался; History
+читает другой `agent:operational-phase` owner и оставалась без Compacting.
+JSONL до сжатия содержал общий `task_started`, а `compacted` пришёл после него;
+ждать writer, который материализуется после compact, для ранней индикации — круг.
+Здесь нельзя чинить отображение подстановкой saved SID или ослаблением writer
+для действий. Наблюдаемая current physical source/launch/turn/request фаза и
+право приписать canonical результат должны оставаться разными доказательствами;
+network end сам по себе по-прежнему не подтверждает success.
 
 Read-only witness754 / SID2e712969, 08.10.2026 UTC: request codex-8369 принят как
 compaction17:16:32.196, на следующей строке ACTIVITY phase=provider-response;
@@ -1870,6 +1992,33 @@ historical styled1056 отсутствует: его ANSI default bits не ус
 terminal:create штатно удаляет его перед запуском shell; режим надо подтвердить
 на cells настоящего CLI, не выводить из env. Этот env guard не менялся.
 
+24.10 SOURCE grammar принимает также первый непрерывный accent-FG title без
+bold внутри доказанной native section. Для options нужны последовательная группа
+и painted selection; для free — прежний cursor/editor proof. Отличающийся selected
+BG может подтвердить нежирный Other, общий фон меню — нет. Plain/dim transcript,
+чужой owner и uncommitted frame не становятся вопросом. На exact старом mirror
+четыре положительных semantic assertions падают, negative guard проходит;
+на новом проходят все пять. Общий controlled cohort127/127 проверяет также
+failure capture через прежний incident reporter, не новый logger; его границы —
+[PTY coverage](логирование-терминала-pty.md#прикладной-coverage-что-нельзя-обещать-автоматически).
+Это доказанный дефект grammar, но не восстановленные ANSI historical3281.
+
+24.10 отдельная owned packaged приёмка Electron28/Codex0.164.0/Luna-low
+подтвердила прямой async tool call с4questions иaccepted:true,9custom UI действий:
+Open,Next/Previous,Close/reopen с draft, exact radio, multiline free,Other,Skip.
+Native count4→3→2→1→0 связан с3точными canonical reply call/index/body; turn
+естественно завершился, final виден в живом History и совпал с собственным
+bounded canonical rollout после quit, без forced History refresh. Main draft
+сохранён. Это trusted CDP/same owned production-copy, не установленный host,
+не wrong-neighbour или OS-gesture приёмка. Normal/narrow520px проверяют custom
+presentation; native PTY-column resize и failure-packet persistence/prune отдельно
+не квалифицированы. Raw runner INCOMPLETE сохранён: его observer ожидал phase
+`final`, тогда как существующий Main сохраняет `final_answer`; это проверено
+OLD-positive RED→POST GREEN без нового provider Send. Отсутствие такого
+observer-match не доказывает отсутствие ответа. Исторические styled3281/1056
+этой собственной серией не восстановлены; полные исходы и пределы —
+[рабочая приёмка](../tmp/оптимизация-history.md).
+
 Диктовка в свободный ответ использует общий receiptv2 для input/textarea:
 owner-key включает текущий native targetId и questionKey. Это сохраняет draft,
 выделение и Undo обычного браузерного редактирования, но не даёт delayed Paste
@@ -1938,6 +2087,29 @@ durable line UUID: связывать их только exact sourceIdentity/ali
 refresh скроет сломанный live путь.
 
 ### In-process субагенты (multi_agent_v1 / collaboration)
+
+У настоящих native-v1 child rollout0.164 собственный `session_meta.payload.id`
+совпадает с child, а `session_id` может сохранять parent context. Read-only
+Inspector допускает это только при явном v1/subagent, exact own id и согласии
+session_id, parent_thread_id и source.subagent.thread_spawn.parent_thread_id.
+Этот child-only адаптер не меняет generic source-settings/Fork/Resume alias
+guard. Шрам26.10: обычное правило двух child aliases ошибочно закрывало body и
+первую own настройку двух правильных файлов4196. Теперь оба исходных bounded
+reader reads возвращают model/effort и собственные сообщения. Никаких parent
+model/Fast defaults, name/mtime fallback или подмены источника не вводится.
+
+`close_agent` не запрещает последующий настоящий native-v1 `resume_agent` того
+же UUID. Main может уже не иметь прежнего descriptor (close/process boundary),
+поэтому exact current-process control + его собственный typed receipt
+`status:pending_init/running` либо `send_input.submission_id` восстанавливает
+live child без перечитывания родителя. Нужны literal UUID, exact call/output,
+source byte offset и прежний generation proof; соседняя часть batch, mailbox,
+ошибка/неизвестный результат или copied/old-process call не разрешают restoration.
+Повторный resume/send_input одного child не размножает lease. Старые known-control
+transitions и v2 сохраняются. `[CodexChildLifecycle] work-start/control-result`
+различает восстановление, owner refusal, число parsed targets/частей output и
+native-v1 proofs, без текста задания. Шрам28.10: два закрытых ревьюера успешно
+возобновились в01:22UTC, но Main оставил count0, потому что искал только старую Map.
 
 Navbar раскрытого child показывает **model/effort его запуска**, а не текущие
 настройки родителя; Fast может подтверждаться отдельным собственным запросом
@@ -2098,6 +2270,15 @@ Model/effort в Codex History — display-only строки из `turn_context`,
 owner по-прежнему используют background-priority; это ускорение показа, а не
 новое доказательство применения настройки. Источник истины остаётся durable
 `turn_context`/`thread_settings_applied`.
+
+В SOURCE26.10 physical primary History наблюдает исторические настройки по
+полным held semantic slash-строкам: облегчённые durable stubs не содержат текста
+и не доказывают model/effort. Подписанный `primary-effective-settings` выбирает
+последние совпавшие model/effort по порядку и максимальный конечный proofAt среди
+всех совпавших строк, включая более ранние timestamps. Используется прежний
+reducer без нового slash-parser; settingsFact не заменяет текст. Значение готово
+до adoption, а pure-view hit переиспользует его. Более новый picker и смена SID
+по-прежнему запрещают запись старого наблюдения; это read proof, не команда CLI.
 
 Новый общий путь для desktop Timeline/History и Project Terminal API — `agent-transcript:*` поверх `SessionTranscriptService` (см. `fact-transcript-сервис.md`). Старые `codex:get-timeline` / `codex:get-full-history` остаются совместимыми entrypoints, но добавлять новый per-surface polling reader нельзя: длинный rollout один, consumers много. Codex parser поэтому держит incremental cache по файлу: совпадение `dev:ino + size + mtimeMs + ctimeMs` = unchanged; append того же физического файла читает только новые bytes и склеивает `leftover`, replacement/shrink/same-size rewrite делает chunked full reread, concurrent callers делят один inflight promise. In-place rewrite+growth штатный writer обязан явно инвалидировать: одного роста размера недостаточно для доказательства prefix. Full-record cache — LRU до шести файлов и 768 MiB raw bytes, но один oversized active rollout намеренно остаётся: его eviction заставил бы повторно парсить 600+ MB на каждом клике. Логи `[CodexJsonlCache] full/append/evict` нужны для blame'а: если Timeline/History тормозит на большой сессии, сначала проверь что нет повторного `full reason=first-read/rewrite-or-shrink` на каждом refresh.
 
@@ -2306,6 +2487,13 @@ launch ID/захваченный Main receipt по-прежнему удержи
 якобы cold. Сам `inputReady` этим не меняется; прежний pinned caller сохраняет ID.
 Рубеж проверяют actual Main reader + SQLite preparation controls в
 `agent-send-preparation.actual.test.js`; это не provider/installed acceptance.
+24Oct новый cold Send получает отдельный Main preparation ceiling120s от
+ACTIVE HEAD, тогда как warm/unknown и старые v1 scopes сохраняют60s. Cold
+выбирается один раз по known Main inactive/starting/restore inspection, не по
+renderer hint или отсутствию draft. Новая v2 cold preparation всё равно берёт
+минимум с исходным startup deadline того же launch; ready/повтор чтения/bridge
+не обновляют его. Actual FIFO issuer + Main reader/SQLite проверяют61.4s positive,
+120s expiry, Stop/owner/input/cancel/draft и queued residence, не live CLI.
 После успешной служебной `/fast` Main отдельно будит прежнее Send-ожидание через
 общий readiness-change. Её Enter снимает owned slash receipt раньше результата;
 задержавшийся IPC-ответ «input занят» может прийти уже после результата. Без
@@ -2314,6 +2502,14 @@ launch ID/захваченный Main receipt по-прежнему удержи
 current owner/input/composer guards с тем же context/attempt и исходным сроком,
 без повторной `/fast` или возрождения отменённого Send. Ошибка доставки wake
 логируется, но не переписывает результат уже выполненной команды.
+
+SOURCE29Oct устраняет «первое сообщение failed, следующее прошло»: standalone
+model intent завершился ошибкой и убрал owned slash, но старый Send продолжал
+требовать applied settings, тогда как новый входил обычным путём. После конца
+control/inflight и свежего ready старый Send тоже возвращается к прежним
+writer/draft/settings guards. Ошибка не означает, что модель применена, и не
+разрешает очистку чужого draft. Wait использует остаток исходного Main scope,
+не новое30s окно; Stop/owner replacement/expiry сильнее позднего readiness.
 Final composer guard стоит ПОСЛЕ pre-paste drain, перед image bindings и первым
 Codex paste без следующего await. Отдельно проверяются exact execution identity,
 mirror pointer/generation и input ownership; Claude capture/stash не получает
@@ -2558,6 +2754,16 @@ Main-owned turn state и его доставка — разные части к�
 
 Прод-шрам 2026-07-15: Codex показал в TUI `unexpected status 403 Forbidden`; в проверенном rollout не было ни непустого `last_agent_message`, ни matching same-turn `final_answer`. Это доказывает только завершение без подтверждённого результата, но не кодирует `403` и даже не определяет класс ошибки. Текст TUI остаётся диагностическим свидетельством, а не lifecycle-контрактом автоматики. Для точного машинного класса нужен отдельный структурированный источник, например Codex App Server.
 
+SOURCE27Oct `[CodexFinalProof]` наблюдает форму candidate/start/terminal в том же
+classifier: типы и bounded значения turn-ID полей, phase/role, длины текстовых
+частей, offset/sequence, previous proof и причину приёма/отказа. Текст ответа и
+prompt не логируются; ошибка observer не меняет исход. Это позволяет отличить
+пустой/commentary/foreign final от потери same-turn binding без повторного чтения
+большой History. `CodexTurnAppend.candidateTextBytes=0` считает user-carrier audit
+кандидатов, а не длину assistant final, и само по себе пустой ответ не доказывает.
+Диагностика не нормализует неизвестный top-level ID в current turn и не включает
+Run after после настоящего no-final.
+
 App Server остаётся только explicit future-path, если пользователь отдельно согласится на зависимость от experimental Codex protocol ради точного статуса `completed/failed`, нативного approval/question UI, item-level tool lifecycle или официального `turn/interrupt`. Не переносить Codex на App Server только ради loader'а, rewind/edit-range или удобства RPC, пока JSONL watcher стабильно держит busy=true на всём turn'е, а автоматика безопасно трактует отсутствие финального результата как неизвестный исход.
 
 ### Native iOS live stream
@@ -2684,9 +2890,54 @@ publication с одной activity identity, а медленный `[CodexWriter
 скрытия/удаления моделей остаются сильнее discovery; текущая модель сессии не
 переключается из-за изменения списка.
 
+SOURCE27Oct: существующий Main-владелец `createCodexModelCatalogLifecycle`
+сохраняет два компактных attempt records. `codex:get-model-catalog-lifecycle`
+читает их без нового запуска; scalar wake `codex:model-catalog-lifecycle-changed`
+не является готовностью UI. Epoch берётся из `appRuntimeIdentity` до первого
+attempt; позднее привязывать старую работу к новому Main нельзя. Публичные
+`codex:list-models`, singleflight/TTL и live→bundled→builtin fallback прежние.
+Callback, spawn/exit/close, попытки termination и cancellation — отдельные факты.
+Даже callback OK/close0 не natural completion после timeout/own kill; tap своего
+handle сохраняет исходные receiver/return/throw и после close не переписывает
+завершённую квитанцию. Getter не хранит ChildProcess/env/stdout и не даёт Stop,
+writer/Input authority или original kernel identity. Resolver/stat bookends
+фактического PATH/cwd и env-node interpreter не заменяют непрерывное наблюдение;
+native byte pins проверяются отдельно вне Main. Record≤4KiB/snapshot≤12KiB,
+totals/retention gaps/неполнота явные; diagnostic failure не меняет model result.
+
 На Codex CLI 0.145.0 серверная видимость `codex-auto-review` менялась между `hide` и `list` без смены локальной версии, а каждый уже запущенный TUI сохранял снимок каталога с момента своего старта. Поэтому две одновременные вкладки могут законно показывать разные первые экраны `/model`: quick-auto слой с `codex-auto-review` и `All models` либо сразу полный список. Видимый `codex-auto-review` поддерживает обычный следующий экран effort (`low..ultra`), а не применяется как готовая пара без выбора reasoning. У Sol/Terra допустимы `low..ultra`, у Luna `low..max`, у 5.5/5.4/mini/spark — только `low..xhigh`; весь перечень остаётся live-фактом, а не вечной константой.
 
-Renderer-side fallback и ручные display/ordering overrides живут в `constants/codexSettings.ts` + `UIStore.codexSettings`; SettingsModal показывает их рядом с Claude Code, по одной модели и её effort-list в строке. Сохранённая запись модели является identity-парой: `id` уходит в runtime и durable intent, `label` показывается человеку. Любая проекция footer/picker, вернувшая label, разрешается обратно через этот Settings-каталог; raw case-sensitive сравнение `GPT-6-Astra !== gpt-6-astra` не доказывает чужую смену модели. На реальном Codex0.156.1 footer показал `GPT-6-Astra max`, а native `/model` ACK сохранил `gpt-6-astra max`: прежний parser оставлял прописные буквы footer и не подтверждал точный выбор. В anchored composer-footer теперь приводится только ASCII-регистр model ID, не произвольный текст/пункт меню; effort и причинные Enter/frame guards остаются прежними. У модели есть отдельная галочка видимости: снятая галочка убирает её из обычных списков ControlBar и StatusBar, но не отменяет доступность в TUI. Если скрыты все, текущая выбранная модель остаётся единственной строкой, чтобы пользователь мог выйти из этого состояния. Новый порядок ставит GPT-5.5 после 5.6 Luna и перед GPT-5.4; нетронутая старая конфигурация мигрируется на этот порядок, а индивидуально отсортированная сохраняется. В той же настройке хранится пара для быстрого перехода; effort в ней всегда приводится к списку выбранной модели, а не берётся из общей шкалы.
+Renderer-side fallback и ручные display/ordering overrides живут в `constants/codexSettings.ts` + `UIStore.codexSettings`; SettingsModal показывает их рядом с Claude Code, по одной модели и её effort-list в строке. Сохранённая запись модели является identity-парой: `id` уходит в runtime и durable intent, `label` показывается человеку. Raw case-sensitive сравнение `GPT-6-Astra !== gpt-6-astra` не доказывает чужую смену модели. На реальном Codex0.156.1 footer показал `GPT-6-Astra max`, а native `/model` ACK сохранил `gpt-6-astra max`: прежний parser оставлял прописные буквы footer и не подтверждал точный выбор. Anchored footer нормализует регистр slug; multiword label получает ID только из уникального точного catalog match либо отдельно наблюдавшегося provider alias. Effort и причинные Enter/frame guards остаются прежними. У модели есть отдельная галочка видимости: снятая галочка убирает её из обычных списков ControlBar и StatusBar, но не отменяет доступность в TUI. Если скрыты все, текущая выбранная модель остаётся единственной строкой, чтобы пользователь мог выйти из этого состояния. Новый порядок ставит GPT-5.5 после 5.6 Luna и перед GPT-5.4; нетронутая старая конфигурация мигрируется на этот порядок, а индивидуально отсортированная сохраняется. В той же настройке хранится пара для быстрого перехода; effort в ней всегда приводится к списку выбранной модели, а не берётся из общей шкалы.
+
+Main picker отдельно разрешает полную display-колонку по уникальному совпадению
+со свежим live-каталогом `id/label`, не принимает первое слово `GPT-6.1` за ID
+строки `GPT-6.1 Terra`. Неоднозначная метка не даёт выбрать строку наугад;
+старый прямой slug сохраняется. Новый footer `enter select · esc back` также
+распознаётся для ручного выбора. Событие готовности от уже начатого picker не
+переоткрывает тот же `/model` после ошибки; новое намерение и readiness до
+первой записи остаются допустимыми. Клик по собственному loader отменяет exact
+intent у Main, сохраняя draft/PTY guards и отдельно подтверждённое native state;
+он не доказывает, что уже отправленный Enter был откачен.
+
+27Oct после Resume текущий закрытый composer показывал `GPT-6.1 Terra max fast`,
+но прежний однословный footer-parser оставил `composer-initialization-pending`
+и вызвал ложный startup timeout. Структурное доказательство текущего composer
+теперь отдельно от точного model ID: распознанный multiword GPT footer может
+подтвердить готовность ввода, но не выдумывает identity. Наблюдавшийся Terra
+alias поддерживается и offline; другие labels разрешаются по уникальному
+свежему live catalog, конфликт остаётся unknown. Та же identity используется
+для launch card, ручного и автоматического model ACK. Новый unresolved footer
+отзывает старый live model proof только своего owner; renderer очищает лишь
+совпавшую прежнюю пару, не более новое или чужое значение. Текущий frame,
+startup blockers, process/writer, draft и input-boundary guards не заменяются
+одним названием модели. Source/private проверка не является native acceptance.
+
+Отдельный startup model-migration применяет тот же unique catalog identity к
+обеим видимым target-меткам, durable arm и post-Enter ACK: два разных ID,
+которые случайно приводятся к одному slug, не дают Enter или commit. Если
+каталог не содержит такой записи, прежний clipped-intro/legacy normalization
+остаётся доступным. Exact terminal/run/launch и подтверждение перехода config
+по-прежнему обязательны; один label или ACK не подтверждает config write.
 
 Выбранные пользователем effort и реальные возможности модели хранятся раздельно: снятый checkbox не расширяет и не сужает live-capability, а merge пересекает настройки с подтверждённым каталогом. Удаление модели — тоже постоянное намерение, не временная фильтрация: её id попадает в отдельный список удалённых и отбрасывается как из fallback, так и из следующего `codex debug models`. Иначе пользователь удалил бы строку в Settings, а она вернулась бы при первом же обновлении каталога. Финальное подтверждение конкретной пары всё равно приходит из native picker.
 
@@ -2697,11 +2948,10 @@ Renderer-side fallback и ручные display/ordering overrides живут в 
 как дополнительный лимит GPT-5.6 Luna после исчерпания обычного.
 Старый однословный footer-parser называл такой готовый composer
 `composer-initialization-pending`; hidden dev на128-МБ копии воспроизвёл
-`active/writerConfirmed` при `inputReady=false`. Только этот точный
-двухсловный provider label переводится в известный `gpt-reserve`; произвольная
-фраза перед `max` не становится model proof. Соседний label/ID для обычных
-Settings-моделей по-прежнему берётся из сохранённого каталога, а не из нового
-списка алиасов.
+`active/writerConfirmed` при `inputReady=false`. Этот точный provider label
+переводится в известный `gpt-reserve`; произвольная фраза перед `max` не
+становится model proof. Отдельно наблюдавшийся `GPT-6.1 Terra` имеет свой
+проверенный offline alias; другие multiword identity требуют уникальный каталог.
 
 Строка auto-пресета в session-local picker доказывает только его видимость в этой вкладке. Она не доказывает default effort и полный набор уровней: неизвестный пресет можно временно добавить в UI лишь после подтверждения точной пары model+effort, а затем заменить данными live-каталога. Иначе короткий первый экран заставляет приложение выдумать пресету всю общую шкалу reasoning, которой upstream мог не разрешать.
 
@@ -2721,6 +2971,12 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 - различать `Select Reasoning Level`, `Advanced Reasoning` и появляющийся только по инициативе upstream Plan-scope dialog; новые имена не должны требовать изменения parser whitelist.
 
 Первый распознанный numbered row не является доказательством готовности кадра: Ink может прислать частичную перерисовку, где нужная модель, `All models`, effort или `More reasoning` появятся следующим PTY frame. Каждый шаг ждёт именно свою семантическую цель. Исключение — доказанно обрезанный полный список с подсказкой `Ctrl+A view all`: такой кадр разрешает только переход к верхней части того же списка, а не выбор отсутствующей строки.
+
+Source27Oct: последний raw PTY delta может разбудить selector раньше commit
+headless mirror, после чего новых байтов не будет. Capture слушает тот же existing
+committed-frame signal exact mirror; ни дополнительный Enter, ни больший timeout
+не нужны. Подмена mirror/cancel не переносит observer. Причинный post-Enter ACK
+по-прежнему берётся из накопленного нового delta, не из исторического текста экрана.
 
 Обычный/default `Max` означает persistent `model_reasoning_effort=max` и не имеет права переписывать уже существующий `plan_mode_reasoning_effort`. Только если сам Codex в активном Plan mode показывает вопрос об области применения, приложение выбирает нужную строку и после подтверждения проверяет оба top-level значения. `Ultra` — conversation-only режим: он никогда не идёт через Plan-scope и считается применённым только после точного acknowledgement `Model changed ... ultra for this conversation`. Acknowledgement и восстановленный composer могут прийти в разных синхронизированных кадрах; требовать оба в одном render — ложный timeout уже успешного выбора.
 
@@ -2768,6 +3024,19 @@ repaste и не публикует final failure перед неожиданны
 Stop/manual/owner/settings/expiry отзывают будущие записи; pending после возможного
 Enter остаётся только для позднего causal outcome, не replay. Это не расширение
 всех `/model`/`/fast` waits и не перенос общего startup budget на любой post-paste.
+
+26.10 History `/compact`367 выявил пропущенный ранний стык: общий composer probe
+истёк за2.5s до вызова Main, хотя настоящий DEC2026 redraw занял7.53s и закончился
+пустым composer. Только typed pending-frame expiry того же ещё не отозванного
+наблюдения теперь передаёт standalone `/compact` без attachments/chips прежнему
+Main executor. Это не empty proof и не повтор отправки: Main сначала получает
+свежий closed+flushed кадр в своём прежнем preparation lifetime, затем выполняет
+одну вставку. Реальный draft на этой поздней границе остаётся нетронутым и даёт
+конфликт, а не stash. Доказанный draft раннего probe сохраняет прежний exact
+capture/return path. Opaque/control unknown, отменённый owner и refusal уже
+существующего preparation не получают нового срока. Дублирующий short probe
+в renderer transport для этой команды больше не предшествует Main; остальные
+slash, ordinary Send и явные picker callers со stash/restore не изменены.
 
 Для `/model` внутри уже принятого Send действует именно исходный preparation
 этого H/O/A, включая меньший cold deadline, а не отдельные2500ms. После одной
@@ -3117,6 +3386,15 @@ writer, composer-ready либо разрешением ввода. Точная 
 > interrupted` остаётся blocker.
 
 Codex участвует в том же automatic interrupted recovery, что Claude, но источник live-сессии другой. У Claude main берёт `bridgeKnownSessions`; у Codex нет bridge-файлов, поэтому `codexKnownSessions` содержит только принятого writer из rollout/process proof. Ручной `codex-c` кладёт source в launch intent и публикует `starting`, но не заполняет live-map и не эмитит окончательный `session-detected` до writer proof. Для остановленной вкладки AutoResume, обычный Resume и Resume All берут durable ID из SQLite и запускают `codex:run-command {command:'codex-c', sessionId, cwd}`; отдельной blocking Continue-модалки нет. После запуска этот ID снова становится только provisional source. Shutdown обязан сохранить отдельно доказанного live writer и durable binding, не повышая resume-аргумент до текущей сессии.
+
+Первый automatic Continue после такого Resume не должен ждать writer, который
+может материализоваться лишь от этого ввода. SOURCE26Oct использует private Main
+input-only verdict exact source/lease/launch/process/composer, не подставляет saved
+SID в observed writer и не снимает response unknown. Одна frozen операция проходит
+прежний FIFO и повторный HEAD task/history/input proof; Main first-submit authority,
+paste/Enter и canonical audit остаются прежними. Поздний manual turn, Stop, другой
+source/PTY либо неизвестная доставка не разрешают автопродолжение. Подробная граница —
+`fact-build-when-idle.md::Немедленный снимок и продолжение`.
 
 Codex startup может показать update prompt (`Update available`, `1. Update now`, `2. Skip`, `3. Skip until next version`). В Noted Terminal это тоже startup prompt, не input-ready: guard выбирает `2. Skip` (если выделен первый пункт — `↓` + Enter, если второй уже выделен — Enter) и заново сбрасывает readiness detection. `Skip until next version` не выбирается автоматически, потому что это меняет будущую политику обновлений, а не только разблокирует текущий запуск. Guard не должен зависеть только от caller'а запуска: `codex:run-command` и terminal MCP вооружают его до записи команды, а ручной повтор через shell history вообще обходит эти handlers. Для такого запуска разрешение на auto-skip восстанавливается лишь когда **последний синхронизированный PTY-кадр** содержит полный безопасный update picker и process tree одновременно подтверждает живого Codex descendant; произвольный текст `Update available` из scrollback не даёт права писать стрелки/Enter. Прод-шрам 2026-07-14: loader правильно видел `blocked:update-prompt`, но guard оставался `startupArmed=false`, потому что после Ctrl+C Codex был перезапущен через `↑ + Enter` в zsh.
 

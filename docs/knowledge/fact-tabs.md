@@ -602,7 +602,7 @@ popup или file-tab в workflow sidebar открывает самостоят�
 и не открывает окно внутри active drag. File с physical parent показывается как
 свой reader, не как AI subagent родителя; physical relationship не переписывается.
 
-Отклик начинается сразу: finite CSS transform1→1.04 за60ms, popup монтируется
+Отклик начинается сразу: finite CSS transform1→1.1 за60ms (Source23Oct), popup монтируется
 только по animationend при всё ещё действующем exact hover. Быстрый уход,
 blur/Escape/pointer action, смена owner/file/mode и unmount отменяют pending intent.
 Поздний end после повторного входа не сокращает новый dwell. До открытия нет
@@ -612,7 +612,7 @@ Popup использует готовую file metadata и не ждёт `probeF
 без await в том же finish-handler. Чтение тела `file:read` принадлежит отдельному
 явному выбору документа. Поэтому сокращение dwell не доказывает ускорение reader
 или installed latency; эти границы проверяются отдельно.
-У обычного file chip scale1.04 сохраняется при переходе по bridge внутрь popup;
+У обычного file chip scale1.1 сохраняется при переходе по bridge внутрь popup;
 нижний край остаётся на месте благодаря origin:left bottom. Уход из всей зоны
 снимает scale, даже если меню закреплено. Popup имеет по1px внешнего/внутреннего
 отступа и зазор между строками1px. Сами строки переиспользуют целый TabCard:
@@ -840,7 +840,8 @@ CURRENT Source20Oct: обычный click оставляет одну выбра
 собираются в `[A B] — X` у первой выбранной позиции; чужие вкладки и chooser
 сохраняют относительный порядок. Recolor не переставляет вкладки. Новая группа
 возможна только из полностью свободного набора; изменить цвет можно при выборе
-всей одной группы. Смешанный набор и subset не сливают/не меняют membership.
+всей одной группы. Выбор цвета для смешанного набора или subset не меняет
+membership; явное добавление выбранных свободных вкладок описано ниже.
 После подтверждённого Full Close выбор цвета и drag используют активную проекцию:
 закрытый участник не блокирует оставшихся. Raw definition и точный field basis
 сохраняют его provenance; recolor не удаляет его из metadata. Unknown catalog
@@ -891,28 +892,88 @@ captured-set admission; whole-workflow Stop или complete global-group Close �
 являются заменой такой адресной операции. Source/private checks не подтверждают
 поведение установленного приложения; текущая приёмка — в рабочем tmp темы.
 
+### Добавление выбранных вкладок в существующую группу
+
+По прямому решению Fedor23Oct группа с одним оставшимся участником сохраняется:
+это позволяет расширять прежнюю группу без потери цвета и настроек. Если выбор
+затрагивает ровно одну группу и свободные вкладки, в строке цвета появляется
+«Добавить в группу · N». N считает только свободные выбранные roots; ПКМ на любом
+выбранном chip использует один набор. Частично выбранная старая группа сохраняет
+невыбранных участников. Две затронутые группы автоматически не объединяются;
+полностью свободный набор по-прежнему создаёт группу через выбор цвета.
+
+```text
+[1]  2  3  4 → выделить1–4 → ПКМ на1 или4
+             → «Добавить в группу ·3» → [1 2 3 4]
+```
+
+Добавление и сборка порядка принимаются вместе прежним organization writer.
+Старый coherent live block сохраняет порядок, свободные roots собираются после
+него в прежнем визуальном порядке; остальные mixed slots и chooser не сдвигаются
+друг относительно друга. Raw tabIds дополняются отдельно: closed provenance,
+невыбранные участники, id/color/collapsed и extensions сохраняются. Saved display
+profiles не собираются автоматически. Обычный recolor по-прежнему не имеет права
+менять состав; explicit Add не выдаёт права Full/Stop или активации вкладок.
+
+При IN→OUT→IN первый и последний endpoint могут иметь одинаковые raw/order при
+разных membership revision. Пробовали retire pair по raw+placement: первый ACK
+удалял witness последнего IN, и Add, нажатый после этого ACK, ошибочно отказывал.
+Retirement также требует точной canonical membership phase roots/followers из
+той же публикации. Workflow ID, похожий intent или mutation ID не заменяют фазу.
+UNKNOWN восстанавливается прежним request/key до нового Add; late UI revoke
+не отменяет принятую запись и не возвращает reveal/focus.
+
+Узкий соседний compiler case: вставка строго между a/b одной coherent группы
+сохраняет canonical mixed slots. Пересборка chooser по числу tab-only позиций
+могла переставить его через неподвижную вкладку, и Main правильно отклонял DTO.
+Ordinal полосы считает вкладки, а не chooser. Общие неоднозначные chooser gaps
+и общий pane writer этим исправлением не переопределены.
+
 ### Свёрнутая группа в оконной полосе
 
-CURRENT Source22Oct: слева от «Цвет группы» доступен toggle свёрнутости одной
+CURRENT Source23Oct: слева от «Цвет группы» доступен toggle свёрнутости одной
 группы. Он сохраняет `collapsed` в прежнем definition, не удаляя membership или
 placement. В полосе остаётся representative: показанный участник, затем последний
 участник из pane history, затем сохранённый первый. Остальные реальные карточки
 скрыты из flow; неизвестный/неполный состав не выдаётся за готовую свёрнутую группу.
+Toggle различает состояния SVG-иконками, во время прежнего canonical commit
+показывает локальный loader; получение revision/save не выдаётся за paint receipt.
+Компактный общий control цвета содержит слева отдельную SVG-кнопку
+«Разгруппировать» только для всей одной цветной группы. Это sibling buttons,
+не вложенный button. Удаляется только точный raw definition через прежний
+field-basis/journal с revision+1; order, placement, вкладки и workflow membership
+не меняются. Partial/foreign/changed owner/activity отказывают до записи;
+UNKNOWN восстанавливает исходную mutation, без повторной ревизии. После снятия
+группы тот же полный selection снова доступен для выбора цвета. У singleton
+collapsed representative расширяется только colorLease; Full/Stop сохраняют
+своего исходного единственного адресата.
+Это право даёт фактический representative непрерывного collapsed run по тем же
+shown/MRU/chooser правилам, что у полосы. Cmd-выбор одного другого участника в
+OPEN view не превращается в выбор всей группы; raw collapsed flag сам по себе
+не доказывает, что разорванный чужой вкладкой/chooser состав сейчас свёрнут.
+
+Settings lease может следовать только доказанной released B5 presentation до ACK.
+Обычные действия и Full/Stop сохраняют отдельный canonical execution lease;
+до canonical membership эти runtime-кнопки недоступны и handler не входит в port.
+Иначе отказ Main сохраняется port по объекту lease и ошибочно отравляет попытку
+после собственного ACK. Group settings не расширяют исходные runtime targets.
 
 Счётчик `+N` справа сверху означает число остальных активных участников. Он стоит
 на рамке с выступом1px, имеет непрозрачный фон карточки, цвет группы и мгновенный
-CSS scale1.04/60ms по общему с file chip token (Source22Oct); transform origin
+CSS scale1.1/60ms по общему с file chip token (Source23Oct); transform origin
 по центру, невидимого увеличенного hit нет. Badge уже примерно на20%, радиус4px,
 шрифт прежний. Непрерывная рамка остаётся под
 подложкой счётчика: после уменьшения нет заранее вырезанной дырки. Шрифт нижнего
 file chip увеличен на2px при прежнем height; цифра использует тот же размер.
 
-Обычное наведение именно на badge запускает конечное заполнение его прямоугольной
-рамки по часовой стрелке за500ms — тот же clock/palette/stroke, что у workflow
-hover-navigation. Это отдельный deadline от короткого scale60ms. Быстрый уход,
-Escape/blur/pointer action или новая definition отменяют pending. Третий режим
-«Раскрывать группу сразу при наведении» пропускает progress/deadline, сохраняя
-остальные правила. Клик и одиночный Cmd не ждут hover deadline.
+Обычное наведение именно на badge раскрывает группу по animationend его
+конечного scale, как file chip; прежнее clockwise-кольцо500ms удалено.
+До endpoint нет нового таймера, layout read или React-state на кадр. Быстрый уход,
+Escape/blur/pointer action или новая definition отменяют pending; поздний чужой
+либо ранний endpoint не открывает группу. Третий режим «Раскрывать группу сразу
+при наведении» пропускает конечную анимацию как условие открытия, сохраняя
+остальные правила. Workflow drag сохраняет собственный500ms navigation dwell.
+Клик и одиночный Cmd не ждут hover animationend.
 
 По умолчанию hover/Cmd открывают временный просмотр до ухода, повторный Cmd
 переключает его. Badge-click закрепляет до outside click; выбор участника не
@@ -924,6 +985,9 @@ ownership revoke сохраняют safety во всех режимах. Cmd tog
 group владеет key listeners, без React modifier-state всех retained panels.
 Её настоящий context menu/flyout/linked-file popup входит в hover-зону по exact
 DOM owner label; чужое меню не удерживает её даже поверх прежнего rectangle.
+Это относится и к отдельному hover-коридору file chip → popup: он несёт тот же
+owner ID. Собственный узкий коридор может лежать ниже cached card bounds, а чужой
+или неразмеченный corridor не получает право удерживать группу по её rectangle.
 Закрытие по Meta не снимает этого owner, пока курсор остаётся в группе: иначе
 третье нажатие без нового mouseenter не раскрывает её. Потеря hover/presentation,
 Escape/blur и unmount по-прежнему отзывают прежний intent.
@@ -939,6 +1003,9 @@ bounded observer; opacity/таймерное скрытие рамки не ис
 поскольку transform сам не вызывает ResizeObserver; покадровый reader не нужен.
 
 Все участники раскрываются absolute на ТОЙ ЖЕ строке и в ТОМ ЖЕ DOM полосы.
+Непрозрачная подложка `TABBAR_PANEL_BG` закрывает весь absolute-ряд и промежутки
+между его карточками. Её границы берутся из прежних offsets/widths, pointer-events
+отключены; дополнительных flow slots, hit targets и geometry observer нет.
 Representative остаётся на прежнемX/Y, показан один раз; одна flow-position
 резервируется и в открытом виде. В default режиме при нехватке места OPEN переставляет только его
 в logical order минимально необходимым образом, сохраняя порядок остальных.
@@ -981,6 +1048,27 @@ canonical prefix остаются, но они не участвуют в выб
 Особый случай ряда шире viewport допускает явную прокрутку раскрытого ряда,
 не превращая обычную wrapped полосу в горизонтальный navbar. Actual pixels,
 native gestures и совместная приёмка принадлежат рабочему tmp/owner4196.
+
+Internal peek release может потерять уже показанную цель: при B,A,C и shown A
+preview A перед B сдвигает B из прежней точки, оставляя representative на месте.
+Повторный live hit на pointerup тогда видит underlay/пустоту и раньше отказывал
+до claim/compiler, хотя сам raw/order lease ещё действовал. Геометрия ради этого
+не расширяется. Узкий release proof сохраняет именно прежний обработанный X/Y
+и подтверждённую проекцию своего internal gesture: source/session/target/revision,
+OPEN owner/order/rows, raw/logical base, anchor/direction/sizes/scroll/layout.
+Новый непоказанный input, новая точка, stale receipt, foreign owner/recolor/order,
+закрытие или imperative resize отзывают proof. Ordinary IN/OUT не получает этой
+ветки; прежние claim, frozen compiler и organization/Main CAS сохраняются.
+Exact catch-up canonical props к уже принятому logical B5 base допустим, чужой
+новый порядок — нет. Group измерение переиспользует прежние boxes; на release
+нет нового rectangle/computed-style read, observer или polling.
+
+Потеря pointer capture сама не завершает renderer-wide gesture. В диагностике
+pointer-release различаются decision/authority/hit и claimed/compiled/dispatched;
+dispatched ещё не ACK. Старое committed0/at- неоднозначно для async writer и не
+доказывает SQL rejection. Source-контрпример проверен положительным RED→GREEN;
+actual cut15 не записал отказавший gate, поэтому его native причина остаётся
+проверяемой гипотезой до следующего прогона с этой диагностикой.
 
 ## Multi-select persistence бокового списка через `data-keep-selection`
 

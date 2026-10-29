@@ -2,9 +2,10 @@
 // browser-safe twin aligned through prompt-origin.test.cjs.
 export function systemPromptSource(value) {
   const source = String(value || '').trim();
-  const supported = ['build-install-return', 'codex-capacity-retry'];
+  const supported = ['build-install-return', 'codex-capacity-retry', 'tab-message-outcome'];
   if (supported.includes(source)) return source;
   const unprefixed = source.replace(/^(?:claude|codex)-/, '');
+  if (/^tab-message-outcome:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}(?::reply)?$/i.test(unprefixed)) return 'tab-message-outcome';
   return supported.includes(unprefixed) ? unprefixed : null;
 }
 

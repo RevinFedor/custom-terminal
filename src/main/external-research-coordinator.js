@@ -28,6 +28,8 @@ function hasLocalFinalization(run) {
   // A legacy local failure need not carry a modern SC terminal snapshot. Its
   // adopted delivery only reads old proof and reports the operational wait.
   return hasAcceptedExternalOutcome(run)
+    || run?.runKind === 'external-research' && run.externalResearchLocalOutcome?.version === 1
+      && run.externalResearchLocalOutcome.state === 'failed' && run.resultComplete === true
     || run?.externalResearchDelivery?.legacy === true && localDelivery.authorized(run);
 }
 
@@ -78,22 +80,39 @@ class ExternalResearchCoordinator {
     this.watchers = new Map();
     this.stopped = false;
     this.deliveryTrailing = new Set();
+    this.monitorRearm = new Map();
+    this.monitorFailures = new Map();
   }
 
   watch(runId, reason = 'watch') {
     if (!runId || this.stopped) return null;
+    if (this.monitorRearm.has(runId)) { this.clearTimer(this.monitorRearm.get(runId)); this.monitorRearm.delete(runId); }
     const existing = this.watchers.get(runId);
     if (existing) return existing.promise;
     const controller = new AbortController();
+    let monitorFailed = false;
     const promise = this._run(runId, reason, controller.signal)
       .catch((error) => {
         if (!controller.signal.aborted) {
+          monitorFailed = true;
           this.logger.warn?.('[ExternalResearch] monitor failed run=' + runId
             + ' error=' + String(error?.message || error));
         }
       })
       .finally(() => {
         if (this.watchers.get(runId)?.controller === controller) this.watchers.delete(runId);
+        if (monitorFailed && !this.stopped) {
+          // Persistence may fail inside the transport-error handler itself.
+          // Supervise the same read-first monitor independently of that store
+          // write; this never creates a new provider intent or Send identity.
+          const failures = (this.monitorFailures.get(runId) || 0) + 1;
+          this.monitorFailures.set(runId, failures);
+          const retryMs = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(8, failures - 1));
+          this.monitorRearm.set(runId, this.setTimer(() => {
+            this.monitorRearm.delete(runId);
+            if (!this.stopped) this.watch(runId, 'monitor-rearmed');
+          }, retryMs));
+        } else this.monitorFailures.delete(runId);
         if (this.deliveryTrailing.delete(runId) && !this.stopped) this.wakeDelivery(runId, 'completion-trailing');
       });
     this.watchers.set(runId, { controller, promise });
@@ -112,6 +131,8 @@ class ExternalResearchCoordinator {
   async stop() {
     this.stopped = true;
     this.deliveryTrailing.clear();
+    for (const timer of this.monitorRearm.values()) this.clearTimer(timer);
+    this.monitorRearm.clear(); this.monitorFailures.clear();
     const pending = [];
     for (const watcher of this.watchers.values()) {
       watcher.controller.abort();
@@ -410,6 +431,14 @@ class ExternalResearchCoordinator {
             await this.finalizeSettled(current, 'external-research-failed');
           }
           pending.shift();
+        }
+        const latest = await this.store.getInternal(runId);
+        if (localDelivery.pending(latest)) {
+          pending = [runId];
+          const retryAt = latest.externalResearchDelivery.retryAt;
+          if (!await delayWithSignal(Math.max(1, Math.min(this.retryMaxMs,
+            retryAt ? retryAt - Date.now() : this.retryBaseMs)), signal, this.setTimer, this.clearTimer)) return;
+          continue;
         }
         return;
       } catch (error) {

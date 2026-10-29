@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { build, transformSync } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import postcss from 'postcss';
 
 // Production components/parser, in-memory bundling and SSR only. No Electron,
 // browser, native input, effects, History RPC, clipboard or geometry assertion.
@@ -139,6 +140,18 @@ test('pending captions, literal tool digests and expanded groups do not become M
   }), /hp-history-caption-text|cb-prose/);
 });
 
+test('rooted complete caption text renders while hidden fields remain a row stub', () => {
+  const entry = { uuid: 'rooted-caption', role: 'assistant', rowStub: true,
+    captionTextComplete: true, content: 'Complete rooted caption **Ω**' };
+  const group = captionGroup('', { captionEntries: [entry], captionEntry: entry });
+  const before = JSON.stringify(group);
+  const html = render(HistoryCollapsedGroupRow, { group, expanded: false, onToggle() {} });
+  assert.match(html, /Complete rooted caption <strong>Ω<\/strong>/);
+  assert.doesNotMatch(html, /Loading text…/);
+  assert.equal(entry.rowStub, true);
+  assert.equal(JSON.stringify(group), before, 'caption readiness cannot mark hidden body fields hydrated');
+});
+
 const timelineProps = (entry, extra = {}) => ({ entry, toolType: 'codex', expanded: false,
   responseLines: 3, fontSize: 13, onExpand() {}, onNavigatePrompt() {}, onNavigateAnswer() {},
   onSourceNavigate() {}, onCopy() { throw Error('SSR must not copy'); },
@@ -230,7 +243,7 @@ test('new caption geometry rejects the old closed-group measurement without chan
     () => true, unit => unit.key,
   );
   const unit = { key: 'same-group', familyKey: 'run', entries: [], expanded: false };
-  assert.match(key(unit), /closed:caption-markdown:v2/);
+  assert.match(key(unit), /closed:caption-markdown:v4:one-comment:90pct/);
   assert.match(key(unit), /same-group/);
   assert.equal(key({ ...unit, expanded: true }), 'group|same-group|open|0||');
   assert.equal(key({ ...unit, familyKey: 'research' }), 'group|same-group|closed|0||');
@@ -249,4 +262,27 @@ test('compact Markdown CSS inherits caption typography, wraps code and preserves
   assert.match(pre, /overflow-wrap: anywhere/);
   assert.doesNotMatch(pre, /max-height:|overflow-[xy]:|overflow: auto/);
   assert.match(timeline, /\.timeline-preview-markdown-line[^}]*white-space: nowrap/s);
+});
+
+test('prose strong uses its own wine token without changing headings, literal code, or status colors', () => {
+  const css = postcss.parse(fs.readFileSync(root + 'packages/claude-blocks/src/blocks.css', 'utf8'));
+  const theme = postcss.parse(fs.readFileSync(root + 'packages/claude-blocks/src/theme.css', 'utf8'));
+  const tokens = new Map(); theme.walkDecls(d => tokens.set(d.prop, d.value));
+  assert.equal(tokens.get('--cb-prose-strong'), '#C77882');
+  assert.equal(tokens.get('--cb-error'), '#ef4444');
+  assert.equal(tokens.get('--cb-error-text'), '#f38ba8');
+  const strong = css.nodes.find(n => n.type === 'rule' && n.selector === '.cb-prose strong');
+  assert.ok(strong);
+  assert.deepEqual(Object.fromEntries(strong.nodes.filter(n => n.type === 'decl').map(d => [d.prop, d.value])),
+    { color: 'var(--cb-prose-strong, inherit)', 'font-weight': '600' });
+  const neutral = css.nodes.find(n => n.type === 'rule' && n.selector === '.cb-prose :is(h1, h2, h3, h4, h5, h6) strong');
+  assert.equal(neutral?.nodes.find(d => d.prop === 'color')?.value, 'inherit');
+  const text = 'Обычно **важно**.\n\n## **Заголовок**\n\n`**literal code**`\n\n```text\n**literal block**\n```';
+  for (const preview of [false, true]) {
+    const html = render(Markdown, { text, preview });
+    assert.match(html, /<strong>важно<\/strong>/);
+    assert.match(html, /<h2><strong>Заголовок<\/strong><\/h2>/);
+    assert.doesNotMatch(html, /<strong>literal/);
+    assert.match(html, /\*\*literal code\*\*/);
+  }
 });

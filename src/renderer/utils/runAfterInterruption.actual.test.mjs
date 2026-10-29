@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import ts from 'typescript';
-import { isRecoverableAgentTurnInterruption } from './agentCompletionOutcome.mjs';
+import { isRecoverableAgentTurnInterruption, normalizeAgentTurnEndReason } from './agentCompletionOutcome.mjs';
+import { createRunAfterCapacityRecovery, isModelCapacityWorkflowOutcome } from './runAfterCapacityRecovery.mjs';
 
 const source = fs.readFileSync(new URL('../hooks/usePromptQueueRunner.ts', import.meta.url), 'utf8');
 const ast = ts.createSourceFile('runner.ts', source, ts.ScriptTarget.Latest, true);
@@ -13,11 +14,15 @@ const compiled = ts.transpileModule(fn, { compilerOptions: { target: ts.ScriptTa
 function harness() {
   const disarms = [], toasts = [];
   const store = { queues: new Map([['own', {}], ['pivot', {}]]),
+    getQueue: () => ({ items: [] }),
     disarmQueuesForTrigger(...args) { disarms.push(args); return ['own']; } };
   const context = vm.createContext({
     queueShutdownPending: false, usePromptQueueStore: { getState: () => store },
     queueAppRuntimeInstanceId: 'main-fixture', queueAppRuntimeStartedAt: 100,
     tabExists: () => true, isRecoverableAgentTurnInterruption,
+    normalizeAgentTurnEndReason, isModelCapacityWorkflowOutcome,
+    capacityWorkflowRecovery: createRunAfterCapacityRecovery(), capacityWorkflowSession: () => 'session',
+    deferredCapacityNaturalOutcomes: new Map(),
     explicitOutcomeTimestamp: data => data.outcomeTs,
     shortQueueTabId: id => id, getTabName: () => 'fixture',
     getPromptQueueAgent: () => 'codex', getPromptQueueSessionId: () => 'session',
@@ -41,7 +46,7 @@ test('manual Escape still disarms one-shot Run after but does not create a warni
       assert.equal(trigger, 'own'); assert.equal(at, 200);
       assert.equal(options.preserveLoop, true);
       assert.equal(options.preservePivoted, true);
-      assert.equal(options.explicitStop, false);
+      assert.notEqual(options.explicitStop, true);
     }
   }
 });

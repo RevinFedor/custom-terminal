@@ -35,6 +35,17 @@ const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
 
 function captureDecision(recent, now, kind = 'unknown', detail = {}) {
+  // An explicit native Help request has one durable 10-second slot per day.
+  // Automatic incidents cannot spend it; it does not refund their four slots.
+  // Both lanes retain the same per-file and total artifact limits.
+  if (kind === 'manual') {
+    // A corrupt/legacy unclassified receipt cannot prove that slot unspent.
+    const manual = recent.filter(e => e.group === 'manual' || !e.group);
+    if (manual.length) return { allowed: false, reason: 'manual-rolling-quota-exhausted',
+      nextEligibleWallMs: Math.min(...manual.map(e => e.at)) + DAY, remaining: 0, group: 'manual' };
+    return { allowed: true, reason: 'reserved', nextEligibleWallMs: now, remaining: 0, group: 'manual' };
+  }
+  recent = recent.filter(e => e.group !== 'manual');
   const background = kind === 'sustained-cpu';
   const group = background ? 'background' : 'responsiveness';
   if (background && Number.isFinite(detail.appCpu) && detail.appCpu < 80
@@ -419,6 +430,8 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
   function beginIncident(kind, detail) {
     const now = monoNow();
     if (active) {
+      // A pre-gesture request must never adopt a prior/other owner's capture.
+      if (kind === 'manual') return { allowed: false, reason: 'merged-into-active-incident', incident: active.id };
       if (active.events.length < 24) active.events.push({ kind, ...detail, observedWallMs: Date.now() });
       else active.omittedEvents = (active.omittedEvents || 0) + 1;
       if (!active.capture?.requested && kind !== 'sustained-cpu') maybeCapture(kind, detail);
@@ -427,9 +440,10 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     }
     const incidentCooldown = kind === 'sustained-cpu' ? 600000 : 30000;
     if (now - lastIncident < incidentCooldown) {
-      logDecision(kind, detail, { allowed: false, reason: 'incident-window-cooldown',
-        nextEligibleWallMs: Date.now() + incidentCooldown - (now - lastIncident) });
-      return null;
+      const decision = { allowed: false, reason: 'incident-window-cooldown',
+        nextEligibleWallMs: Date.now() + incidentCooldown - (now - lastIncident) };
+      logDecision(kind, detail, decision);
+      return kind === 'manual' ? decision : null;
     }
     lastIncident = now;
     const id = 'incident-' + Date.now() + '-' + process.pid;
@@ -440,7 +454,7 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     const heavy = maybeCapture(kind, detail);
     log('[Perf:Incident] id=' + id + ' kind=' + kind + ' capture=' + Number(heavy) +
       ' captureSkip=' + (active.capture.skipReason || 'none') + ' file=' + artifacts.file(id + '.json'));
-    return heavy ? id : null;
+    return kind === 'manual' ? { ...active.capture, id } : heavy ? id : null;
   }
   function tick() {
     if (stopped) return;
@@ -514,7 +528,18 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     timer = setTimeout(tick, delayMs); timer.unref?.();
   }
   timer = setTimeout(tick, 2000); timer.unref?.();
-  return { artifacts, incident, stop() { stopped = true; clearTimeout(timer); persist(); } };
+  return { artifacts, incident,
+    requestManualCapture(request) {
+      if (stopped) return { allowed: false, reason: 'recorder-stopped' };
+      // Fixed typed fields only; never let caller data replace the capture tag,
+      // incident ID, admission kind, or quota policy.
+      const detail = { version: request.version, requestId: request.requestId, mainPid: request.mainPid,
+        owner: request.owner, pid: request.owner.rendererPid, reason: request.reason,
+        durationMs: request.durationMs };
+      try { return beginIncident('manual', detail); }
+      catch (err) { return { allowed: false, reason: 'recorder-admission-error', error: String(err.message).slice(0, 160) }; }
+    },
+    stop() { stopped = true; clearTimeout(timer); persist(); } };
 }
 
 module.exports = { cpuFrame, systemCpu, summarizeFrames, createArtifactStore, createFlightRecorder, captureDecision };

@@ -4,7 +4,7 @@ import { ArrowRight, Pause, Play, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useAgentSettingsActivity } from '../../hooks/useAgentSettingsActivity';
-import { mergeTabProviderSnapshot, projectTabProviderSnapshot, codexSettingsIntentIsWaiting, codexSettingsSelection, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
+import { mergeTabProviderSnapshot, projectTabProviderSnapshot, codexSettingsIntentCancelled, codexSettingsIntentIsWaiting, codexSettingsSelection, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
 import {
@@ -1266,6 +1266,8 @@ function ClaudeControlBar({
     codexSettingsIntentRevision?: number;
     codexSettingsIntentAppliedRevision?: number;
     codexSettingsIntentAppliedOwnerId?: string;
+    codexSettingsIntentActionSequence?: number;
+    codexSettingsIntentCancelled?: { revision: number; actionSequence: number };
     codexSettingsIntentControl?: string;
     codexSettingsIntentError?: string | null;
     codexSettingsIntentStateVersion?: number;
@@ -1372,6 +1374,7 @@ function ClaudeControlBar({
   const [localBusyReason, setLocalBusyReason] = useState<string | null>(null);
   const controlActionInFlightRef = useRef<string | null>(null);
   const claudeSettingActionsRef = useRef({ tabId, seq: 0, pending: 0 });
+  const codexSettingsSaveRef = useRef<{ tabId: string; actionSeq: number; cancelRequested: boolean } | null>(null);
   if (claudeSettingActionsRef.current.tabId !== tabId) {
     claudeSettingActionsRef.current = { tabId, seq: claudeSettingActionsRef.current.seq + 1, pending: 0 };
   }
@@ -2145,7 +2148,7 @@ function ClaudeControlBar({
     return confirmedClaudeEffort;
   })();
 
-  const codexSettingsIntentPending = isCodex
+  const codexSettingsIntentPending = isCodex && !codexSettingsIntentCancelled(providerState)
     && Number(providerState.codexSettingsIntentRevision || 0)
       > Number(providerState.codexSettingsIntentAppliedRevision || 0);
   const claudeModelProofNeedsAttention = (isCodex && (codexSettingsIntentPending || !!providerState.codexSettingsIntentError)) || (isAnthropicPTY && settingProofNeedsAttention({
@@ -2827,6 +2830,8 @@ function ClaudeControlBar({
     source: 'model' | 'effort' | 'pair' | 'quick',
   ) => {
     const actionSeq = claudeSettingActionsRef.current.seq;
+    const save = { tabId, actionSeq, cancelRequested: false };
+    codexSettingsSaveRef.current = save;
     const requestedState = { codexModel: model, codexEffort: effort };
     // Every lifecycle state uses the same durable, revisioned intent. Stopped
     // and starting sessions queue it; a verified launch composer may apply it
@@ -2842,6 +2847,17 @@ function ClaudeControlBar({
         effort,
         control: source === 'effort' ? 'effort' : source === 'quick' ? 'quick' : 'model',
       });
+      if (save.cancelRequested) {
+        const state = result?.providerState;
+        const revision = Number(result?.intentRevision || state?.codexSettingsIntentRevision || 0);
+        const actionSequence = Number(state?.codexSettingsIntentActionSequence || 0);
+        if (!result?.success || revision <= 0 || !Number.isInteger(actionSequence) || !result?.cancelTarget?.scope) {
+          useUIStore.getState().showToast('Не удалось подтвердить отмену выбора модели', 'error', 6000);
+          return { success: false, cancelled: false, model, effort: null };
+        }
+        const cancelled = await requestCodexSettingsCancellation(result.cancelTarget, save.tabId);
+        return { success: false, cancelled: cancelled?.cancelled === true, model, effort: null };
+      }
       await recoverAgentDraftTransferToHistory(result, tabId, useUIStore);
       if (!claudeSettingActionIsCurrent(actionSeq)) return { success: false, model, effort: null };
       console.log('[ControlBarLoader] codex-' + source + '-result tab=' + tabId.slice(-12) + ' model=' + model + ' effort=' + effort + ' result=' + JSON.stringify(result || null));
@@ -2903,6 +2919,7 @@ function ClaudeControlBar({
         `intent-request-failed:${source}:${error?.message || String(error)}`);
       return { success: false, model, effort: null };
     } finally {
+      if (codexSettingsSaveRef.current === save) codexSettingsSaveRef.current = null;
       if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
     }
@@ -3372,6 +3389,15 @@ function ClaudeControlBar({
   });
   const settingsWriteBusy = settingsWritePresentation.busy;
   const busyTarget = settingsWriteBusy ? settingsWritePresentation.target : controlBarBusyTarget(localBusyReason);
+  const canCancelCodexSetting = (control: ControlBarBusyTarget) => {
+    if (!isCodex || !control) return false;
+    const saving = codexSettingsSaveRef.current;
+    if (isLocalBusy && saving?.tabId === tabId && controlBarBusyTarget(localBusyReason) === control) return true;
+    const target = settingsActivity?.cancelTarget;
+    return settingsActivity?.busy === true && settingsActivity.toolType === 'codex'
+      && settingsActivity.target === control && !!target && Number.isInteger(target.revision)
+      && Number.isInteger(target.actionSequence);
+  };
   const isBusySpinnerOn = (control: ControlBarBusyTarget) => isControlBarBusyTarget({
     busy: settingsWriteBusy || isLocalBusy,
     reason: settingsWriteBusy ? String(settingsWritePresentation.target) : localBusyReason,
@@ -3386,14 +3412,41 @@ function ClaudeControlBar({
     if (!isLocalBusy) setBusyCancelHover(false);
   }, [isLocalBusy]);
 
-  // Manual escape hatch for a STUCK local-control indicator. The right cluster's
-  // shimmer is driven only by isLocalBusy; isPasteBusy remains a silent write
-  // lock. If a local command never confirms (for example, /effort was manually
-  // aborted), the cluster would otherwise shimmer forever. Clicking the cluster
-  // clears only the local-control flag; it does not cancel or unlock a genuine
-  // main-side paste. Юзер: «сделать эту область кликабельной, при наведении
-  // красное СТОП на весь loader, переклик сбрасывает состояние».
+  const requestCodexSettingsCancellation = async (
+    target: { revision: number; actionSequence: number; activityId?: number;
+      scope: { terminalInstanceId: string | null; lifecycleGeneration: string | null; terminalRunSeq: number; stopRevision: number } | null }, targetTabId = tabId,
+  ) => {
+    try {
+      const result = await ipcRenderer.invoke('codex:cancel-model-effort-intent', { tabId: targetTabId, ...target });
+      if (targetTabId === tabId && result?.providerState) adoptProviderState(result.providerState);
+      if (!result?.success) {
+        const reason = result?.error === 'codex_settings_already_applied'
+          ? 'Настройка уже применена; отмена не откатывает её'
+          : result?.cancelled === true
+            ? 'Ввод остановлен, но отмену не удалось сохранить для следующего запуска'
+            : 'Не удалось отменить выбор модели: ' + (result?.error || 'состояние изменилось');
+        useUIStore.getState().showToast(reason, 'error', 6000);
+      }
+      return result;
+    } catch (error: any) {
+      useUIStore.getState().showToast('Не удалось отменить выбор модели: ' + (error?.message || String(error)), 'error', 6000);
+      return { success: false };
+    }
+  };
+
+  // For Codex's revisioned intent this is a real Main cancellation, not a
+  // renderer-only reset. Legacy local controls retain their previous escape hatch.
   const forceResetBusy = () => {
+    if (isCodex && ['model', 'effort', 'quick'].includes(String(busyTarget || ''))) {
+      const saving = codexSettingsSaveRef.current;
+      if (isLocalBusy && saving?.tabId === tabId && controlBarBusyTarget(localBusyReason) === busyTarget) {
+        saving.cancelRequested = true;
+      } else if (canCancelCodexSetting(busyTarget)) {
+        void requestCodexSettingsCancellation(settingsActivity.cancelTarget!);
+      }
+      setBusyCancelHover(false);
+      return;
+    }
     console.warn('[ControlBar] manual local-busy reset by user for tab ' + tabId.slice(-12));
     setLocalBusy(false, 'manual-reset');
     // Release the in-flight guard too. Without it the visible wait ends but the
@@ -4708,6 +4761,7 @@ function ClaudeControlBar({
 
           {showQuickPresetControl && (() => {
           const quickSpinning = isBusySpinnerOn('quick');
+          const quickCanCancel = quickSpinning && canCancelCodexSetting('quick');
           const quickBlocked = settingsWriteBusy || (quickPresetIsCodex ? false : isBusyBlocked('quick'));
           return (
             <div style={{ position: 'relative', display: 'inline-flex' }}>
@@ -4715,13 +4769,13 @@ function ClaudeControlBar({
                 ref={quickPresetButtonRef}
                 type="button"
                 data-busy-spinner={quickSpinning ? '1' : undefined}
-                disabled={quickPresetDisabled || !hasQuickPreset || quickBlocked}
+                disabled={quickCanCancel ? false : quickPresetDisabled || !hasQuickPreset || quickBlocked}
                 aria-busy={quickSpinning}
                 onClick={quickSpinning
                   ? forceResetBusy
                   : (quickPresetIsCodex ? toggleQuickCodexPreset : toggleQuickClaudePreset)}
                 onMouseEnter={(event) => {
-                  if (quickSpinning) { if (!settingsWriteBusy) setBusyCancelHover(true); return; }
+                  if (quickSpinning) { if (quickCanCancel || !settingsWriteBusy) setBusyCancelHover(true); return; }
                   setQuickPresetHover(true);
                   const rect = event.currentTarget.getBoundingClientRect();
                   setQuickPresetRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
@@ -4732,7 +4786,7 @@ function ClaudeControlBar({
                   setQuickPresetRect(null);
                 }}
                 aria-label={`Быстро переключить модель ${quickPresetIsCodex ? 'Codex' : 'Claude'}`}
-                title={quickPresetDisabled
+                title={quickCanCancel ? 'Отменить применение быстрого выбора' : quickPresetDisabled
                   ? (quickPresetIsCodex
                     ? (isCommandRunning
                       ? 'Быстрое переключение станет доступно после подтверждения текущих model и effort'
@@ -4773,7 +4827,7 @@ function ClaudeControlBar({
                   <path d="M7 21l-4-4 4-4" />
                   <path d="M21 17H3" />
                 </svg>
-                {quickSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
+                {quickSpinning && <ControlBusySpinner hovered={(quickCanCancel || !settingsWriteBusy) && busyCancelHover} />}
               </button>
               {showQuickPresetTooltip && !quickSpinning && quickPresetButtonRef.current && createPortal(
                 <CenteredUpwardPopover
@@ -4795,6 +4849,7 @@ function ClaudeControlBar({
           {/* Model */}
           {(() => {
           const modelSpinning = isBusySpinnerOn('model');
+          const modelCanCancel = modelSpinning && canCancelCodexSetting('model');
           const modelBlocked = settingsWriteBusy || (isCodex || canQueueClaudeSettings ? false : isBusyBlocked('model'));
           return (
           <div style={{ position: 'relative' }}>
@@ -4805,14 +4860,14 @@ function ClaudeControlBar({
                 // opening the list mid-write would offer a choice that cannot be
                 // taken. Hover swaps the ring for a red ✕, the click aborts.
                 onClick: forceResetBusy,
-                onMouseEnter: () => { if (!settingsWriteBusy) setBusyCancelHover(true); },
+                onMouseEnter: () => { if (modelCanCancel || !settingsWriteBusy) setBusyCancelHover(true); },
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('model'))}
               data-agent-setting-trigger="model"
               data-setting-proof-warning={claudeModelProofNeedsAttention ? 'model' : undefined}
               data-setting-value={modelActiveId}
               data-busy-spinner={modelSpinning ? '1' : undefined}
-              disabled={codexModelMenuDisabled || modelBlocked}
+              disabled={modelCanCancel ? false : codexModelMenuDisabled || modelBlocked}
               aria-busy={modelSpinning}
               style={{
                 ...triggerStyle,
@@ -4838,8 +4893,9 @@ function ClaudeControlBar({
                   cursor: 'not-allowed',
                 } : {}),
               }}
-              title={modelSpinning
-                ? 'Жду подтверждения применения модели'
+              title={modelCanCancel
+                ? 'Отменить применение модели'
+                : modelSpinning ? 'Жду подтверждения применения модели'
                 : isCodex && providerState.codexSettingsIntentError
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : modelBlocked
@@ -4872,7 +4928,7 @@ function ClaudeControlBar({
                     треугольник занимал место в самой узкой строке интерфейса. */}
                 <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : claudeModelProofNeedsAttention ? '#fbbf24' : '#fff' }}>{modelLabel}</span>
               </span>
-              {modelSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
+              {modelSpinning && <ControlBusySpinner hovered={(modelCanCancel || !settingsWriteBusy) && busyCancelHover} />}
             </button>
             {openPopup === 'model' && !modelSpinning && !settingsWriteBusy && renderControlPopup('model', (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 96 }}>
@@ -5087,6 +5143,7 @@ function ClaudeControlBar({
               still applies to the next reasoning turn, so it stays clickable. */}
           {(() => {
           const effortSpinning = isBusySpinnerOn('effort') || isBusySpinnerOn('think') || isBusySpinnerOn('fast');
+          const effortCanCancel = effortSpinning && canCancelCodexSetting('effort');
           const effortBlocked = settingsWriteBusy || (isCodex || canQueueClaudeSettings
             ? false
             : isBusyBlocked('effort') && isBusyBlocked('think') && isBusyBlocked('fast'));
@@ -5102,14 +5159,14 @@ function ClaudeControlBar({
               {...(effortSpinning ? {
                 ref: (el: HTMLButtonElement | null) => { triggerRefs.current.effort = el; },
                 onClick: forceResetBusy,
-                onMouseEnter: () => { if (!settingsWriteBusy) setBusyCancelHover(true); },
+                onMouseEnter: () => { if (effortCanCancel || !settingsWriteBusy) setBusyCancelHover(true); },
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('effort'))}
               data-agent-setting-trigger="effort"
               data-setting-proof-warning={claudeEffortProofNeedsAttention ? 'effort' : undefined}
               data-setting-value={effortActive || ''}
               data-busy-spinner={effortSpinning ? '1' : undefined}
-              disabled={codexEffortDisabled || effortBlocked}
+              disabled={effortCanCancel ? false : codexEffortDisabled || effortBlocked}
               aria-busy={effortSpinning}
               style={{
                 ...triggerStyle,
@@ -5140,8 +5197,9 @@ function ClaudeControlBar({
                   cursor: 'not-allowed',
                 } : {}),
               }}
-              title={effortSpinning
-                ? 'Жду подтверждения применения настройки'
+              title={effortCanCancel
+                ? 'Отменить применение настройки'
+                : effortSpinning ? 'Жду подтверждения применения настройки'
                 : isCodex && providerState.codexSettingsIntentError
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : effortBlocked
@@ -5169,7 +5227,7 @@ function ClaudeControlBar({
                   {effortTriggerLabel}
                 </span>
               </span>
-              {effortSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
+              {effortSpinning && <ControlBusySpinner hovered={(effortCanCancel || !settingsWriteBusy) && busyCancelHover} />}
             </button>
             </ControlHint>
             {openPopup === 'effort' && !effortSpinning && !settingsWriteBusy && renderControlPopup('effort', (

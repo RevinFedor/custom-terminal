@@ -1,0 +1,560 @@
+{
+  "origin": {
+    "kind": "saved actual own native Goal replay",
+    "diagnosticSHA256": "20a8abe1921bbd856c6e2137ac35f67d26f7b79c707bdb7f5ee6004e8bfa535b",
+    "runtimeRun": "history4196-cold-mcp-goal-e2e-20261023-v2",
+    "limits": "Frame33 independently replayed; frame38 must match the saved Main committed snapshot after trailing-space normalization. Input/owner/clock ports in tests are controlled; no new native run."
+  },
+  "baseline": {
+    "generation": "195130b3-0547-49b0-8254-96c378fc397b",
+    "writeSeq": 2,
+    "rows": 24,
+    "cols": 80,
+    "screen": "                                                                                \u001b[80D",
+    "capturedAt": 1792700484542
+  },
+  "events": [
+    {
+      "kind": "output",
+      "seq": 3,
+      "at": 1792700484542,
+      "data": "\r\u001b[0m\u001b[27m\u001b[24m\u001b[Jfedor@MacBook-Pro-User cold-goal-20261023-v2 % \u001b[K\u001b[?2004h"
+    },
+    {
+      "kind": "resize",
+      "cols": 78,
+      "rows": 77,
+      "at": 1792700484923,
+      "pendingWrites": false
+    },
+    {
+      "kind": "output",
+      "seq": 4,
+      "at": 1792700484924,
+      "data": "\r\r\u001b[0m\u001b[27m\u001b[24m\u001b[Jfedor@MacBook-Pro-User cold-goal-20261023-v2 % "
+    },
+    {
+      "kind": "output",
+      "seq": 5,
+      "at": 1792700598226,
+      "data": "\u001b[?2004l\r\r\n"
+    },
+    {
+      "kind": "output",
+      "seq": 6,
+      "at": 1792700598226,
+      "data": "\u001b[1m\u001b[7m%\u001b[27m\u001b[1m\u001b[0m                                                                             \r \r\u001b]133;D;130\u0007\u001b]7;file://MacBook-Pro-User.local/private/tmp/noted-ios35-readiness-gap-20261020.iXCtTj/packaged-prep/profile/data/fixture/cold-goal-20261023-v2\u001b\\\u001b]133;A\u0007"
+    },
+    {
+      "kind": "output",
+      "seq": 7,
+      "at": 1792700598227,
+      "data": "\r\u001b[0m\u001b[27m\u001b[24m\u001b[Jfedor@MacBook-Pro-User cold-goal-20261023-v2 % \u001b[K\u001b[?2004hc\bcommand codex --no-alt-screen - \r\u001b[K-\r-dangerously-bypass-approvals-and-sandbox -c 'tui.whimsy=false' -c 'opena"
+    },
+    {
+      "kind": "output",
+      "seq": 8,
+      "at": 1792700598229,
+      "data": "i_bas \r\u001b[Ke\re_url=\"http://127.0.0.1:4002/codex/t/tab-\u001b[38;2;180;130;255ma6079bb6-a2f2-4c3f-807f-f47513bca70c\u001b[39m\" \r\u001b[K'\r' -c 'service_tier=\"default\"' --model 'gpt-6-luna' -c 'model_reasoning_effort= \r\u001b[K\"\r\"low\"' -C '/privat"
+    },
+    {
+      "kind": "output",
+      "seq": 9,
+      "at": 1792700598229,
+      "data": "e/tmp/noted-ios35-readiness-gap-2"
+    },
+    {
+      "kind": "output",
+      "seq": 10,
+      "at": 1792700598230,
+      "data": "0261020.iXCtTj/packaged-pre \r\u001b[Kp\rp/profile/data/fixture/cold-goal-20261023-v2' re"
+    },
+    {
+      "kind": "output",
+      "seq": 11,
+      "at": 1792700598233,
+      "data": "sume '01a16546-4497-7ab2-883d- \r\u001b[K3\r3ab9b6a4adcc'\u001b[?2004l\r\r\n"
+    },
+    {
+      "kind": "output",
+      "seq": 12,
+      "at": 1792700598238,
+      "data": "\u001b]133;B;tool=codex\u0007\u001b]133;C\u0007"
+    },
+    {
+      "kind": "output",
+      "seq": 13,
+      "at": 1792700598305,
+      "data": "\u001b[?2004h\u001b[>4;0m\u001b[>7u\u001b[?1004h\u001b[6n\u001b]10;?\u001b\\\u001b]11;?\u001b\\\u001b[?u\u001b[c"
+    },
+    {
+      "kind": "output",
+      "seq": 14,
+      "at": 1792700598310,
+      "data": "\u001b[?2026h\u001b[?2026h\u001b[9;1H\u001b[J"
+    },
+    {
+      "kind": "output",
+      "seq": 15,
+      "at": 1792700598311,
+      "data": "\u001b[?25l\u001b[9;2H\u001b[0m\u001b[49m\u001b[K\u001b[10;29H\u001b[0m\u001b[49m\u001b[K\u001b[11;13H\u001b[0m\u001b[49m\u001b[K\u001b[12;20H\u001b[0m\u001b[49m\u001b[K\u001b[13;2H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[14;27H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[15;2H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[16;2H\u001b[0m\u001b[49m\u001b[K\u001b[9;1H \u001b[10;1H  \u001b[38;2;99;168;248;49m>_ \u001b[1m\u001b[39;49mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.163.0)\u001b[11;1H\u001b[22m     \u001b[2mloading\u001b[12;1H  Resuming session…\u001b[13;1H\u001b[22m\u001b[39;48;2;53;53;53m \u001b[14;1H\u001b[1m›\u001b[22m \u001b[2mAsk Codex to do anything\u001b[15;1H\u001b[22m \u001b[16;1H\u001b[39;49m \u001b[39m\u001b[49m\u001b[0m\u001b[9;1H\u001b[0 q\u001b[9;1H \u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 16,
+      "at": 1792700598313,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 17,
+      "at": 1792700598316,
+      "data": "\u001b[?2026h\u001b[?25l\u001b[11;6H\u001b[2m/private/tmp/…/packaged-prep/profile/data/fixture/cold-goal-20261023-v2\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 18,
+      "at": 1792700598320,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 19,
+      "at": 1792700598324,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 20,
+      "at": 1792700598340,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 21,
+      "at": 1792700598715,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 22,
+      "at": 1792700598717,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 23,
+      "at": 1792700598719,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 24,
+      "at": 1792700598729,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 25,
+      "at": 1792700598732,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 26,
+      "at": 1792700598732,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 27,
+      "at": 1792700598736,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 28,
+      "at": 1792700598793,
+      "data": "\u001b]0;cold-goal-20261023-v2\u0007"
+    },
+    {
+      "kind": "output",
+      "seq": 29,
+      "at": 1792700598794,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 30,
+      "at": 1792700598796,
+      "data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[14;3H\u001b[?25h\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 31,
+      "at": 1792700598800,
+      "data": "\u001b]7501;state=idle:app=codex\u001b\\"
+    },
+    {
+      "kind": "output",
+      "seq": 32,
+      "at": 1792700598802,
+      "data": "\u001b[?2026h\u001b[9;1H\u001b[J\u001b[?25l\u001b[9;76H\u001b[0m\u001b[49m\u001b[K\u001b[10;76H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[11;76H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[12;76H\u001b[0m\u001b[48;2;53;53;53m\u001b[K\u001b[14;76H\u001b[0m\u001b[49m\u001b[K\u001b[15;76H\u001b[0m\u001b[49m\u001b[K\u001b[16;76H\u001b[0m\u001b[49m\u001b[K\u001b[17;76H\u001b[0m\u001b[49m\u001b[K\u001b[18;76H\u001b[0m\u001b[49m\u001b[K\u001b[19;76H\u001b[0m\u001b[49m\u001b[K\u001b[20;76H\u001b[0m\u001b[49m\u001b[K\u001b[21;76H\u001b[0m\u001b[49m\u001b[K\u001b[9;1H   \u001b[39;48;2;53;53;53m                                                                        \u001b[10;1H     \u001b[1mResume paused goal?\u001b[22m                                                   \u001b[11;1H\u001b[1m›\u001b[22m \u001b[2mA\u001b[22m  \u001b[2mGoal: Own finite acceptance fixture only. On the first resumed\u001b[22m        \u001b[12;1H     \u001b[2moperational turn, first pause THIS native Goal using\u001b[22m                  \u001b[13;1H\u001b[39;49m  \u001b[38;2;246;226;183;49mG\u001b[39;48;2;53;53;53m  \u001b[2mupdate_goal(status=\"paused\"). Do not create any other Goal. Then\u001b[22m      \u001b[38;2;171;223;167;49mac…\u001b[14;1H\u001b[39;49m   \u001b[39;48;2;53;53;53m  \u001b[2mreply exactly OWN_GOAL_PAUSED and stop. Do not inspect user files,\u001b[22m    \u001b[15;1H\u001b[39;49m   \u001b[39;48;2;53;53;53m  \u001b[2mhistorie"
+    },
+    {
+      "kind": "output",
+      "seq": 33,
+      "at": 1792700598803,
+      "data": "s, other sessions, browser or network.\u001b[22m                        \u001b[16;1H\u001b[39;49m   \u001b[39;48;2;53;53;53m                                                                        \u001b[17;1H\u001b[39;49m   \u001b[39;48;2;53;53;53m                                                                        \u001b[18;1H\u001b[39;49m   \u001b[1m\u001b[38;2;0;0;46;48;2;99;168;248m› 1. Resume goal   \u001b[22mMark it active and continue when idle\u001b[1m                \u001b[19;1H\u001b[22m\u001b[39;49m   \u001b[39;48;2;53;53;53m  2. Leave paused  \u001b[2mKeep it paused; use /goal resume later\u001b[22m               \u001b[20;1H\u001b[39;49m   \u001b[39;48;2;53;53;53m                                                                        \u001b[21;1H\u001b[39;49m     \u001b[1m\u001b[38;2;212;212;212;49menter\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m select · \u001b[22m\u001b[1m\u001b[38;2;212;212;212;49mesc\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m back                                               \u001b[39m\u001b[49m\u001b[0m\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 34,
+      "at": 1792700598916,
+      "data": "\u001b]7501;state=working:app=codex\u001b\\\u001b[?2026h\u001b[9;77r\u001b[9;1H\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001b[r\u001b[1;20r\u001b[8;1H\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  \u001b[38;2;99;168;248;49m>_ \u001b[1m\u001b[39;49mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.163.0)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K     \u001b[2m/private/tmp/…/packaged-prep/profile/data/fixture/cold-goal-20261023-v2\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  permissions: \u001b[22m\u001b[1m\u001b[38;5;5;49mYOLO mode\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  To get started, describe a task or try one of these commands:\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  /init\u001b[2m - create an AGENTS.md file with instructions for Codex\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  /status\u001b[2m - show current session configuration\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  /permissions\u001b[2m - choose what Codex is allowed to do\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  /model\u001b[2m - choose what model and reasoning effort to use\u001b[39m\u001b[49m\u001b[0m\r\n"
+    },
+    {
+      "kind": "output",
+      "seq": 35,
+      "at": 1792700598919,
+      "data": "\u001b[39;49m\u001b[K  /review\u001b[2m - review any changes and find issues\u001b[39m\u001b[49m\u001b[0m\u001b[r\u001b[21;75H\u001b[?25l\u001b[25;78H\u001b[0m\u001b[49m\u001b[K\u001b[21;4H\u001b[39;48;2;53;53;53m                                                                        \u001b[22;4H  \u001b[1mResume paused goal?\u001b[22m                                                   \u001b[23;4H  \u001b[2mGoal: Own finite acceptance fixture only. On the first resumed\u001b[22m        \u001b[24;4H  \u001b[2moperational turn, first pause THIS native Goal using\u001b[22m                  \u001b[25;4H  \u001b[2mupdate_goal(status=\"paused\"). Do not create any other Goal. Then\u001b[22m      \u001b[38;2;137;137;137;49mew\u001b[26;4H\u001b[39;48;2;53;53;53m  \u001b[2mreply exactly OWN_GOAL_PAUSED and stop. Do not inspect user files,\u001b[22m    \u001b[27;4H  \u001b[2mhistories, other sessions, browser or network.\u001b[22m                        \u001b[28;4H                                                                        \u001b[29;4H                                                                        \u001b[30;4H  1. Resume goal   \u001b[2mMark it active and continue when idle\u001b[22m             "
+    },
+    {
+      "kind": "output",
+      "seq": 36,
+      "at": 1792700598920,
+      "data": "   \u001b[31;4H\u001b[1m\u001b[38;2;0;0;46;48;2;99;168;248m› 2. Leave paused  \u001b[22mKeep it paused; use /goal resume later\u001b[1m               \u001b[32;4H\u001b[22m\u001b[39;48;2;53;53;53m                                                                        \u001b[33;4H\u001b[39;49m  \u001b[1m\u001b[38;2;212;212;212;49menter\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m select · \u001b[22m\u001b[1m\u001b[38;2;212;212;212;49mesc\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m back                                               \u001b[39m\u001b[49m\u001b[0m\u001b[?2026l"
+    },
+    {
+      "kind": "output",
+      "seq": 37,
+      "at": 1792700598921,
+      "data": "\u001b[?2026h\u001b[21;4H\u001b[39;48;2;53;53;53m                                                                        \u001b[22;4H  \u001b[1mResume paused goal?\u001b[22m                                                   \u001b[23;4H  \u001b[2mGoal: Own finite acceptance fixture only. On the first resumed\u001b[22m        \u001b[24;4H  \u001b[2moperational turn, first pause THIS native Goal using\u001b[22m                  \u001b[25;4H  \u001b[2mupdate_goal(status=\"paused\"). Do not create any other Goal. Then\u001b[22m      \u001b[26;4H  \u001b[2mreply exactly OWN_GOAL_PAUSED and stop. Do not inspect user files,\u001b[22m    \u001b[27;4H  \u001b[2mhistories, other sessions, browser or network.\u001b[22m                        \u001b[28;4H                                                                        \u001b[29;4H                                                                        \u001b[30;4H  1. Resume goal   \u001b[2mMark it active and continue when idle\u001b[22m                \u001b[31;4H\u001b[1m\u001b[38;2;0;0;46;48;2;99;168;248m› 2. Leave paused  \u001b[22mKeep it paused; use /goal resume later\u001b[1m               \u001b[32;4H\u001b[22m\u001b[39;48;"
+    },
+    {
+      "kind": "output",
+      "seq": 38,
+      "at": 1792700598922,
+      "data": "2;53;53;53m                                                                        \u001b[33;4H\u001b[39;49m  \u001b[1m\u001b[38;2;212;212;212;49menter\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m select · \u001b[22m\u001b[1m\u001b[38;2;212;212;212;49mesc\u001b[22m\u001b[2m\u001b[2m\u001b[39;49m back                                               \u001b[39m\u001b[49m\u001b[0m\u001b[?2026l"
+    }
+  ],
+  "frameSeqs": [
+    33,
+    38
+  ],
+  "savedFrame38": {
+    "cols": 78,
+    "rows": 77,
+    "viewportY": 0,
+    "lines": [
+      {
+        "row": 0,
+        "text": "fedor@MacBook-Pro-User cold-goal-20261023-v2 % "
+      },
+      {
+        "row": 1,
+        "text": "fedor@MacBook-Pro-User cold-goal-20261023-v2 % command codex --no-alt-screen -"
+      },
+      {
+        "row": 2,
+        "text": "-dangerously-bypass-approvals-and-sandbox -c 'tui.whimsy=false' -c 'openai_bas"
+      },
+      {
+        "row": 3,
+        "text": "e_url=\"http://127.0.0.1:4002/codex/t/tab-a6079bb6-a2f2-4c3f-807f-f47513bca70c\""
+      },
+      {
+        "row": 4,
+        "text": "' -c 'service_tier=\"default\"' --model 'gpt-6-luna' -c 'model_reasoning_effort="
+      },
+      {
+        "row": 5,
+        "text": "\"low\"' -C '/private/tmp/noted-ios35-readiness-gap-20261020.iXCtTj/packaged-pre"
+      },
+      {
+        "row": 6,
+        "text": "p/profile/data/fixture/cold-goal-20261023-v2' resume '01a16546-4497-7ab2-883d-"
+      },
+      {
+        "row": 7,
+        "text": "3ab9b6a4adcc'"
+      },
+      {
+        "row": 8,
+        "text": ""
+      },
+      {
+        "row": 9,
+        "text": "  >_ OpenAI Codex (v0.163.0)"
+      },
+      {
+        "row": 10,
+        "text": "     /private/tmp/…/packaged-prep/profile/data/fixture/cold-goal-20261023-v2"
+      },
+      {
+        "row": 11,
+        "text": "  permissions: YOLO mode"
+      },
+      {
+        "row": 12,
+        "text": ""
+      },
+      {
+        "row": 13,
+        "text": "  To get started, describe a task or try one of these commands:"
+      },
+      {
+        "row": 14,
+        "text": ""
+      },
+      {
+        "row": 15,
+        "text": "  /init - create an AGENTS.md file with instructions for Codex"
+      },
+      {
+        "row": 16,
+        "text": "  /status - show current session configuration"
+      },
+      {
+        "row": 17,
+        "text": "  /permissions - choose what Codex is allowed to do"
+      },
+      {
+        "row": 18,
+        "text": "  /model - choose what model and reasoning effort to use"
+      },
+      {
+        "row": 19,
+        "text": "  /review - review any changes and find issues"
+      },
+      {
+        "row": 20,
+        "text": "                                                                           "
+      },
+      {
+        "row": 21,
+        "text": "     Resume paused goal?                                                   "
+      },
+      {
+        "row": 22,
+        "text": "› A  Goal: Own finite acceptance fixture only. On the first resumed        "
+      },
+      {
+        "row": 23,
+        "text": "     operational turn, first pause THIS native Goal using                  "
+      },
+      {
+        "row": 24,
+        "text": "  G  update_goal(status=\"paused\"). Do not create any other Goal. Then      ew"
+      },
+      {
+        "row": 25,
+        "text": "     reply exactly OWN_GOAL_PAUSED and stop. Do not inspect user files,    "
+      },
+      {
+        "row": 26,
+        "text": "     histories, other sessions, browser or network.                        "
+      },
+      {
+        "row": 27,
+        "text": "                                                                           "
+      },
+      {
+        "row": 28,
+        "text": "                                                                           "
+      },
+      {
+        "row": 29,
+        "text": "     1. Resume goal   Mark it active and continue when idle                "
+      },
+      {
+        "row": 30,
+        "text": "   › 2. Leave paused  Keep it paused; use /goal resume later               "
+      },
+      {
+        "row": 31,
+        "text": "                                                                           "
+      },
+      {
+        "row": 32,
+        "text": "     enter select · esc back                                               "
+      },
+      {
+        "row": 33,
+        "text": ""
+      },
+      {
+        "row": 34,
+        "text": ""
+      },
+      {
+        "row": 35,
+        "text": ""
+      },
+      {
+        "row": 36,
+        "text": ""
+      },
+      {
+        "row": 37,
+        "text": ""
+      },
+      {
+        "row": 38,
+        "text": ""
+      },
+      {
+        "row": 39,
+        "text": ""
+      },
+      {
+        "row": 40,
+        "text": ""
+      },
+      {
+        "row": 41,
+        "text": ""
+      },
+      {
+        "row": 42,
+        "text": ""
+      },
+      {
+        "row": 43,
+        "text": ""
+      },
+      {
+        "row": 44,
+        "text": ""
+      },
+      {
+        "row": 45,
+        "text": ""
+      },
+      {
+        "row": 46,
+        "text": ""
+      },
+      {
+        "row": 47,
+        "text": ""
+      },
+      {
+        "row": 48,
+        "text": ""
+      },
+      {
+        "row": 49,
+        "text": ""
+      },
+      {
+        "row": 50,
+        "text": ""
+      },
+      {
+        "row": 51,
+        "text": ""
+      },
+      {
+        "row": 52,
+        "text": ""
+      },
+      {
+        "row": 53,
+        "text": ""
+      },
+      {
+        "row": 54,
+        "text": ""
+      },
+      {
+        "row": 55,
+        "text": ""
+      },
+      {
+        "row": 56,
+        "text": ""
+      },
+      {
+        "row": 57,
+        "text": ""
+      },
+      {
+        "row": 58,
+        "text": ""
+      },
+      {
+        "row": 59,
+        "text": ""
+      },
+      {
+        "row": 60,
+        "text": ""
+      },
+      {
+        "row": 61,
+        "text": ""
+      },
+      {
+        "row": 62,
+        "text": ""
+      },
+      {
+        "row": 63,
+        "text": ""
+      },
+      {
+        "row": 64,
+        "text": ""
+      },
+      {
+        "row": 65,
+        "text": ""
+      },
+      {
+        "row": 66,
+        "text": ""
+      },
+      {
+        "row": 67,
+        "text": ""
+      },
+      {
+        "row": 68,
+        "text": ""
+      },
+      {
+        "row": 69,
+        "text": ""
+      },
+      {
+        "row": 70,
+        "text": ""
+      },
+      {
+        "row": 71,
+        "text": ""
+      },
+      {
+        "row": 72,
+        "text": ""
+      },
+      {
+        "row": 73,
+        "text": ""
+      },
+      {
+        "row": 74,
+        "text": ""
+      },
+      {
+        "row": 75,
+        "text": ""
+      },
+      {
+        "row": 76,
+        "text": ""
+      }
+    ]
+  }
+}

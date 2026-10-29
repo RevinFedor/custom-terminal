@@ -94,4 +94,14 @@ test('stale full tab saves cannot erase or resurrect main-owned startup settings
   restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
   assert.deepEqual(restored.providerState, settingsIntent,
     'revisioned Codex model/effort intent must survive stale full-tab saves');
+
+  const cancelled = { ...settingsIntent, codexSettingsIntentActionSequence: 7,
+    codexSettingsIntentStateVersion: 8, codexSettingsIntentCancelled: { revision: 4, actionSequence: 7 } };
+  manager.updateTabProviderState(tabId, cancelled);
+  manager.saveTabs(project.id, [{ ...staleTab, providerState: settingsIntent }]);
+  restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
+  assert.deepEqual(restored.providerState, cancelled, 'stale renderer saves must not resurrect cancelled settings');
+  manager.close(); manager = new DatabaseManager();
+  restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
+  assert.deepEqual(restored.providerState, cancelled, 'the cancellation must survive an actual private database reopen');
 });

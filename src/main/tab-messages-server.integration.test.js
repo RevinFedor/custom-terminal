@@ -95,14 +95,16 @@ async function acceptanceInChild(root) {
   const updates = [];
   const sends = [];
   const statuses = new Map();
+  let returnProofReads = 0;
   const fatal = deferred();
   let receipts;
   let db;
   let web;
   const webContents = new EventEmitter();
+  webContents.mainFrame = { processId: 101, routingId: 102 };
   webContents.isDestroyed = () => false;
   const window = { isDestroyed: () => false, webContents };
-  const replyBridge = (packet, data) => ipcMain.emit('web:bridge-reply', { sender: webContents }, {
+  const replyBridge = (packet, data) => ipcMain.emit('web:bridge-reply', { sender: webContents, senderFrame: webContents.mainFrame }, {
     requestId: packet.requestId, ok: true, data,
   });
   webContents.send = (channel, packet) => {
@@ -155,6 +157,7 @@ async function acceptanceInChild(root) {
       events.emit('send', packet);
     } catch (error) {
       fatal.reject(error);
+      if (channel === 'web:bridge-request') replyBridge(packet, { success: false, submitted: false, code: 'fixture_port_assertion' });
       throw error;
     }
   };
@@ -184,6 +187,7 @@ async function acceptanceInChild(root) {
   const waitFor = (collection, event, predicate) => {
     const found = collection.find(predicate);
     if (found) return Promise.resolve(found);
+    process.send?.({ phase: 'waiting-' + event, sends: sends.length, updates: updates.length });
     return new Promise((resolve) => {
       const listener = (value) => {
         if (!predicate(value)) return;
@@ -227,6 +231,7 @@ async function acceptanceInChild(root) {
       sdkSessions: new Map(), tabWorkContext: context, agentSendReceiptStore: receipts,
       agentSendReceiptStartupReady: Promise.resolve({ ready: true }),
       readAgentRuntimeSnapshot: async (id) => { runtimeReads += 1; return statuses.get(id); },
+      readMessageReturnProof: async () => { returnProofReads++; throw Error('Addressed Reply must not read a consuming-turn proof'); },
       resolveCodexRuntimeSessionInfo: async (id) => statuses.get(id),
       getAgentExecutionContext: (id) => statuses.get(id),
       agentSendBridgeTimeoutMs: 15_000,
@@ -293,6 +298,9 @@ async function acceptanceInChild(root) {
       const me = await request('/api/me');
       assert.equal(me.status, 200);
       assert.deepEqual(me.body.capabilities.tabMessages, { version: 1, durable: true, replyTo: true, dismiss: true,
+        batchReply: { version: 1, endpoint: '/api/tab-messages/replies', atomic: true },
+        localClose: { version: 1, releasesOwnWait: true, deliveryPreserved: true },
+        loopWait: { version: 1, mode: 'all-work', deadlineMs: 1800000, naturalReturnRequired: false, settlement: 'reply-delivery' },
         sourceNavigation: true, cancellation: { version: 1, durable: true, deliveryEvidencePreserved: true } });
       assert.equal((await request('/api/tab-messages/missing/unsupported')).status, 404);
       const provenSource = statuses.get('A');
@@ -329,6 +337,10 @@ async function acceptanceInChild(root) {
       assert.equal(conflict.body.messageId, a);
       assert.equal(Object.hasOwn(conflict.body, 'text'), false);
       queue(firstSend);
+      const queuedCheck = await request(`/api/tab-messages/${a}`);
+      assert.equal(queuedCheck.body.message.deliveryState, 'queued', JSON.stringify({
+        message: queuedCheck.body.message.deliveryState, native: receipts.get(firstSend.payload.sendOperationKey)?.state,
+        receipt: receipts.get(firstSend.payload.sendOperationKey)?.receipt?.status }));
       await waitState(a, 'queued');
       await audit(firstSend, { sendAttemptId: 'foreign-attempt' });
       assert.equal((await request(`/api/tab-messages/${a}`)).body.message.deliveryState, 'queued');
@@ -374,6 +386,18 @@ async function acceptanceInChild(root) {
       assert.equal(full.body.reply.text, fullAnswer);
       assert.equal(full.body.reply.replyTo, a);
       assert.equal(full.body.reply.deliveryState, 'sent');
+      for (const id of [a, c]) {
+        await waitFor(updates, 'update', packet => packet.message.messageId === id
+          && packet.message.loopWait?.state === 'settled');
+        const saved = await request(`/api/tab-messages/${id}`), wait = saved.body.message.loopWait;
+        assert.equal(wait.state, 'settled'); assert.equal(wait.settlement.kind, 'reply-delivered');
+        assert.equal(wait.settlement.receipt.operationKey, saved.body.reply.operationKey);
+        assert.equal(wait.settlement.receipt.attemptId, receipts.get(saved.body.reply.operationKey).attemptId);
+        assert.ok(wait.settlement.receipt.promptHash); assert.ok(wait.settlement.receipt.requestHash);
+        assert.equal(wait.replyProcessed, undefined); assert.equal(wait.processed, undefined);
+        assert.equal(statuses.get(saved.body.message.sourceTabId).status, 'busy', 'source never finished its own turn');
+      }
+      assert.equal(returnProofReads, 0);
       const list = await request('/api/tab-messages?tabId=B&limit=10');
       assert.equal(list.body.messages.length, 4);
       for (const message of list.body.messages) {
@@ -398,8 +422,34 @@ async function acceptanceInChild(root) {
       auth = web.getInfo().token;
       assert.ok(auth === oldAuth, 'restart preserves only the isolated token');
       assert.equal((await request(`/api/tab-messages/${a}`)).body.reply.text, fullAnswer);
+      assert.equal((await request(`/api/tab-messages/${a}`)).body.message.loopWait.state, 'settled');
       assert.equal((await ask('A', text, 'question-A')).body.deduplicated, true);
       assert.equal(sends.length, 4, 'server restart and exact retries must not submit another provider prompt');
+      const batchQuestions = [];
+      for (const key of ['batch-Q2', 'batch-Q3']) {
+        const accepted = await ask('A', key, key), id = accepted.body.messageId;
+        const packet = await waitSend(id); queue(packet); await audit(packet); await waitState(id, 'sent'); batchQuestions.push(id);
+      }
+      const hidden = await request('/api/tab-messages/' + batchQuestions[1] + '/dismiss', { method: 'POST', body: { tabId: 'A' } });
+      assert.ok(hidden.body.message.sourceDismissedAt); assert.equal(hidden.body.message.cancelledAt, null);
+      const batchRequest = { ...actor('B'), messageIds: [a, ...batchQuestions], text: 'ONE shared return for both waiting questions', requestId: 'BATCH-REPLY' };
+      const batch = await request('/api/tab-messages/replies', { method: 'POST', body: batchRequest });
+      assert.equal(batch.status, 202, JSON.stringify(batch.body));
+      assert.deepEqual(batch.body.results.map(row => row.status), ['already-answered', 'reply-created', 'reply-created']);
+      assert.equal(batch.body.messages.length, 1); const sharedId = batch.body.messages[0].messageId;
+      const sharedPacket = await waitSend(sharedId); queue(sharedPacket);
+      await waitState(sharedId, 'queued'); await audit(sharedPacket); await waitState(sharedId, 'sent');
+      for (const id of batchQuestions) {
+        const result = await request('/api/tab-messages/' + id);
+        assert.equal(result.body.reply.messageId, sharedId); assert.deepEqual(result.body.reply.replyToIds, batchQuestions);
+      }
+      assert.ok((await request('/api/tab-messages/' + batchQuestions[1])).body.message.sourceDismissedAt);
+      const replayBatch = await request('/api/tab-messages/replies', { method: 'POST', body: batchRequest });
+      assert.equal(replayBatch.body.deduplicated, true); assert.equal(replayBatch.body.messages[0].messageId, sharedId);
+      const answeredBatch = await request('/api/tab-messages/replies', { method: 'POST', body: { ...batchRequest, requestId: 'ALL-ANSWERED' } });
+      assert.equal(answeredBatch.body.messages.length, 0); assert.ok(answeredBatch.body.results.every(row => row.status === 'already-answered'));
+      assert.equal(sends.length, 7, 'two new questions and exactly one shared Reply; no implicit re-answer');
+      assert.equal(returnProofReads, 0);
       const originalPrompt = db.prepare('SELECT frozenPrompt FROM tab_messages WHERE messageId = ?').get(a).frozenPrompt;
       const shifted = tabs.map((tab) => ({ ...tab, codexSessionId: randomUUID() }));
       assert.equal(manager.saveProjectTabs(project.id, shifted).success, true);
@@ -431,8 +481,8 @@ async function acceptanceInChild(root) {
       assert.equal(Object.hasOwn(forgedClosed.body, 'messageId'), false);
       assert.equal((await ask('A', text, 'unknown-request')).status, 404);
       assert.equal(db.prepare('SELECT frozenPrompt FROM tab_messages WHERE messageId = ?').get(a).frozenPrompt, originalPrompt);
-      assert.equal(db.prepare('SELECT count(*) n FROM tab_messages').get().n, 4);
-      assert.equal(sends.length, 4);
+      assert.equal(db.prepare('SELECT count(*) n FROM tab_messages').get().n, 7);
+      assert.equal(sends.length, 7);
       return { checks: ['private-root-and-loopback', 'actual-http-authentication', 'durable-before-held-provider-ack',
         'two-callers-serial-delivery', 'out-of-order-addressed-replies', 'compact-list-and-full-get',
         'frozen-context-and-trusted-offsets', 'exact-audit-and-pin-release', 'actual-server-restart',
@@ -470,21 +520,25 @@ if (process.env.TAB_MESSAGES_HTTP_CHILD === '1') {
       });
       let stderr = '';
       child.stderr.on('data', (data) => { stderr += data.toString(); });
-      let result;
-      child.on('message', (message) => { result = message; });
+      let result, progress;
+      child.on('message', (message) => {
+        if (message.phase) progress = message;
+        else result = message;
+      });
       const exited = once(child, 'exit');
       const abort = () => child.kill('SIGKILL');
       t.signal.addEventListener('abort', abort, { once: true });
       t.after(async () => {
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         await exited;
+        if (result?.ok !== true) console.log('[TabMessagesFixture] last boundary=' + JSON.stringify(progress));
         t.signal.removeEventListener('abort', abort);
         fs.rmSync(root, { recursive: true, force: true });
       });
       const [code] = await exited;
       assert.equal(code, 0, result?.error || stderr || 'isolated HTTP child failed');
       assert.equal(result?.ok, true);
-      assert.equal(result.report.sends, 4);
+      assert.equal(result.report.sends, 7);
       assert.equal(result.report.checks.length, 10);
     });
 }

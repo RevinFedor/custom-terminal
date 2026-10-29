@@ -1042,6 +1042,58 @@ export function dropTabFromAllPaneStrips(panes, tabId, options = {}) {
   return changed ? { panes: next } : null;
 }
 
+/** Presentation cleanup for explicitly confirmed closed IDs, never an inventory
+ * filter. Unknown/reserve tabs and window geometry must survive a catalog read.
+ * Also clean dormant snapshots so a later workflow switch cannot revive a chip.
+ */
+export function dropClosedTabPlacements(layout, tabIds) {
+  const closed = new Set(tabIds);
+  if (!layout || !closed.size) return layout;
+  const clean = source => {
+    let panes = source.splitPanes;
+    for (const tabId of closed) {
+      panes = dropTabFromAllPaneStrips(panes, tabId)?.panes || panes;
+      panes = dropTabFromAllPaneHistories(panes, tabId)?.panes || panes;
+      panes = dropTabFromAllPaneDetachedTabs(panes, tabId)?.panes || panes;
+    }
+    let strips = source.centerStrips;
+    for (const [key, strip] of Object.entries(strips || {})) {
+      const kept = strip.filter(entry => !closed.has(entry.tabId));
+      if (kept.length === strip.length) continue;
+      if (strips === source.centerStrips) strips = {...strips};
+      if (kept.length) strips[key] = kept;
+      else delete strips[key];
+    }
+    const shownClosed = closed.has(source.activeSpaceTab?.tabId);
+    // Single-centre selection is also a physical slot. Do not fall through to
+    // an execution namespace's unrelated activeTabId when its content closes.
+    const vacantCenter = shownClosed && !(source.splitPanes || []).length;
+    if (vacantCenter) {
+      const entry = Object.entries(source.centerStrips || {}).find(([, strip]) =>
+        strip.some(tab => tab.tabId === source.activeSpaceTab.tabId));
+      panes = [vacantPaneWithTabs({}, (entry?.[1] || []).filter(tab => !closed.has(tab.tabId)))];
+      if (entry && strips?.[entry[0]]) {
+        if (strips === source.centerStrips) strips = {...strips};
+        delete strips[entry[0]];
+      }
+    }
+    if (panes === source.splitPanes && strips === source.centerStrips && !shownClosed) return source;
+    return {...source, splitPanes: panes, centerStrips: strips,
+      ...(shownClosed ? {activeSpaceTab: null} : {}),
+      ...(vacantCenter ? {splitFocusedIndex: 0, splitSizes: null} : {})};
+  };
+  let next = clean(layout);
+  if (Array.isArray(layout.spaces)) {
+    const spaces = layout.spaces.map(space => {
+      if (!space.layout) return space;
+      const cleaned = clean(space.layout);
+      return cleaned === space.layout ? space : {...space, layout: cleaned};
+    });
+    if (spaces.some((space, index) => space !== layout.spaces[index])) next = {...next, spaces};
+  }
+  return next;
+}
+
 /**
  * Tabs changed OWNER (moved to another project). Rewrite the project on every
  * chip that names one of them, in every strip.

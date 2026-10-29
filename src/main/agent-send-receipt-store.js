@@ -385,6 +385,8 @@ class AgentSendReceiptStore {
         ON ${TABLE_NAME}(state, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_send_receipts_tab_handoff
         ON ${TABLE_NAME}(tab_id, handoff_id);
+      CREATE INDEX IF NOT EXISTS idx_agent_send_receipts_tab_updated
+        ON ${TABLE_NAME}(tab_id, updated_at DESC, operation_key DESC);
       CREATE TABLE IF NOT EXISTS agent_send_receipt_pins (
         operation_key TEXT NOT NULL,
         owner TEXT NOT NULL,
@@ -997,6 +999,29 @@ class AgentSendReceiptStore {
         attemptId,
         record: this._record(identity.operationKey),
       };
+    })());
+  }
+
+  retainActiveHeadPreparation(operationKeyInput, requestFingerprint, proposed) {
+    const operationKey = requiredString(operationKeyInput, 'operationKey');
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || record.requestFingerprint !== requestFingerprint || record.attemptId
+        || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(record.state)
+        || record.deliveryControl?.cancelledAt) return { ok: false, reason: 'preparation-owner-changed', record };
+      const existing = record.receipt?.activeHeadPreparation;
+      if (existing) {
+        const valid = require('./agent-send-preparation').activeHeadPreparation(record);
+        return { ok: !!valid, applied: false, preparation: valid, record,
+          reason: valid ? null : 'preparation-scope-invalid' };
+      }
+      const mode = proposed?.mode === 'cold-codex' && record.provider === 'codex' ? 'cold-codex' : 'warm';
+      if (!Number.isFinite(proposed?.startedAt)) return { ok: false, reason: 'preparation-clock-invalid', record };
+      const preparation = { version: 1, operationKey, requestFingerprint, tabId: record.tabId, handoffId: record.handoffId,
+        mode, startedAt: proposed.startedAt, deadlineAt: proposed.startedAt + (mode === 'cold-codex' ? 120000 : 60000) };
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET receipt_json = ?, updated_at = ? WHERE operation_key = ? AND attempt_id IS NULL`)
+        .run(encodeJson({ ...record.receipt, activeHeadPreparation: preparation }), this.now(), operationKey);
+      return { ok: true, applied: true, preparation, record: this._record(operationKey) };
     })());
   }
 
@@ -1768,6 +1793,18 @@ class AgentSendReceiptStore {
       if (!audit.success) {
         return { ok: true, matched: true, promoted: false, reason: 'audit-not-successful', record };
       }
+      if (record.receipt?.imageRequestProjection?.version === 2
+        || auditInput?.canonicalReason === 'codex_image_request_transform') {
+        const imageProof = require('./codex-image-request-projection');
+        // Public projection events intentionally omit the message body. A
+        // duplicate can only enrich the already-confirmed exact row below;
+        // it cannot acquire first promotion authority from a reason string.
+        const proof = record.state === STORE_STATES.CONFIRMED && !auditInput.imageTransformEvidence
+          ? imageProof.readPersistedCodexImageRequestProjection(record)
+          : imageProof.validateCodexImageTransformPromotion(record, auditInput.imageTransformEvidence, auditInput);
+        if (!proof.valid) return { ok: false, matched: true, promoted: false,
+          reason: proof.reason || 'image-transform-canonical-proof-missing', record };
+      }
       if ((record.receipt?.ownedAttachments || record.receipt?.ownedAttachmentProjection
         || auditInput?.canonicalReason === 'owned_mobile_attachment_paths')
         && !readOwnedAttachmentProjection(record).valid) {
@@ -2192,6 +2229,21 @@ class AgentSendReceiptStore {
       CASE WHEN json_valid(receipt_json) THEN json_extract(receipt_json, '$.sourceIdentityAliases') END AS audit_source_identity_aliases_json
       FROM ${TABLE_NAME} WHERE provider = ?`;
     return this.db.prepare(sql).all(requiredString(provider, 'provider')).map(rowToRecord);
+  }
+
+  findExecutionReceipts({ tabId, provider, sessionId, turnId }) {
+    // Positive lookup only, not a claim that no older input exists. Bound the
+    // inspected metadata and materialize only exact matches; no History/body
+    // preparation and no cold-reader bootstrap on a Loop/recovery wake.
+    const rows = this.db.prepare(`SELECT operation_key FROM (
+      SELECT operation_key, provider, session_id, state,
+        json_extract(CASE WHEN json_valid(receipt_json) THEN receipt_json ELSE '{}' END,
+          '$.auditExecutionContext.turnId') AS turn_id
+      FROM ${TABLE_NAME} WHERE tab_id = ? ORDER BY updated_at DESC, operation_key DESC LIMIT 32
+    ) WHERE provider = ? AND session_id = ? AND state = 'confirmed' AND turn_id = ? LIMIT 2`)
+      .all(requiredString(tabId, 'tabId'), requiredString(provider, 'provider'),
+        requiredString(sessionId, 'sessionId'), requiredString(turnId, 'turnId'));
+    return rows.map(row => this._record(row.operation_key));
   }
 
   reconcileStartup() {

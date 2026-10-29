@@ -92,6 +92,51 @@ test('prepare/sign/integrations and staged validation precede quit; old app is r
   await assert.rejects(fs.stat(path.join(f.applicationsDir, '.noted-terminal-install-lock')), { code: 'ENOENT' });
 });
 
+test('Voice-bound app-owned Quit preserves prepare-first order and waits only the captured PID; rollback carries the same maintenance identity', async t => {
+  for (const fail of [undefined, 'validate-installed']) {
+    const f = await fixture(t, { fail });
+    const operationId = 'install:noted:voice-one';
+    const result = await f.execute({ appOwnedQuitSource: { status: 'found', server: { pid: 42 } },
+      validateContinuationCandidate: async () => f.events.push({ label: 'continuation-cohort' }),
+      maintenance: { operationId, begin: async () => ({ operationId }),
+        complete: async () => ({ operationId, complete: true }),
+        launchArguments: () => ['--args', '--research-maintenance-operation=' + operationId] } });
+    const labels = f.events.map(event => event.label);
+    assert(labels.indexOf('validate-stage') < labels.indexOf('continuation-cohort'));
+    assert(labels.indexOf('continuation-cohort') < labels.indexOf('idle-ack'));
+    assert(labels.indexOf('build') < labels.indexOf('idle-ack'));
+    assert.deepEqual(f.events.find(event => event.label === 'quit').args,
+      ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only', '42']);
+    for (const event of f.events.filter(event => event.label === 'open')) assert(event.args.includes('--research-maintenance-operation=' + operationId));
+    assert.equal(result.ok, !fail);
+    if (fail) assert.equal(result.recovery.status, 'previous-app-reopened');
+  }
+});
+
+test('missing bound candidate capability and a rejected capture cannot Quit or replace the installed app', async t => {
+  for (const failure of ['candidate', 'capture']) {
+    const f = await fixture(t);
+    const result = await f.execute({ appOwnedQuitSource: { status: 'found', server: { pid: 42 } },
+      validateContinuationCandidate: async () => { if (failure === 'candidate') throw Error('unsupported-bound-candidate'); },
+      beforeQuit: async () => { throw Object.assign(Error('capture-refused'), { quitRequested: false }); } });
+    assert.equal(result.ok, false); assert.equal(result.recovery.status, 'installed-app-untouched');
+    assert.equal(f.events.some(event => ['quit', 'replace', 'open'].includes(event.label)), false);
+  }
+});
+
+test('unknown capture ACK never falls through to unscoped quit or installation', async t => {
+  const f = await fixture(t), commands = [];
+  const result = await f.execute({ appOwnedQuitSource: { status: 'found', server: { pid: 42 } },
+    beforeQuit: async () => { throw Error('capture ACK lost'); },
+    run: async (command, args) => {
+      if (command === '/usr/bin/ditto') await fs.cp(args[0], args[1], { recursive: true });
+      if (command === 'bash') { commands.push(args); throw Error('captured Main has not exited'); }
+    } });
+  assert.equal(result.ok, false); assert.equal(result.recovery.status, 'shutdown-unconfirmed');
+  assert.equal(commands.length, 1); assert.deepEqual(commands[0], ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only', '42']);
+  assert.equal(await f.readVersion(f.installedApp), 'old installed bytes');
+});
+
 test('explicit continue mode commits its cut and quits before any compiler, with one quiet operation', async t => {
   const f = await fixture(t), operationId = 'install:continue:one';
   const result = await f.execute({ quitBeforePrepare: true, earlyQuitSource: { status: 'found', server: { pid: 42 } }, maintenance: { operationId,
@@ -181,7 +226,7 @@ test('manual and Voice Record entrypoints rebuild source despite any leftover pr
           if (owner === 'voice-record') process.env.NOTED_INSTALL_IDLE_ACK_ID = 'new-install-job';
           else delete process.env.NOTED_INSTALL_IDLE_ACK_ID;
           let result;
-          await main({ projectDir: f.root, install: async ({ signal, projectDir }) => {
+          await main({ projectDir: f.root, inspect: () => ({ status: 'found', server: { pid: 42, port: 7878 } }), install: async ({ signal, projectDir }) => {
             // Real entrypoint and installer; only OS build/quit/open and the
             // external idle-ACK/API are replaced by the private fixture.
             result = await f.execute({ signal, projectDir });
@@ -210,7 +255,7 @@ test('cancel before quit releases the installer and a new invocation rebuilds fr
   } });
   const invoke = async () => {
     let result;
-    await main({ projectDir: f.root, install: async ({ signal, projectDir }) => {
+    await main({ projectDir: f.root, inspect: () => ({ status: 'found', server: { pid: 42, port: 7878 } }), install: async ({ signal, projectDir }) => {
       result = await f.execute({ signal, projectDir });
       return result;
     } });
@@ -254,6 +299,40 @@ test('failed post-launch quiet readback preserves verified installed app and sam
   assert.equal(result.maintenance.operationId, 'install:pending');
   assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
   assert(!f.events.some(x => x.label === 'restore'));
+});
+
+test('same-operation maintenance lost ACK completes one installer without replaying replacement', async t => {
+  const { default: maintenanceApi } = await import('./research-maintenance.cjs');
+  const { default: policy } = await import('../src/main/external-research-maintenance.js');
+  const f = await fixture(t), calls = [];
+  let value = { version: 1, operations: [] };
+  const operationId = 'install:lost-complete-ack';
+  const scope = maintenanceApi.createClient({
+    inspect: () => ({ status: 'found', server: { port: 7878, pid: 100 } }),
+    token: () => 'owned-test-token', wait: async () => ({ port: 7880, pid: 101 }),
+    request: async request => {
+      calls.push({ method: request.method, action: request.body?.action });
+      let operation;
+      if (request.body) {
+        const changed = policy.transition(value, request.body);
+        value = changed.value; operation = changed.operation;
+        if (request.body.action === 'complete') throw new Error('request timeout');
+      }
+      return { statusCode: 200, body: { ok: true, maintenance: {
+        ...value, operation, activeOperationId: policy.activeId(value),
+      } } };
+    },
+  }).installScope(operationId);
+  const result = await f.execute({ maintenance: scope });
+  assert.equal(result.ok, true);
+  assert.equal(result.maintenance.operationId, operationId);
+  assert.equal(result.maintenance.confirmation, 'recovered-by-exact-readback');
+  assert.equal(calls.filter(call => call.action === 'complete').length, 1);
+  assert.equal(calls.filter(call => call.method === 'GET').length, 1);
+  for (const label of ['quit', 'replace', 'open']) assert.equal(f.events.filter(event => event.label === label).length, 1);
+  assert(!f.events.some(event => event.label === 'restore'));
+  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
+  assert.equal(await f.readVersion(result.previousApp), 'old installed bytes');
 });
 
 for (const failure of [...PREPARE_SCRIPTS, 'validate-release', 'copy', 'validate-stage', 'idle-ack']) {

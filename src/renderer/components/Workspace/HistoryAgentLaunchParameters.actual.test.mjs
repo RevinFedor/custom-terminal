@@ -349,3 +349,40 @@ test('Inspector forwards its selected reader metadata phase to the existing head
   assert.match(source, /launchMetadataPending\s*}\s*=\s*useSubagentSteps\(/);
   assert.match(source, /<HistoryAgentLaunchParameters[^>]+loading=\{launchMetadataPending}/);
 });
+
+test('actual selected hook clears rejected source rows and shows unavailable, not a perpetual running loader', async () => {
+  const h = loadingReader(); h.render();
+  h.requests[0].resolve({success: true, steps: [{id: 'own-A', kind: 'message', text: 'OWN'}], offset: 80, pending: false});
+  await flushRead(); assert.equal(h.render().steps.length, 1);
+  const next = h.tick();
+  h.requests[1].resolve({success: false, reason: 'child-root-identity-mismatch', steps: [], offset: 0, reset: true});
+  await next;
+  const rejected = h.render();
+  assert.equal(rejected.unavailable, true); assert.equal(rejected.pending, false);
+  assert.equal(rejected.steps.length, 0); assert.equal(rejected.launchMetadataPending, false);
+  const repeated = h.tick();
+  h.requests[2].resolve({success: false, reason: 'child-root-identity-mismatch'}); await repeated;
+  assert.equal(h.render().steps, rejected.steps, 'same-valued refusal retains its empty row reference');
+  const corrected = h.tick(); assert.equal(h.requests[3].request.offset, 0);
+  h.requests[3].resolve({success: true, steps: [{id: 'own-A-2', kind: 'message', text: 'OWN_CORRECTED'}], offset: 90, pending: false});
+  await corrected;
+  assert.equal(h.render().unavailable, false); assert.equal(h.render().steps.length, 1);
+  h.dispose();
+});
+
+test('actual selected hook ignores late foreign-root rejection after A→B and resets unavailable on reopen', async () => {
+  const h = loadingReader(); h.render('child-A'); h.render('child-B');
+  h.requests[0].resolve({success: false, reason: 'child-root-identity-mismatch'}); await flushRead();
+  assert.equal(h.render('child-B').unavailable, false);
+  assert.equal(h.render('child-B').launchMetadataPending, true);
+  h.requests[1].resolve({success: false, reason: 'child-root-identity-mismatch'}); await flushRead();
+  assert.equal(h.render('child-B').unavailable, true);
+  h.render('child-A'); assert.equal(h.render('child-A').unavailable, false);
+  h.dispose();
+});
+
+test('Inspector body explicitly presents source mismatch before loading, fallback or stale rows', () => {
+  const source = fs.readFileSync(new URL('./HistoryPanel.tsx', import.meta.url), 'utf8');
+  assert.match(source, /unavailable: stepsUnavailable[\s\S]{0,200}useSubagentSteps\(/);
+  assert.match(source, /chip.kind === 'subagent' && \(stepsUnavailable \? \([\s\S]{0,200}источник не соответствует выбранному агенту/);
+});

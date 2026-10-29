@@ -35,8 +35,9 @@ test('actual settings runtime releases global queue and actual PTY before the SA
 
 test('actual settings + Main writer keep original cold deadline after settings work and lock release', async t => {
   const h = fixture(t, { deadlineOffset: 5000 }), s = settings(h, { readTime: 3000 });
+  const startedAt = h.clock.now();
   const p = s.start(); await tick(160);
-  assert.equal(h.clock.now(), 4000); assert.equal(s.queue.pending, 0); assert.equal(h.ctx.held(), false);
+  assert.equal(h.clock.now(), startedAt + 3000); assert.equal(s.queue.pending, 0); assert.equal(h.ctx.held(), false);
   h.clock.advance(2000); await tick(160); const r = await p;
   assert.equal(r.submitted, false, JSON.stringify(r));
   h.frame(); await tick(80); assert.equal(h.writes.length, 0); assert.equal(h.stages, 1);

@@ -4,6 +4,32 @@ import { createUIActionDiagnostics, createStylesheetDiagnostics, describeDiagnos
   describeDiagnosticTarget, describeDiagnosticClipboard, recordUIClipboardOutcome, createUIClipboardOutcomeQueue,
   summarizeUIAction, formatDiagnosticKey, UI_ACTION_COVERAGE } from './uiPerformanceDiagnostics.mjs';
 
+test('admitted hover reuses the physical Meta action and bounds pointer work without reading message text/layout', async () => {
+  const module = await import('./uiPerformanceDiagnostics.mjs?hover-owner-control-v1');
+  const previousDocument = globalThis.document; globalThis.document = { styleSheets: [] };
+  const logs = []; let wakes = 0, at = performance.timeOrigin + 100;
+  try {
+    const d = module.installUIActionDiagnostics({ now: () => at, emit: raw => logs.push(JSON.parse(raw.slice(raw.indexOf('{')))), onPendingFrame: () => wakes++ });
+    const target = { tagName: 'SPAN', closest: () => null,
+      get textContent() { throw Error('no message body'); }, get value() { throw Error('no composer'); },
+      getBoundingClientRect() { throw Error('no extra layout'); } };
+    const key = { type: 'keydown', key: 'Meta', metaKey: true, timeStamp: 100, target };
+    const captured = module.captureUIAction(key), reused = module.captureUIHoverAction(key);
+    assert.equal(reused.id, captured.id); assert.equal(wakes, 1, 'no duplicate physical-key action');
+    const hover = module.captureUIHoverAction({ type: 'mouseover', timeStamp: 101, target });
+    assert.notEqual(hover.id, captured.id); assert.equal(hover.event, 'hover'); assert.equal(wakes, 2);
+    const leave = module.captureUIHoverAction({ type: 'pointerout', timeStamp: 102, target });
+    assert.notEqual(leave.id, hover.id); assert.equal(leave.event, 'hover');
+    assert.equal(module.captureUIHoverAction({ type: 'keydown', key: 'private-typed-text', timeStamp: 102, target }), null);
+    assert.equal(module.captureUIHoverAction({ type: 'mousemove', timeStamp: NaN, get target() { throw Error('invalid input must not inspect target'); } }), null);
+    d.phaseForAction(hover.id, 'history-record-time:view-request', { tab: 'owned', text: 'SECRET' });
+    at += 16; d.frame(at); at += 16; d.frame(at);
+    const row = logs.find(value => value.id === hover.id);
+    assert.equal(row.coverage, UI_ACTION_COVERAGE); assert.equal(row.phases[0].name, 'history-record-time:view-request');
+    assert.doesNotMatch(JSON.stringify(row), /SECRET|private-typed-text/);
+  } finally { globalThis.document = previousDocument; }
+});
+
 test('a removed click target keeps captured source and correlated frame/native outcome', () => {
   let time = 100; const logs = [], native = [];
   const d = createUIActionDiagnostics({ now: () => time, emit: s => logs.push(JSON.parse(s.slice(s.indexOf('{')))), notify: s => native.push(s) });
@@ -27,8 +53,30 @@ test('rings and phase lists are bounded and late work is not attributed to old i
   const current = d.matching('keydown', time);
   assert.equal(current.phases.length, 32); assert.equal(current.phasesDropped, 68);
   assert.equal(current.phases.at(-1).count, 99, 'the final phase must survive a busy middle');
-  assert.deepEqual(d.health(), { actionRingEvicted: 6, actionPhasesDropped: 68 });
+  assert.deepEqual(d.health(), { actionRingEvicted: 6, actionPhasesDropped: 68, actionCommitReportsDropped: 0, actionCommitsOmitted: 0 });
   time += 2100; d.phase('unrelated'); assert.equal(current.phasesDropped, 68);
+});
+test('an async reveal after both frame callbacks keeps its exact action and final commit without another heavy capture', () => {
+  let at=100;const logs=[],native=[];
+  const d=createUIActionDiagnostics({now:()=>at,emit:raw=>logs.push(JSON.parse(raw.slice(raw.indexOf('{')))),notify:value=>native.push(value)});
+  const action=d.capture('hover',100,{source:'owned-hover'});d.phaseForAction(action.id,'strip-group:commit-start');
+  at=116;d.frame(at);at=132;d.frame(at);assert.equal(logs.length,1);
+  at=250;assert.equal(d.commitForAction(action.id,'strip-group:layout',{memberCount:3}),true);
+  assert.equal(logs.length,2);assert.equal(logs[1].id,action.id);assert.equal(logs[1].kind,'visible-commit');
+  assert.equal(logs[1].commitPhase,'strip-group:layout');assert.equal(logs[1].durationMs,150);
+  assert.equal(logs[1].phases.at(-1).name,'strip-group:layout');assert.equal(logs[1].coverage,UI_ACTION_COVERAGE);
+  assert.equal(d.commitForAction(action.id,'strip-group:layout'),false);assert.equal(logs.length,2);
+  assert.equal(native.length,0,'late IO/commit timing does not request a new native capture');
+});
+test('commit report failure, ring eviction and per-action commit cap are explicit and never retarget another input', () => {
+  let at=100,throwEmit=true;const d=createUIActionDiagnostics({now:()=>at,max:1,emit:()=>{if(throwEmit)throw Error('controlled log failure');}});
+  const old=d.capture('hover',at,{},false);assert.equal(d.commitForAction(old.id,'visible'),false);
+  assert.equal(d.health().actionCommitReportsDropped,1);throwEmit=false;
+  const current=d.capture('hover',++at,{},false);
+  assert.equal(d.commitForAction(old.id,'late-old'),false);assert.equal(current.phases.length,0);
+  for(let i=0;i<32;i++)assert.equal(d.commitForAction(current.id,'phase-'+i),true);
+  assert.equal(d.commitForAction(current.id,'over-cap'),false);
+  assert.equal(current.phases.length,32);assert.equal(d.health().actionCommitsOmitted,2);
 });
 test('stylesheet identities expose nested mount/remove without reading rules or walking descendants', () => {
   const d = createStylesheetDiagnostics();

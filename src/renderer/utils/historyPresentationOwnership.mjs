@@ -1,3 +1,5 @@
+export const HISTORY_SURFACE_PRESENTATION_EVENT = 'history-panel:external-presentation';
+
 /**
  * A mounted History owner can move between presented and dormant without a
  * React unmount. `visit` versions that presentation lifetime so delayed DOM

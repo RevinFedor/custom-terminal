@@ -16,7 +16,7 @@ test('revision reuse preserves the exact provider-wide hash through writes, roll
   let manager = new DatabaseManager();
   t.after(() => { manager.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const oracle = tool => {
-    const rows = manager.db.prepare(`SELECT session_id, audit_timestamp, transport_hash, entry_uuid, schema_version, chips_json
+    const rows = manager.db.prepare(`SELECT session_id, audit_timestamp, transport_hash, entry_uuid, schema_version, chips_json, updated_at
       FROM history_prompt_presentations WHERE tool_type = ? ORDER BY session_id ASC, audit_timestamp ASC, transport_hash ASC`).all(tool);
     return rows.length ? crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex').slice(0, 24) : 'none';
   };
@@ -44,9 +44,10 @@ test('revision reuse preserves the exact provider-wide hash through writes, roll
   assert.equal(payloadReads, 0, 'unrelated state/provider changes must not rehash every prompt body');
   manager.db.prepare = prepare;
 
-  // Updating bookkeeping alone did not change the old hash either.
+  // Session selection is ordered by updated_at; duplicate UUID candidates
+  // make an ordering-only change semantic even when chip bodies are unchanged.
   manager.db.prepare("UPDATE history_prompt_presentations SET updated_at = updated_at + 1 WHERE tool_type = 'codex'").run();
-  assert.equal(read(), token);
+  assert.notEqual(read(), token); assert.equal(read(), oracle('codex'));
 
   save('source', 'two');
   const changed = read(); assert.notEqual(changed, token); assert.equal(changed, oracle('codex'));

@@ -11,15 +11,14 @@ export function BuildInstallTracker({ job, stale, error, history = false, onCanc
   const [open, setOpen] = useState(false);
   const state = buildInstallPresentation(job, stale);
   const pendingContinuation = activity.pending(job.continuation);
-  const continuationOnly = !job.running && pendingContinuation;
   const Icon = state.spinning ? LoaderCircle : !stale && job.ok === true && !job.installOutcomeUnknown ? CircleCheck : CircleAlert;
   return <div data-build-install-job={job.id} data-request-kind="install" style={{ minWidth: 0, borderBottom: '1px solid #303030' }}>
     <RequestTrackerRow actions={(job.running || pendingContinuation) && <button type="button"
-      title={continuationOnly ? 'Закрыть ожидание продолжения; отправленное уведомление не отменяется' : 'Отменить установку'}
-      aria-label={continuationOnly ? 'Закрыть ожидание продолжения' : 'Отменить установку'}
-      disabled={stale || (continuationOnly ? !job.continuation?.canCancelContinuation : job.cancelled)}
+      title="Отменить запрос, его ожидания и будущие продолжения"
+      aria-label="Отменить запрос установки"
+      disabled={stale || job.requestCancelledAt != null}
       onClick={() => onCancel(job)} style={{ ...requestRowActionStyle,
-        opacity: stale || (continuationOnly ? !job.continuation?.canCancelContinuation : job.cancelled) ? 0.5 : 1 }}><X size={13} /></button>}>
+        opacity: stale || job.requestCancelledAt != null ? 0.5 : 1 }}><X size={13} /></button>}>
       <button type="button" aria-expanded={open} onClick={() => setOpen(value => !value)}
         title={(job.force ? 'Force Build Install · ' : 'Build Install · ') + state.label}
         style={{ ...requestRowLinkStyle, color: state.color }}>
@@ -35,8 +34,12 @@ export function BuildInstallTracker({ job, stale, error, history = false, onCanc
       <div>Job: {job.id}</div>
       {job.returnTo?.sessionId && <div>Сессия: {job.returnTo.sessionId}</div>}
       {job.callback && <div>Возврат: {job.callback.status}</div>}
-      {pendingContinuation && <div>Подтверждение продолжения: {job.continuation?.state}.
-        Закрытие снимает только это ожидание, не останавливает текущий ответ.</div>}
+      {pendingContinuation && <div>
+        {job.callback?.status === 'sent' ? 'Уведомление доставлено. Приложение ждёт завершения ответа на него.'
+          : 'Приложение проверяет доставку уведомления и завершение ответа на него.'}
+        {' '}Подтверждать вручную ничего не нужно: плашка закроется после проверки ответа.
+        {' '}Крестик отменяет этот запрос, его ожидания и будущие уведомления/продолжения.
+        {' '}Уже начатый ответ и сохранённые квитанции остаются.</div>}
       {!!job.wait?.blockers?.length && <div>Ожидание: {job.wait.blockers.map(row => row.name || row.tabId).join(', ')}</div>}
       {!!job.wait?.preservedExternalWaits?.length && <div>Сохранено ожиданий Research: {job.wait.preservedExternalWaits.length}</div>}
       {job.interruptionReport && <div>Отчёт: вкладок {job.interruptionReport.tabs.length}, MCP {job.interruptionReport.mcp.length}; unknown {job.interruptionReport.unknown.length}</div>}

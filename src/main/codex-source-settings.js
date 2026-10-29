@@ -182,6 +182,7 @@ function resolveCodexSourceSettingsProof(records, expectedSessionId) {
 }
 
 module.exports = {
+  inspectCodexSessionMetadata: inspectSessionMetadata,
   extractCodexSettingsCandidate: extractSettingsCandidate,
   createCodexSourceSettingsReducer,
   resolveCodexSourceSettingsProof,

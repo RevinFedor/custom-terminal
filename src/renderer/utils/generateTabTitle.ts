@@ -11,7 +11,8 @@ import {
   type AIPrompt,
 } from '../store/usePromptsStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { isServicePromptEntry } from '../../shared/prompt-origin.mjs';
+import {TIMELINE_TITLE_COMMAND_RE as TAB_TITLE_COMMAND_RE,
+  isCodexBootstrapInstructionPrompt,isEligibleTimelineTitleEntry} from '../../shared/timeline-entry-facts.mjs';
 import {
   normalizeForkMarkers,
   resolveForkMarkerBoundary,
@@ -22,14 +23,6 @@ const { ipcRenderer } = window.require('electron');
 
 export const AUTO_TAB_TITLE_MAX_PROMPT_CHARS = 12000;
 export const TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS = 8000; // ≈2000 tokens for mixed RU/EN prompts.
-
-const TAB_TITLE_COMMAND_RE = /^\s*(#(?:pack|effort|usage|help|model|status|clear)\b|\/(?:model|help|status|usage|compact|clear|exit|quit|login|logout|cost|rewind|init)\b)/i;
-const TAB_TITLE_BOOTSTRAP_PROMPT_RE = /^\s*Continue from where you left off\.?\s*$/i;
-const TAB_TITLE_CODEX_BOOTSTRAP_PROMPT_RE = /^\s*(?:#\s*)?(?:AGENTS|GEMINI)\.md instructions for\b/i;
-
-function isCodexBootstrapInstructionPrompt(text: string): boolean {
-  return TAB_TITLE_CODEX_BOOTSTRAP_PROMPT_RE.test(text);
-}
 
 export interface TabTitleSourceEntry {
   type?: string;
@@ -84,17 +77,7 @@ interface PromptUsageMetadata {
 }
 
 export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
-  if (entry.type !== 'user' || entry.isCompactSummary) return false;
-  if (isServicePromptEntry(entry)) return false;
-  const text = String(entry.content || '').trim();
-  if (text.length < 2) return false;
-  if (TAB_TITLE_COMMAND_RE.test(text)) return false;
-  if (TAB_TITLE_BOOTSTRAP_PROMPT_RE.test(text)) return false;
-  // Codex can emit project instructions as a role=user bootstrap block; it is not a user prompt.
-  if (isCodexBootstrapInstructionPrompt(text)) return false;
-  if (text.startsWith('This session is being continued from a previous conversation')) return false;
-  if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return false;
-  return true;
+  return isEligibleTimelineTitleEntry(entry);
 }
 
 interface AutoTabTitleCandidatePending {

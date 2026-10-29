@@ -40,6 +40,16 @@ test('original user choice survives automatic Reserve; explicit Reserve and anot
   assert.equal(sameCodexReserveReturnChoice(chosen, { ...chosen, actionSequence: 5 }), false);
 });
 
+test('cancelled picker choices cannot become a later Reserve return preference', () => {
+  const cancelled = { ...intent, cancelled: true };
+  assert.equal(codexReserveReturnChoice({ sessionId: 'S', intent: cancelled }), null);
+  const observed = { model: 'gpt-6-astra', effort: 'high' };
+  const preference = captureCodexReserveReturnPreference({ sessionId: 'S',
+    intent: { ...cancelled, model: 'gpt-reserve' }, observed });
+  assert.equal(preference.model, 'gpt-6-astra', 'a cancelled Reserve choice cannot erase an observed prior model');
+  assert.equal(codexReserveReturnChoice({ sessionId: 'S', intent: cancelled, preference }).model, 'gpt-6-astra');
+});
+
 test('fallback captures the previous per-session pair even without an explicit picker choice', () => {
   const preference = captureCodexReserveReturnPreference({ sessionId: 'S', observed: { model: 'gpt-6-astra', effort: 'high' } });
   assert.equal(codexReserveReturnChoice({ sessionId: 'S', preference }).model, 'gpt-6-astra');

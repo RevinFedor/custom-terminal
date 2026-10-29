@@ -337,6 +337,11 @@ export type BindHistoryPromptHandoffSendIdentityResult =
  * timestamps are presentation data, never identity fallbacks.
  */
 export interface HistoryPromptHandoffProjectionRow {
+  applicationQueueId?: number | null;
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
+  authoringSnapshot?: { editorText: string; chips: readonly Record<string, any>[];
+    imagePaths: readonly HistoryPromptHandoffImageRef[] };
   historyReturn?: any;
   enterAttemptAt?: number;
   sendInputTiming?: HistoryPromptHandoff['sendInputTiming'];
@@ -401,14 +406,16 @@ export interface RunHistoryPromptHandoffInput
 
 export type HistoryPromptHandoffChange =
   | { type: 'replay' }
+  | { type: 'presentation-control'; handoffId: string }
   | { type: 'begin'; handoffId: string }
   | { type: 'transport-phase'; handoffId: string }
   | { type: 'provider-queue-accepted'; handoffId: string }
   | { type: 'bind-send-identity'; handoffId: string }
   | { type: 'settle'; handoffId: string }
   | { type: 'canonical-adopt'; handoffId: string }
-  | { type: 'retract'; handoffId: string; reason: string }
-  | { type: 'consume'; handoffId: string }
+  | { type: 'retract'; handoffId: string; reason: string; removedOwner?: Readonly<HistoryPromptHandoff> }
+  | { type: 'consume'; handoffId: string; removedOwner?: Readonly<HistoryPromptHandoff> | null;
+      operationKey?: string; attemptId?: string | null }
   | { type: 'evict'; handoffId: string; reason: 'bounds' };
 
 export type HistoryPromptHandoffListener = (
@@ -516,6 +523,24 @@ export const DEFAULT_HISTORY_PROMPT_HANDOFF_RECONCILE_LIMITS:
   });
 
 export const HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS = 15_000;
+
+// Payload caches are bounded; expiry is not consumption of a Main-owned
+// accepted intent. All three local projections use this same retention rule.
+export function historyPromptFailureHasRecoveryOwner(value: {
+  applicationQueueId?: number | null; statusReason?: string;
+}) {
+  return Number.isSafeInteger(value.applicationQueueId) && Number(value.applicationQueueId) > 0
+    || value.statusReason === 'history-preparation-interrupted';
+}
+
+export function historyPromptHandoffRecoveryFields(handoff: Readonly<HistoryPromptHandoff>) {
+  return { applicationQueueId: handoff.applicationQueueId ?? null,
+    sendOperationKey: handoff.sendOperationKey, sendAttemptId: handoff.sendAttemptId,
+    applicationQueuePosition: handoff.applicationQueuePosition,
+    applicationQueueMerge: handoff.applicationQueueMerge,
+    authoringSnapshot: { editorText: handoff.authoringText,
+      chips: handoff.authoringChips, imagePaths: handoff.authoringImagePaths } };
+}
 
 const RECORD_OVERHEAD_BYTES = 256;
 
@@ -762,6 +787,19 @@ function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHando
   });
 }
 
+function sameFrozenAuditProof(
+  left: Readonly<HistoryPromptHandoffAuditProof> | null,
+  right: Readonly<HistoryPromptHandoffAuditProof> | null,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  // Both operands are the normalized fixed-vocabulary records above. They
+  // contain scalar values only; a newly frozen copy is not new evidence.
+  const keys = Object.keys(left) as (keyof HistoryPromptHandoffAuditProof)[];
+  return keys.length === Object.keys(right).length
+    && keys.every(key => Object.is(left[key], right[key]));
+}
+
 const reconcileLimit = (
   value: number | undefined,
   fallback: number,
@@ -801,6 +839,12 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
 
   if (
     row.handoffId === handoff.handoffId
+    && row.applicationQueueId === (handoff.applicationQueueId ?? null)
+    && row.sendOperationKey === handoff.sendOperationKey
+    && row.sendAttemptId === handoff.sendAttemptId
+    && row.authoringSnapshot?.editorText === handoff.authoringText
+    && row.authoringSnapshot?.chips === handoff.authoringChips
+    && row.authoringSnapshot?.imagePaths === handoff.authoringImagePaths
     && JSON.stringify(row.semanticTags || []) === JSON.stringify(semanticTags || [])
     && row.applicationQueuePosition === handoff.applicationQueuePosition
     && JSON.stringify(row.applicationQueueMerge || null) === JSON.stringify(handoff.applicationQueueMerge || null)
@@ -830,6 +874,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     ...row,
     ...(semanticTags ? { semanticTags: semanticTags.map(tag => ({ ...tag })) } : {}),
     handoffId: handoff.handoffId,
+    ...historyPromptHandoffRecoveryFields(handoff),
     applicationQueuePosition: handoff.applicationQueuePosition,
     applicationQueueMerge: handoff.applicationQueueMerge,
     queueStatus: handoff.queueStatus,
@@ -994,8 +1039,42 @@ export class HistoryPromptHandoffStore {
   private readonly tabs = new Map<string, Map<string, StoredHandoff>>();
   private readonly listeners = new Map<string, Set<HistoryPromptHandoffListener>>();
   private readonly deliveryControls = new Map<string, { attemptId: string | null; hidden: boolean; retired: boolean; cancelled: boolean }>();
+  private readonly receiptReads = new Map<string, Set<{
+    valid: boolean; waitingForList: boolean; onInvalidated: () => void;
+  }>>();
   private handoffs = 0;
   private approxBytes = 0;
+
+  // Only active read leases are retained. A successful explicit X invalidates
+  // pre-X lists even if the bounded hidden-control projection is later evicted.
+  beginReceiptRead(tabId: string, {
+    observePendingHandoffChanges = false, onInvalidated = () => {},
+  }: { observePendingHandoffChanges?: boolean; onInvalidated?: () => void } = {}) {
+    const reads = this.receiptReads.get(tabId) || new Set<{
+      valid: boolean; waitingForList: boolean; onInvalidated: () => void;
+    }>();
+    this.receiptReads.set(tabId, reads);
+    const lease = { valid: true, waitingForList: observePendingHandoffChanges, onInvalidated }; reads.add(lease);
+    return { isCurrent: () => lease.valid, adoptList: () => {
+      lease.waitingForList = false;
+      return lease.valid;
+    }, close: () => {
+      lease.valid = false; reads.delete(lease);
+      if (reads.size === 0) this.receiptReads.delete(tabId);
+    } };
+  }
+
+  recordPresentationDismissal(record: DurableHistorySendReceiptRecord) {
+    if (!record.tabId || !record.handoffId || !record.operationKey
+      || record.surface !== 'desktop-history' || !['codex', 'claude'].includes(record.provider || '')
+      || !Object.prototype.hasOwnProperty.call(record, 'attemptId') || !hiddenSendPresentation(record)) return false;
+    const previous = this.deliveryControls.get(JSON.stringify([record.tabId, record.handoffId, record.operationKey]));
+    this.observeDeliveryControl(record);
+    if (previous?.hidden && previous.attemptId === (record.attemptId || null)) return true;
+    for (const read of this.receiptReads.get(record.tabId) || []) read.valid = false;
+    this.notify(record.tabId, { type: 'presentation-control', handoffId: record.handoffId });
+    return true;
+  }
 
   // Thin projection metadata outlives payload eviction. Main remains the
   // durable owner; late receipt/list replies may not undo an observed control.
@@ -1017,6 +1096,24 @@ export class HistoryPromptHandoffStore {
       return next;
     }
     return compatible ? previous : null;
+  }
+
+  // Point read of the existing bounded owners. A captured absence is not a
+  // tombstone; the demand-scoped subscriber below also rejects absent→new→absent.
+  readReceiptRecoveryOwner(record: DurableHistorySendReceiptRecord) {
+    const tabId = typeof record.tabId === 'string' ? record.tabId.trim() : '';
+    const handoffId = typeof record.handoffId === 'string' ? record.handoffId.trim() : '';
+    const previous = this.deliveryControls.get(JSON.stringify([record.tabId, record.handoffId, record.operationKey]));
+    const control = previous && (previous.cancelled || previous.attemptId === (record.attemptId || null))
+      ? previous : null;
+    return {
+      handoff: this.tabs.get(tabId)?.get(handoffId)?.value,
+      hidden: control?.hidden === true,
+      retired: control?.retired === true,
+      cancelled: control?.cancelled === true,
+      returned: this.isReturned(tabId, handoffId),
+      restored: this.isRestored(tabId, handoffId),
+    };
   }
 
   constructor(
@@ -1590,29 +1687,31 @@ export class HistoryPromptHandoffStore {
       finiteTimestamp(input.changedAt, Date.now()),
     );
 
+    const statusReason = String(input.reason || '');
+    const requiresAuditIdentity = current.value.requiresAuditIdentity
+      || input.requiresAuditIdentity === true;
+    // Receipt reads are triggered by row publication. Publishing an identical
+    // frozen proof again feeds that read -> publish -> read loop forever.
+    // Compare normalized proof values BEFORE freezeHandoff clones the proof.
+    if (input.queueStatus === current.value.queueStatus
+      && statusReason === current.value.statusReason
+      && statusChangedAt === current.value.statusChangedAt
+      && requiresAuditIdentity === current.value.requiresAuditIdentity
+      && sameFrozenAuditProof(nextProof, current.value.auditProof)) return current.value;
+
     const next = freezeHandoff({
       ...current.value,
       queueStatus: input.queueStatus,
-      statusReason: String(input.reason || ''),
+      statusReason,
       statusChangedAt,
       // Exact identity is monotonic. Once a sender declares that a local row
       // needs audit proof, a timeout/mismatch cannot downgrade it to text/time
       // similarity and accidentally adopt an older identical prompt.
-      requiresAuditIdentity: current.value.requiresAuditIdentity
-        || input.requiresAuditIdentity === true,
+      requiresAuditIdentity,
       // Proof is monotonic inside an attempt. `null` means this particular
       // observation had no proof; it does not revoke an earlier exact one.
       auditProof: nextProof,
     });
-    if (
-      next.queueStatus === current.value.queueStatus
-      && next.statusReason === current.value.statusReason
-      && next.statusChangedAt === current.value.statusChangedAt
-      && next.requiresAuditIdentity === current.value.requiresAuditIdentity
-      && next.auditProof === current.value.auditProof
-    ) {
-      return current.value;
-    }
     const approxBytes = estimateHandoffBytes(next);
     if (approxBytes > this.limits.maxBytes) return undefined;
     this.approxBytes += approxBytes - current.approxBytes;
@@ -1622,6 +1721,49 @@ export class HistoryPromptHandoffStore {
     if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
     this.notify(tabId, { type: 'settle', handoffId });
     return next;
+  }
+
+  settleConfirmedReceiptIfCurrent(record: DurableHistorySendReceiptRecord, expected: Readonly<HistoryPromptHandoff>) {
+    const tabId = expected.tabId, handoffId = expected.handoffId;
+    const tab = this.tabs.get(tabId), current = tab?.get(handoffId);
+    if (!tab || current?.value !== expected || record.state !== 'confirmed'
+      || record.tabId !== tabId || record.handoffId !== handoffId || record.provider !== expected.toolType
+      || !record.operationKey || !record.attemptId
+      || !historyPromptHandoffAcceptsAuditIdentity(expected,
+        { sendOperationKey: record.operationKey, sendAttemptId: record.attemptId })) return { changed: false };
+    const receipt = record.receipt || {}, audit = record.auditIdentity || {};
+    const proof = historyPromptHandoffAuditProofFromSendResult({ ...receipt,
+      // Durable promotion supersedes older nested transport/timeout audits.
+      codexAudit: undefined, pasteAudit: undefined,
+      success: true, exactAuditConfirmed: true,
+      auditTimestamp: receipt.auditTimestamp || audit.auditTimestamp,
+      entryUuid: receipt.entryUuid || audit.entryUuid,
+      sourceIdentity: receipt.sourceIdentity || audit.sourceIdentity,
+      sessionId: receipt.sessionId || record.sessionId,
+    });
+    if (!proof?.sessionId || !(proof.entryUuid || proof.sourceIdentity)
+      || expected.sessionIdHint && expected.sessionIdHint !== proof.sessionId
+      || /^(?:claude-queue:|codex-tui-queue:)/.test(proof.sourceIdentity || '')) return { changed: false };
+    const nextProof = mergeCompatibleAuditProof(expected.auditProof, proof);
+    if (!nextProof) return { changed: false };
+    const changedAt = Math.max(expected.statusChangedAt, finiteTimestamp(record.updatedAt, Date.now()));
+    if (expected.sendOperationKey === record.operationKey && expected.sendAttemptId === record.attemptId
+      && expected.queueStatus === 'sent' && expected.statusReason === 'durable-audit-confirmed'
+      && expected.statusChangedAt === changedAt && sameFrozenAuditProof(expected.auditProof, nextProof)) {
+      return { changed: false, handoff: expected };
+    }
+    // One immutable successor, one publication. Do not run multi-step hydrate
+    // against whatever a reentrant subscriber happens to create under the ID.
+    const next = freezeHandoff({ ...expected, sendOperationKey: record.operationKey, sendAttemptId: record.attemptId,
+      queueStatus: 'sent', statusReason: 'durable-audit-confirmed', statusChangedAt: changedAt,
+      requiresAuditIdentity: true, auditProof: nextProof });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return { changed: false };
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes }); this.promoteTab(tabId); this.enforceLimits(tabId, handoffId);
+    if (this.tabs.get(tabId)?.get(handoffId)?.value !== next) return { changed: true };
+    this.notify(tabId, { type: 'settle', handoffId });
+    return { changed: true, handoff: this.tabs.get(tabId)?.get(handoffId)?.value === next ? next : undefined };
   }
 
   adoptCanonicalEntry(
@@ -1678,6 +1820,20 @@ export class HistoryPromptHandoffStore {
     return next;
   }
 
+  adoptCanonicalEntryIfCurrent(
+    tabIdValue: string,
+    handoffIdValue: string,
+    expected: Readonly<HistoryPromptHandoff>,
+    input: AdoptHistoryPromptHandoffCanonicalInput,
+  ): Readonly<HistoryPromptHandoff> | undefined {
+    const tabId = requireKey(tabIdValue, 'tabId'), handoffId = requireKey(handoffIdValue, 'handoffId');
+    if (this.tabs.get(tabId)?.get(handoffId)?.value !== expected) return undefined;
+    // The exact result of OUR synchronous enrichment is the only successor
+    // allowed here. Never recapture a listener's replacement after notify.
+    // No enrichment still permits the original already-owned cleanup.
+    return this.adoptCanonicalEntry(tabId, handoffId, input) || expected;
+  }
+
   retract(tabId: string, handoffId: string, reason: string): boolean {
     return this.remove(tabId, handoffId, {
       type: 'retract',
@@ -1693,11 +1849,24 @@ export class HistoryPromptHandoffStore {
     });
   }
 
-  consumeMergedSource(tabId: string, handoffId: string): void {
+  consumeIfCurrent(tabIdValue: string, handoffIdValue: string, expected: Readonly<HistoryPromptHandoff> | null,
+    beforeNotify: () => void): boolean {
+    const tabId = requireKey(tabIdValue, 'tabId'), handoffId = requireKey(handoffIdValue, 'handoffId');
+    const current = this.tabs.get(tabId)?.get(handoffId)?.value || null;
+    if (current !== expected) return false;
+    if (!current) { beforeNotify(); return true; }
+    return this.remove(tabId, handoffId, { type: 'consume', handoffId }, beforeNotify);
+  }
+
+  consumeMergedSource(tabId: string, handoffId: string, expected: Readonly<HistoryPromptHandoff> | null,
+    operationKey: string): void {
+    const current = this.tabs.get(tabId)?.get(handoffId)?.value || null;
+    if (current !== expected) return;
     if (!this.consume(tabId, handoffId)) {
       // A durable merge is an explicit removal proof even if the bounded
       // handoff cache evicted the original while its History row stayed visible.
-      this.notify(requireKey(tabId, 'tabId'), { type: 'consume', handoffId: requireKey(handoffId, 'handoffId') });
+      this.notify(requireKey(tabId, 'tabId'), { type: 'consume', handoffId: requireKey(handoffId, 'handoffId'),
+        removedOwner: null, operationKey, attemptId: null });
     }
   }
 
@@ -1742,6 +1911,7 @@ export class HistoryPromptHandoffStore {
     tabIdValue: string,
     handoffIdValue: string,
     change: HistoryPromptHandoffChange,
+    beforeNotify?: () => void,
   ): boolean {
     const tabId = requireKey(tabIdValue, 'tabId');
     const handoffId = requireKey(handoffIdValue, 'handoffId');
@@ -1752,7 +1922,11 @@ export class HistoryPromptHandoffStore {
     this.handoffs -= 1;
     this.approxBytes -= current.approxBytes;
     if (tab.size === 0) this.tabs.delete(tabId);
-    this.notify(tabId, change);
+    // Snapshot the removed owner before any synchronous listener can begin a
+    // replacement with the same H/O/A. Cleanup may only target this object.
+    const removal = change.type === 'consume' || change.type === 'retract'
+      ? { ...change, removedOwner: current.value } : change;
+    try { beforeNotify?.(); } finally { this.notify(tabId, removal); }
     return true;
   }
 
@@ -1763,8 +1937,7 @@ export class HistoryPromptHandoffStore {
       const status = record.value.queueStatus;
       if (status !== 'failed' && status !== 'cancelled') continue;
       if (now - record.value.statusChangedAt < HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS) continue;
-      if (record.value.applicationQueueId) continue;
-      if (record.value.statusReason === 'history-preparation-interrupted') continue;
+      if (historyPromptFailureHasRecoveryOwner(record.value)) continue;
       tab.delete(handoffId);
       this.handoffs -= 1;
       this.approxBytes -= record.approxBytes;
@@ -1831,6 +2004,16 @@ export class HistoryPromptHandoffStore {
   }
 
   private notify(tabId: string, change: HistoryPromptHandoffChange): void {
+    // A pending list has not captured its per-record owners yet. Observe every
+    // real lifecycle notification, including absence→begin→consume ABA and
+    // enrichment replay, without retaining a permanent handoff revision table.
+    // After synchronous adoption the existing per-record witnesses take over;
+    // hydration of that adopted list must not invalidate its own read.
+    for (const read of Array.from(this.receiptReads.get(tabId) || [])) {
+      if (!read.valid || !read.waitingForList) continue;
+      read.valid = false;
+      read.onInvalidated();
+    }
     const tabListeners = this.listeners.get(tabId);
     if (!tabListeners || tabListeners.size === 0) return;
     const snapshot = this.getSnapshot(tabId);
@@ -2195,6 +2378,17 @@ export const consumeHistoryPromptHandoff = (tabId: string, handoffId: string) =>
   return historyPromptHandoffStore.consume(tabId, handoffId);
 };
 
+export const adoptHistoryPromptHandoffCanonicalEntryIfCurrent = (
+  tabId: string, handoffId: string, expected: Readonly<HistoryPromptHandoff>,
+  input: AdoptHistoryPromptHandoffCanonicalInput,
+) => historyPromptHandoffStore.adoptCanonicalEntryIfCurrent(tabId, handoffId, expected, input);
+
+// Presentation-only compare-and-consume. The recovery removal happens after
+// owner CAS but before notification, so a listener's new recovery survives.
+export const consumeHistoryPromptHandoffIfCurrent = (tabId: string, handoffId: string,
+  expected: Readonly<HistoryPromptHandoff> | null) => historyPromptHandoffStore.consumeIfCurrent(
+  tabId, handoffId, expected, () => removeHistorySendRecovery(tabId, handoffId));
+
 export const dismissReceiptlessHistoryPromptPresentation = (tabId: string, handoffId: string, input: any) => {
   // Called only after Main's successful exact absence read, not an IPC error.
   // Persist before removal; do NOT consume the recovery snapshot/assets.
@@ -2212,6 +2406,90 @@ export const subscribeHistoryPromptHandoffs = (
 
 export const getHistoryPromptHandoffsSnapshot = (tabId: string) =>
   historyPromptHandoffStore.getSnapshot(tabId);
+
+/** One selected receipt's read-only recovery claim; never Send/receipt authority. */
+export function captureHistoryReceiptRecoveryOwner(
+  record: DurableHistorySendReceiptRecord,
+  { onInvalidated = () => {} }: { onInvalidated?: () => void } = {},
+) {
+  const tabId = typeof record.tabId === 'string' ? record.tabId.trim() : '';
+  const handoffId = typeof record.handoffId === 'string' ? record.handoffId.trim() : '';
+  historyPromptHandoffStore.observeDeliveryControl(record);
+  let initial = historyPromptHandoffStore.readReceiptRecoveryOwner(record);
+  const dismissalKey = JSON.stringify([tabId, handoffId]);
+  const dismissal = receiptlessPresentationDismissals.get(dismissalKey);
+  let active = true;
+  let expectedOwnDismissal = false;
+  const presentationDismissed = initial.hidden || hiddenSendPresentation(record)
+    || record.historyReturn?.state === 'restored';
+  const recoveryAllowed = !presentationDismissed && !initial.returned && !initial.restored
+    && !(record.historyReturn?.token && dismissal === record.historyReturn.token);
+  let current = !!tabId && !!handoffId
+    && (!initial.handoff || (historyPromptHandoffAcceptsAuditIdentity(initial.handoff, {
+      sendAttemptId: record.attemptId, sendOperationKey: record.operationKey,
+    }) && initial.handoff.toolType === record.provider
+      && (!initial.handoff.sessionIdHint || !record.sessionId || initial.handoff.sessionIdHint === record.sessionId)));
+  const invalidate = () => {
+    if (!current) return;
+    current = false;
+    onInvalidated();
+  };
+  const samePresentationOwner = (latest: ReturnType<HistoryPromptHandoffStore['readReceiptRecoveryOwner']>) =>
+    latest.handoff === initial.handoff && latest.returned === initial.returned
+      && latest.restored === initial.restored
+      && receiptlessPresentationDismissals.get(dismissalKey) === dismissal;
+  const unchanged = () => {
+    const latest = historyPromptHandoffStore.readReceiptRecoveryOwner(record);
+    return samePresentationOwner(latest)
+      && latest.hidden === initial.hidden && latest.retired === initial.retired
+      && latest.cancelled === initial.cancelled;
+  };
+  const unsubscribe = tabId ? subscribeHistoryPromptHandoffs(tabId, (_snapshot, change) => {
+    if (active && current && expectedOwnDismissal && change.type === 'presentation-control'
+      && change.handoffId === handoffId) {
+      expectedOwnDismissal = false;
+      const latest = historyPromptHandoffStore.readReceiptRecoveryOwner(record);
+      if (samePresentationOwner(latest) && latest.hidden
+        && latest.retired === initial.retired && latest.cancelled === initial.cancelled) {
+        initial = latest;
+        return;
+      }
+    }
+    if ((change.type !== 'replay' && change.handoffId === handoffId) || !unchanged()) invalidate();
+  }) : () => {};
+  return {
+    recoveryAllowed,
+    presentationDismissed,
+    isCurrent: () => active && current && unchanged(),
+    acceptPresentationDismissal(control: DurableHistorySendReceiptRecord) {
+      if (!active || !current || !unchanged() || control.tabId !== record.tabId
+        || control.handoffId !== record.handoffId || control.operationKey !== record.operationKey
+        || (control.attemptId ?? null) !== (record.attemptId ?? null) || control.provider !== record.provider) return false;
+      // Only our own exact hidden-control event may advance this witness.
+      // A reentrant begin/consume, even for the same attempt, invalidates the
+      // original handoff object/absence; a fresh capture must never adopt it.
+      expectedOwnDismissal = true;
+      try {
+        if (!historyPromptHandoffStore.recordPresentationDismissal(control)) return false;
+      } finally { expectedOwnDismissal = false; }
+      return active && current && unchanged();
+    },
+    dispose: () => { if (active) { active = false; unsubscribe(); } },
+  };
+}
+
+export const beginHistorySendReceiptRead = (
+  tabId: string,
+  options?: Parameters<HistoryPromptHandoffStore['beginReceiptRead']>[1],
+) => historyPromptHandoffStore.beginReceiptRead(tabId, options);
+export const recordHistorySendPresentationDismissal = (record: DurableHistorySendReceiptRecord) =>
+  historyPromptHandoffStore.recordPresentationDismissal(record);
+
+export function historyReceiptNeedsCanonicalProjection(record: DurableHistorySendReceiptRecord) {
+  return (record.state === 'confirmed' || record.state === 'not-submitted'
+    && !(record.surface === 'desktop-history' && record.applicationQueue?.version === 1
+      && Number(record.applicationQueue.id) > 0)) && !record.presentation;
+}
 
 export function waitForHistoryPromptHandoffSendIdentity(
   tabId: string,
@@ -2360,9 +2638,50 @@ export function applyHistoryQueuedMessageMerge(result: any): boolean {
     if (current && (current.sendAttemptId || current.auditProof || current.providerQueueProof
       || current.sendOperationKey !== operationKey)) return false;
   }
-  for (const handoffId of result.sourceHandoffIds) historyPromptHandoffStore.consumeMergedSource(result.tabId, handoffId);
+  for (let index = 0; index < result.sourceHandoffIds.length; index++) {
+    const handoffId = result.sourceHandoffIds[index];
+    historyPromptHandoffStore.consumeMergedSource(result.tabId, handoffId,
+      originals.find(value => value.handoffId === handoffId) || null, result.sourceOperationKeys[index]);
+  }
   if (!retired) hydrateHistoryPromptHandoffFromDurableReceipt(result.record);
   return true;
+}
+
+// Delivery is independent of canonical History availability. Update only an
+// already-present exact card; this path cannot create a second optimistic row
+// or acknowledge/consume its canonical presentation.
+export function settleExistingHistoryPromptHandoffFromDurableReceipt(
+  record: DurableHistorySendReceiptRecord,
+) {
+  if (record?.state !== 'confirmed') return { changed: false };
+  const original = getHistoryPromptHandoffsSnapshot(record.tabId).find(value => value.handoffId === record.handoffId);
+  if (!original) return { changed: false };
+  const receipt = record.receipt || {};
+  const authoring = receipt.authoringSnapshot;
+  const imageProof = record.imagePresentation;
+  const legacyImages = receipt.presentationSnapshot?.imagePaths
+    || (imageProof?.version === 1 && imageProof.operationKey === record.operationKey
+      && imageProof.attemptId === record.attemptId && imageProof.requestHash === record.promptHash
+      ? imageProof.imagePaths : []) || [];
+  // The original editor snapshot is immutable; materialized presentation
+  // paths/labels are deliberately not compared to this authoring identity.
+  const sameAuthoring = typeof authoring?.editorText === 'string' ? original.authoringText === authoring.editorText
+    && JSON.stringify(original.authoringChips) === JSON.stringify(authoring.chips || [])
+    && JSON.stringify(original.authoringImagePaths) === JSON.stringify(authoring.imagePaths || [])
+    : (original.text === receipt.promptText || original.text === receipt.presentationSnapshot?.text)
+      && original.authoringText === original.text && original.authoringChips.length === 0
+      && JSON.stringify(original.promptChips) === JSON.stringify(receipt.presentationSnapshot?.promptChips || [])
+      && JSON.stringify(original.authoringImagePaths.length ? original.authoringImagePaths : original.imagePaths)
+        === JSON.stringify(legacyImages);
+  if (!sameAuthoring) return { changed: false, ownerChanged: true };
+  const owner = captureHistoryReceiptRecoveryOwner(record);
+  try {
+    if (!owner.recoveryAllowed || !owner.isCurrent()) return { changed: false };
+    if (getHistoryPromptHandoffsSnapshot(record.tabId).find(value => value.handoffId === record.handoffId) !== original) {
+      return { changed: true };
+    }
+    return historyPromptHandoffStore.settleConfirmedReceiptIfCurrent(record, original);
+  } finally { owner.dispose(); }
 }
 
 export function hydrateHistoryPromptHandoffFromDurableReceipt(
@@ -2425,6 +2744,9 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       const handoff = beginHistoryPromptHandoff({ tabId, handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
         historyReturn: record.historyReturn,
         applicationQueueId: record.applicationQueue?.id,
+        applicationQueuePosition: record.applicationQueue?.position || record.applicationQueue?.id,
+        sessionIdHint: receipt.presentationSnapshot?.historySessionId || record.sessionId || null,
+        source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
         toolType, text: promptText, imagePaths: presentation.imagePaths || [],
         semanticTags: presentation.semanticTags,
         promptChips: presentation.promptChips || [], authoringText: receipt.authoringSnapshot?.editorText,
@@ -2432,7 +2754,8 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         submittedAt: Number(presentation.historySendStartedAt) || Number(record.createdAt),
         enterAttemptAt: receipt.enterAttemptAt, sendInputTiming: receipt.sendInputTiming, requiresAuditIdentity: true,
         initialReceipt: { queueStatus: receipt.cancelled || record.applicationQueue?.state === 'cancelled' ? 'cancelled' : 'failed',
-          reason: receipt.code || 'application-queue-not-submitted' } });
+          reason: receipt.code || 'application-queue-not-submitted',
+          changedAt: Number(record.updatedAt) || Number(record.createdAt) } });
       historyPromptHandoffStore.hydrateSemanticPresentation(record);
       if (handoff) removeHistorySendRecovery(tabId, handoffId);
       return { hydrated: !!handoff, reason: 'application-queue-not-submitted',

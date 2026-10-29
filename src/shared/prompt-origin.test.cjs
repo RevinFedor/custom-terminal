@@ -101,3 +101,13 @@ test('plain MCP sends and legacy addressed sends share an owned origin without a
     assert.equal(api.getTerminalMcpTag({ content: '[Tab message: reply] terminal-mcp' }), null);
   }
 });
+test('application-owned question outcomes are system context, not a forged target Reply, run or Loop command', async () => {
+  for (const api of [cjs, await import('./prompt-origin.mjs')]) {
+    const tag = api.promptOriginTagForSource('tab-message-outcome:fd4156d7-3441-410a-bad3-534c2c8f005f:reply');
+    assert.equal(tag.source, 'system'); assert.equal(tag.systemSource, 'tab-message-outcome');
+    assert.equal(api.getTerminalMcpTag({ semanticTags: [tag] }), null);
+    assert.equal(api.isServicePromptEntry({ semanticTags: [tag] }), true);
+    assert.equal(api.getAutomaticContinuationKind({ semanticTags: [tag] }), null);
+    assert.equal(api.getTerminalMcpTag({ content: '[Tab message: waiting outcome] Question ID: copied' }), null);
+  }
+});

@@ -318,3 +318,43 @@ test('Codex raw tickets come from complete actual FD bytes, including short read
   assert.equal(observed[0].sourceTicket.isCurrent(), false);
   assert.equal(state.offset, bytes.length);
 });
+
+test('Codex raw append preserves physical positions through empty, malformed and CRLF lines', async t => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-raw-lines-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'own.jsonl');
+  const prefix = Buffer.from('{"type":"session_meta"}\n');
+  const timestamp = '2026-10-26T00:00:00.000Z';
+  const raw = '\n \r\n{invalid}\n';
+  const content = 'exact 😀\r\n\u0000\ud800 body';
+  const record = { type: 'response_item', timestamp, payload: {
+    type: 'message', role: 'assistant', id: 'physical',
+    content: [{ type: 'output_text', text: content }],
+  } };
+  const line = Buffer.from(JSON.stringify(record) + '\r\n');
+  const partial = Buffer.from('{"unfinished":');
+  const bytes = Buffer.concat([prefix, Buffer.from(raw), line, partial]);
+  await fs.promises.writeFile(filePath, bytes);
+  const stat = await fs.promises.stat(filePath);
+  const state = { key: 'own', filePath, size: bytes.length, offset: prefix.length,
+    leftover: '', sessionId: 'physical', sourceRewriteVersion: 0,
+    fileIdentity: `${stat.dev}:${stat.ino}`,
+    consumers: new Map([['history', { tabId: 'own' }], ['timeline', { tabId: 'own' }]]) };
+  const observed = [];
+  const service = new SessionTranscriptService({ onRawRecord: d => observed.push(d), claudeData: null, codexData: null });
+  service.sessions.set(state.key, state);
+  await service._broadcastCodexDelta(state, prefix.length);
+  assert.equal(observed.length, 1, 'empty and malformed lines never publish, duplicate tab is one consumer');
+  const actual = observed[0], start = prefix.length + Buffer.byteLength(raw);
+  assert.equal(actual.message.__line, prefix.length + 3, 'preserve the existing physical line counter');
+  assert.equal(actual.message.__byteOffset, start);
+  assert.equal(actual.recordByteOffset, start);
+  assert.equal(actual.recordEndByteOffset, start + line.length);
+  assert.equal(actual.message.payload.content[0].text, content);
+  assert.equal(actual.sourceTicket.digest, require('node:crypto').createHash('sha256').update(line).digest('hex'));
+  assert.equal(actual.sourceTicket.isCurrent(), true);
+  state.sourceRewriteVersion++;
+  assert.equal(actual.sourceTicket.isCurrent(), false);
+  assert.deepEqual(state.codexLeftoverBytes, partial);
+  assert.equal(state.offset, bytes.length);
+});

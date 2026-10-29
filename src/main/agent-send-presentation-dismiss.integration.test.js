@@ -10,14 +10,15 @@ const Database = require('better-sqlite3');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { AgentSendQueue } = require('./agent-send-queue');
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
-const main = fs.readFileSync(path.join(__dirname,'main.js'),'utf8');
+const main = fs.readFileSync(process.env.DISMISS_MAIN_SOURCE || path.join(__dirname,'main.js'),'utf8');
 const panel = fs.readFileSync(path.join(__dirname,'../renderer/components/Workspace/HistoryPanel.tsx'),'utf8');
 const handoffSource = fs.readFileSync(path.join(__dirname,'../renderer/utils/historyPromptHandoffs.ts'),'utf8');
-let presentation, localCommand, recovery, planHistoryPromptPresentationDismissal;
+let presentation, localCommand, recovery, timing, planHistoryPromptPresentationDismissal;
 test.before(async()=>{
   presentation=await import('../renderer/utils/historyPromptPresentation.mjs');
   localCommand=await import('../renderer/utils/agentLocalCommand.mjs');
   recovery=await import('../renderer/utils/historySendRecovery.mjs');
+  timing=await import('../renderer/utils/historySendTiming.mjs');
   ({planHistoryPromptPresentationDismissal}=await import('../renderer/utils/historyPromptPresentationDismissal.mjs'));
 });
 const part=(source,first,next)=>{
@@ -36,6 +37,7 @@ function handoffs() {
     if(id==='./historyPromptPresentation.mjs')return presentation;
     if(id==='./agentLocalCommand.mjs')return localCommand;
     if(id==='./historySendRecovery.mjs')return recovery;
+    if(id==='./historySendTiming.mjs')return timing;
     if(id.startsWith('.'))return require(path.resolve(__dirname,'../renderer/utils',id));
     return require(id);
   }});
@@ -49,6 +51,7 @@ async function harness(t,{provider='codex',surface='desktop-history',hydrated=fa
   let db=new Database(filename),store=createAgentSendReceiptStore(db);
   const sends=[],calls=[],notices=[],persisted=[];
   const queue=new AgentSendQueue({store,ready:()=>false,execute:async request=>{sends.push(request);throw Error('physical send forbidden')}});
+  t.after(async()=>{queue.dispose();await tick();db.close();fs.rmSync(root,{recursive:true,force:true})});
   const handoffId='orchestration-complete:study-queue-algorithm-astra6-20261004-v1';
   const request={tabId:'T',provider,handoffId,sendOperationKey:'history:T:'+handoffId,
     prompt:'private synthetic completion',source:'history-panel',
@@ -97,12 +100,68 @@ async function harness(t,{provider='codex',surface='desktop-history',hydrated=fa
     if (!result.success) { notices.push(result.reason); return; }
     rows = rows.filter(row => row.handoffId !== handoffId); persisted.push(rows);
   };
-  t.after(async()=>{queue.dispose();await tick();db.close();fs.rmSync(root,{recursive:true,force:true})});
   return {context,module,queue,store,identity,before,sends,calls,notices,persisted,rows:()=>rows,
     dismiss,
     reopen:async()=>{queue.dispose();await tick();db.close();db=new Database(filename);store=createAgentSendReceiptStore(db);return store.get(identity.operationKey)},
   };
 }
+
+function actualUiDismiss(h) {
+  const context = h.context;
+  context.returnPromptInflight = { current: new Set() };
+  context.sessionId = 'private-SID';
+  context.removeLocalPromptEntry = id => {
+    context.setEntries(rows => rows.filter(row => row.handoffId !== id));
+  };
+  context.planHistoryPromptPresentationDismissal = planHistoryPromptPresentationDismissal;
+  context.historySendPresentationAction = () => ({ kind: 'dismiss', enabled: true });
+  context.isLocalPromptEntry = row => row.role === 'queued';
+  vm.runInContext(compile(part(panel, '  const dismissPromptPresentation = useCallback(',
+    '\n\n  const acknowledgeMaterializedHistoryReceipt') + '\nglobalThis.uiDismiss = dismissPromptPresentation;'), context);
+  return row => context.uiDismiss(row);
+}
+
+test('actual failed-card X → Main SQLite post-control → stale list lease; no delivery mutation or resurrection', async t => {
+  const h = await harness(t, { hydrated: true });
+  const row = { ...h.rows()[0], sendOperationKey: h.identity.operationKey, sendAttemptId: null };
+  const lease = h.module.beginHistorySendReceiptRead?.('T');
+  assert.ok(lease, 'existing read needs the explicit control boundary');
+  await actualUiDismiss(h)(row);
+  assert.deepEqual(h.notices, []); assert.equal(h.rows().some(value => value.handoffId === row.handoffId), false);
+  assert.equal(lease.isCurrent(), false); lease.close();
+  const after = h.store.get(h.identity.operationKey);
+  assert.equal(after.state, h.before.state); assert.equal(after.attemptId, h.before.attemptId);
+  assert.equal(after.receipt.submitted, false); assert.equal(h.sends.length, 0);
+  assert.equal(h.module.hydrateHistoryPromptHandoffFromDurableReceipt(h.queue.projectRecord(h.before)).hydrated, false);
+});
+
+test('actual X lost ACK keeps card; identical explicit retry learns the same persisted post-control', async t => {
+  const h = await harness(t, { hydrated: true });
+  const row = { ...h.rows()[0], sendOperationKey: h.identity.operationKey, sendAttemptId: null };
+  const invoke = h.context.ipcRenderer.invoke;
+  let lose = true;
+  h.context.ipcRenderer.invoke = async (...args) => {
+    const result = await invoke(...args);
+    if (lose) { lose = false; throw Error('controlled lost ACK after durable dismissal'); }
+    return result;
+  };
+  const click = actualUiDismiss(h);
+  await click(row);
+  assert.equal(h.rows().some(value => value.handoffId === row.handoffId), true);
+  assert.equal(h.store.get(h.identity.operationKey).receipt.presentationDismissedSurface, 'desktop-history');
+  await click(row);
+  assert.equal(h.rows().some(value => value.handoffId === row.handoffId), false);
+  assert.equal(h.sends.length, 0);
+});
+
+test('actual stale-attempt X cannot hide the current SQLite intent or invalidate its list', async t => {
+  const h = await harness(t, { hydrated: true });
+  const lease = h.module.beginHistorySendReceiptRead('T');
+  await actualUiDismiss(h)({ ...h.rows()[0], sendOperationKey: h.identity.operationKey, sendAttemptId: 'foreign-attempt' });
+  assert.equal(h.rows().length, 2); assert.equal(lease.isCurrent(), true); lease.close();
+  assert.equal(h.store.get(h.identity.operationKey).receipt.presentationDismissedAt, undefined);
+  assert.equal(h.sends.length, 0);
+});
 
 for(const provider of ['codex','claude'])for(const surface of ['desktop-history','project-api']) {
   test(provider+'/'+surface+': legacy dismissal API → Main → SQLite null attempt; reopen cannot resurrect it',async t=>{

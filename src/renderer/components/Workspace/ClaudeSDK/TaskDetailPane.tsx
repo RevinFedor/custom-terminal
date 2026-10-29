@@ -142,7 +142,7 @@ function AgentDetail({ task, parentSessionId, cwd }: { task: BgTask; parentSessi
         if (res?.success) {
           const raw = res.messages || [];
           const parsed = parseSubagentMessages(raw);
-          console.warn('[BgProbeR:SubAgentLoad] agentId=' + agentId?.slice(0,8) + ' rawCount=' + raw.length + ' parsedCount=' + parsed.length + ' rawTypes=' + raw.map((m: any) => m.type + (m.subagent_type ? '@'+m.subagent_type : '')).slice(0, 10).join(',') + ' firstRaw=' + JSON.stringify(raw[0]).slice(0, 300));
+          console.warn('[BgProbeR:SubAgentLoad] agentId=' + agentId?.slice(0,8) + ' rawCount=' + raw.length + ' parsedCount=' + parsed.length + ' rawTypes=' + raw.slice(0, 10).map((m: any) => (typeof m?.type === 'string' ? m.type.slice(0, 48) : 'unknown') + (typeof m?.subagent_type === 'string' ? '@' + m.subagent_type.slice(0, 48) : '')).join(','));
           setMessages(parsed);
         }
       } catch {}

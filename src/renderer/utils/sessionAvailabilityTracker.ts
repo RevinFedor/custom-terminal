@@ -34,6 +34,10 @@ export interface AgentSessionAvailability {
   deletionOperationId?: string | null;
 }
 
+// Current UI consumers use verdict/identity/deletion metadata, not probe time.
+// Imperative readers retain the full, fresh verdict through the raw getters.
+type SessionAvailabilityView = Omit<AgentSessionAvailability, 'checkedAt'>;
+
 type SessionTabLike = {
   id?: string;
   cwd?: string;
@@ -58,6 +62,7 @@ const NONE: AgentSessionAvailability = Object.freeze({
 
 const registry = new Map<string, Registration>();
 const cache = new Map<string, AgentSessionAvailability>();
+const views = new Map<string, SessionAvailabilityView>();
 const fallback = new Map<string, AgentSessionAvailability>();
 const listeners = new Map<string, Set<() => void>>();
 let flushTimer: number | null = null;
@@ -127,20 +132,31 @@ function snapshot(key: string, descriptor?: AgentSessionDescriptor | null): Agen
   return cache.get(key) || initialVerdict(descriptor);
 }
 
-function sameVerdict(left: AgentSessionAvailability | undefined, right: AgentSessionAvailability): boolean {
-  if (!left) return false;
-  return left.state === right.state
-    && left.historyState === right.historyState
-    && left.reason === right.reason
-    && left.checkedAt === right.checkedAt
-    && left.deletedAt === right.deletedAt
-    && left.deletionSource === right.deletionSource
-    && JSON.stringify(left.missingDependencies || []) === JSON.stringify(right.missingDependencies || []);
+function viewSnapshot(key: string, descriptor?: AgentSessionDescriptor | null): SessionAvailabilityView {
+  if (!key || !descriptor) return NONE;
+  return views.get(key) || initialVerdict(descriptor);
+}
+
+// Compare the small IPC metadata object by value, including field presence and
+// extension fields. A field whitelist would hide new owner/source/count metadata.
+function sameViewValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left) && Array.isArray(right) && left.length !== right.length) return false;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key)
+    && sameViewValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
 }
 
 function publish(key: string, verdict: AgentSessionAvailability) {
-  if (sameVerdict(cache.get(key), verdict)) return;
+  // Refresh raw checkedAt even when the subscribed UI projection is unchanged.
+  // Only this top-level probe clock is excluded; nested metadata remains exact.
   cache.set(key, verdict);
+  const { checkedAt: _checkedAt, ...view } = verdict;
+  if (sameViewValue(views.get(key), view)) return;
+  views.set(key, view);
   for (const listener of listeners.get(key) || []) {
     try { listener(); } catch {}
   }
@@ -172,6 +188,7 @@ function bindGlobals() {
     for (const [key, registration] of registry) {
       if (!ids.has(registration.descriptor.sessionId.toLowerCase())) continue;
       cache.delete(key);
+      views.delete(key);
       for (const listener of listeners.get(key) || []) {
         try { listener(); } catch {}
       }
@@ -317,7 +334,7 @@ async function probeRegistered(force: boolean) {
 
 export function useSessionAvailability(
   descriptor: AgentSessionDescriptor | null | undefined,
-): AgentSessionAvailability {
+): SessionAvailabilityView {
   const key = sessionAvailabilityKey(descriptor);
   useEffect(() => {
     if (!descriptor || !key) return undefined;
@@ -325,8 +342,8 @@ export function useSessionAvailability(
   }, [key, descriptor?.cwd]);
   return useSyncExternalStore(
     (listener) => subscribe(key, listener),
-    () => snapshot(key, descriptor),
-    () => snapshot(key, descriptor),
+    () => viewSnapshot(key, descriptor),
+    () => viewSnapshot(key, descriptor),
   );
 }
 

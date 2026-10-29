@@ -490,6 +490,14 @@ export const terminalRegistry = {
     return terminals.get(tabId);
   },
 
+  // O(1) read identity for an async navigation gesture. This is neither a
+  // rendered-frame/draft proof nor permission to write to the terminal.
+  getPresentationIdentity(tabId: string) {
+    const terminal=terminals.get(tabId),boundary=rendererBoundaryStates.get(tabId);
+    if(!terminal||boundary?.terminal!==terminal)return null;
+    return {instanceId:boundary.instanceId,generation:boundary.generation,generationOrdinal:boundary.generationOrdinal};
+  },
+
   markRendererWriteFlushed(tabId: string, terminal: XTerminal, meta: {
     writeSeq?: number | null;
     generation?: string | null;

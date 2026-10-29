@@ -83,7 +83,9 @@ test('response timing sidecar moves from tab-owned pending state to an exact his
     manager.getHistoryResponseTimingRevision('codex', 'session-1', 'tab-1'),
     pendingRevision,
   );
-  assert.equal(manager.getHistoryResponseTimingRevision('codex', 'another-session'), 'none');
+  // UUID-bound decoration can use this provider's candidates from any
+  // session. A session with no local rows still has a provider witness.
+  assert.notEqual(manager.getHistoryResponseTimingRevision('codex', 'another-session'), 'none');
 
   assert.deepEqual(manager.cloneHistoryResponseTimingsForSession({
     toolType: 'codex',

@@ -106,6 +106,19 @@ test('health counters saturate monotonically and snapshots do not expose mutable
   assert.equal(later.actionRingEvicted, cap); assert.equal(later.actionPhasesDropped, 7);
   assert.equal(later.drops.noConnection, 0);
 });
+test('late commit loss counters reach the same heartbeat, saturate and tolerate older action-health records', () => {
+  let loss=3,omitted=4;
+  const {channel}=harness(()=>({actionRingEvicted:0,actionPhasesDropped:0,actionCommitReportsDropped:loss,actionCommitsOmitted:omitted}));
+  const socket=new Socket();channel.setWriter(createPerfSocketWriter(socket,23));channel.heartbeat(hb);
+  assert.equal(socket.lines[0].diagnosticHealth.actionCommitReportsDropped,3);
+  assert.equal(socket.lines[0].diagnosticHealth.actionCommitsOmitted,4);
+  loss=0;omitted=ui.DIAGNOSTIC_COUNTER_LIMIT+100;channel.heartbeat(hb);
+  assert.equal(socket.lines[1].diagnosticHealth.actionCommitReportsDropped,3);
+  assert.equal(socket.lines[1].diagnosticHealth.actionCommitsOmitted,ui.DIAGNOSTIC_COUNTER_LIMIT);
+  assert.equal(socket.lines[1].diagnosticHealth.saturated,true);
+  const old=harness(()=>({actionRingEvicted:0,actionPhasesDropped:0}));
+  assert.equal(old.channel.health().actionCommitReportsDropped,0);assert.equal(old.channel.health().actionCommitsOmitted,0);
+});
 
 test('incident wire is bounded and allowlisted; no key text, URL, phase or prototype payload escapes', () => {
   const { channel } = harness(); const socket = new Socket();

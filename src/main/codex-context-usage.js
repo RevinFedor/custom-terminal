@@ -5,6 +5,55 @@ const fs = require('node:fs');
 const DEFAULT_CODEX_CONTEXT_TAIL_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CODEX_CONTEXT_TAIL_CHUNK_BYTES = 64 * 1024;
 
+// A reverse read may split one large record over many chunks. Keep fixed-size
+// blocks instead of concatenating the complete carry on every preceding read.
+// Even one-byte reads retain at most ceil(lineBytes / blockBytes) blocks.
+class ReverseLineCarry {
+  constructor(budget, stats) {
+    this.blockBytes = Math.max(1, Math.floor(Math.min(64 * 1024, budget)));
+    this.blocks = []; this.length = 0; this.stats = null;
+    try {
+      if (stats && typeof stats === 'object') {
+        Object.assign(stats, { copiedBytes: 0, maxCarryBytes: 0, maxCarryBlocks: 0, lineAssemblies: 0 });
+        this.stats = stats;
+      }
+    } catch { /* Optional work counters cannot fail the read. */ }
+  }
+  prepend(bytes) {
+    let end = bytes.length;
+    while (end > 0) {
+      let head = this.blocks[this.blocks.length - 1];
+      if (!head || head.start === 0) {
+        head = { bytes: Buffer.allocUnsafe(this.blockBytes), start: this.blockBytes };
+        this.blocks.push(head);
+      }
+      const count = Math.min(end, head.start);
+      bytes.copy(head.bytes, head.start - count, end - count, end);
+      head.start -= count; end -= count; this.length += count;
+      if (this.stats) try { this.stats.copiedBytes += count; } catch { this.stats = null; }
+    }
+    if (this.stats) {
+      try {
+        this.stats.maxCarryBytes = Math.max(this.stats.maxCarryBytes, this.length);
+        this.stats.maxCarryBlocks = Math.max(this.stats.maxCarryBlocks, this.blocks.length);
+      } catch { this.stats = null; }
+    }
+  }
+  take(prefix) {
+    if (!this.length) return prefix;
+    const joined = Buffer.allocUnsafe(prefix.length + this.length);
+    prefix.copy(joined);
+    let offset = prefix.length;
+    for (let index = this.blocks.length - 1; index >= 0; index--) {
+      const block = this.blocks[index];
+      offset += block.bytes.copy(joined, offset, block.start);
+    }
+    if (this.stats) try { this.stats.copiedBytes += joined.length; this.stats.lineAssemblies++; } catch { this.stats = null; }
+    this.blocks.length = 0; this.length = 0;
+    return joined;
+  }
+}
+
 function finiteNonNegative(value) {
   if (value == null || value === '') return null;
   const number = Number(value);
@@ -53,6 +102,7 @@ async function readLatestCodexContextObservation(filePath, {
   endOffset = null,
   maxBytes = DEFAULT_CODEX_CONTEXT_TAIL_BYTES,
   chunkBytes = DEFAULT_CODEX_CONTEXT_TAIL_CHUNK_BYTES,
+  framingStats = null,
 } = {}) {
   const stat = await fs.promises.stat(filePath);
   if (!stat.isFile() || stat.size <= 0) {
@@ -67,7 +117,7 @@ async function readLatestCodexContextObservation(filePath, {
   const handle = await fs.promises.open(filePath, 'r');
   let position = boundedEnd;
   let scannedBytes = 0;
-  let carry = Buffer.alloc(0);
+  const carry = new ReverseLineCarry(budget, framingStats);
   let parseErrors = 0;
 
   const inspectCompleteLines = (buffer) => {
@@ -95,14 +145,13 @@ async function readLatestCodexContextObservation(filePath, {
       const chunk = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(chunk, 0, length, start);
       if (bytesRead <= 0) break;
-      const combined = carry.length > 0
-        ? Buffer.concat([chunk.subarray(0, bytesRead), carry])
-        : chunk.subarray(0, bytesRead);
+      const data = chunk.subarray(0, bytesRead);
       scannedBytes += bytesRead;
       position = start;
-
-      if (start === 0) {
-        const observation = inspectCompleteLines(combined);
+      let end = data.length;
+      for (let newline = data.lastIndexOf(0x0a); newline >= 0;
+        newline = newline > 0 ? data.lastIndexOf(0x0a, newline - 1) : -1) {
+        const observation = inspectCompleteLines(carry.take(data.subarray(newline + 1, end)));
         if (observation) {
           return {
             ...observation,
@@ -111,26 +160,15 @@ async function readLatestCodexContextObservation(filePath, {
             parseErrors,
           };
         }
-        carry = Buffer.alloc(0);
+        end = newline;
+      }
+      const prefix = data.subarray(0, end);
+      if (start === 0) {
+        const observation = inspectCompleteLines(carry.take(prefix));
+        if (observation) return { ...observation, source: 'rollout-tail', scannedBytes, parseErrors };
         break;
       }
-
-      const firstNewline = combined.indexOf(0x0a);
-      if (firstNewline < 0) {
-        carry = combined;
-        continue;
-      }
-      const complete = combined.subarray(firstNewline + 1);
-      const observation = inspectCompleteLines(complete);
-      if (observation) {
-        return {
-          ...observation,
-          source: 'rollout-tail',
-          scannedBytes,
-          parseErrors,
-        };
-      }
-      carry = Buffer.from(combined.subarray(0, firstNewline));
+      carry.prepend(prefix);
     }
   } finally {
     await handle.close();

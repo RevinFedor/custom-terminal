@@ -23,6 +23,27 @@ test('normalizes an explicit persistent ChatGPT request without reading attachme
   assert.throws(() => externalResearchJobId('bad run id'), /2-194 characters/);
 });
 
+test('strict observer is a separate immutable read-only request; author options/files are rejected', () => {
+  const target = { version: 1, recoveryOperationId: 'manual-one', generationKind: 'new_user',
+    document: { tabId: 42, timeOrigin: 123 }, account: { userId: 'u', accountId: 'a' },
+    turn: { quality: 'native', conversationId: 'same', userMessageId: 'new-user' },
+    previousUserMessageIds: ['old-user'], previousFinalMessageIds: ['old-final'] };
+  const raw = { provider: 'chatgpt', prompt: 'observe only', browserId: 'yandex', conversationUrl: 'https://chatgpt.com/c/same',
+    options: { observeExistingTurn: target } };
+  const request = normalizeExternalResearchRequest(raw);
+  assert.equal(request.options.readOnlyImport, true); assert.equal(request.options.autoClose, false);
+  assert.equal(request.options.importWaitForFinal, true); assert.deepEqual(request.files, []);
+  for (const extra of [{ files: [{ path: '/tmp/never-read' }] }, { options: { ...raw.options, model: '6-astra' } }, { browserId: undefined }]) {
+    assert.throws(() => normalizeExternalResearchRequest({ ...raw, ...extra }), /invalid existing-turn observation/);
+  }
+  const first = externalResearchRequestFingerprint({ runId: 'same', sourceTabId: 'S', request });
+  const changed = structuredClone(request); changed.options.observeExistingTurn.previousFinalMessageIds.push('another-final');
+  assert.notEqual(first, externalResearchRequestFingerprint({ runId: 'same', sourceTabId: 'S', request: changed }));
+  const continued = continuationRequest({ runKind: 'external-research', status: 'completed', resultComplete: true,
+    externalResearchConversationUrl: request.conversationUrl, externalResearchIntent: request }, { prompt: 'NEW AUTHOR QUESTION' });
+  assert.equal(continued.options.observeExistingTurn, undefined); assert.equal(continued.options.readOnlyImport, undefined);
+});
+
 test('follow-up keeps conversation and provider but has a separate request identity', () => {
   const previous = {
     runKind: 'external-research', status: 'completed', resultComplete: true,

@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { History, Pin, Settings } from 'lucide-react';
+import { History, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
 import { useUsageVisibilityStore } from '../store/useUsageVisibilityStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
@@ -48,8 +48,6 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
   const setFreezeCmdPopups = useUIStore((s) => s.setFreezeCmdPopups);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPinned = useUIStore((s) => s.setHistoryPinned);
-  const timelinePinned = useUIStore((s) => s.timelinePinned);
-  const setTimelinePinned = useUIStore((s) => s.setTimelinePinned);
   const freePortsBeforeStart = useUIStore((s) => s.freePortsBeforeStart);
   const setFreePortsBeforeStart = useUIStore((s) => s.setFreePortsBeforeStart);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
@@ -181,11 +179,9 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
           activeColor="#ef4444"
         />
         <InvalidPathsChip onOpenSettings={onOpenSettings} />
-        <HistoryTimelinePinToggle
+        <HistoryPinToggle
           historyPinned={historyPinned}
-          timelinePinned={timelinePinned}
           onToggleHistory={() => setHistoryPinned(!historyPinned)}
-          onToggleTimeline={() => setTimelinePinned(!timelinePinned)}
         />
         <StatusToggle
           label="freeze tooltips"
@@ -1016,58 +1012,41 @@ function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }
   );
 }
 
-function HistoryTimelinePinToggle({
+function HistoryPinToggle({
   historyPinned,
-  timelinePinned,
   onToggleHistory,
-  onToggleTimeline,
 }: {
   historyPinned: boolean;
-  timelinePinned: boolean;
   onToggleHistory: () => void;
-  onToggleTimeline: () => void;
 }) {
   return (
     <div
-      data-history-timeline-pin-toggle
+      data-history-pin-toggle
       className="inline-flex items-center rounded overflow-hidden"
       style={{ height: 20, border: '1px solid rgba(255,255,255,0.08)' }}
     >
-      <SplitIconButton
+      <HistoryPinButton
         title="History pin (Cmd+] / Opt+]): когда история открыта, держать её обычной колонкой, а не overlay поверх терминала."
         active={historyPinned}
         activeColor="#a78bfa"
-        side="left"
         onClick={onToggleHistory}
       >
         <History size={13} strokeWidth={1.9} />
-      </SplitIconButton>
-      <SplitIconButton
-        title="Timeline pin (Cmd+\\ / Opt+\\): когда таймлайн раскрыт, держать его обычной колонкой, а не overlay поверх терминала."
-        active={timelinePinned}
-        activeColor="#38bdf8"
-        side="right"
-        onClick={onToggleTimeline}
-      >
-        <Pin size={13} strokeWidth={1.9} />
-      </SplitIconButton>
+      </HistoryPinButton>
     </div>
   );
 }
 
-function SplitIconButton({ title, active, activeColor, side, onClick, children }: {
+function HistoryPinButton({ title, active, activeColor, onClick, children }: {
   title: string;
   active: boolean;
   activeColor: string;
-  side: 'left' | 'right';
   onClick: () => void;
   children: React.ReactNode;
 }) {
   return (
     <ControlHint
-      label={side === 'left'
-        ? (active ? 'Открепить History и вернуть overlay' : 'Закрепить History колонкой')
-        : (active ? 'Открепить Timeline и вернуть overlay' : 'Закрепить Timeline колонкой')}
+      label={active ? 'Открепить History и вернуть overlay' : 'Закрепить History колонкой'}
       side="top"
     >
     <button
@@ -1080,7 +1059,6 @@ function SplitIconButton({ title, active, activeColor, side, onClick, children }
         height: 18,
         padding: 0,
         border: 'none',
-        borderLeft: side === 'right' ? '1px solid rgba(255,255,255,0.08)' : 'none',
         outline: 'none',
         background: active ? `${activeColor}22` : 'transparent',
         color: active ? activeColor : '#666',

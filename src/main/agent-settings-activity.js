@@ -12,18 +12,21 @@ function createAgentSettingsActivity({ isCurrent = () => true, publish = () => {
       if (!isCurrent(tabId, op.runtime)) { state.operations.delete(id); retired = true; }
     }
     if (retired) state.sequence = ++sequence;
-    const active = [...(state?.operations.values() || [])];
-    const latest = active.at(-1);
+    const entries = [...(state?.operations.entries() || [])];
+    const active = entries.map(([, operation]) => operation);
+    const [latestId, latest] = entries.at(-1) || [];
     return { tabId, sequence: state?.sequence || 0, busy: active.length > 0,
       target: latest?.target || null, toolType: latest?.toolType || null,
+      ...(latest?.cancelTarget ? { cancelTarget: { ...latest.cancelTarget, activityId: latestId } } : {}),
       ...(active.length && active.every(op => op.replaceable === true) ? { replaceable: true } : {}) };
   };
   const emit = tabId => publish(read(tabId));
-  const begin = ({ tabId, target = 'model', toolType, runtime, replaceable = false }) => {
+  const begin = ({ tabId, target = 'model', toolType, runtime, replaceable = false, cancelTarget = null }) => {
     const state = tabs.get(tabId) || { sequence: 0, operations: new Map() };
     const token = { tabId, id: ++sequence };
     state.sequence = sequence;
-    state.operations.set(token.id, { target, toolType, runtime, replaceable: replaceable === true });
+    state.operations.set(token.id, { target, toolType, runtime, replaceable: replaceable === true,
+      ...(cancelTarget ? { cancelTarget: { ...cancelTarget } } : {}) });
     tabs.set(tabId, state);
     emit(tabId);
     return token;

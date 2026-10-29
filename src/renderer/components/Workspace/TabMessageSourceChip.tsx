@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { ArrowDownLeft, ArrowUpRight, CircleAlert, Globe, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
@@ -15,9 +15,10 @@ const { ipcRenderer } = window.require('electron');
 type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null; messageId?: string };
 
 /** The existing saved-job jump, shared by History's arrow and Timeline's label. */
-export function ResearchSourceAction({ runId, label, iconOnly = false, researchIcon = false, onNavigate, destination = 'desktop' }: {
+export function ResearchSourceAction({ runId, label, iconOnly = false, researchIcon = false, onNavigate, destination = 'desktop', buttonStyle }: {
   runId: string; label?: string; iconOnly?: boolean; researchIcon?: boolean; onNavigate?: () => void;
   destination?: 'desktop' | 'browser';
+  buttonStyle?: CSSProperties;
 }) {
   const [navigation, setNavigation] = useState<{ runId: string; state: 'idle' | 'opening' | 'opened' | 'failed'; jobId?: string }>({ runId, state: 'idle' });
   const opening = navigation.runId === runId && navigation.state === 'opening';
@@ -55,11 +56,13 @@ export function ResearchSourceAction({ runId, label, iconOnly = false, researchI
     aria-busy={opening} disabled={opening}
     onMouseDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void open(); }}
     className={iconOnly ? 'hp-research-source-action' : 'history-research-source'}
-    style={iconOnly ? undefined : { display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0,
+    style={iconOnly ? buttonStyle : { display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0,
       maxWidth: '100%', overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 11, color: '#eee',
       background: 'transparent', border: 0, padding: '2px 3px', borderRadius: 4,
       cursor: opening ? 'default' : 'pointer', textAlign: 'left' }}>
-    {iconOnly ? browser ? <Globe size={14} aria-hidden="true" /> : <ArrowUpRight size={14} aria-hidden="true" /> : <>
+    {iconOnly ? browser ? <Globe size={14} aria-hidden="true" />
+      : researchIcon ? <img src={scDesktopIcon} alt="SC Desktop" width={14} height={14} style={{ flexShrink: 0 }} />
+        : <ArrowUpRight size={14} aria-hidden="true" /> : <>
       {researchIcon && <img src={scDesktopIcon} alt="SC Desktop" width={16} height={16} style={{ flexShrink: 0 }} />}
       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
     </>}
@@ -67,10 +70,10 @@ export function ResearchSourceAction({ runId, label, iconOnly = false, researchI
 }
 
 export function HistoryPromptSource({ source, phase, onNavigate, researchIcon = false }: {
-  source: Partial<Source> & { label?: string; researchRunId?: string }; phase?: string; onNavigate?: () => void;
+  source: Partial<Source> & { label?: string; description?: string; researchRunId?: string }; phase?: string; onNavigate?: () => void;
   researchIcon?: boolean;
 }) {
-  const incoming = phase === 'question' || phase === 'request';
+  const incoming = phase === 'question' || phase === 'request' || phase === 'prompt';
   const response = phase === 'reply' || phase === 'completion' || phase === 'failure';
   const Icon = incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
   const [jumping, setJumping] = useState(false);
@@ -94,14 +97,14 @@ export function HistoryPromptSource({ source, phase, onNavigate, researchIcon = 
       style={{ ...iconStyle, padding: 0, border: 0, borderRadius: 4, cursor: 'pointer' }}>
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </button> : <span data-history-source-direction={direction}
-      title={incoming ? 'Запрос к вам' : 'Ответ на ваш запрос'}
+      title={phase === 'prompt' ? 'Сообщение вам' : incoming ? 'Запрос к вам' : 'Ответ на ваш запрос'}
       style={{ ...iconStyle, color: '#a3a3a3' }}>
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </span>)}
     {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />
       : source.researchRunId ? <ResearchSourceAction runId={source.researchRunId} label={source.label}
         researchIcon={researchIcon} onNavigate={onNavigate} />
-      : <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
+      : <span title={source.description} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
   </div>;
 }
 

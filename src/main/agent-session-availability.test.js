@@ -36,6 +36,64 @@ function resultFor(response, sessionId) {
   return response.results.find((result) => result.sessionId === sessionId);
 }
 
+test('native compressed Codex rollout is present, not deleted, without decoding its body', async () => {
+  const f = await fixture();
+  try {
+    const compressed = path.join(f.codexHome, 'sessions', '2026', '08', '30', `rollout-${CODEX_ID}.jsonl.zst`);
+    // Presence is a metadata contract, not a readability/lineage assertion.
+    await fs.promises.writeFile(compressed, Buffer.from([0x28, 0xb5, 0x2f, 0xfd]));
+    const service = new AgentSessionAvailabilityService({ codexHome: f.codexHome, claudeProjectsDir: f.claudeProjectsDir });
+    const descriptor = { tabId: 'compressed', provider: 'codex', sessionId: CODEX_ID };
+    const result = resultFor(await service.probeBatch({ sessions: [descriptor] }), CODEX_ID);
+    assert.equal(result.state, 'available');
+    assert.equal(result.representation, 'zstd');
+    assert.equal(result.deletedAt, null);
+    const files = await service.resolveSessionFiles({ sessions: [descriptor] });
+    assert.equal(files.results[0].filePath, compressed);
+    assert.equal(files.results[0].representation, 'zstd');
+    assert.equal(await fs.promises.stat(compressed.slice(0, -4)).then(() => true, () => false), false);
+  } finally { await f.cleanup(); }
+});
+
+test('compression and native resume transitions keep availability and prefer the live plain file', async () => {
+  const f = await fixture();
+  try {
+    const plain = path.join(f.codexHome, 'sessions', '2026', '08', '30', `rollout-${CODEX_ID}.jsonl`);
+    const service = new AgentSessionAvailabilityService({ codexHome: f.codexHome, claudeProjectsDir: f.claudeProjectsDir });
+    const descriptor = { tabId: 'native-transition', provider: 'codex', sessionId: CODEX_ID };
+    const probe = () => service.resolveSessionFiles({ sessions: [descriptor], force: true });
+    await fs.promises.writeFile(plain, '{}\n');
+    assert.equal((await probe()).results[0].filePath, plain);
+    await fs.promises.rename(plain, plain + '.zst');
+    assert.equal((await probe()).results[0].state, 'available');
+    assert.equal((await probe()).results[0].filePath, plain + '.zst');
+    await fs.promises.writeFile(plain, '{}\n');
+    assert.equal((await probe()).results[0].filePath, plain);
+    // The same precedence applies to a fresh discovery, not only cached paths.
+    const fresh = new AgentSessionAvailabilityService({ codexHome: f.codexHome, claudeProjectsDir: f.claudeProjectsDir });
+    assert.equal((await fresh.resolveSessionFiles({ sessions: [descriptor] })).results[0].filePath, plain);
+  } finally { await f.cleanup(); }
+});
+
+test('compressed thin-fork sources are not falsely reported missing and archived compressed stays archived', async () => {
+  const f = await fixture();
+  try {
+    await fs.promises.writeFile(path.join(f.codexHome, 'sessions', '2026', '08', '30', `rollout-${CHILD_ID}.jsonl`), '{}\n');
+    await fs.promises.writeFile(path.join(f.codexHome, 'sessions', '2026', '08', '30', `rollout-${SOURCE_ID}.jsonl.zst`), 'compressed');
+    await fs.promises.writeFile(path.join(f.codexHome, 'archived_sessions', `rollout-${ARCHIVED_ID}.jsonl.zst`), 'compressed');
+    const service = new AgentSessionAvailabilityService({ codexHome: f.codexHome, claudeProjectsDir: f.claudeProjectsDir,
+      getCodexLineageManifest: id => id === CHILD_ID ? { sourceSegments: [{ physicalSessionId: SOURCE_ID }] } : null });
+    const result = await service.probeBatch({ sessions: [
+      { tabId: 'child', provider: 'codex', sessionId: CHILD_ID },
+      { tabId: 'archive', provider: 'codex', sessionId: ARCHIVED_ID },
+    ] });
+    assert.equal(resultFor(result, CHILD_ID).state, 'available');
+    assert.deepEqual(resultFor(result, CHILD_ID).missingDependencies, []);
+    assert.equal(resultFor(result, ARCHIVED_ID).state, 'archived');
+    assert.equal(resultFor(result, ARCHIVED_ID).representation, 'zstd');
+  } finally { await f.cleanup(); }
+});
+
 test('batch probe distinguishes active, archived, missing, and exact Gemini files', async () => {
   const f = await fixture();
   try {

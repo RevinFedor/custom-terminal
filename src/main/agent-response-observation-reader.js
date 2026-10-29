@@ -107,6 +107,7 @@ function hookKey(tabId, subject) {
 function createAgentResponseObservationReader({
   captureState, readLifecycle, loadSessionTurns, readTurnResult, readCodexExecution,
   readLatestCodexExecution, readHistoricalCodexExecution,
+  readInputAdmission = null,
   maxHookEntries = 64, maxHookChars = 1_000_000, maxStateEntries = 1024,
 } = {}) {
   const revisions = new Map();
@@ -242,7 +243,17 @@ function createAgentResponseObservationReader({
     const invalid = ownerError(before, expectedSessionId, null);
     if (invalid) return invalid;
     if (before.toolType !== 'codex') return failure('continuation_history_provider_unsupported');
-    if (before.busy === true || before.transitioning !== false
+    let provisionalInput = null;
+    if (before.busy === null && before.error === 'response_busy_unknown'
+      && before.transitioning === true && typeof readInputAdmission === 'function') {
+      try { provisionalInput = await readInputAdmission(tabId, { toolType: 'codex', sessionId: expectedSessionId, cwd: before.cwd }); }
+      catch { return { ...pending('continuation_history_runtime_unstable'), inputReason: 'continuation_history_input_scope_unavailable' }; }
+    }
+    const provisionalCurrent = () => provisionalInput?.version === 1
+      && provisionalInput.kind === 'codex-continuation-input' && provisionalInput.mode === 'provisional-resume'
+      && provisionalInput.ready === true && provisionalInput.target?.sessionId === expectedSessionId
+      && provisionalInput.isCurrent?.() === true;
+    if (before.busy === true || before.transitioning !== false && !provisionalCurrent()
       || !['found', 'absent'].includes(before.processStatus)) return pending('continuation_history_runtime_unstable');
     if (typeof readLatestCodexExecution !== 'function') return failure('codex_latest_observed_execution_reader_unavailable');
     let loaded;
@@ -256,7 +267,8 @@ function createAgentResponseObservationReader({
     const changedOwner = ownerError(after, expectedSessionId, null);
     if (changedOwner) return changedOwner;
     if (before.revision !== after.revision || before.toolType !== after.toolType || before.cwd !== after.cwd
-      || before.processStatus !== after.processStatus || after.busy === true || after.transitioning !== false) {
+      || before.processStatus !== after.processStatus || after.busy === true
+      || after.transitioning !== false && !provisionalCurrent()) {
       return pending('response_state_changed');
     }
     if (loaded?.success !== true || loaded.sourceVerified !== true) {

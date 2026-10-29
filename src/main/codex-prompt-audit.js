@@ -361,6 +361,10 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
   const expected = String(audit?.expectedText || '');
   const actual = String(actualText || '');
   if (!expected) return null;
+  if (audit?.imageRequestProjection?.version === 2) {
+    const matched = matchCodexImageTransformCarrier(audit, actual);
+    return matched ? { reason: 'codex_image_request_transform' } : null;
+  }
 
   // The Codex PTY materializes each byte of a Windows CRLF pasted through its
   // composer as a line break of its own. The rollout therefore contains LF+LF
@@ -398,6 +402,59 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
     return { reason: 'codex_image_placeholder_canonical' };
   }
   return null;
+}
+
+// Only proven positive occurrences may change representation. Literal spans,
+// unavailable diagnostics and interior whitespace are compared byte-for-byte.
+// This is shared by live, startup and the final durable promotion owner.
+function matchCodexImageTransformCarrier(audit, actualText) {
+  if (typeof actualText !== 'string' || typeof audit?.expectedText !== 'string') return false;
+  const expected = audit.expectedText, proof = audit.imageRequestProjection;
+  if (proof?.version !== 2 || !Array.isArray(proof.images)) return false;
+  const candidates = [actualText];
+  const blocks = collectCodexProviderImageBlocks(actualText);
+  let prefixEnd = 0;
+  const seen = new Set();
+  for (const block of blocks) {
+    if (actualText.slice(prefixEnd, block.index).trim()) break;
+    const slot = block.nameSlot || block.bodySlot;
+    const image = Number.isSafeInteger(slot) && proof.images[slot - 1];
+    if (!image || !block.slotsAgree || block.path !== image.transportPath || seen.has(slot)) break;
+    seen.add(slot); prefixEnd = block.index + block.match.length;
+  }
+  if (prefixEnd) candidates.push(actualText.slice(prefixEnd).trimStart());
+  const match = (actual, map, trim) => {
+    let sourceAt = 0;
+    const literals = [], tokensByImage = [];
+    for (const [index, image] of proof.images.entries()) {
+      const range = image.transportRange;
+      if (!range || range.start < sourceAt || expected.slice(range.start, range.end) !== image.transportPath) return false;
+      let literal = map(expected.slice(sourceAt, range.start));
+      if (trim && sourceAt === 0) literal = literal.trimStart();
+      literals.push(literal);
+      const tokens = [image.transportPath, `[Image #${index + 1}] `, `[Image #${index + 1}]`,
+        `[Image ${index + 1}] `, `[Image ${index + 1}]`];
+      if (proof.images.length === 1 || seen.has(index + 1)) tokens.push('[Image] ', '[Image]');
+      tokensByImage.push(tokens); sourceAt = range.end;
+    }
+    let tail = map(expected.slice(sourceAt));
+    if (trim) tail = sourceAt === 0 ? tail.trim() : tail.trimEnd();
+    literals.push(tail);
+    // A native slot may add its own single separator. Do not greedily consume
+    // the user's existing whitespace beside it, or collapse that whitespace.
+    const failed = new Set();
+    const walk = (index, at) => {
+      const key = index + ':' + at;
+      if (failed.has(key) || !actual.startsWith(literals[index], at)) return false;
+      at += literals[index].length;
+      if (index === tokensByImage.length) return at === actual.length;
+      for (const token of tokensByImage[index]) if (actual.startsWith(token, at) && walk(index + 1, at + token.length)) return true;
+      failed.add(key); return false;
+    };
+    return walk(0, 0);
+  };
+  return candidates.some(actual => [value => value, value => value.replace(/\r\n/g, '\n\n')]
+    .some(map => match(actual, map, false) || match(actual, map, true)));
 }
 
 function codexAuditRecordIsAfterBoundary(
@@ -584,6 +641,7 @@ module.exports = {
   codexUserCarrierTextsMatch,
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
+  matchCodexImageTransformCarrier,
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,

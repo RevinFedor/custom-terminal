@@ -70,6 +70,15 @@ Discovery файла сессии (`findCodexSessionFile` — полный walk 
 
 Атрибуция «медленного subscribe»: `[Perf:IpcSlow] channel=agent-transcript:subscribe` меряет invoke→ответ, то есть включает очередь за чужим main-блокером. Проба `[TranscriptService:SubscribeSlow] ensureMs=…` печатается только когда СОБСТВЕННАЯ работа handler'а превысила 50мс: IpcSlow без этой строки рядом = виноват сосед (искать по `MainLoopGap.ops`), с ней = реальный медленный `_ensureState`.
 
+SOURCE26.10 cold state init различает resolve/path memo, discovery с read-view,
+refresh/stat и bounded context seed. Общий `ensureMs` включает await этих стадий;
+даже большой ensure не доказывает exclusive CPU handler'а. Joined init имеет
+тот же `initAttemptId` и собственные исходные action/read/request IDs. Сама
+History RPC и подготовка subscription могут закончиться в разное время.
+Вложенные admission/decode/publication read-view фазы и scalar framing counters
+описаны в `логирование-оптимизации.md::Cold History`; новая диагностика не делает
+дополнительного discovery/stat/decode и не меняет watcher/readiness authority.
+
 ## Ранняя свежесть native History, отдельно от runtime
 
 04.10 пользователь потребовал не ждать тяжёлой History, чтобы понять, устарел ли
@@ -180,6 +189,23 @@ domain. UNKNOWN/disconnect/error не доказывает exit: replacement ж�
 Node child injection существует только в Source tests, production fallback на
 worker_threads не используется. Это не защита всех Main SQLite/Claude/client reads.
 
+Native-приёмка read-кода должна проверять filesystem API целевого runtime.
+На Electron28.3.3/Node18.18.2/ABI119 `Dir.readSync` с `encoding:'buffer'`
+падает в `Dir.processReadResult → path.join(Buffer)` с `ERR_INVALID_ARG_TYPE`.
+Catch такого сбоя как «дочерний файл не найден» оставляет завершённый Task
+в состоянии running. В частном candidate это исправлено однобайтовым чтением
+имён с восстановлением raw bytes; порядок/Unicode и actual child completion
+проверены отдельно. Это не изменение текущего default service. OS errno
+недоступной директории и программная несовместимость должны различаться;
+произвольные ошибки нельзя превращать в отсутствие child.
+Отдельный native pathname требует фиксированного scratch budget до decode,
+а загрузка постоянного кода helper — bootstrap до измеряемой read-операции.
+Проверка raw-имён на Linux не заменяет macOS: APFS fixture с невалидным UTF-8
+может завершиться `EILSEQ` ещё при создании файла. Подставной Dirent проверяет
+алгоритм, но не физическую поддержку такого имени. Native RSS/DT_UNKNOWN и
+универсальная filesystem-совместимость этим не доказаны. Точные receipts и
+границы candidate — [рабочее состояние](../tmp/оптимизация-history.md).
+
 Тяжёлый read имеет отдельные demand leases, не только общий Promise: уход A
 не отменяет B, уход последнего отзывает producer, следующий C получает новую
 generation. Cold admission удаляет отменённого waiter. HTTP aborted/premature
@@ -194,6 +220,88 @@ ACK не расширяет окно, end ждёт final credit. JSON/NDJSON к�
 маскируются consumer cleanup. Conditional/delta/freshness сохраняют свои ветки.
 Эта граница ограничивает transport-owned bytes, не canonical/pending graph,
 произвольный toJSON, full-array DTO или строки потребителя.
+
+23.10 SOURCE добавляет отдельный opt-in canonical/pending producer в прежнем
+Codex file-feed: `projectCodexFullHistoryFromFile/Stream({rootedOwner})` принимает
+`CodexRootProjectionOwner` с reader-owned `HistoryPagedStore`. Тот же semantic
+reducer хранит rows, logical owners, aliases и pending indexes на страницах;
+continuation отделён от CoW presentation view. Результат содержит явные cursors
+и operation leases, а не полный DTO. Current pin и до четырёх checkpoint pins
+принадлежат reader/cache; скрытый SQLite на каждый legacy projector не создаётся.
+Append/restart проверяет сохранённый prefix точным порционным сравнением bytes,
+поэтому тёплая admission пока стоит O(prefix), а не O(stat). CoW/SQL write
+amplification и сборка неиспользуемых страниц требуют отдельного бюджета.
+
+Полный startup/service sweep пока является частью admission, а не лишним
+безусловным read, который можно просто заменить несколькими `collectStep`.
+На конечном SQLite-контроле накопленный мусор занимал241 из512SQL-pages: порог
+75% ещё не требовал pressure cleanup, но следующая допустимая300003UTF16-unit
+сборка получила SQLITE_FULL; прежний полный collect доставлял точные bytes с
+одной попытки. Для сокращения sweep нужен pre-write reservation/allocation proof,
+учитывающий unreclaimed pages, рабочие SQL-страницы и journal. Процент заполнения,
+cleanup после ошибки или повтор producer такой proof не заменяют. GC-диагностика
+считает steps/reclaimed/retired только после успешного commit, иначе rollback
+выдаёт освобождённые страницы, которых в действительности не стало меньше.
+
+26.10 SOURCE sweep этой же коллекции обрабатывает оставшиеся в текущем work-budget
+page ordinals одним SQL-диапазоном: наружу выходят только count/end, а рёбра и
+непомеченные страницы удаляются внутри прежней транзакции. Предел работы,
+checkpoints, полная mark/sweep-последовательность, lease fences и `DELETE/FULL`
+не меняются. Конечный real-SQLite differential сохранил полные frozen values,
+rollback и33 шага/2102work/2048reclaimed, SQL executions12567→236; прежний quota
+counterexample по-прежнему требует полного sweep. Это Source-доказательство
+сокращения SQL-вызовов, не native latency или общий memory bound.
+
+Поздняя фаза удаления старых GC-отметок также остаётся в том же collector.
+`epoch<>? LIMIT 1` обходил текущие отметки заново для каждого удаления. SOURCE
+читает два непересекающихся диапазона `epoch<? UNION ALL epoch>? LIMIT 1` через
+существующий `hp_gc_pending(epoch,done,page)`: по-прежнему одна старая отметка
+на work item, без нового индекса или массива IDs. Обе стороны сохраняют старые
+и возможные будущие epochs, исключая только текущий; `epoch` имеет NOT NULL.
+Это устраняет повторный scan, сохраняя полный sweep, транзакции и rollback.
+Фактический выигрыш в Electron проверяется после сборки; SQL-control не является
+замером native CPU/RAM или всей задержки открытия.
+
+В mark-фазе SOURCE удерживает только текущие `page`/`next_edge` внутри одного
+существующего transaction callback. Children сразу попадают в SQLite queue;
+завершение страницы сохраняет cursor вместе с `done=1`, а незавершённый cursor
+сбрасывается в SQL перед выходом callback, до `checkDisk`/commit. Эти два скаляра
+не переживают bounded step, rollback или yield. Edge и completion по-прежнему
+расходуют отдельные work units; полный sweep,64-work quantum, epoch restart,
+builders/pins и quota fences сохраняются. Это сокращает повторные `markNext` и
+промежуточные `markAdvance`, не меняет cold O(N) и само по себе не доказывает
+wall-time benefit. Worker fingerprint включает этот store: новая реализация
+проходит обычную смену source schema/freshness, без заимствования старых receipts.
+
+24.10 SOURCE rooted file path подаёт bytes в `readRootedJsonlRange` и paged
+parser до накопления полной JSONL-строки. Parsed cursors лениво связываются с
+прежним reducer, raw bytes остаются frozen backing для старых leases после
+rewrite. Partial tail повторно разбирается порциями из backing; это bounded
+working set с O(unfinished-record bytes) повторной работой, не сохранённое
+lexical continuation. Number conversion и codec ancestry также используют
+ограниченный scratch и backing frames.
+
+Это ещё не default service/worker protocol: обычные desktop callers сохраняют
+прежний полный graph. Read-only semantic adapters могут материализовать большой
+leaf: exec/Babel, image markup/references, native question proof и tool-name
+normalization. Их полное содержание сохраняется, но zero-materialization
+assertions остаются RED. Postprocessors, ordinal UI, Full/Copy/Input и native
+RSS этим opt-in не ограничены.
+Пустые Proxy targets внутри reducer представляют logical handles; их bounded
+cache не является пределом всех transient/native allocations. Подключение
+service не должно использовать `getHistory→captureLegacy`: такой переход сначала
+строит весь DTO и добавляет запись на диск вместо устранения исходного owner.
+
+SOURCE private root-route классифицирует physical Codex scope напрямую по
+paged header/lineage metadata. Legacy lineage/recovery getter здесь недопустим:
+даже один обычный parent может иметь тысячи forward children и UUID members.
+Read descriptor связывается с настоящим canonical file/epoch и проверяется до
+prompt/timing preparation, которая вправе сделать собственные sidecar writes.
+Только точно аттестованный полный event/link counter contract позволяет игнорировать
+посторонний Main UI commit; неизвестная схема сохраняет общий committed DB fence,
+а local rollback/смена connection/source и настоящее изменение lineage отзывают
+кандидат. Это read proof, не право recovery write, Send, Resume или Input.
+Неподдержанный composite остаётся отдельной явно выбранной legacy веткой.
 
 После saved COW Rewind подготовка должна попасть именно в этот configured worker,
 а не только в Main cache: иначе тот же большой retained prefix строился дважды.
@@ -214,6 +322,366 @@ canonical base rows до sidecars, полные раскрываемые payload
 восстанавливает parser. После RAM eviction новое событие может восстановить
 continuation и дочитать suffix; это отдельная работа, не цена каждого seek.
 Continuation включает aliases/связи объектов, pending calls и неполный UTF-8 хвост.
+
+26.10 SOURCE private primary root может объявлять `metadataRowWindow` profile
+`primary-metadata-fields-v1`: range передаёт консервативную credit-оценку строки,
+а rowWindow возвращает её упорядоченные name/value descriptors одним обходом.
+Проверяется точный signed source/durable metadata address текущего lease;
+неподдержанный профиль, недостаточный credit или большая строка выбирают прежний
+fields-walk ДО fast RPC. Ошибка выданного запроса не даёт повтор/fallback.
+Сумма bounds включает scalar-page BIGINT и отдельный descriptor/control overhead;
+max3 items/старые byte credits/cache/page/quota/FIFO не меняются. На конечном
+16-user corpus source+durable RPC204→108 при равных полных значениях; это Source
+work proof, не native latency. В этом срезе декодированные IDs/metadata ещё
+оставались отдельным native owner; более поздний canonical-путь описан ниже.
+Full/Copy/selected-text consumers также хешируют
+UTF16LE фиксированным4096B scratch, сохраняя lone surrogates/CRLF; конечная joined
+строка/decoded graph/rich renderer от этого не становятся bounded.
+
+SOURCE27.10 direct-root History объявляет отдельный negotiated профиль
+`primary-presentation-address-v1`: до3 адресов в пределах прежних65536B. Старый
+metadata rowWindow остаётся limit1. Prepared source ordinal, canonical ordinal и
+display rank различаются: скрытый член группы возвращает свой exact UUID/source
+ряд, а carrier/header — отдельные поля. Physical key сохраняет прежние override/
+source/queue/UUID правила; это не rank/lease key и не сертификат layout.
+Неоднозначность не выбирает произвольный ряд; ошибка, отмена и смена cut не дают
+negative proof или legacy fallback. Point probe не закрывает shared parent и
+независимый document reader.
+Текущие body/address maps публикуются вместе; вытесненный snapshot не допускает
+строку заново. Остальные full-metadata consumers сохраняют свой прежний путь;
+адресный профиль сам по себе не ограничивает один большой unit/scalar или общую
+память и не даёт Input/queue/writer/Stop authority.
+
+Новый primary Root пока выбирается только общим Main/renderer test-profile
+gate (`history-primary-rollout.cjs`). Packaged private acceptance с этим gate
+не является доказательством, что ordinary installed reader уже переключён.
+
+28.10 SOURCE окно уже загруженных primary bodies сохраняет только текущий
+диапазон и небольшой соседний запас; при движении дальние тела и их addresses
+вытесняются вместе. Запас не запускает чтение ещё не открытых гигантских строк.
+Полный prepared metadata graph и geometry имеют других владельцев: размер
+body-window нельзя выдавать за предел всей History/RSS. Full/Copy и Timeline
+по-прежнему адресуют полный источник, а не накопленный набор посещённых страниц.
+
+Для обычной ENTRY selected-body reader теперь удерживает exact installed view
+отдельным pin и порционно декодирует выбранную строку. Раньше даже готовый body
+повторно материализовался и сериализовался в новый V8-document, попадая за чужой
+cold/maintenance lane. Pin остаётся SQL allocation, с прежними lease FIFO,
+source predecessor, quotas и cleanup по исходному child request ID; это не
+разрешение пропускать зависимость своего source. Group и неподдержанные формы
+сохраняют прежний настоящий V8-путь. Полный selected-native result может быть
+большим; кредит отдельного packet не является лимитом итогового объекта.
+
+Рабочий page-cache Root получает фиксированную долю прежнего index-memory
+budget, а не дополнительный глобальный бюджет. Прежние настройки Root3slots/2KiB
+raw и8KiB SQLite многократно перечитывали backing даже на16строках. При32MiB
+allowance теперь28MiB остаются prepared indexes,4MiB зарезервированы под raw
+slots и main/TEMP pager targets. Это учёт и SQLite target, не замер native RSS;
+tiny/injected adversarial stores и zero-budget не расширяются. Увеличение
+SSD-лимита само по себе эту рабочую память и лишние чтения не исправляло.
+
+#### Координаты текущей и удерживаемой проекции
+
+SOURCE28Oct переведённая primary Root-ветка не строит `unitIndexByUuid`;
+`displayEntryIndexByUuid` был alias той же Map, а не второй owner. Готовый Root
+сохраняет свои выбранные адреса. Для реально показанного порядка при pending/
+отсутствующем Root используется отдельный `history-presentation-position-v1`:
+
+```text
+показанные entries/units/keys + исходный owner → регистрация в paged store
+полный выбранный UUID → независимый query → rank/member + прежний physical key
+исходные visit/gesture/scroller/restore/paint guards → допустимая коррекция
+```
+
+Регистрация остаётся allocating работой по всему порядку под прежними квотами. Она захватывает
+реальные display arrays, owner/rewrite/generation/mode, без зависимости от будущего
+preparation input. Одинаковые показанные arrays не загружаются заново только из-за
+изменения такого input. Last physical unit / first matching group member сохраняют
+прежнюю Map-грамматику. Полные UTF16 сравниваются независимо от chunk partition;
+даже mismatch завершает проверку целостности выбранного leaf. Genuine legacy/
+composite Map сохраняется. Это не универсальная замена object-key Map.
+
+Только аутентифицированные held fork-v2/target не пишут target pages/SQL pins и
+не ждут несвязанную canonical allocation maintenance. Они делят одну настоящую
+immutable SQL pin с независимым lifetime, сохраняя свой lease FIFO и явно заданный
+source FIFO. Cold-регистрация и release остаются на прежних allocating/cleanup
+границах. Родительский close не отзывает уже выданного child.
+
+Четыре выбранных consumer lanes ограничены одним running и одним replaceable
+pending demand каждая; raw cleanup ACK хранит точного владельца отдельно от
+результата/отмены. Неразрешённый predecessor даёт явный UNKNOWN до новой allocation,
+не отсутствие и не replay. Parent ACK сам по себе не подтверждает cleanup детей.
+Координаты не дают canonical/source, body/paint, Input или writer authority.
+Исходный Timeline срок остаётся inclusive20s с проверкой после await; resize/
+saved-anchor сохраняют прежнюю240-attempt сходимость без нового20s ограничения.
+SOURCE-контроли не подтверждают mounted/native latency или global memory.
+
+#### Независимо удерживаемая prepared-проекция
+
+SOURCE28Oct primary-модель выдаёт independently retained prepared child до
+сохраняющегося Np decode. Он держит исходный semantic bundle/view, signed
+metadata descriptor, schema/semantic/view/source binding и свой lease/request ID.
+Закрытие или замена Root/model освобождает только model reference: показанный
+cut продолжает читать свою проекцию. Это display/read lifetime, не текущая
+canonical/source truth, writer/Input, data-commit или paint authority.
+
+Полная Np thin-graph/UTF16 validation имеет отдельный owner fact; canonical Nc
+fact её не заменяет. Cold backing check и authenticated same-data rebind остаются
+разными доказательствами. Отмена prepared fork чистит только его новую allocation
+с исходным preparedRequestId. Даже genuine поле inputDocument в malformed reply
+не разрешает closing другого удерживаемого документа того же consumer.
+
+Sparse CURRENT publication хранит настоящие local objects и затронутые source
+ordinals/sidecars, сохраняя V49 matching/order/reservation/witness правила.
+Historical predicates читают полные prepared/MIXED значения, а compatibility
+materializer всё ещё возвращает настоящий Np-массив оставшимся consumers.
+React data commit связывает exact shown publication/current overlay отдельно
+от canonical receiptDataSubject, same diagnostic-tail object и measured paint.
+
+Selected V51 arm отпускает native array borrows после регистрации и выбирает
+историческую строку по исходному ordinal из retained child; CURRENT locator
+сохраняет native object identity. Непереведённая transformation заранее выбирает
+названный native compatibility adapter; UNKNOWN/error не запускают такой fallback.
+Source-order и обычный group replay не требуют N-Map; произвольный немонотонный
+ordinal lookup может стоить O(Np×Nu), preflight и registration остаются двумя
+проходами. Это не устранение cold Np decoder/units/keys или latency/RSS proof.
+
+Два неочевидных lifetime ограничения нельзя убрать при упрощении. Retained invoke
+создаётся отдельной factory вне transient async query context: inline closure
+удерживал original Model.open context и native Np даже после model.close.
+Selected metadata text заимствует уже pinned signed node через private non-owning
+HistoryTextDocument; полный length/digest и обычные range/credit checks сохраняются.
+Его close локальный: новая text allocation/raw release ACK здесь не нужны и
+не удерживают отменённую lane. Обычные Full/Copy/Input/decoder text forks и
+последний реальный prepared release сохраняют прежние независимые lifetimes.
+
+#### Каталог агентов: historical thin и native CURRENT
+
+SOURCE primary roster/Inspector читает отдельный retained catalog из прежнего
+chip-domain: показанные entries и literal raw live join. Итоговый display-domain
+после Rewind/settings, mounted window и canonical Nc не заменяют этот состав.
+Original model может закрыться, а собственный source/catalog child продолжает
+читать тот же cut. Полные selected значения остаются native sinks; Np decoder,
+compatibility graph, registration и geometry этим consumer не устраняются.
+
+Historical input должен совпасть с **декодированным** старым thin metadata:
+raw paged null-prototype object не эквивалентен обычному object старого decoder.
+Иначе прежний label `[object Object]` становился TypeError. Catalog-local paged
+COW сохраняет data properties, indexed arrays/holes/undefined и alias/cycle
+identity; CURRENT objects и глобальная canonical grammar не нормализуются.
+
+Main-facts authority возникает из original normalized records и exact filtered
+collection capture. Кандидат event-normalization ещё может содержать identity,
+которую прежний owner filter должен отвергнуть; factory не переносит этот фильтр
+раньше и не превращает такой record в авторизованный Map. Structural ReadonlyMap
+или custom getter не доказывают pure lookup. Original collection contents/order
+и data descriptors проверяются отдельно от FULL native caller witness и его
+cheap owner fence. Main-only active/terminal grammar совпадает в CURRENT face
+и готовом paged catalog. Terminal `values()` нельзя заменить entries traversal
+по одной проверке методов Map: публичный iterator.next может различать результаты.
+Native continuation сохраняет literal method и один next-method на iterator;
+build/replay имеют независимые iterator records.
+
+Own data property сама по себе не неизменна: другой CURRENT getter способен
+изменить и восстановить её между наблюдениями. Общие reads остаются в ordered
+replay; adjacent RLE меняет хранение, но исполняет каждый вызов и проверку отмены.
+Отдельный optional settings shortcut требует genuine Node non-Proxy authority
+и original own keys/descriptors/values; отсутствие такого proof оставляет точный
+generic replay. Его storage/time зависят от наблюдённой последовательности,
+поэтому универсальный O(CURRENT) и global/native memory bound не заявляются.
+Cooperative64 относится к controlled producer work/ограниченным UTF16 windows
+вне SQL transaction/builder, не к wall time произвольного callback/giant sink.
+
+При явном закрытии самого `HistoryPagedStore` cleanup его pins и native
+`db.close` — отдельные fallible шаги: ошибка первого не пропускает второй и
+остаётся основной даже при отказе диагностики. Если native close отказал,
+успех не объявляется и прежний explicit retry сохраняется; автоматического
+повтора нет. Это закрытие всего backing owner, не cleanup выбранного child.
+Сохранённый путь failed backing не обещает неизменные байты момента ошибки:
+для причинного разбора нужна полная семья DB/journal до последующего cleanup.
+
+SOURCE27.10 добавляет отдельный `primary-canonical-consumers-v1` для
+later-canonical receipt recovery, terminal-preview membership и поиска уже
+confirmed receipt. Canonical source и prepared/live composition читаются раздельно;
+пустой результат тоже требует dedicated producer proof текущего cut. Выбранные
+полные значения сравниваются потоково через независимые child documents;
+ошибка/UNKNOWN/отмена не означают absence и не закрывают shared parent.
+Размер страницы — до3 descriptors/прежние65536B; metadata limit1 и allocating
+maintenance/quota/FIFO/64work сохраняются. Receipt проверяет полный нормализованный
+текст, exact SID и physical offset начиная с сохранённого boundary. Live handoff
+различает canonical presence, prepared membership, полный text hash и actual
+measured paint/address: один из этих фактов не заменяет остальные. Этот профиль
+сам по себе не устраняет native metadata inventory и не доказывает
+сокращение всей памяти или O(1) поиск. Более поздний canonical fact снимает одну
+из двух renderer-копий; prepared-массив сохраняет отдельное назначение.
+
+#### Canonical metadata без второй renderer-копии
+
+SOURCE27Oct primary-путь получает `primary-canonical-metadata-v1` вместо полного
+декодирования и заморозки canonical Nc в renderer. Prepared Np — другая
+последовательность после overlays/Rewind: её настоящий compatibility graph
+сохраняется. Успешный model metadata содержит `canonicalMetadataFact`, а не
+`durableEntries`; signed durable descriptor остаётся для выбранных полных чтений.
+Отключить старый decoder без замены проверки нельзя: hidden canonical строка
+может отсутствовать в Np, но всё ещё обязана пройти прежнюю thin/graph-проверку.
+
+```text
+canonical metadata на SSD → полный обход и immutable digest
+                          → cold demand: очистить page cache, заново разрешить root,
+                            проверить весь граф/UTF16 и исходный digest
+renderer: prepared Np + проверенный canonical fact + выбранный diagnostic tail
+                          → data commit → отдельное measured paint proof
+```
+
+Pending/visited адреса полного обхода живут в прежнем quota-accounted SQLite;
+native frontier ограничен64 адресами, работа проверяется/уступает через64 единицы.
+Вставки frontier коммитятся ограниченными batch без await внутри транзакции;
+отмена проверяется ДО flush, а committed sequence меняется сразу после успешного
+commit/checkDisk. При ошибке чистятся только собственные committed job rows.
+Так устраняется per-node transaction amplification без пропуска строк, aliases,
+cycles или scalar/text integrity. Это остаётся O(размер графа и текста), не O(1)
+и не предел global/native memory; аварийный выход до finally может оставить
+временные rows до retirement derived backing.
+
+Cold-проверка не использует прежний успешный результат вместо чтения backing.
+Даже root cursor разрешается ПОСЛЕ очистки page cache: иначе cached owner envelope
+может выбрать старый граф при уже изменённой физической странице с новым SHA.
+Passive view reuse имеет иной scope: отдельный producer demand подтверждает
+предыдущую завершённую validation receipt и новую точную привязку того же immutable
+owner. Header/count/token без такой проверки не подходят. Ошибка/UNKNOWN не дают
+пустой fact, legacy fallback или новый load cycle. Проверенный пустой domain
+отличается от unavailable; selected tail не даёт body/Input/writer authority.
+
+Версия acceleration учитывает фактически загруженные implementation bytes:
+isolated Root worker хеширует как собственное engine-дерево, так и общий
+`src/shared` для `.js/.cjs`. Общая metadata grammar загружается до этого hash;
+иначе её изменение не отзывает старую интерпретацию. Это расширение freshness
+scope, не смена legacy-worker routing. Source-регрессии проверяют cold corruption,
+rollback/cancel и реальный hash/renderer CJS admission; native UI/RSS/latency
+квалифицируются отдельно в рабочем плане.
+
+Confirmed matcher — отдельный договор: первая подходящая canonical-строка по
+UUID/sourceIdentity или двум Array alias-полям, с прежним optional SID-фильтром.
+Он не требует user-role, текста, timestamp или byte-boundary и не заменяется
+later-user predicate. Typed receipt→audit fallback для поиска отличается от
+прежнего truthy-OR до проверки типов в ACK; очищенный selector не даёт новой
+ACK authority. Выбранный proof читается без native metadata inventory, но Main
+ACK по-прежнему проверяет собственные operation/attempt/provider/SID и CAS.
+
+В SOURCE27Oct тот же held-root/selected-value канал обслуживает primary live
+identity coverage. Фиксированные `truthy`, `live-setting-kind`,
+`live-setting-value` дополняют allowlist; произвольного getter/eval или нового
+read profile нет. До3 текущих claims сравниваются с полным canonical источником
+через signed text children. Полный проход сохраняет поздние coercion failures и
+последний валидный settings fact для каждого identity; plain membership и
+settings conflict возвращаются отдельно. Raw assistant UUID не заменяет
+`assistant-uuid:` identity, а `sourceUuidAliases` не добавляются в live grammar.
+Strict session equality не становится string/deep equality.
+
+Это O(N) на batch до3, при L текущих claims — до O(N×ceil(L/3)) посещений плюс
+settings pass. Historical native Set/Map для нового query не создаётся, но обе
+metadata arrays при model.open и остальные compatibility consumers сохраняются.
+При нескольких malformed rows в разных batches первый diagnostic может
+отличаться от прежнего общего прохода: результат остаётся UNKNOWN, без частичной
+retirement и собственного retry; exact diagnostic-order equivalence не заявлена.
+Consumer/commit/cancellation — в `fact-живой-ответ-в-history.md::Primary root`.
+
+SOURCE27Oct selected prompt adoption использует этот же held канал для delayed
+append, raw-status, no-exact-ID recovery, ordered shared handoff и genuinely late
+CURRENT locals. Fixed operations `prompt-identity`, `prompt-selected-identity`,
+`graph-identity`, `array-some-check` и ограниченные semanticTags member fields
+сохраняют full normalization, typed/lazy aliases и native refusal. Ordinary
+finder идёт по source order с inline legacy/exact/fallback внутри строки;
+shared pass сначала ищет допустимый full legacy handoff по всей последовательности.
+Один current-pass UUID exclusion Set сохраняется через await и резервирует UUID
+до enrichment/ACK. Это не historical inventory и не canonical ordinal.
+
+Selected identity graph включает пять identity fields и реальные attachment
+length-presence flags; sparse/inherited aliases, own undefined, cycles, shared
+refs и принимаемые Maps/Sets сохраняются. Другие root content/actions/timestamp
+не перечисляются. Декодирование выбранного graph/scalar остаётся native sink,
+без универсальной memory/giant-graph квалификации. Канонический match не равен
+prepared absence: TTL/suppression/Rewind тоже могут убрать local из проекции.
+Model provisional prepareAdopt ищет late locals в эффективном MIXED prepared
+domain с полным CURRENT local вместо captured stub. Старые N metadata arrays
+пока ещё нужны для membership/order и остальных topology/adoption consumers.
+
+Narrow generator current local compatibility согласует extraction, generated
+code, dependencies и manifest. Recovery-owned failed/cancelled local не истекает
+по старому15s TTL; primaryTimeWindow использует ту же политику. Shared image
+normalizer включает CURRENT protected web-image grammar. При изменении Panel
+проверять и full input SHA manifest, даже если selected declarations не менялись.
+
+
+Exact identity index final semantic root включает `sourceUuidAliases` вместе
+с прежними uuid/sourceIdentity/entryRef/sourceIdentityAliases/uuidAliases.
+Alias-only match не равен отсутствию canonical row; повторные matches читаются
+страницами в canonical order. `aliases:false` по-прежнему ищет только UUID.
+Этот индекс не доказывает tag/text/tool-result coverage и не заменяет полную
+durable metadata проекцию в её нынешних consumers.
+
+Primary History не строит дополнительный полный Set durable UUID при adoption.
+Rewind проверяет точный UUID через `hasCanonicalUuid` и final canonical index
+только для signed durable cursor, включая скрытые Rewind/suppression строки.
+Merged live metadata и окно не доказывают canonical presence. Отмена, смена
+владельца или отказ query не превращаются в отсутствие. Для ID вне find wire
+limits SOURCE26.10 читает signed durable descriptors порциями до3 строк и только
+поле UUID; подходящий текст сверяется по полным UTF16 units независимого leaf,
+до1024 units за чтение. Non-owning probe не закрывает shared parent при отказе;
+отмена/смена cut/UNKNOWN не дают false или повтор. Canonical hidden/suppressed
+строки остаются членами, alias-only и merged-live строки — нет. Prepared native
+metadata graph сохраняется для своих consumers; canonical renderer graph снят
+отдельным validation fact. Legacy/composite Set прежний.
+
+Prompt adoption имеет более узкую identity-семантику, чем общий final index:
+только uuid/sourceIdentity и Array sourceIdentityAliases/sourceUuidAliases.
+SOURCE26.10 отдельный `primary-prompt-identity` требует producer proof
+`canonical-prompt-identity-v1`; generic find по новому имени поля недопустим —
+старый worker мог успешно вернуть empty для отсутствующего поля. Index даёт
+кандидатов, затем проверяются полные pre-overlay semantic fields; thin metadata
+может не содержать alias. Для длинного ID signed scan cursor читается порциями,
+а возвращается metadata descriptor точного canonical ordinal. Чужой token/cut,
+старый protocol, UNKNOWN и отмена — ошибки, не negative proof и не fallback.
+
+Обычный primary `hasDurablePrompt` с audit UUID/source identity использует этот
+асинхронный point proof; все recovery decisions ожидают его результат. Отдельный
+layout owner и demand cancellation отсеивают смену tab/session/header; body-only
+уведомление не отменяет чтение. Локально branded read failure сохраняет pending,
+останавливает fallthrough к новому query/refresh и не перезаписывает новый draft;
+уже захваченный staged transfer восстанавливается прежним CURRENT merge. Только
+полный известный negative допускает прежнее однократное fresh History чтение.
+На этом срезе no-exact-ID text matching и оба metadata decoder оставались OPEN;
+более поздние primary prompt adoption и canonical fact описаны выше. Legacy
+по-прежнему использует свой native matcher.
+
+Primary durable tool-result coverage также не выводится из thin metadata:
+в ней нет полных actions. SOURCE26.10 существующий read-page protocol сверяет
+до3 captured claims с held pre-overlay semantic actions. Signed key descriptor
+и полный typed UTF16 SHA связывают proof с CURRENT результатом перед удалением;
+внешняя смена owner/Map/cut/request или изменённое значение сохраняют новый результат.
+Task canonical alias, strict raw-result/error и resultRef сохраняют разные
+прежние predicates. Нет fallback/retry после ошибки, demand не закрывает root
+или независимый Full. Пока это полный paged scan на claim, не O(1) lookup и не
+устранение всех IDs/metadata либо одного большого native result.
+
+Собственное retirement каждой страницы не должно заново запускать этот pass.
+SOURCE26.10 держит текущую рабочую Map отдельно от неизменённой state-owned Map,
+публикует валидный результат один раз при завершении/отмене и хранит только
+точную receipt этой собственной публикации. Внешняя Map, новый header или owner
+создают новую работу; body-only window revision её не перезапускает. На конечных
+9 claims запросы9→3, публикации3→1; это Source work, не native latency.
+
+Исторические Codex settings нельзя выводить из content-less durable stubs.
+SOURCE26.10 `primary-effective-settings` читает held pre-overlay semantic rows
+через тот же подписанный lease и возвращает до2 исходных slash-text descriptors
+и глобальный max proofAt. Reader и renderer переиспользуют неизменённый reducer
+из packaged `src/shared/codex-history-effective-settings.mjs`; settingsFact и
+settings-before не заменяют его predicate. Root model готовит значение до adoption,
+pure-view metadata hit сохраняет его identity без нового settings query/decode. Применение
+по-прежнему сверяет текущий SID и более новые picker/history proofs. Полные
+native content/timestamp одной slash-строки остаются явным OPEN single-value sink;
+prepared metadata graph и global memory bounds этот settings-профиль не устраняет.
+
 Большие завершённые payload выносятся до оценки/сохранения графа и коммитятся
 с continuation атомарно. Семантический hash строки не равен V8 byte checksum:
 одинаковый объект после deserialize может иметь другую бинарную кодировку.
@@ -313,6 +781,30 @@ read proof. `[HistoryRead]` отделяет очередь своей сесс�
 cache/read/preparation, serialization и main delivery; renderer отдельно пишет
 decode. Причина SSD miss и RAM eviction различается, поздний отказ не теряется
 за успешными фазами. Точный словарь/пределы — `логирование-оптимизации.md`.
+Для capability RPC SOURCE добавляет к прежней correlation только opaque lease,
+известный page kind/Timeline operation и encoding fork. Это связывает ожидание
+страницы с уже выданным root; node token и тела не читаются для диагностики.
+Частота событий, квоты, FIFO/admission и source authority не меняются.
+SOURCE26.10 installed root-capability reads упорядочиваются по проверенному
+native lease вместо случайной общей очереди `[null,null]`. Иначе готовый frozen
+Timeline мог ждать fork другого parent, который сам ожидал maintenance. Lookup
+читает только существующий plane/state и не создаёт backing/source. Dispatch
+повторно проверяет capability; ошибочный или освобождённый root идёт прежним путём.
+Для allocator сохраняются обе predecessor edges — прежняя source/null и lease;
+явные SID/CWD у capability тоже сохраняют source edge. Все edges публикуются
+до await в прежней queue map. Cold/maintenance FIFO, byte credits, independent
+document leases, cancellation и UNKNOWN не меняются. Конечный Source control
+проверяет это с SQLite-adapter; native latency и общий peak RAM из него не следуют.
+Следующий SOURCE cut допускает только проверенный уже установленный TEXT pin
+мимо долгой maintenance preparation: backing и SQL должны быть готовы, открытой
+транзакции и полного collector быть не должно. Все source/null+lease edges и
+allocation classification остаются прежними. Полный collector удерживает это
+исключение выключенным до своего success/error/cancel; новые fast pins иначе
+сбрасывали бы mark на каждом yield. V8/unit/memo forks идут прежним admission.
+Pin/install остаются в прежней quota-проверяемой SQL transaction с root-cap и
+opening reservations. При rollback освобождается также локальный lease handle;
+ошибка не превращается в повтор. Это не отменяет существующие query pins и не
+доказывает global starvation/RAM bounds.
 Finite HTTP read дополнительно связывает logical read и physical GET attempt с
 этим RPC tuple исключительно через diagnostic envelope, не service payload.
 Worker boot/import/DB-ready, source-epoch wait, session/cold admission и work/reply
@@ -576,6 +1068,23 @@ Renderer snapshot ключуется всей identity `tab + tool + session + c
 
 Текущая row-window модель desktop не является возвращением удалённых display-only окон. Позиционный массив всегда полный; вне читаемого диапазона тяжёлый payload заменён identity-stub, поэтому UUID-порядок, scrollbar, restore и Timeline addressing не меняются. Tail и незавершённая фоновая работа остаются полными, а перемещение окна проходит обычной delta. Группировка обязана быть структурно одинаковой на stubs и full rows.
 
+SOURCE28.10 ordinary desktop уменьшает прежний запас750строк с каждой стороны
+и хвост300 до viewport-sized окна с запасом16 и хвостом32. Начальные16 всего
+почти целиком занимались viewport и давали miss уже на втором обычном wheel;
+32 включают экран и соседний запас. Широкий viewport
+увеличивает radius до покрытия всех реально показанных членов/captions; скрытые
+члены закрытой группы не создают две конкурирующие цели подгрузки. После смены
+окна delta передаёт также новые stubs для прежних full rows: старые тела должны
+исчезнуть из текущего snapshot, а не накапливаться по мере посещений. Явные
+Timeline/search/caption запросы сохраняют exact UUID. Публичные Main defaults
+и Full/Copy не сокращаются вместе с desktop request.
+
+Покрытый viewport не строит новый all-history UUID Map при каждом скролле.
+Только фактический visible miss переводится в raw positions одним проходом,
+с временными ключами лишь текущего диапазона. Полный компактный positional
+array остаётся отдельной стоимостью; это не universal O(viewport) или общий
+RSS bound. Незавершённая работа может держать строки вне обычного окна.
+
 Для правых Research-серий stub сохраняет короткие string-поля semanticTags:
 kind/runId/runKind/phase и tab-message/origin coordinates для прежнего приоритета
 classifier. Envelope, offsets/hash и chips не переносятся. Старая потеря tags
@@ -660,7 +1169,11 @@ provider, а не только текущую session. Сужать её рад�
 Теперь DatabaseManager повторно использует ТОТ ЖЕ SHA по отдельной SQLite
 версии provider. INSERT/DELETE и изменения полей, участвующих в hash, двигают
 её триггерами в той же транзакции, включая запись из другого соединения.
-Обновление только `updated_at` SHA прежде не меняло и не инвалидирует кэш.
+Source-ремонт25.10 включает `updated_at` в hash и update-trigger: session lookup
+читает кандидатов по этому полю, а для одинакового `entry_uuid` последний
+кандидат побеждает. Поэтому один upsert без изменения chips способен поменять
+видимую пометку. Прежнее исключение для timestamp-only update было неверным.
+Memo принадлежит точному SQLite connection; замена соединения не наследует его.
 Внутри транзакции reuse/publish кэша запрещены: rollback способен повторно
 использовать номер версии для другого содержимого. Restart начинает с пустого
 кэша; первая проверка или реальное изменение всё ещё вычисляет прежний hash.
@@ -691,6 +1204,17 @@ commit. Если появился ещё не обработанный pending, 
 следующем ifRevision. Не оборачивать весь prepare в SQLite transaction: это
 выключило бы memo prompt SHA и вернуло большой scan. Prompt authoring/recovery,
 offscreen binding, порядок всех rows и full-payload API сохранены.
+
+Выбор уже bound timing идёт по UUID шире списка captured sessions. Поздний
+primary interval либо alias в другой session может победить по `endTs`, поэтому
+одних tab/session counters недостаточно. Source25.10 добавляет transactional
+provider counter, включая primary/alias и joined interval insert/update/delete
+с OLD/NEW связями; SQL-выбор не сужается ради кэша. Чужое UI-сохранение по-прежнему
+не меняет attested scoped witness. Unknown/custom DDL остаётся консервативным,
+а reader не выполняет миграции. Новый scalar-vector также участвует в typed
+late-supersession: старый frozen view сохраняется, новый кандидат не публикуется.
+Это подтверждено двумя реальными SQL counterexamples и Source-интеграцией;
+не утверждение об уже обновлённой пользовательской установке.
 
 С отдельным worker connection проверка свободного target и claim — одна
 атомарная SQL-команда. Alias writer проверяет тот же target в write transaction.
@@ -778,5 +1302,11 @@ boundary даже при временном `publicTurnStateSuppressed`. Main о
 доказать текущие launch/run/lifecycle/watcher file+offset; сервис сам не решает,
 какой rollout принадлежит живому процессу и не использует provider session как
 read-owner.
+
+SOURCE26.10 raw Codex append обходит полные строки непосредственно в уже
+проверенном batch, без массива Buffer-view для всех строк. Порядок callbacks,
+UTF-8 carry, точные byte spans и source-ticket guards сохраняются. Полный append
+Buffer и одна большая физическая запись пока остаются native owners: устранение
+массива ссылок не делает весь этот read path ограниченным по памяти.
 
 См. `fact-timeline.md::Визуальный фидбек и навигация`, `fact-codex.md::Timeline и History`, `fact-mobile-web.md::Bridge pattern`.

@@ -416,6 +416,7 @@ async function rendererFixture(h) {
   const draftContract = await import('../renderer/utils/agentDraftPreflight.mjs');
   const { readCodexDraftAuthority } = await import('../renderer/utils/codexDraftAuthority.mjs');
   const c = vm.createContext({ ...draftContract, ...require('../shared/agent-send-target-precondition.cjs'),
+    agentSendReadTiming: require('../shared/agent-send-read-timing.cjs'),
     manualActionContract: require('../shared/agent-manual-action.cjs'), ipcRenderer, AbortController,
     Date: { now: h.clock.now }, setTimeout: h.clock.setTimer, clearTimeout: h.clock.clearTimer,
     console: { log() {}, warn() {}, error() {} },

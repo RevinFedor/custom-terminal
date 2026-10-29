@@ -142,6 +142,17 @@ test('same-owner model observation and intent revision changes invalidate the se
   assert.equal(h.count('runtime'), 2);
 });
 
+test('cancelled desired settings do not replace proven current model or report pending', async () => {
+  const h = fixture('codex');
+  h.state.options = { codexSettingsIntentModel: 'gpt-6.1-terra', codexSettingsIntentEffort: 'max',
+    codexSettingsIntentRevision: 21, codexSettingsIntentActionSequence: 8,
+    codexSettingsIntentAppliedRevision: 19, codexSettingsIntentCancelled: { revision: 21, actionSequence: 8 } };
+  const result = await h.reader.read('T');
+  assert.equal(result.model, 'codex-observed-1'); assert.equal(result.effort, 'ultra');
+  assert.equal(result.requestedModel, null); assert.equal(result.requestedEffort, null);
+  assert.equal(result.settingsPending, false);
+});
+
 test('ordinary animated frame changes do not force repeated observation', async () => {
   const h = fixture('codex');
   const pause = pauseFirst(h, 'readStoredChoices');

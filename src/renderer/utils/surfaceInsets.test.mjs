@@ -7,12 +7,11 @@ import {
   resolveCenterRightInset,
 } from './surfaceInsets.mjs';
 
-test('timeline: only an expanded UNPINNED tree covers the center', () => {
+test('timeline: expanded tree overlays even with a legacy pinned value', () => {
   // Collapsed rail already owns its slot — nothing to dodge.
   assert.equal(resolveTimelineInset({ treeMode: false, pinned: false, width: 420 }), 0);
-  // Pinned is a column: the center box is already narrower, so insetting would
-  // double-count and push controls into empty space.
-  assert.equal(resolveTimelineInset({ treeMode: true, pinned: true, width: 420 }), 0);
+  // An old saved pin cannot turn Timeline into a layout column again.
+  assert.equal(resolveTimelineInset({ treeMode: true, pinned: true, width: 420 }), 420 - TIMELINE_COLLAPSED_SLOT_WIDTH);
   assert.equal(
     resolveTimelineInset({ treeMode: true, pinned: false, width: 420 }),
     420 - TIMELINE_COLLAPSED_SLOT_WIDTH,

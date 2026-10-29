@@ -13,6 +13,28 @@ const {
   withPromptOriginPresentation,
 } = require('./history-prompt-presentations');
 
+test('plain MCP sender survives normalization without inventing a message or run', () => {
+  const tag = { kind: 'prompt-origin', source: 'terminal-mcp', sourceTabId: 'sender',
+    sourceTabName: 'Stored sender', sourceProjectId: 'source-project', auditSourceIdentity: 'exact-user' };
+  const snapshot = normalizePromptPresentationSnapshot({ semanticTags: [tag], historySendStartedAt: 123 });
+  assert.equal(snapshot.semanticTags[0].sourceTabId, 'sender');
+  assert.equal(snapshot.semanticTags[0].sourceTabName, 'Stored sender');
+  assert.equal(snapshot.semanticTags[0].sourceProjectId, 'source-project');
+  assert.equal(snapshot.semanticTags[0].auditSourceIdentity, 'exact-user');
+  assert.equal(snapshot.semanticTags[0].messageId, undefined);
+  assert.equal(snapshot.semanticTags[0].runId, undefined);
+  assert.equal(snapshot.historySendStartedAt, 123);
+});
+
+test('plain MCP source names without an exact tab ID do not acquire navigation', () => {
+  for (const source of ['terminal-mcp', 'loop']) {
+    const snapshot = normalizePromptPresentationSnapshot({ semanticTags: [{ kind: 'prompt-origin', source,
+      sourceTabId: ' ', sourceTabName: 'guessed', sourceProjectId: 'guessed' }] });
+    assert.equal(snapshot.semanticTags[0].sourceTabName, undefined);
+    assert.equal(snapshot.semanticTags[0].sourceProjectId, undefined);
+  }
+});
+
 test('native ID pasted-content stays opaque to the main image-ref reader, including malformed pairs', () => {
   assert.deepEqual(collectHistoryImagePathMarkersOutsidePastedContent(
     '[imagePath: /before.png] <pasted_content id="1fe1">\n[imagePath: /literal.png]\n'

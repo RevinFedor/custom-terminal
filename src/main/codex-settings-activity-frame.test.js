@@ -5,7 +5,8 @@ const vm = require('node:vm');
 const path = require('node:path');
 const { classifyCodexManualEnterFrame } = require('./codex-model-picker');
 const { createAgentSettingsActivity } = require('./agent-settings-activity');
-const { parseCodexVerifiedComposerFooter, inspectCodexInputReadyTextCore, selectCodexCurrentInteractiveFrameText } = require('./codex-tui-readiness');
+const { parseCodexVerifiedComposerFooter, hasCodexComposerStatusFooter,
+  inspectCodexInputReadyTextCore, selectCodexCurrentInteractiveFrameText } = require('./codex-tui-readiness');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const part = name => {
@@ -23,7 +24,8 @@ test('manual model picker activity waits for the committed model/effort footer, 
     part('codexInputControlFromCommittedSnapshot'), part('observeCodexSettingsActivityFrame'),
     '({ observe: observeCodexSettingsActivityFrame })',
   ].join('\n'), {
-    classifyCodexManualEnterFrame, parseCodexVerifiedComposerFooter,
+    classifyCodexManualEnterFrame, parseCodexVerifiedComposerFooter, hasCodexComposerStatusFooter,
+    getCodexModelIdentityCatalog: () => [],
     codexInputControlFrameCache: new WeakMap(),
     getHeadlessTerminalMirror: () => mirror,
     getTerminalLifecycleGeneration: () => generation,
@@ -52,6 +54,12 @@ test('manual model picker activity waits for the committed model/effort footer, 
   assert.equal(activity.read('T').busy, true);
   frame(['› Ask Codex to do anything', 'gpt-5.6-luna medium · Full Access']);
   assert.equal(activity.read('T').busy, false);
+  frame(menu);
+  frame(['› Ask Codex to do anything', 'GPT-6.1 Terra max fast · Context 27% used']);
+  assert.equal(activity.read('T').busy, false, 'the real Terra footer releases the manual control');
+  frame(menu);
+  frame(['› Ask Codex to do anything', 'GPT-7.2 Artemis high · Context 4% used']);
+  assert.equal(activity.read('T').busy, false, 'an unresolved ID can close the menu without claiming model success');
   const app = activity.begin({ tabId: 'T', target: 'effort', toolType: 'codex' });
   frame(menu);
   assert.equal(activity.read('T').target, 'effort', 'native submenu does not replace the clicked effort indicator');

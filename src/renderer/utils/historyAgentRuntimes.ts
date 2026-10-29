@@ -751,7 +751,15 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const queue = options.queue === true || options.statusAtSend === 'busy';
   const modelForPicker = options.model;
   const effortForPicker = options.effort;
-  const draftStateForSend = await probeCodexDraft(tabId, 'history-send-preflight', {
+  const mainCompactPreparation = localSlashCommand && normalizeCodexLocalSlashCommand(prompt) === '/compact';
+  // Standalone Compact already owns a bounded Main preparation, including
+  // unknown frames before insertion. A second short renderer-side read must
+  // not prevent that owner from receiving the operation. This hint grants no
+  // input rights; Main must observe a current empty frame itself.
+  const draftStateForSend = mainCompactPreparation
+    ? { hasDraft: null, preview: '', source: 'main-compact-preparation',
+        codexStartupFrameWaitId: options.codexStartupFrameWaitId }
+    : await probeCodexDraft(tabId, 'history-send-preflight', {
     codexStartupFrameWaitId: options.codexStartupFrameWaitId,
     handoffId: options.handoffId, attemptId: options.sendAttemptId,
   });
@@ -776,6 +784,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         visualSource: draftStateForSend?.source || 'history-send-preflight',
         visualPreview: draftStateForSend?.preview || '',
         turnBusy: queue,
+        requireEmptyComposer: mainCompactPreparation,
       })
     : ipcRenderer.invoke('codex:send-command', tabId, prompt, {
         queue,

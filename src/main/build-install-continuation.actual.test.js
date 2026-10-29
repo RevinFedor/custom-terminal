@@ -72,6 +72,15 @@ test('install ACK/shutdown/restart and callback receipt preserve Loop hold; only
   h.arm(); await h.reconcile(); assert.equal(h.inputs.length, 0, 'duplicate/late callback cannot create provider input');
 });
 
+test('source opt-in is immutable before the Voice POST; absent/false preserve old fingerprints and cannot upgrade an old request', t => {
+  const h = fixture(t); const old = h.begin();
+  assert.equal(h.reserve({ requestId: 'I', jobId: 'J', source: h.source, autoContinueInterruptedTabs: false }).fingerprint, old.fingerprint);
+  assert.throws(() => h.reserve({ requestId: 'I', jobId: 'J', source: h.source, autoContinueInterruptedTabs: true }), /identity_changed/);
+  const enabled = h.reserve({ requestId: 'opt-in', jobId: 'opt-job', source: h.source, autoContinueInterruptedTabs: true });
+  assert.equal(enabled.autoContinueInterruptedTabs, true);
+  assert.throws(() => h.reserve({ requestId: 'opt-in', jobId: 'opt-job', source: h.source }), /identity_changed/);
+});
+
 function closeWaitRequest(h) {
   return { tabId: '753', requestId: 'I', id: 'J', fingerprint: h.read().entries[0].fingerprint };
 }

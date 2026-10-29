@@ -1,5 +1,6 @@
 import React, { useState, useRef, useLayoutEffect, useCallback, useEffect } from 'react';
-import { createPortal } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
+import { captureUIHoverAction, uiPerformancePhaseForAction, uiPerformanceCommitForAction } from '../../utils/uiPerformanceDiagnostics.mjs';
 
 type Side = 'top' | 'bottom' | 'left' | 'right' | 'auto';
 
@@ -108,6 +109,7 @@ export default function Tooltip({
   // Tiny delay before hiding when leaving the trigger — lets the cursor cross
   // the GAP onto the tooltip without it disappearing under the pointer.
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revealActionRef = useRef<string | null>(null);
   const isInactive = disabled || !content;
   // Only the pointed/open tooltip consumes the physical key in React. Hidden
   // retained controls must not all render merely to keep their tooltip closed.
@@ -119,7 +121,7 @@ export default function Tooltip({
   // Keeping the tip alive while the cursor is inside it is what makes text
   // selection / Copy click possible — without it the leave-trigger event would
   // hide before pointer-enter on the tip can fire.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isInactive) {
       setVisible(false);
       setHovering(false);
@@ -146,22 +148,34 @@ export default function Tooltip({
     if (!visible && copied) setCopied(false);
   }, [visible, copied]);
 
-  const show = useCallback(() => {
+  const show = useCallback((event?: PointerEvent) => {
     if (isInactive) return;
     if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
-    setHovering(true);
-  }, [isInactive]);
+    if (!interactive && delay <= 0 && (always || cmdHeld)) {
+      const action = captureUIHoverAction(event); revealActionRef.current = action?.id || null;
+      if (action) uiPerformancePhaseForAction(action.id, 'tooltip:show-request');
+      // This label has no interactive bridge. Its existing layout measurement
+      // can finish in this event, alongside the button's immediate feedback.
+      flushSync(() => setHovering(true));
+    } else setHovering(true);
+  }, [isInactive, interactive, delay, always]);
 
   // Defer the hide by one frame's worth so the cursor can cross GAP onto the
   // tip without losing it. The tip's own onPointerEnter will cancel this timer.
   // 60ms — minimum that reliably covers the 6px gap at typical cursor speeds
   // while still feeling instant on leave. Higher values produced a "lingering"
   // tooltip after the cursor was already far from the trigger.
-  const hide = useCallback(() => {
+  const hide = useCallback((immediate = false, event?: PointerEvent) => {
     if (!interactive) {
+      const action = immediate && visible ? captureUIHoverAction(event) : null;
+      revealActionRef.current = null;
+      if (showTimerRef.current) { clearTimeout(showTimerRef.current); showTimerRef.current = null; }
       if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
-      setHovering(false);
-      setInTip(false);
+      const dismiss = () => { setHovering(false); setInTip(false); setVisible(false); };
+      // Pointer-leave is continuous-priority; clear the portal in that event.
+      // Blur/effect cleanup paths do not force a React commit.
+      if (immediate && visible) flushSync(dismiss); else dismiss();
+      if (action) uiPerformanceCommitForAction(action.id, 'tooltip:hidden-commit');
       return;
     }
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
@@ -169,7 +183,7 @@ export default function Tooltip({
       setHovering(false);
       hideTimerRef.current = null;
     }, 60);
-  }, [interactive]);
+  }, [interactive, visible]);
 
   // Extract a plain-text representation of `content` for the Copy button.
   // String content is trivial; for ReactNode trees we read the rendered text
@@ -294,6 +308,12 @@ export default function Tooltip({
       window.removeEventListener('resize', measure);
     };
   }, [visible, side, align, content, boundarySelector]);
+  useLayoutEffect(() => {
+    const actionId = revealActionRef.current;
+    if (!actionId || !visible || !pos || !tipRef.current) return;
+    revealActionRef.current = null;
+    uiPerformanceCommitForAction(actionId, 'tooltip:visible-commit');
+  }, [visible, pos]);
 
   // Compose handlers with the child's existing ones so we don't override them.
   const child = children as React.ReactElement<any>;
@@ -307,11 +327,11 @@ export default function Tooltip({
     },
     onPointerEnter: (e: React.PointerEvent) => {
       childProps.onPointerEnter?.(e);
-      show();
+      show(e.nativeEvent);
     },
     onPointerLeave: (e: React.PointerEvent) => {
       childProps.onPointerLeave?.(e);
-      hide();
+      hide(true, e.nativeEvent);
     },
     onPointerDown: (e: React.PointerEvent) => {
       childProps.onPointerDown?.(e);

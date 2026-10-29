@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { validateAsarArchive } from './validate-app-asar.mjs';
 import maintenanceApi from './research-maintenance.cjs';
+import voiceContinuationApi from './voice-install-continuation.cjs';
+import prodApi from './noted-prod-api.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_NAME = 'Noted Terminal.app';
@@ -294,6 +296,9 @@ export async function buildInstallNotedTerminal({
   beforeQuit = async () => {},
   quitBeforePrepare = false,
   earlyQuitSource = null,
+  appOwnedQuitSource = null,
+  confirmClosedSource = null,
+  validateContinuationCandidate = null,
   beforeReplace = async () => {},
   onPhase = () => {},
   maintenance = null,
@@ -310,6 +315,14 @@ export async function buildInstallNotedTerminal({
   let replacementInstalled = false;
   let quitAttempted = false;
   let earlyQuitConfirmed = false;
+  const ownedQuitSource = quitBeforePrepare ? earlyQuitSource : appOwnedQuitSource;
+  if (confirmClosedSource && (typeof confirmClosedSource !== 'function' || quitBeforePrepare || appOwnedQuitSource)) {
+    throw Error('closed-source confirmation is only valid for an external prepare-first install');
+  }
+  if (appOwnedQuitSource && (appOwnedQuitSource.status !== 'found'
+    || !Number.isInteger(appOwnedQuitSource.server?.pid) || appOwnedQuitSource.server.pid < 1)) {
+    throw Error('explicit app-owned Quit requires an authoritative source process');
+  }
   let launchAttempted = false;
   let step = 'lock';
   let recovery = null;
@@ -369,6 +382,7 @@ export async function buildInstallNotedTerminal({
     await runStep('/usr/bin/ditto', [releaseApp, stagedApp]);
     step = 'validate-stage';
     await validate(stagedApp, { run, fileSystem, signal });
+    if (validateContinuationCandidate) await validateContinuationCandidate(stagedApp);
     await beforeReplace({ stagedApp, installedApp, signal });
     step = 'owner-idle-ack';
     onPhase({ stage: 'awaiting-owner', step });
@@ -376,14 +390,34 @@ export async function buildInstallNotedTerminal({
       maintenanceReceipt = { ...await maintenance.begin(), beginConfirmed: true };
       maintenanceBegun = true;
     }
-    if (!quitBeforePrepare) await beforeQuit({ stagingRoot, installedApp, signal });
+    if (!quitBeforePrepare && !confirmClosedSource) {
+      if (appOwnedQuitSource) quitAttempted = true;
+      try { await beforeQuit({ stagingRoot, installedApp, signal }); }
+      catch (error) { if (error.quitRequested === false) quitAttempted = false; throw error; }
+    }
     checkAbort(signal);
-    step = 'quit';
-    onPhase({ stage: 'quitting', step });
-    quitAttempted = true;
-    // Do not abort the shutdown helper halfway through and race its remaining
-    // cleanup with reopening the old app. Cancellation is checked just after.
-    if (!quitBeforePrepare) await runStep('bash', ['scripts/graceful-quit.sh', '20'], { signal: undefined });
+    if (confirmClosedSource) {
+      // Only the plain CLI's earlier proven-absent source can enter here.
+      // Recheck after staging/maintenance and immediately before any rename:
+      // a shared standalone hub is not Main, and must never receive Quit.
+      step = 'confirm-closed-source';
+      const source = await confirmClosedSource();
+      checkAbort(signal);
+      if (source?.status !== 'absent') throw Error('closed install source is no longer proven absent: '
+        + (source?.status || 'unknown'));
+    } else {
+      step = 'quit';
+      onPhase({ stage: 'quitting', step });
+      quitAttempted = true;
+      // Do not abort the shutdown helper halfway through and race its remaining
+      // cleanup with reopening the old app. Cancellation is checked just after.
+      if (!quitBeforePrepare) {
+        if (appOwnedQuitSource) await run('bash', ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only',
+          String(appOwnedQuitSource.server.pid)], { cwd: projectDir });
+        else await runStep('bash', ['scripts/graceful-quit.sh', '20'], { signal: undefined });
+        earlyQuitConfirmed = true;
+      }
+    }
     checkAbort(signal);
     if (prior) {
       step = 'preserve-previous';
@@ -425,18 +459,26 @@ export async function buildInstallNotedTerminal({
       ...(maintenanceReceipt ? { maintenance: maintenanceReceipt } : {}) };
   } catch (error) {
     log('failed step=' + step + ' error=' + error.message);
-    if (quitBeforePrepare && quitAttempted && !earlyQuitConfirmed) {
+    if (ownedQuitSource && quitAttempted && !earlyQuitConfirmed) {
       try {
         await run('bash', ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only',
-          String(earlyQuitSource.server.pid)], { cwd: projectDir });
+          String(ownedQuitSource.server.pid)], { cwd: projectDir });
         earlyQuitConfirmed = true;
       } catch { recovery = { status: 'shutdown-unconfirmed', path: installedApp }; }
     }
-    if (quitAttempted && !recovery) {
+    if ((quitAttempted || previousMoved || replacementInstalled) && !recovery) {
       try {
         // If launch itself failed, stop any partially launched new app before
         // moving bundles. Recovery deliberately ignores the cancelled signal.
-        if (launchAttempted && replacementInstalled) await run('bash', ['scripts/graceful-quit.sh', '20'], { cwd: projectDir });
+        if (launchAttempted && replacementInstalled) {
+          if (confirmClosedSource) {
+            // A failed open may have launched Main, or left only the shared
+            // hub. Do not fall back to the path-wide Quit in this CLI scope.
+            const source = await confirmClosedSource();
+            if (source?.status !== 'absent') throw Error('closed-source rollback requires proven Main absence: '
+              + (source?.status || 'unknown'));
+          } else await run('bash', ['scripts/graceful-quit.sh', '20'], { cwd: projectDir });
+        }
         if (replacementInstalled) {
           await fileSystem.rename(installedApp, path.join(stagingRoot, 'failed.app'));
           replacementInstalled = false;
@@ -446,7 +488,7 @@ export async function buildInstallNotedTerminal({
           previousMoved = false;
         }
         if (await exists(installedApp, fileSystem)) {
-          await run('/usr/bin/open', [installedApp, ...(quitBeforePrepare ? maintenance?.launchArguments?.() || [] : [])], { cwd: projectDir });
+          await run('/usr/bin/open', [installedApp, ...(ownedQuitSource ? maintenance?.launchArguments?.() || [] : [])], { cwd: projectDir });
           recovery = { status: 'previous-app-reopened', path: installedApp };
           log('reopened previous installed app at ' + installedApp);
         } else recovery = { status: 'no-previous-app', path: null };
@@ -455,11 +497,13 @@ export async function buildInstallNotedTerminal({
         log('recovery failed; preserved artifacts at ' + (stagingRoot || installedApp) + ': ' + recoveryError.message);
       }
     } else if (!recovery) recovery = { status: 'installed-app-untouched', path: installedApp };
-    if (maintenanceBegun && (!quitAttempted || recovery?.status === 'previous-app-reopened')) {
+    if (maintenanceBegun && (!quitAttempted || recovery?.status === 'previous-app-reopened')
+      && (!confirmClosedSource || recovery?.status === 'previous-app-reopened')) {
       try { maintenanceReceipt = await maintenance.complete({ reopenedPrevious: true }); }
       catch (endError) { log('same maintenance operation retained: ' + endError.message); }
     }
-    return { ok: false, installed: replacementInstalled, launchRequested: false, error: error.message, failedStep: step, recovery, previousApp: previousMoved ? previousApp : null, stagingRoot,
+    return { ok: false, installed: replacementInstalled, launchRequested: false, cancelled: signal?.aborted === true,
+      error: error.message, failedStep: step, recovery, previousApp: previousMoved ? previousApp : null, stagingRoot,
       ...(maintenanceReceipt ? { maintenance: maintenanceReceipt } : {}) };
   } finally {
     // Only our empty lock directory is removed. All app artifacts (including
@@ -471,13 +515,19 @@ export async function buildInstallNotedTerminal({
   }
 }
 
-export async function main({ projectDir = projectRoot, install = buildInstallNotedTerminal } = {}) {
+export async function main({ projectDir = projectRoot, install = buildInstallNotedTerminal,
+  inspect = prodApi.inspectProdServer } = {}) {
   if (process.platform !== 'darwin') throw new Error('Noted Terminal installation requires macOS');
   const controller = new AbortController();
   const cancel = () => controller.abort(new Error('install cancelled'));
+  const nonce = process.env.NOTED_INSTALL_IDLE_ACK_ID || '';
+  const voiceContinuation = process.env.NOTED_INSTALL_CONTINUATION_BINDING
+    ? voiceContinuationApi.createVoiceInstallContinuation(JSON.parse(process.env.NOTED_INSTALL_CONTINUATION_BINDING)) : null;
+  if (voiceContinuation && (voiceContinuation.binding.jobId !== nonce || process.env.NOTED_INSTALL_FORCE !== '1')) {
+    throw Error('voice_install_driver_identity_changed');
+  }
   process.once('SIGINT', cancel);
   process.once('SIGTERM', cancel);
-  const nonce = process.env.NOTED_INSTALL_IDLE_ACK_ID || '';
   let controlBuffer = '';
   const onControlData = chunk => {
     controlBuffer += chunk.toString();
@@ -496,16 +546,30 @@ export async function main({ projectDir = projectRoot, install = buildInstallNot
     process.stdin.once('error', onControlEnd);
   }
   try {
+    let confirmClosedSource = null;
+    if (!nonce && !voiceContinuation) {
+      const source = await inspect();
+      checkAbort(controller.signal);
+      if (!['found', 'absent'].includes(source?.status)) {
+        throw Error('install source is not known: ' + (source?.reason || source?.status || 'unknown'));
+      }
+      if (source.status === 'absent') confirmClosedSource = () => inspect();
+    }
     const result = await install({
       projectDir,
+      ...(confirmClosedSource ? { confirmClosedSource } : {}),
+      ...(voiceContinuation ? { appOwnedQuitSource: voiceContinuation.source,
+        validateContinuationCandidate: voiceContinuation.validateCandidate } : {}),
       signal: controller.signal,
       onPhase: phase => console.log('[NotedInstall:phase] ' + JSON.stringify({ protocol: 1, nonce, ...phase })),
       maintenance: maintenanceApi.createClient().installScope('install:noted:' + (nonce || randomUUID()), {
         log: message => console.log('[NotedInstall] ' + message),
       }),
       beforeQuit: nonce ? async ({ signal }) => {
-        await waitForInstallAck({ nonce, signal });
+        try { await waitForInstallAck({ nonce, signal }); }
+        catch (error) { if (voiceContinuation) error.quitRequested = false; throw error; }
         process.stdin.resume(); // keep cancellation observable after the ACK
+        if (voiceContinuation) await voiceContinuation.capture();
       } : async () => {},
     });
     console.log(INSTALL_RESULT_PREFIX + JSON.stringify({ protocol: 1, nonce: nonce || null,

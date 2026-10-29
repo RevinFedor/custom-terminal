@@ -65,11 +65,11 @@ test('A to B before the first mounted row invalidates A and only publishes B', (
   const published: string[] = [];
   let ownerBMounted = false;
 
-  probe.start(ownerA, () => false, () => published.push('A'));
+  probe.start(ownerA, () => false, () => { published.push('A'); });
   assert.equal(frames.flushOne(), true);
   assert.equal(frames.pending, 1);
 
-  probe.start(ownerB, () => ownerBMounted, () => published.push('B'));
+  probe.start(ownerB, () => ownerBMounted, () => { published.push('B'); });
   assert.equal(probe.isActive(ownerA), false);
   assert.equal(probe.isActive(ownerB), true);
   assert.equal(frames.pending, 1);
@@ -83,6 +83,42 @@ test('A to B before the first mounted row invalidates A and only publishes B', (
   assert.deepEqual(published, ['B']);
   assert.equal(probe.isActive(ownerB), false);
   assert.equal(frames.pending, 0);
+});
+
+test('a rejected measured-window publication remains active until its same-owner proof is accepted', () => {
+  const frames = createFrameHarness(), probe = createHistoryViewportPaintProbe(frames);
+  const own = owner('current-primary', 3); let covered = false, attempts = 0, accepted = 0;
+  probe.start(own, () => true, () => {
+    attempts++;
+    if (!covered) return false;
+    accepted++; return true;
+  });
+  frames.flushOne(); frames.flushOne();
+  assert.equal(attempts, 1); assert.equal(accepted, 0);
+  assert.equal(probe.isActive(own), true); assert.equal(frames.pending, 1);
+  covered = true;
+  frames.flushOne(); assert.equal(accepted, 0);
+  frames.flushOne(); assert.equal(accepted, 1); assert.equal(probe.isActive(own), false);
+  assert.equal(frames.pending, 0);
+});
+
+test('a refused publication cannot revive itself after its callback cancels or replaces the probe', () => {
+  for (const replace of [false, true]) {
+    const frames = createFrameHarness(), probe = createHistoryViewportPaintProbe(frames);
+    const old = owner('A', 1), next = owner('B', 2); let oldAttempts = 0, nextAccepted = 0;
+    probe.start(old, () => true, () => {
+      oldAttempts++;
+      probe.cancel(old);
+      if (replace) probe.start(next, () => true, () => { nextAccepted++; return true; });
+      return false;
+    });
+    frames.flushOne(); frames.flushOne();
+    assert.equal(oldAttempts, 1); assert.equal(probe.isActive(old), false);
+    assert.equal(frames.pending, replace ? 1 : 0);
+    if (replace) { frames.flushOne(); frames.flushOne(); }
+    assert.equal(nextAccepted, replace ? 1 : 0);
+    assert.equal(frames.pending, 0);
+  }
 });
 
 test('a transient previous-owner row must survive the paint boundary before publish', () => {

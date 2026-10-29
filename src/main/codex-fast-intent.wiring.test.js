@@ -29,13 +29,13 @@ test('desktop and mobile persist Fast intent without requiring a live Codex proc
   assert.match(controlBar, /const codexFastDisabled = false/);
   assert.doesNotMatch(controlBar, /const fastBlocked = isBusyBlocked\('fast'\)/);
 
-  const bridgeStart = app.indexOf("if (action === 'sendCodexFast')");
+  const bridgeStart = app.indexOf("if (action === 'sendCodexFast'");
   const bridgeEnd = app.indexOf("if (action === 'setSDKParams')", bridgeStart);
   const bridge = app.slice(bridgeStart, bridgeEnd);
   assert.match(bridge, /codex:toggle-fast-intent/);
   assert.doesNotMatch(bridge, /requires a live Codex process|codex:get-draft-state/);
   const paramsStart = app.indexOf("if (action === 'getSDKParams')");
-  const paramsEnd = app.indexOf("if (action === 'sendCodexFast')", paramsStart);
+  const paramsEnd = app.indexOf("if (action === 'sendCodexFast'", paramsStart);
   assert.ok(paramsStart >= 0 && paramsEnd > paramsStart);
   assert.match(app.slice(paramsStart, paramsEnd), /agent:get-current-params/);
   assert.doesNotMatch(app.slice(paramsStart, paramsEnd), /provider:get-status|claude:get-confirmed-settings/);

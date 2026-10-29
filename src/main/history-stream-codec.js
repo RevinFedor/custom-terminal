@@ -4,6 +4,7 @@
 // row cursors and large-leaf references. It never serializes a whole graph or
 // joins a leaf. This bounds codec ownership, not a legacy producer's graph.
 const { currentReadControl } = require('./history-read-control');
+const { isHistoryPagedCursor, historyPagedJsonEvents } = require('./history-paged-store');
 const DEFAULT_FRAME_BYTES = 16 * 1024;
 const highSurrogate = n => n >= 0xd800 && n <= 0xdbff;
 const lowSurrogate = n => n >= 0xdc00 && n <= 0xdfff;
@@ -68,6 +69,7 @@ async function* encodeHistoryStream(root, { format = 'json', frameBytes = DEFAUL
   const scalarChars = Math.max(2, Math.floor(frameBytes / 6));
   const ancestors = new Set();
   const prepare = (value, key) => {
+    if (isHistoryPagedCursor(value)) return value;
     if (leafResolver?.isReference?.(value)) return value;
     if (value !== null && (typeof value === 'object' || typeof value === 'bigint')
       && typeof value.toJSON === 'function') value = value.toJSON(key);
@@ -77,6 +79,25 @@ async function* encodeHistoryStream(root, { format = 'json', frameBytes = DEFAUL
   async function* visit(value, depth) {
     control?.assertCurrent();
     stats.maxDepth = Math.max(stats.maxDepth, depth);
+    if (isHistoryPagedCursor(value)) {
+      for (const event of historyPagedJsonEvents(value, { stats, assertCurrent: () => control?.assertCurrent() })) {
+        if (typeof event === 'string') { yield event; continue; }
+        if (event.text) {
+          function* chunks() {
+            for (const chunk of event.text.textChunks()) { stats.leafChunks++; yield chunk; }
+          }
+          yield* quotePieces(chunks(), scalarChars, stats, control);
+          continue;
+        }
+        const scalar = event.scalar;
+        if (scalar === null) yield 'null';
+        else if (typeof scalar === 'number') yield Number.isFinite(scalar) ? String(scalar === 0 ? 0 : scalar) : 'null';
+        else if (typeof scalar === 'boolean') yield scalar ? 'true' : 'false';
+        else if (typeof scalar === 'bigint') throw new TypeError('Do not know how to serialize a BigInt');
+        else throw new TypeError('History response is not a JSON value');
+      }
+      return;
+    }
     if (leafResolver?.isReference?.(value)) {
       const chunks = leafResolver.readChunks(value, { chunkBytes: frameBytes, control });
       async function* observed() { for await (const chunk of chunks) { stats.leafChunks++; yield chunk; } }
@@ -125,7 +146,8 @@ async function* encodeHistoryStream(root, { format = 'json', frameBytes = DEFAUL
   }
   async function* tokens() {
     if (format === 'json') { yield* visit(prepare(root, ''), 0); return; }
-    for await (const row of root) { yield* visit(prepare(row, ''), 0); yield '\n'; }
+    const rows = isHistoryPagedCursor(root) ? root.rows() : root;
+    for await (const row of rows) { yield* visit(prepare(row, ''), 0); yield '\n'; }
   }
   let buffer = Buffer.allocUnsafe(frameBytes), used = 0;
   for await (const token of tokens()) {

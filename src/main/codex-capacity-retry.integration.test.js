@@ -268,6 +268,7 @@ test('actual common readiness scenario forbids both fresh start and resume for a
   }).outputText;
   const context = vm.createContext({
     exports: {},
+    AbortController, performance, agentSendReadTiming: require('../shared/agent-send-read-timing.cjs'),
     ...require('../shared/agent-send-target-precondition.cjs'),
     manualActionContract: require('../shared/agent-manual-action.cjs'),
     console: { log() {}, warn() {} },
@@ -278,6 +279,7 @@ test('actual common readiness scenario forbids both fresh start and resume for a
   for (const sessionId of [null, 'S']) {
     await assert.rejects(context.prepareAgentRuntimeForSend({
       tabId: 'T', sessionId, requireLive: true,
+      launchAdmission: { cancel() {} }, // no launch is permitted in this inactive-runtime control
       runtime: {
         label: 'Codex', toolType: 'codex', getPresence: async () => ({ status: 'inactive', inputReady: false }),
         resume: async () => assert.fail('automatic continuation must not resume a stopped session'),
@@ -414,6 +416,7 @@ function coordinatedLifecycleFixture(store) {
   const context = vm.createContext({
     getOrchestrationRunStore: () => store,
     responseObservationService: null,
+    wakeMessageLoopWaits() {}, // no question in this run/coordination fixture
     emitOrchestrationChanges() {},
     finalizeSettledOrchestrations: async runs => settled.push(...runs),
     shouldRetryWaitingNotificationForSourceLifecycle: () => false,
@@ -518,7 +521,7 @@ test('an earlier TUI capacity frame updates presentation but cannot start a sour
   assert.equal(h.settled.length, 0);
   assert.match(part(mainSource, 'finishCodexModelCapacityOutcome'), /capacitySurfaceOnly: true/);
   const emissions = part(mainSource, 'emitCodexBusy');
-  assert.equal((emissions.match(/capacitySurfaceOnly: true/g) || []).length, 2);
+  assert.equal((emissions.match(/capacitySurfaceOnly: true/g) || []).length, 3, 'renderer IPC joins the existing web busy/done presentation flags');
 });
 
 for (const code of ['codex_capacity_retry_exhausted', 'codex_capacity_retry_not_submitted'])

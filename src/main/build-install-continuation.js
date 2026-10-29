@@ -6,11 +6,26 @@ const crypto = require('node:crypto');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { promptFingerprint } = require('./claude-prompt-carriers');
+const { agentPromptAuditAddresses } = require('./agent-prompt-audit-identity');
 const activity = require('../shared/build-install-activity.cjs');
 const logicalFingerprint = text => crypto.createHash('sha256').update(text).digest('hex');
 const clone = value => JSON.parse(JSON.stringify(value));
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const error = code => Object.assign(new Error(code), { code, statusCode: 409 });
+
+// A confirmed source-only audit can acquire a canonical UUID/alias later.
+// The receipt owner proves that enrichment. Keep the frozen delivery binding
+// and require every previously pinned address in the SAME current receipt;
+// another attempt, payload, preparation or audit time is never equivalent.
+function sameCallbackBinding(previous, current, record) {
+  if (!previous || !current) return false;
+  const { userUuid, sourceIdentity, ...frozen } = previous;
+  const { userUuid: _currentUser, sourceIdentity: _currentSource, ...now } = current;
+  if (digest(frozen) !== digest(now) || !userUuid && !sourceIdentity) return false;
+  const addresses = agentPromptAuditAddresses(record.auditIdentity);
+  return (!userUuid || addresses.entryUuids.includes(userUuid))
+    && (!sourceIdentity || addresses.sourceIdentities.includes(sourceIdentity));
+}
 
 function createBuildInstallContinuations({ read, write, receipts, readResult, readSource,
   readQueuedRequest = () => null, readPreparedHandoff = () => null, changed = () => {} }) {
@@ -36,33 +51,34 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
     changed(clone(entry));
   };
   const find = id => load().entries.find(entry => entry.requestId === id);
-  const reserve = ({ requestId, jobId, source }) => {
-    if (!requestId || !source?.tabId || !source.projectId || !source.sessionId
+  const reserve = ({ requestId, jobId, source, autoContinueInterruptedTabs }) => {
+    if (typeof requestId !== 'string' || !/^[\w:.-]{1,180}$/.test(requestId) || !source?.tabId || !source.projectId || !source.sessionId
       || !['claude', 'codex'].includes(source.toolType)) throw error('install_continuation_identity_required');
-    const fingerprint = digest({ requestId, source });
+    const fingerprint = digest({ requestId, source, ...(autoContinueInterruptedTabs === true ? { autoContinueInterruptedTabs: true } : {}) });
     let entry = find(requestId);
     if (entry && entry.fingerprint !== fingerprint) throw error('install_continuation_identity_changed');
     if (entry?.jobId && jobId && entry.jobId !== jobId) throw error('install_continuation_job_changed');
     if (!entry) {
       entry = { version: 1, requestId, jobId, source: clone(source), fingerprint,
-        state: 'waiting-install', createdAt: Date.now(), callback: null };
+        state: 'waiting-install', createdAt: Date.now(), callback: null,
+        ...(autoContinueInterruptedTabs === true ? { autoContinueInterruptedTabs: true } : {}) };
       load().entries.push(entry);
     }
     if (jobId && !entry.jobId) entry.jobId = jobId;
     commit(entry); // exact retry persists the same accepted RAM intent
     return clone(entry);
   };
-  const sourceReservation = ({ requestId, jobId, tabId, sessionId, projectId }) => {
+  const sourceReservation = ({ requestId, jobId, tabId, sessionId, projectId, autoContinueInterruptedTabs }) => {
     const entry = find(requestId);
     if (!entry) return null;
     if (entry.source.tabId !== tabId || entry.source.sessionId !== sessionId
       || projectId && entry.source.projectId !== projectId) throw error('install_continuation_identity_changed');
-    return reserve({ requestId, jobId, source: entry.source }).source;
+    return reserve({ requestId, jobId, source: entry.source, autoContinueInterruptedTabs }).source;
   };
   const armCallback = ({ requestId, jobId, prompt }) => {
     const entry = find(requestId);
     if (!entry || entry.jobId !== jobId || typeof prompt !== 'string' || !prompt) throw error('install_continuation_callback_owner_changed');
-    if (['ended-without-callback', 'cancelled'].includes(entry.state)) throw error('install_continuation_already_settled');
+    if (entry.cancelledAt || ['ended-without-callback', 'cancelled'].includes(entry.state)) throw error('install_continuation_already_settled');
     const callback = { handoffId: 'build-install-return:' + jobId, promptHash: promptAuditFingerprint(prompt) };
     if (entry.callback && digest(entry.callback) !== digest(callback)) throw error('install_continuation_callback_changed');
     const intent = { logicalHash: logicalFingerprint(prompt), logicalResultHash: promptFingerprint(prompt) };
@@ -96,6 +112,23 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
     entry.outcomeFloorAt = entry.cancelledAt; entry.disposition = 'user-cancelled-continuation';
     commit(entry);
     return clone(entry);
+  };
+  const cancelRequest = request => {
+    assertCommitted();
+    const entry = find(request.requestId);
+    if (!entry || entry.source.tabId !== request.tabId || entry.jobId !== request.id
+      || request.fingerprint && request.fingerprint !== entry.fingerprint) throw error('install_continuation_cancel_owner_changed');
+    if (entry.cancelledAt) return clone(entry);
+    // Explicit user cancellation revokes this request even before its callback
+    // is proven. Past callback/audit fields remain immutable historical facts.
+    if (activity.pending(entry)) {
+      entry.state = 'cancelled';
+      // Neutral cancellation must not move the floor past a real final that
+      // happened while this request held Loop. Still reject pre-request finals.
+      entry.outcomeFloorAt = Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now();
+    }
+    entry.cancelledAt = Date.now(); entry.disposition = 'user-cancelled-request';
+    commit(entry); return clone(entry);
   };
   const settleNoCallback = job => {
     const entry = find(job.requestId);
@@ -185,7 +218,7 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
     const records = receipts()?.list({ tabId: entry.source.tabId, handoffId: entry.callback.handoffId }) || [];
     if (records.length !== 1) return;
     const record = records[0], audit = record.auditIdentity, binding = callbackBinding(entry, record);
-    if (!binding || entry.callbackBinding && digest(entry.callbackBinding) !== digest(binding)) return;
+    if (!binding || entry.callbackBinding && !sameCallbackBinding(entry.callbackBinding, binding, record)) return;
     if (!entry.callbackBinding) {
       entry.callbackIntent ||= { logicalHash: binding.logicalHash, logicalResultHash: binding.logicalResultHash };
       entry.callbackBinding = binding;
@@ -196,7 +229,6 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
       || source.toolType !== entry.source.toolType || !['found', 'absent'].includes(source.processStatus)) return;
     const auditAt = Date.parse(audit.auditTimestamp);
     if (!Number.isFinite(auditAt)) return;
-    const identity = digest(binding);
     const result = await readResult({ sessionId: record.sessionId, cwd: entry.source.cwd,
       toolType: entry.source.toolType, promptHash: binding.resultPromptHash,
       promptUserUuid: audit.entryUuid || undefined, promptSourceIdentity: audit.sourceIdentity || undefined,
@@ -212,7 +244,7 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
       || latestSource.toolType !== entry.source.toolType || !['found', 'absent'].includes(latestSource.processStatus)) return;
     const current = receipts()?.get(record.operationKey);
     const currentBinding = current && callbackBinding(entry, current);
-    if (!currentBinding || digest(currentBinding) !== identity) return;
+    if (!currentBinding || !sameCallbackBinding(binding, currentBinding, current)) return;
     // All-tab startup and a native single-tab wake can overlap. Recheck the
     // shared entry after the last await; one completed/revoked entry cannot
     // publish another release or be resurrected by a late read.
@@ -222,8 +254,28 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
     entry.state = 'continued'; entry.continuedAt = Date.now(); entry.outcomeFloorAt = auditAt;
     entry.callbackProof = { operationKey: record.operationKey, attemptId: record.attemptId,
       userUuid: result.userUuid || null, sourceIdentity: result.sourceIdentity || null,
-      turnId: result.executionContext?.turnId || null, sessionId: record.sessionId };
+      turnId: result.executionContext?.turnId || null, sessionId: record.sessionId,
+      executionContext: result.executionContext || null };
     commit(entry);
+  };
+  const readCallbackProof = async ({ requestId, jobId, source: expected }) => {
+    assertCommitted();
+    const entry = find(requestId);
+    if (entry?.jobId === jobId && digest(entry.source) === digest(expected) && ['ended-without-callback', 'cancelled'].includes(entry.state)) {
+      return { disposition: 'ended-without-callback', binding: null };
+    }
+    if (!entry?.callback || entry.jobId !== jobId || digest(entry.source) !== digest(expected)) return null;
+    const records = receipts()?.list({ tabId: entry.source.tabId, handoffId: entry.callback.handoffId }) || [];
+    if (records.length !== 1) return null;
+    const record = records[0], binding = callbackBinding(entry, record);
+    if (!binding || entry.callbackBinding && !sameCallbackBinding(entry.callbackBinding, binding, record)) return null;
+    const source = await readSource(entry.source.tabId);
+    if (source?.coherent !== true || source.sessionId !== binding.sessionId || source.toolType !== entry.source.toolType) return null;
+    const latest = receipts()?.get(record.operationKey), current = latest && callbackBinding(entry, latest);
+    if (!current || !sameCallbackBinding(binding, current, latest)) return null;
+    return { binding: { ...current, handoffId: entry.callback.handoffId,
+      promptHash: current.transportAuditHash, executionContext: latest.receipt?.auditExecutionContext
+        || entry.callbackProof?.executionContext || null }, naturalFinal: entry.state === 'continued' };
   };
   const reconcile = tabId => {
     const key = tabId || '*';
@@ -237,8 +289,8 @@ function createBuildInstallContinuations({ read, write, receipts, readResult, re
     });
     work.set(key, promise); return promise;
   };
-  return { reserve, sourceReservation, armCallback, snapshot, blocked, reconcile, settleNoCallback,
-    canCancelConfirmedWait, cancelConfirmedWait };
+  return { reserve, sourceReservation, armCallback, snapshot, blocked, reconcile, settleNoCallback, readCallbackProof,
+    canCancelConfirmedWait, cancelConfirmedWait, cancelRequest };
 }
 
 module.exports = { createBuildInstallContinuations };

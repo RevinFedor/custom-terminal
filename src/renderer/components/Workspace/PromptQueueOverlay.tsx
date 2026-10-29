@@ -11,6 +11,7 @@ import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, GitBranch
 import { ComposerChip } from '@noted/claude-blocks';
 import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
 import { ComposerEditor } from '../ComposerEditor';
+import { LoopPromptFields } from './LoopPromptFields';
 import {
   type ComposerEditorHandle,
   type ComposerInlineToken,
@@ -22,6 +23,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { runAfterActionModels } from '../../utils/runAfterActionModels';
 import { sendQueuedPromptNow } from '../../utils/runAfterSendNow';
+import { buildQueuedPromptTransport } from '../../store/usePromptQueueStore';
 import { isTabBusyNow, signalPromptQueueDictationResolved, getPromptQueueRuntimeSnapshot, subscribePromptQueueRuntime } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { PROMPT_QUEUE_BUTTON_SIZE, PROMPT_QUEUE_RAIL_BORDER } from '../../utils/promptQueueChrome.mjs';
@@ -31,6 +33,9 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import {
   collectPromptImageRefIds,
+  hasPromptPendingImageMarker,
+  maskPromptWebImageReferences,
+  replacePromptPendingImageMarkers,
   getPromptImageStatusTokenRanges,
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
@@ -467,7 +472,7 @@ const RESIZE_MAX_WIDTH = 600;
 const RUN_AFTER_IMAGE_PENDING_MARKER = '[Image saving…]';
 
 const runAfterImageNotice = (text: string, imagePaths: QueuedImageRef[]) => {
-  if (String(text || '').includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+  if (hasPromptPendingImageMarker(text)) {
     return { message: 'Saving image attachment…', blocking: true, progress: true };
   }
   const inspection = inspectPromptImageAttachments(text, imagePaths || []);
@@ -651,6 +656,7 @@ export function PromptQueueOverlay({
     () => queue ? loopDependencyEntry(tabId, queue) : null);
   useEffect(() => { void initializeLoopDependencies().catch(() => {}); }, []);
   const loopPromptText = usePromptQueueStore((s) => s.sharedLoopPromptText);
+  const localLoopPromptText = queue?.localLoopPromptText || '';
   // Вкладка без своей записи в очереди = новая вкладка → свёрнуто. Локальный
   // `?? false` здесь раньше означал «развёрнуто» и переспорил бы дефолт стора.
   const collapsed = embedded ? false : queue?.panelCollapsed ?? DEFAULT_RUN_AFTER_PANEL_COLLAPSED;
@@ -662,7 +668,7 @@ export function PromptQueueOverlay({
     setPromptTrigger, setPromptCondition,
     setAutoRun,
     setPostPromptEnabled, setPostPromptText,
-    setLoopPromptEnabled, setLoopPromptText,
+    setLoopPromptEnabled, setLoopPromptText, setLocalLoopPromptText,
     setPanelCollapsed: setStoredPanelCollapsed, setPreviewId: setStoredPreviewId,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
@@ -701,6 +707,7 @@ export function PromptQueueOverlay({
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorText, setEditorText] = useState('');
+  const [loopEditorHeight, setLoopEditorHeight] = useState(240);
   const [editorChips, setEditorChips] = useState<QueuedComposerChip[]>([]);
   const [editorImagePaths, setEditorImagePaths] = useState<QueuedImageRef[]>([]);
   const editorHistoryPayload = useMemo<RunAfterComposerAggregate>(() => ({
@@ -1542,7 +1549,7 @@ export function PromptQueueOverlay({
         return changed;
       }
 
-      if (editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+      if (hasPromptPendingImageMarker(editorText)) {
         console.log('[PromptQueue:Images] commit deferred tab=' + tabId.slice(-8)
           + ' item=' + (initial.id || 'new') + ' reason=image-import-pending');
         return false;
@@ -1703,7 +1710,7 @@ export function PromptQueueOverlay({
   const prepareQueueClose = useCallback((reason?: 'outside') => {
     // Pointer dismissal is an editor exit, not a pin. Keep pending attachments
     // and a requested Timeline selection alive without changing click ownership.
-    if (editorOpen && editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return false;
+    if (editorOpen && hasPromptPendingImageMarker(editorText)) return false;
     if (rewindTargetRequestId && reason === 'outside') return false;
     if (rewindTargetRequestId) cancelQueuedRewindTarget(tabId, rewindTargetRequestId);
     const active = document.activeElement;
@@ -2172,13 +2179,17 @@ export function PromptQueueOverlay({
     textarea.measureNaturalHeight((measuredHeight) => {
       if (editorTextareaRef.current !== textarea) return;
       const nextHeight = Math.min(
-        Math.max(measuredHeight, editorTextareaMinHeight),
+        Math.max(measuredHeight, specialPromptMode === 'loop' ? 144 : editorTextareaMinHeight),
         maxTextareaHeight
       );
+      if (specialPromptMode === 'loop') {
+        setLoopEditorHeight(nextHeight);
+        return;
+      }
       textarea.style.height = `${nextHeight}px`;
       textarea.style.overflowY = measuredHeight > maxTextareaHeight ? 'auto' : 'hidden';
     });
-  }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isSpecialPromptMode]);
+  }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isSpecialPromptMode, specialPromptMode]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -2296,7 +2307,8 @@ export function PromptQueueOverlay({
         console.warn('[PromptQueue] replay attachment unavailable but transferable tab=' + tabId.slice(-8)
           + ' item=' + id.slice(-8) + ' action=replace-with-imageError');
       }
-      const payload = buildQueuedPromptPayload(validation.item);
+      const replayTransport = buildQueuedPromptTransport(validation.item);
+      const payload = replayTransport.prompt;
       const submitNow = opts?.submit === true;
       console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
       // Same rule as grab: put the prompt back where the user is typing.
@@ -2371,6 +2383,8 @@ export function PromptQueueOverlay({
           submit: false,
           source: 'prompt-queue-replay',
           presentationSnapshot: {
+            authoringTransport: { sourceHash: window.require('node:crypto').createHash('sha256').update(payload).digest('hex'),
+              imageRanges: replayTransport.imageRanges },
             promptChips: validation.item.chips || [],
             imagePaths: validation.item.imagePaths || [],
           },
@@ -2614,7 +2628,7 @@ export function PromptQueueOverlay({
     }
     const initial = editorInitialRef.current;
     if (!initial) return;
-    if (editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+    if (hasPromptPendingImageMarker(editorText)) {
       showToast('Wait for the current image to finish saving.', 'warning', 3000);
       return;
     }
@@ -2679,7 +2693,7 @@ export function PromptQueueOverlay({
             }
           : null;
       if (!current) return;
-      const tokenStart = current.text.indexOf(RUN_AFTER_IMAGE_PENDING_MARKER);
+      const tokenStart = maskPromptWebImageReferences(current.text).indexOf(RUN_AFTER_IMAGE_PENDING_MARKER);
       if (tokenStart < 0) {
         console.log('[PromptQueue:Images] paste-import dropped tab=' + tabId.slice(-8)
           + ' item=' + (initial.id || 'new') + ' reason=pending-marker-removed');
@@ -2766,9 +2780,8 @@ export function PromptQueueOverlay({
               imagePaths: liveDraft.imagePaths,
             }
           : null;
-      if (!current?.text.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return;
-      const failedText = current.text.replace(
-        RUN_AFTER_IMAGE_PENDING_MARKER,
+      if (!hasPromptPendingImageMarker(current?.text)) return;
+      const failedText = replacePromptPendingImageMarkers(current.text,
         '[imageError: run_after_image_import_failed]',
       );
       const failedChips = retainPasteChipsForText(failedText, current.chips || []) as QueuedComposerChip[];
@@ -2878,7 +2891,7 @@ export function PromptQueueOverlay({
         const text = raw.trim();
         const historyImages = ui.historyPromptDraftImages[tabId] || [];
         const historyImageInspection = inspectPromptImageAttachments(raw, historyImages);
-        const historyAttachmentsBlocked = raw.includes('[Image saving…]')
+        const historyAttachmentsBlocked = hasPromptPendingImageMarker(raw)
           || historyImageInspection.blocking;
         if (historyAttachmentsBlocked) {
           showToast('Wait for the image attachment or repair its marker before moving this prompt', 'warning');
@@ -3545,7 +3558,7 @@ export function PromptQueueOverlay({
                 {effectiveWidth >= 220 && <span>Loop</span>}
               </button>
             </ControlHint>
-            <ControlHint label="Изменить общий prompt обоих режимов Loop" side="left">
+            <ControlHint label="Изменить общий и локальный текст Loop" side="left">
               <button
                 type="button"
                 className="pq-edge-action"
@@ -4982,7 +4995,21 @@ export function PromptQueueOverlay({
               <span>{editorImageNotice.message}</span>
             </div>
           )}
-          <div
+          {specialPromptMode === 'loop' ? <LoopPromptFields
+            tabId={tabId} sharedText={editorText} localText={localLoopPromptText}
+            sharedRef={editorTextareaRef} autoFocus={editorAutoFocus}
+            height={loopEditorHeight} fontSize={promptQueueEditorFontSize}
+            onSharedChange={text => {
+              editorDirtyFieldsRef.current.special = true;
+              setEditorText(text); writeThroughEditorPayload(text, []);
+            }}
+            onLocalChange={text => {
+              if (!acquireEditorPayloadLock(null)) return;
+              editorDirtyFieldsRef.current.special = true;
+              setLocalLoopPromptText(tabId, text);
+            }}
+            onSave={saveEditorAndReturn} onClose={resetEditor}
+          /> : <div
             style={{
               position: 'relative',
               flex: '0 0 auto',
@@ -5103,7 +5130,7 @@ export function PromptQueueOverlay({
                 boxSizing: 'border-box',
               }}
             />
-          </div>
+          </div>}
           <div
             className="pq-editor-resize-handle"
             data-cmd-hover-popover

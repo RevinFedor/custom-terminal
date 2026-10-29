@@ -155,9 +155,11 @@ test('actual send fingerprint includes structured metadata and remains order-ind
   const result = await prepareStructuredAuthoring(draft());
   const scope = { sendRequestFingerprint: null, fingerprintAgentSendRequest, prompt: result.prompt,
     model: null, effort: null, thinking: null, cwd: null, source: null, queue: false, ownership: 'project', expectedTarget: null,
+    promptQueueAction: null,
     authoringSnapshot: result.authoringSnapshot };
   const calculate = values => vm.runInNewContext(statement.getText(parsed) + '\nrequestFingerprint', values);
   const first = calculate(scope);
+  assert.notEqual(calculate({ ...scope, promptQueueAction: 'send-now' }), first);
   const reordered = clone(result.authoringSnapshot);
   reordered.chips[0] = Object.fromEntries(Object.entries(reordered.chips[0]).reverse());
   assert.equal(calculate({ ...scope, authoringSnapshot: reordered }), first);

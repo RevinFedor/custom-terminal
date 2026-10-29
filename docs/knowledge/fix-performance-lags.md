@@ -822,6 +822,32 @@ React получает только видимый по прежним predicate
 ошибочный observer DOM-title исправлен после проверки реального ControlHint.
 Подробные cuts, исходные отказы и оставшиеся сценарии — в рабочем tmp темы.
 
+## 7h. Deadline прогрева выпускал следующую pane до окончания чтения
+
+26.10 после Build Install фоновые History/Timeline продолжали нагружать приложение.
+Completion-serial очередь имела два обхода: `SplitPaneSurface` через55с вызывал
+`completeAdmission('component-timeout')`, а очередь через60с завершала lease сама.
+Первый путь также ставил phase=ready и будил Timeline незавершённой панели.
+В сохранённом installed журнале найдены6 точных request/owner overlap: чтение
+продолжалось81–106с после timeout-complete. Большой cold read/ожидание admission
+не равны завершению, поэтому последующие панели начинали наложенную работу.
+
+SOURCE сохраняет оба порога как однократную `overdue` диагностику. Tracker,
+текущая History→Timeline фаза и admission остаются до реальных initial-source
+signals либо отмены владельца. Foreground promotion, no-session/failure/unmount
+и stale-token guards сохранены; прогрев не отключён. Контроль исполняет actual
+component callbacks и очередь с управляемыми часами: до исправления2FAIL, после
+6PASS; отдельно wiring/status10PASS. Это проверка сериализации, не замер падения
+общего CPU после установки. Исторические Main/renderer/GPU CPU и отсутствие
+горячего профиля не позволяют приписать этому дефекту всю нагрузку компьютера.
+
+26.10 installed byte-check подтвердил обе исправленные функции в compiled
+renderer. В новом boot три реальные overdue-панели завершились только по
+`initial-source-settled`; очередь86 jobs дошла до pending0. При этом после её
+опустошения renderer/GPU продолжали потреблять CPU. Отдельный subscribe ждал
+538с, хотя History RPC закончился за41с: общий prewarm interval нельзя называть
+стоимостью одного projector или считать всю постоянную нагрузку исправленной.
+
 ## 8. Observability Toolkit (для будущих регрессий)
 
 12.10 installed-репорт после restore показал одновременно renderer input waits

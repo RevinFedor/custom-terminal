@@ -1,4 +1,15 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
+
+/* Match the runtime source cut, including shared and generated compatibility code.
+   Unrelated checkouts under packages/ must not change the application CSS. */
+@source "../../../index.html";
+@source "../../";
+@source not "../../pty-proxy/target";
+@source "../../../packages/claude-blocks/src";
+@source "../../../vendor/markdown-editor/src";
+@source "../../../vendor/noted-shared/packages/file-explorer/src";
+@source "../../../vendor/noted-shared/packages/structured-dnd/src";
+@source not "../../../**/*.{test,spec}.{js,jsx,cjs,cjsx,mjs,mjsx,ts,tsx,cts,ctsx,mts,mtsx}";
 @import "./presentationAnimations.css";
 
 /* Search ranges are owned per History, but these rules are loaded once.
@@ -765,19 +776,16 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   to { opacity: 1; }
 }
 
-/* Pulsing dot for background-task chips while running. Changes
-   background-color (not just opacity) so H.264/JPEG keep the delta — see
-   "AI-Optimized UI & Video Forensics" rule. Box-shadow scale adds GPU-cheap
-   halo for the visible-corner peripheral signal. */
-@keyframes sdk-bg-task-pulse {
-  0%, 100% {
-    background-color: #d97706;
-    box-shadow: 0 0 3px rgba(217, 119, 6, 0.4);
-  }
-  50% {
-    background-color: #fbbf24;
-    box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
-  }
+/* Same amber/yellow endpoints and 1.4s pulse as the background-task dot.
+   Reuse the isolated glow rasters above: animating color/shadow repaints on
+   every frame, while complementary opacity preserves the opaque colour signal.
+   The host's existing hidden-owner pause is inherited by both pseudo-elements. */
+.noted-background-task-dot {
+  --noted-glow-light: #d97706;
+  --noted-glow-dark: #fbbf24;
+  --noted-glow-light-shadow: 0 0 3px rgba(217, 119, 6, 0.4);
+  --noted-glow-dark-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+  --noted-glow-duration: 1.4s;
 }
 
 @keyframes spin {

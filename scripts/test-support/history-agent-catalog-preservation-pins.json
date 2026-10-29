@@ -1,0 +1,155 @@
+{
+  "schema": "v53-preserved-source-blocks-v1",
+  "seed": {
+    "path": "src/renderer/components/Workspace/HistoryPanel.tsx",
+    "bytes": 1332531,
+    "sha256": "9b61ffee0592c8148e285600a72aedb4205220b6cbb7b673e124709898a1f994"
+  },
+  "files": [
+    {
+      "path": "src/renderer/components/Workspace/Timeline.tsx",
+      "bytes": 497503,
+      "sha256": "a1d6072d29018fb793e22e579f9f21ccedc0f120de60673e6560d7c572a443e7"
+    },
+    {
+      "path": "src/renderer/components/Workspace/TimelineRootSurface.tsx",
+      "bytes": 74385,
+      "sha256": "5d8688d3eff6a05dbca1f9788039d92239324e2e903008e7f0524ab3afe687a2"
+    },
+    {
+      "path": "src/renderer/utils/historyMeasuredLayout.ts",
+      "bytes": 15716,
+      "sha256": "4562e3ed988f621a95d2d58ff1790cba6dd529090595d6358cb7df84bbc655b1"
+    },
+    {
+      "path": "src/renderer/utils/historyDisplayUnits.mjs",
+      "bytes": 58106,
+      "sha256": "2f68d97ec19f625e6db0652f6a8e05bede08e48d2218a4b825b3da5138404210"
+    },
+    {
+      "path": "src/renderer/utils/historyDisplayUnitsBaseline.mjs",
+      "bytes": 2840,
+      "sha256": "ccf4affff7812287d29815856a93915e6885bee737d0a80ed2213411100c1b9d"
+    },
+    {
+      "path": "src/renderer/utils/historyBottomGeometry.mjs",
+      "bytes": 1063,
+      "sha256": "caee080ecf11987c3a82ede8a111b1e02da5d9ef8a06c2fce211ac549373bf03"
+    },
+    {
+      "path": "src/renderer/utils/historyMeasurementViewportSync.mjs",
+      "bytes": 1850,
+      "sha256": "b0ae0cba8d1088434279d20ab2f537d70be8bce442ee2e0a5439aba0578d07fc"
+    },
+    {
+      "path": "src/main/history-root-engine/main/history-root-display-view.js",
+      "bytes": 41071,
+      "sha256": "fdf9decaa8db49a53da3d9920500a8909b0a24d3f3ae252296d25e26121bd342"
+    },
+    {
+      "path": "src/main/history-root-engine/main/history-primary-physical-key.js",
+      "bytes": 3672,
+      "sha256": "e8b8a8774c6bd1eec0ec14bf07f8eafbbac89e506ef44ee38df67ebbc111a585"
+    }
+  ],
+  "blocks": [
+    {
+      "name": "physical-and-measured-keys",
+      "first": "const historyVirtuosoUnitKey =",
+      "last": "interface FileAction",
+      "bytes": 1906,
+      "sha256": "d527c1e0d1b4568fcdd57ab3fbd96567a59235a89ef2495023197ead4e77d1ff"
+    },
+    {
+      "name": "Research-full-inventory-and-visibility",
+      "first": "function HistoryResearchModelsProvider(",
+      "last": "const HistoryResearchReply =",
+      "bytes": 2224,
+      "sha256": "9e2147e1e9da21eb7922b25ffbae0f11b30521b31764bb1dfb4e400865ffe90d"
+    },
+    {
+      "name": "layout-key-array",
+      "first": "  const displayUnitLayoutKeys = useMemo(",
+      "last": "  const materializeHistoryWindowForPresentation =",
+      "bytes": 627,
+      "sha256": "1efc1a8c8c2193245cd9d4358201256b3dd08cc9a2a588de851a4236efd52f90"
+    },
+    {
+      "name": "restore-and-mount-wave",
+      "first": "  const historyOwnerVisit = historyOwnerVisitState;",
+      "last": "  const historyRestoreInFlightRef =",
+      "bytes": 15939,
+      "sha256": "0f71d4fc6565a41e7d35516d6c0fd4961ca6b9a702e97df2d5857e6ffb6a95e1"
+    },
+    {
+      "name": "Timeline-full-viewport-membership",
+      "first": "  const assistantToUserMap = React.useMemo(",
+      "last": "  // Resize is a temporary position owner",
+      "bytes": 3425,
+      "sha256": "beb046a0140b01aa7cbdeab26c404f63c943aaffa443b405bfe50db600fc3c4c"
+    },
+    {
+      "name": "preserved-coauthor-Send-queue-release",
+      "first": "function HistorySendQueueReleaseAction(",
+      "last": "const HistoryUserEntry =",
+      "bytes": 1281,
+      "sha256": "60bc65dbc18372c56fa87e61d61cec9aa2814281a09edfcf5cee7140c1d31aa9"
+    }
+  ],
+  "writers": [
+    {
+      "token": "saveHistoryMeasuredLayout(",
+      "occurrence": 0,
+      "count": 5,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5126,
+      "sha256": "f94596c80f347b7be039f07a1d5890c02e754e582c61720e8e961e20aedd9eb6"
+    },
+    {
+      "token": "saveHistoryMeasuredLayout(",
+      "occurrence": 1,
+      "count": 5,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5124,
+      "sha256": "1b889146c9094ecf631bd5b7bd28c76bb0b57b1b61c81759da3eb9660828e3b6"
+    },
+    {
+      "token": "saveHistoryMeasuredLayout(",
+      "occurrence": 2,
+      "count": 5,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5130,
+      "sha256": "5c6bc1b8459c6e8b8a1af612dabc5320fb99110ac7037a415db736005fd38a1a"
+    },
+    {
+      "token": "saveHistoryMeasuredLayout(",
+      "occurrence": 3,
+      "count": 5,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5120,
+      "sha256": "aeda1438913eb9f8a7cc9bccf3e16021693e46f1ad2bd42377d471f86f2a7b5a"
+    },
+    {
+      "token": "saveHistoryMeasuredLayout(",
+      "occurrence": 4,
+      "count": 5,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5124,
+      "sha256": "d430597e8dba31e9fbe56ebe3b901e5dd4617c83e7e2f9e7aa8efaeeda55464b"
+    },
+    {
+      "token": "getHistoryMeasuredLayout(",
+      "occurrence": 0,
+      "count": 1,
+      "before": 4096,
+      "after": 1024,
+      "bytes": 5126,
+      "sha256": "073e81f268226e98ddd1d373907a7ececec733a670ac9ea9e75a61b178c20868"
+    }
+  ]
+}

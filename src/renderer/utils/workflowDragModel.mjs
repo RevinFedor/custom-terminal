@@ -1,12 +1,13 @@
 import {normalizeDragRoots,getSubtreeIds} from '@noted/structured-dnd/core';
 import {workflowTabCatalog,workflowReserveOutline} from './workflowReserve.mjs';
 import {captureSpaceLayout} from './workspaceSpacesModel.mjs';
-import {moveTabsToPane} from './splitPanesModel.mjs';
+import {moveTabsToPane,paneSlots,paneTabs} from './splitPanesModel.mjs';
 import {moveEntriesToIndex} from './horizontalReorder.mjs';
 import {removeLayoutTabs,stableJson,layoutReferences} from '../../shared/workflow-organization.cjs';
 import {dragPlacement,dragRelation,dragFamily} from '../../shared/workflow-drag.cjs';
 import {projectPaneStripLayoutRows} from '../../shared/pane-strip-row-layout.cjs';
 import {preparePaneStripGroupRelease} from '../../shared/pane-strip-group-admission.cjs';
+import {projectActivePaneStripGroups} from '../../shared/pane-strip-color-groups.cjs';
 
 const freeze = value => {
   if(value && typeof value==='object' && !Object.isFrozen(value)) {
@@ -18,6 +19,29 @@ const json = value => JSON.parse(JSON.stringify(value));
 const visit = (nodes,fn,parent=null,group=null) => nodes.forEach(node=>{
   fn(node,parent,group); visit(node.children || [],fn,node.tabId || parent,node.groupId || group);
 });
+
+// The target ordinal counts tabs, not chooser slots. Strictly inside one
+// coherent group there is an exact mixed-slot gap: preserve every stationary
+// slot rather than letting a new root consume an old chooser's tab-count anchor.
+// General/chooser-adjacent gaps retain moveTabsToPane's existing semantics.
+function coherentGroupInsertionSlots(before,after,entries,at,field,activity) {
+  if(!field?.groups?.length)return null;
+  const moving=new Set(entries.map(entry=>entry.tabId));
+  const slots=paneSlots(before).filter(slot=>!moving.has(slot.tabId));
+  const tabs=slots.filter(slot=>slot.tabId),left=tabs[at-1],right=tabs[at];
+  if(!left||!right)return null;
+  const rightAt=slots.indexOf(right);
+  if(slots[rightAt-1]!==left)return null;
+  const group=projectActivePaneStripGroups(field.groups,id=>activity?.[id])
+    .find(group=>group.tabIds.includes(left.tabId)&&group.tabIds.includes(right.tabId));
+  if(!group)return null;
+  const members=new Set(group.tabIds.filter(id=>!moving.has(id)));
+  const positions=slots.flatMap((slot,index)=>members.has(slot.tabId)?[index]:[]);
+  if(positions.length!==members.size||positions.at(-1)-positions[0]+1!==members.size)return null;
+  const incoming=paneTabs(after).filter(slot=>moving.has(slot.tabId));
+  if(incoming.length!==moving.size)return null;
+  return [...slots.slice(0,rightAt),...incoming,...slots.slice(rightAt)];
+}
 
 export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTabIds=[],entries,origin='sidebar',sourcePaneKey=null,sourceWorkflowId=state.activeSpaceId}) {
   const catalog=workflowTabCatalog(state), guards={};
@@ -168,6 +192,9 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
         const index=(layout.splitPanes || []).findIndex(item=>item.windowId===pane.windowId);
         const moved=moveTabsToPane(layout.splitPanes,index,entries,target.at,shown.tabId);
         if(!moved)return null;
+        const slots=coherentGroupInsertionSlots(layout.splitPanes[index],moved.panes[index],entries,moved.insertedAt,
+          baseline.stripColorGroups,admission.stripGroupActivity);
+        if(slots)moved.panes[index]={...moved.panes[index],tabs:slots};
         layout={...layout,splitPanes:moved.panes,splitFocusedIndex:index,activeSpaceTab:shown,
           activeProjectId:shown.projectId,focusedProjectId:shown.projectId};
       }

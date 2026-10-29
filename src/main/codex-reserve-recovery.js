@@ -11,7 +11,7 @@ const pair = value => value && clean(value.model) && clean(value.model) !== 'non
 // choice belongs to its source session; another imported/forked source cannot
 // borrow it merely because it occupies the same tab.
 function codexReserveReturnChoice({ sessionId, intent, preference } = {}) {
-  const requested = pair(intent);
+  const requested = intent?.cancelled ? null : pair(intent);
   if (requested && isReserve(requested.model)) return null;
   if (requested && intent.appliedOwnerId === sessionId
     && intent.appliedRevision === intent.revision) {
@@ -28,8 +28,8 @@ function codexReserveReturnChoice({ sessionId, intent, preference } = {}) {
 }
 
 function captureCodexReserveReturnPreference({ sessionId, intent, observed, previous } = {}) {
-  if (!sessionId || isReserve(intent?.model)) return null;
-  const requested = pair(intent);
+  if (!sessionId || !intent?.cancelled && isReserve(intent?.model)) return null;
+  const requested = intent?.cancelled ? null : pair(intent);
   const actual = pair(observed);
   const chosen = requested && intent.appliedOwnerId === sessionId
     && intent.appliedRevision === intent.revision && !isReserve(requested.model) ? requested

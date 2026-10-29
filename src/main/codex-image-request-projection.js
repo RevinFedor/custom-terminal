@@ -7,6 +7,7 @@ const { attachmentProjectionSourceRecord } = require('./owned-mobile-attachments
 
 const KIND = 'codex-image-path-aliases';
 const SCOPE_FIELDS = ['tabId', 'handoffId', 'operationKey', 'attemptId'];
+const fullHash = text => require('node:crypto').createHash('sha256').update(text).digest('hex');
 
 function imageRefIdentity(ref) {
   return {
@@ -18,7 +19,10 @@ function imageRefIdentity(ref) {
 }
 
 /** Exact application-owned image marker -> PTY alias mapping, before Enter. */
-function createCodexImageRequestProjection({ requestText, transportText, segments, imageRefs, authoringTransport = null, ...scope } = {}) {
+function createCodexImageRequestProjection({ requestText, transportText, segments, imageRefs, authoringTransport = null, stages = null, ...scope } = {}) {
+  if (Array.isArray(stages) && stages.length) return createImageTransformProjection({
+    requestText, transportText, imageRefs, authoringTransport, stages, ...scope,
+  });
   if (SCOPE_FIELDS.some(field => typeof scope[field] !== 'string' || !scope[field])) return null;
   if (typeof requestText !== 'string' || typeof transportText !== 'string') return null;
   const imageSegments = (Array.isArray(segments) ? segments : []).filter(segment => segment?.kind === 'image');
@@ -66,7 +70,7 @@ function validateCodexImageRequestProjection({ tabId, record, audit } = {}) {
   record = attachmentProjectionSourceRecord(record);
   const proof = audit?.imageRequestProjection;
   const refused = reason => ({ valid: false, reason });
-  if (!proof || proof.kind !== KIND || proof.version !== 1) return refused('image-request-projection-missing');
+  if (!proof || proof.kind !== KIND || ![1, 2].includes(proof.version)) return refused('image-request-projection-missing');
   if (record?.provider !== 'codex') return refused('image-request-provider-mismatch');
   const scope = {
     tabId,
@@ -97,9 +101,12 @@ function validateCodexImageRequestProjection({ tabId, record, audit } = {}) {
     segments: proof.images.map(image => ({ kind: 'image', text: image.transportPath, sourcePath: image.sourcePath })),
     imageRefs: audit.expectedImageRefs,
     authoringTransport: proof.authoringTransport || null,
+    ...(proof.version === 2 ? { stages: proof.stages } : {}),
+    ...(proof.version === 2 ? { createdAt: proof.createdAt } : {}),
   });
   if (!replay || replay.requestHash !== proof.requestHash || replay.transportHash !== proof.transportHash
-    || JSON.stringify(replay.images) !== JSON.stringify(proof.images)) {
+    || JSON.stringify(replay.images) !== JSON.stringify(proof.images)
+    || proof.version === 2 && JSON.stringify(replay) !== JSON.stringify(proof)) {
     return refused('image-request-reconstruction-mismatch');
   }
   return {
@@ -146,6 +153,23 @@ function readPersistedCodexImageRequestProjection(record) {
  * The durable record continues to name the immutable original request.
  */
 function projectCodexImageAuditToRequest({ tabId, record, audit, result } = {}) {
+  if (audit?.imageRequestProjection?.version === 2) {
+    const validated = validateCodexImageRequestProjection({ tabId, record, audit });
+    if (!validated.valid) return { applied: false, reason: validated.reason };
+    const match = require('./codex-prompt-audit').matchCodexImageTransformCarrier(audit, result?.actualText);
+    if (result?.success !== true || typeof result.actualText !== 'string' || !match
+      || result.actualHash !== promptAuditFingerprint(result.actualText) || result.actualLen !== result.actualText.length
+      || result.expectedHash !== validated.transportHash || result.expectedLen !== validated.transportLength) {
+      return { applied: false, reason: 'image-transform-native-carrier-mismatch' };
+    }
+    const actualPaths = result.actualImagePaths || [];
+    if (actualPaths.length && (actualPaths.length !== audit.imageRequestProjection.images.length
+      || actualPaths.some((value, index) => ![audit.imageRequestProjection.images[index].sourcePath,
+        audit.imageRequestProjection.images[index].transportPath].includes(value)))) {
+      return { applied: false, reason: 'image-provider-paths-mismatch' };
+    }
+    return { ...validated, applied: true, canonicalReason: 'codex_image_request_transform' };
+  }
   const nativeSlots = result?.canonicalized === true
     && result.canonicalReason === 'codex_image_placeholder_canonical';
   const exactTransport = result?.canonicalized !== true
@@ -179,9 +203,91 @@ function projectCodexImageAuditToRequest({ tabId, record, audit, result } = {}) 
     canonicalReason: nativeSlots ? result.canonicalReason : 'codex_image_path_alias_exact' };
 }
 
+// Replay only outcomes durably produced by Main before its first payload write.
+// No disk access, fresh staging or inference from a client imageError flag.
+function replayImageTransformStage(input, stage, authoringTransport) {
+  if (!stage || !['preflight', 'staging'].includes(stage.stage) || !Array.isArray(stage.outcomes)
+    || !stage.outcomes.length || stage.outcomes.length > 4096 || stage.inputHash !== fullHash(input)
+    || stage.inputLength !== input.length) return null;
+  let index = 0, invalid = false;
+  const replay = buildCodexImagePastePlan(input, (sourcePath, occurrence) => {
+    const outcome = stage.outcomes[index++];
+    if (!outcome || outcome.sourcePath !== sourcePath.trim() || outcome.marker !== occurrence.marker
+      || outcome.sourceRange?.start !== occurrence.start || outcome.sourceRange?.end !== occurrence.end) {
+      invalid = true; return { success: false, error: 'invalid-outcome' };
+    }
+    if (outcome.kind === 'unavailable') {
+      if (typeof outcome.error !== 'string' || !outcome.error || outcome.error.length > 8192) invalid = true;
+      return { success: false, path: sourcePath.trim(), error: outcome.error };
+    }
+    if (stage.stage === 'preflight' && outcome.kind === 'retained') return {
+      success: true, path: sourcePath.trim(), inputPath: occurrence.marker,
+    };
+    if (stage.stage === 'staging' && outcome.kind === 'image' && path.isAbsolute(outcome.text)
+      && !/\s/.test(outcome.text)) return { success: true, path: sourcePath.trim(), inputPath: outcome.text };
+    invalid = true; return { success: false, error: 'invalid-outcome-kind' };
+  }, { authoringTransport, missingCode: stage.stage === 'preflight' ? 'queue_image_path_unavailable' : 'codex_image_path_unavailable' });
+  const actual = stage.stage === 'preflight' ? { ...replay.transform, stage: 'preflight',
+    outcomes: replay.transform.outcomes.map(outcome => outcome.kind === 'image' ? { ...outcome, kind: 'retained' } : outcome) } : replay.transform;
+  if (invalid || index !== stage.outcomes.length || JSON.stringify(actual) !== JSON.stringify(stage)) return null;
+  return { text: replay.text, authoringTransport: { sourceHash: fullHash(replay.text),
+    imageRanges: actual.outcomes.filter(outcome => outcome.kind === 'retained').map(outcome => ({
+      ...outcome.outputRange, path: /\[imagePath:\s*([^\]\r\n]+?)\s*\]/i.exec(outcome.marker)[1],
+    })) } };
+}
+
+function createImageTransformProjection({ requestText, transportText, imageRefs, authoringTransport = null, stages, createdAt = Date.now(), ...scope }) {
+  if (SCOPE_FIELDS.some(field => typeof scope[field] !== 'string' || !scope[field])
+    || typeof requestText !== 'string' || typeof transportText !== 'string' || stages.length > 2
+    || stages[0]?.stage === 'staging' && stages.length !== 1
+    || stages.length === 2 && stages[1]?.stage !== 'staging' || !Number.isSafeInteger(createdAt) || createdAt < 0) return null;
+  let current = requestText, plan = authoringTransport;
+  try {
+    if (plan) require('./structured-authoring').validateAuthoringTransport(current, plan);
+    for (const stage of stages) {
+      const replay = replayImageTransformStage(current, stage, plan);
+      if (!replay) return null;
+      current = replay.text; plan = replay.authoringTransport;
+    }
+  } catch { return null; }
+  if (current !== transportText || current === requestText) return null;
+  const positive = stages.at(-1).stage === 'staging' ? stages.at(-1).outcomes.filter(outcome => outcome.kind === 'image') : [];
+  const refs = Array.isArray(imageRefs) ? imageRefs : [];
+  if (positive.length !== refs.length) return null;
+  const images = positive.map((outcome, index) => ({ sourcePath: outcome.sourcePath, transportPath: outcome.text,
+    ref: imageRefIdentity(refs[index]), transportRange: { ...outcome.outputRange } }));
+  if (images.some(image => image.ref.path !== image.sourcePath)) return null;
+  return { kind: KIND, version: 2, createdAt, ...Object.fromEntries(SCOPE_FIELDS.map(field => [field, scope[field]])),
+    requestText, requestHash: promptAuditFingerprint(requestText), requestLength: requestText.length,
+    transportHash: promptAuditFingerprint(transportText), transportLength: transportText.length,
+    ...(authoringTransport ? { authoringTransport: JSON.parse(JSON.stringify(authoringTransport)) } : {}),
+    images, stages: JSON.parse(JSON.stringify(stages)) };
+}
+
+// Final durable owner rechecks the same stored pre-Enter plan and native
+// carrier. An allowlisted reason/arbitrary caller hash cannot promote a send.
+function validateCodexImageTransformPromotion(record, evidence, auditInput = null) {
+  if (record?.receipt?.imageRequestProjection?.version !== 2) return { valid: false, reason: 'image-transform-persisted-proof-missing' };
+  const saved = readPersistedCodexImageRequestProjection(record);
+  if (!saved.valid) return saved;
+  const identity = evidence?.actualIdentity, boundary = record.transcriptBoundary || record.receipt?.transcriptBoundary;
+  if (!identity || typeof identity.sessionId !== 'string' || !Number.isFinite(Date.parse(identity.timestamp))
+    || auditInput && (identity.sessionId !== auditInput.sessionId || evidence.actualHash !== auditInput.actualHash)
+    || boundary?.sessionId === identity.sessionId && boundary?.filePath && !identity.filePath
+    || !require('./codex-prompt-audit').codexAuditRecordIsAfterBoundary({ preSubmitBoundary: boundary,
+      sentAt: record.receipt.imageRequestProjection.createdAt }, identity)) {
+    return { valid: false, reason: 'image-transform-causal-carrier-missing' };
+  }
+  const result = evidence && { ...evidence, success: true,
+    expectedHash: saved.transportHash, expectedLen: saved.transportLength };
+  const projected = projectCodexImageAuditToRequest({ tabId: record.tabId, record, audit: saved.audit, result });
+  return projected.applied ? { valid: true, ...projected } : { valid: false, reason: projected.reason };
+}
+
 module.exports = {
   createCodexImageRequestProjection,
   projectCodexImageAuditToRequest,
   readPersistedCodexImageRequestProjection,
   validateCodexImageRequestProjection,
+  validateCodexImageTransformPromotion,
 };

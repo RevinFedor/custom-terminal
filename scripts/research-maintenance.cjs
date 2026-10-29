@@ -3,8 +3,22 @@
 // Operator command. No app-data edits, model inputs, quota overrides or Send.
 const { inspectProdServer, readToken, requestJson, waitForProdServer } = require('./noted-prod-api');
 const endpoint = '/api/orchestrations/maintenance';
-const { startupArguments } = require('../src/main/external-research-maintenance');
+const { startupArguments, normalize, activeId } = require('../src/main/external-research-maintenance');
 const failure = (code, message) => Object.assign(new Error(message), { code });
+const transportAmbiguity = error => error?.message === 'request timeout'
+  || ['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT',
+    'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error?.code);
+function completedReadback(state, operationId) {
+  if (state?.activeOperationId !== null) return false;
+  try {
+    const value = normalize(state);
+    return activeId(value) === null && value.operations.some(operation =>
+      operation.operationId === operationId && operation.state === 'completed');
+  } catch { return false; }
+}
+const startupMatches = (state, operationId) => state?.startup?.version === 1
+  && state.startup.operationId === operationId && state.startup.durable === true
+  && state.startup.beforeRestore === true;
 function createClient({ inspect = inspectProdServer, token = readToken, request = requestJson, wait = waitForProdServer } = {}) {
   async function server() {
     const found = await inspect();
@@ -60,21 +74,33 @@ function createClient({ inspect = inspectProdServer, token = readToken, request 
           const owner = await wait({ token: await token(), previousPid: reopenedPrevious ? null : previousPid });
           if (bootstrap && !reopenedPrevious) {
             const state = await call(owner, 'GET');
-            if (state.startup?.version !== 1 || state.startup.operationId !== operationId
-              || state.startup.durable !== true || state.startup.beforeRestore !== true
-              || state.activeOperationId !== operationId) {
+            if (!startupMatches(state, operationId) || state.activeOperationId !== operationId) {
               throw failure('maintenance_startup_unconfirmed', 'New Main did not confirm same-operation maintenance before restore');
             }
           } else if (bootstrap) {
             throw failure('maintenance_startup_unconfirmed', 'Legacy rollback cannot claim a new-Main quiet startup receipt');
           }
-          const state = await call(owner, 'POST', { version: 1, action: 'complete', operationId });
-          if (state.operation?.state !== 'completed' || state.activeOperationId) throw failure('maintenance_end_unconfirmed', 'Maintenance did not finish under its same identity');
-          const readback = await call(owner, 'GET');
-          if (readback.activeOperationId || !readback.operations.some(x => x.operationId === operationId && x.state === 'completed')) {
-            throw failure('maintenance_end_unconfirmed', 'Maintenance readback is incomplete');
+          let confirmation = null;
+          try {
+            const state = await call(owner, 'POST', { version: 1, action: 'complete', operationId });
+            if (state.operation?.operationId !== operationId || state.operation.state !== 'completed'
+              || state.activeOperationId !== null) throw failure('maintenance_end_unconfirmed', 'Maintenance did not finish under its same identity');
+            if (!completedReadback(await call(owner, 'GET'), operationId)) {
+              throw failure('maintenance_end_unconfirmed', 'Maintenance readback is incomplete');
+            }
+          } catch (error) {
+            if (!transportAmbiguity(error)) throw error;
+            // A lost POST/readback ACK may follow a durable completion. Read
+            // the SAME operation once; never replay the mutation or installer.
+            let readback;
+            try { readback = await call(owner, 'GET'); } catch { throw error; }
+            if (!completedReadback(readback, operationId)
+              || (bootstrap && !startupMatches(readback, operationId))) throw error;
+            confirmation = 'recovered-by-exact-readback';
+            log('same maintenance completion confirmed by exact readback operation=' + operationId);
           }
-          return { operationId, complete: true, bootstrap, preparedBeforeQuit: !bootstrap };
+          return { operationId, complete: true, bootstrap, preparedBeforeQuit: !bootstrap,
+            ...(confirmation ? { confirmation } : {}) };
         },
       };
     },

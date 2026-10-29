@@ -13,7 +13,7 @@ const end = source.indexOf('\ntype HistoryInstructionAttachment', begin);
 const code = ts.transpileModule(source.slice(begin, end) + '\nglobalThis.Token = HistoryComposerToken;', {
   compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const context = { React, require, HistoryImageTokenThumbnail: () => null,
+const context = { React, require, useRef: React.useRef, useEffect: React.useEffect, HistoryImageTokenThumbnail: () => null,
   ComposerChip: props => React.createElement('button', { className: props.className }, props.label) };
 vm.runInNewContext(code, context);
 

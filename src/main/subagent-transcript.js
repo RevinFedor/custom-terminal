@@ -26,6 +26,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { inspectCodexSessionMetadata } = require('./codex-source-settings');
 const {
   classifyHistoryAction,
   parseMcpToolName,
@@ -96,6 +97,8 @@ function createSubagentStepProjectionState(options = {}) {
     codexCells: new Map(),
     codexExpectedSessionId: expectedCodexSessionId,
     codexSessionId: expectedCodexSessionId,
+    codexRootIdentity: options.codexRootIdentity || null,
+    codexRootIdentityError: null,
     codexRootMetaSeen: options.codexRootMetaSeen === true,
     codexAgentPath: String(options.codexAgentPath || ''),
     codexNeedsNewTaskBoundary: options.codexNeedsNewTaskBoundary === true,
@@ -119,7 +122,7 @@ function createSubagentStepProjectionState(options = {}) {
     codexLaunchServiceTierSealed: boundarySeen || !!options.launchServiceTier,
     launchTierDiagnostics: createLaunchTierDiagnostics(options.launchTierDiagnostics
       || (options.launchServiceTier ? { reason: options.launchServiceTier.serviceTier || 'own-snapshot-unclassified' } : null)),
-    sourceStat: null,
+    sourceStat: options.sourceStat ? { ...options.sourceStat } : null,
   };
 }
 
@@ -129,6 +132,8 @@ function resetSubagentStepProjectionState(state) {
   state.codexCalls?.clear?.();
   state.codexCells?.clear?.();
   state.codexSessionId = String(state.codexExpectedSessionId || '');
+  state.codexRootIdentity = null;
+  state.codexRootIdentityError = null;
   state.codexRootMetaSeen = false;
   state.codexAgentPath = '';
   state.codexNeedsNewTaskBoundary = false;
@@ -615,10 +620,10 @@ function findClaudeAgentFile({ parentSessionId, cwd, agentId, taskText, spawnedA
 }
 
 /** Locate a Codex subagent rollout by its thread id (known from spawn output). */
-function findCodexAgentFile({ agentSessionId }) {
+function findCodexAgentFile({ agentSessionId, sessionsDir }) {
   const wanted = String(agentSessionId || '').trim();
   if (!wanted) return null;
-  const root = codexSessionsDir();
+  const root = sessionsDir || codexSessionsDir();
   const stack = [root];
   const found = [];
   while (stack.length) {
@@ -642,6 +647,39 @@ function findCodexAgentFile({ agentSessionId }) {
  * JSONL record (plus the stream chunk): copied rollouts can be hundreds of MB
  * and may contain very large compact records.
  */
+// Keep only identity/provenance scalars, never base instructions or body text.
+function codexSubagentRootIdentitySnapshot(meta) {
+  const value = key => typeof meta?.[key] === 'string' ? meta[key] : null;
+  const sourceParent = meta?.source?.subagent?.thread_spawn?.parent_thread_id;
+  return {
+    id: value('id'), session_id: value('session_id'),
+    parent_thread_id: value('parent_thread_id'), thread_source: value('thread_source'),
+    multi_agent_version: value('multi_agent_version'),
+    source: typeof sourceParent === 'string'
+      ? { subagent: { thread_spawn: { parent_thread_id: sourceParent } } } : null,
+  };
+}
+
+// Native v1 can retain the parent's session_id as launch context. Its own id
+// still MUST match the selected child, with independently agreeing parent
+// provenance. Generic/Fork writer alias validation remains unchanged.
+function codexSubagentRootIdentityError(meta, expectedSessionId) {
+  if (expectedSessionId) {
+    const string = value => typeof value === 'string' ? value.trim() : '';
+    const id = string(meta?.id);
+    const parent = string(meta?.parent_thread_id);
+    const nativeV1ParentContext = id === expectedSessionId && !!parent && parent !== id
+      && string(meta?.session_id) === parent
+      && meta?.thread_source === 'subagent'
+      && ['v1', '1'].includes(string(meta?.multi_agent_version).toLowerCase())
+      && string(meta?.source?.subagent?.thread_spawn?.parent_thread_id) === parent;
+    const payload = nativeV1ParentContext ? { id: meta.id } : meta;
+    const proof = inspectCodexSessionMetadata([{ type: 'session_meta', payload }], expectedSessionId);
+    if (!proof.valid) return proof.reason;
+  }
+  return null;
+}
+
 async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = '', resume = null }) {
   if (!filePath || !fs.existsSync(filePath)) {
     return { found: false, requiresBoundary: false, offset: 0, sessionId: '', agentPath: '' };
@@ -653,11 +691,19 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     statSize = stat.size;
     sourceStat = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
   } catch {}
-  const resumeOffset = resume && Number(resume.resumeOffset) >= 0
+  const sameSource = !!sourceStat && !!resume?.sourceStat
+    && sourceStat.dev === resume.sourceStat.dev && sourceStat.ino === resume.sourceStat.ino
+    && sourceStat.size >= resume.sourceStat.size
+    && (sourceStat.size !== resume.sourceStat.size || sourceStat.mtimeMs === resume.sourceStat.mtimeMs);
+  const resumeOffset = resume && sameSource && (!expectedSessionId || resume.rootIdentity)
+    && Number(resume.resumeOffset) >= 0
     && Number(resume.resumeOffset) <= statSize
     ? Number(resume.resumeOffset)
     : 0;
   let rootMetaSeen = resumeOffset > 0 && resume?.rootMetaSeen === true;
+  let rootIdentity = rootMetaSeen ? resume.rootIdentity || null : null;
+  let identityError = rootMetaSeen
+    ? codexSubagentRootIdentityError(rootIdentity, expectedSessionId) : null;
   let sessionId = String((rootMetaSeen && resume?.sessionId) || expectedSessionId || '');
   let agentPath = String((rootMetaSeen && resume?.agentPath) || '');
   let requiresBoundary = rootMetaSeen && resume?.requiresBoundary === true;
@@ -683,6 +729,8 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     agentPath,
     requiresBoundary,
     rootMetaSeen,
+    rootIdentity,
+    identityError,
     sourceLine,
     bootstrapInstruction,
     launchServiceTier,
@@ -691,16 +739,21 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     sourceStat,
   });
 
+  if (identityError) return { found: false, offset: 0, ...resultBase() };
+
   const inspectLine = (lineBuffer, byteOffset, hasNewline, lineNumber) => {
     if (!rootMetaSeen) {
       let record = null;
       try { record = JSON.parse(lineBuffer.toString('utf8')); } catch { /* not metadata */ }
-      if (record?.type === 'session_meta' && record.payload) {
+      if (record?.type === 'session_meta' && (record.payload || expectedSessionId)) {
         rootMetaSeen = true;
-        const child = codexSubagentMeta(record.payload);
-        sessionId = String(record.payload.id || sessionId || '');
+        rootIdentity = codexSubagentRootIdentitySnapshot(record.payload);
+        identityError = codexSubagentRootIdentityError(record.payload, expectedSessionId);
+        const child = codexSubagentMeta(record.payload || {});
+        sessionId = String(record.payload?.id || (expectedSessionId && record.payload?.session_id) || '');
         agentPath = child.agentPath;
         requiresBoundary = child.needsNewTaskBoundary;
+        if (identityError) return { found: false, offset: 0, ...resultBase() };
         if (!requiresBoundary) {
           return {
             found: false,
@@ -1017,7 +1070,9 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     state.codexRootMetaSeen = true;
     const meta = record?.payload || {};
     const child = codexSubagentMeta(meta);
-    state.codexSessionId = String(meta.id || state.codexExpectedSessionId || '');
+    state.codexRootIdentity = codexSubagentRootIdentitySnapshot(meta);
+    state.codexRootIdentityError = codexSubagentRootIdentityError(meta, state.codexExpectedSessionId);
+    state.codexSessionId = String(meta.id || (state.codexExpectedSessionId && meta.session_id) || '');
     state.codexAgentPath = child.agentPath;
     state.codexNeedsNewTaskBoundary = child.needsNewTaskBoundary;
     state.codexNewTaskBoundarySeen = !child.needsNewTaskBoundary;
@@ -1029,6 +1084,8 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     state.codexCells.clear();
     return [];
   }
+
+  if (state.codexRootIdentityError) return [];
 
   // Read the first exact child-owned settings snapshot even when it precedes
   // NEW_TASK. Never let a later Resume/settings change masquerade as launch.
@@ -1285,18 +1342,18 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
 function prepareAgentStepReadState({ projectionState, sessionId, offset, size, sourceStat }) {
   const start = Math.max(0, Number(offset) || 0);
   const state = projectionState || createSubagentStepProjectionState({ codexSessionId: sessionId });
-  if (!state.codexExpectedSessionId && sessionId) {
+  const ownerChanged = !!sessionId && state.codexExpectedSessionId !== String(sessionId);
+  if (sessionId) {
     state.codexExpectedSessionId = String(sessionId);
-    state.codexSessionId = String(sessionId);
   }
   const previous = state.sourceStat;
   const sourceChanged = !!previous && !!sourceStat
     && (previous.dev !== sourceStat.dev || previous.ino !== sourceStat.ino
       || sourceStat.size < previous.size
       || (sourceStat.size === previous.size && sourceStat.mtimeMs !== previous.mtimeMs));
-  if (start === 0 || sourceChanged) resetSubagentStepProjectionState(state);
+  if (start === 0 || sourceChanged || ownerChanged) resetSubagentStepProjectionState(state);
   // File replaced/truncated (rare, but a stale offset would emit garbage).
-  const from = sourceChanged || start > size ? 0 : start;
+  const from = sourceChanged || ownerChanged || start > size ? 0 : start;
   if (from === 0 && start !== 0) resetSubagentStepProjectionState(state);
   state.sourceStat = sourceStat ? { dev: sourceStat.dev, ino: sourceStat.ino,
     size: sourceStat.size, mtimeMs: sourceStat.mtimeMs } : null;
@@ -1314,6 +1371,11 @@ function consumeAgentStepChunk({
   retainedState = true,
 }) {
   const bytesRead = chunk.length;
+  const identityFailure = () => ({ success: false, reason: 'child-root-identity-mismatch',
+    error: 'subagent transcript root identity mismatch', steps: [], offset: 0, size, reset: true,
+    rootIdentity: state.codexRootIdentity, identityError: state.codexRootIdentityError,
+    sourceStat: state.sourceStat });
+  if (toolType === 'codex' && state.codexRootIdentityError) return identityFailure();
   const steps = Array.isArray(state.prefaceSteps) ? state.prefaceSteps.splice(0) : [];
   if (from >= size || bytesRead === 0) {
     return {
@@ -1430,6 +1492,7 @@ function consumeAgentStepChunk({
     state.launchTierDiagnostics.partial = shape.recordType === 'event_msg'
       && shape.payloadType === 'thread_settings_applied';
   }
+  if (toolType === 'codex' && state.codexRootIdentityError) return identityFailure();
   return {
     success: true,
     steps: steps.slice(-MAX_STEPS_RETURNED),

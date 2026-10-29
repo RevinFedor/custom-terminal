@@ -60,7 +60,9 @@ async function fixture(t, { heavy = false, empty = false, recent = false } = {})
     readDefaultCodexSetting: () => null,
     codexDataModule: { _api: scopedApi }, codexConversationMaterializationCache: new Map(),
   });
-  vm.runInContext(prefix, context);
+  const goalPreference = tree.statements.find(n => ts.isFunctionDeclaration(n)
+    && n.name?.text === 'resolveCodexLaunchGoalPreference');
+  vm.runInContext((goalPreference ? goalPreference.getText(tree) + '\n' : '') + prefix, context);
   return { ...created, root, sessionsDir, context, scopedApi, launches, fullReads: () => fullReads,
     run: patch => context.runCodexCommandFromPayloadInner(null, {
       tabId: 'T', command: 'codex-c', sessionId: SID, cwd: root,

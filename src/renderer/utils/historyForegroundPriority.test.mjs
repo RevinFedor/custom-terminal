@@ -4,6 +4,8 @@ import {
   HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES,
   createHistoryForegroundPriority,
   isHistoryLightweightServiceDelta,
+  isHistoryViewportHydrationDelta,
+  HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES,
   shouldBypassHistoryApplyPriority,
 } from './historyForegroundPriority.mjs';
 
@@ -36,6 +38,36 @@ test('background slot waits through quiet edge and browser background lane', asy
   assert.equal(result.reason, 'idle');
   assert.ok(result.waitedMs >= 75);
   assert.equal(backgroundYields, 1);
+});
+
+test('a qualified visible hydration result does not wait behind its own wheel hold', async () => {
+  let now = 0;
+  const priority = createHistoryForegroundPriority({ now: () => now,
+    delay: async ms => { now += ms; }, backgroundYield: async () => {}, hasPendingInput: () => false });
+  priority.mark('own-tab', 500);
+  now = 220; // range debounce + already completed read
+  const result = await priority.waitForBackgroundSlot({ shouldBypass: () => shouldBypassHistoryApplyPriority({
+    phase: 'refresh', ownerCurrent: true, presented: true, visibleHydrationDelta: true,
+  }) });
+  assert.equal(result.waitedMs, 0, 'visible missing bodies are foreground work for this exact wheel');
+});
+
+test('viewport promotion admits only bounded returned row-window deltas', () => {
+  const base = { delta: true, rowWindowApplied: true, changedEntries: [{ uuid: 'a' }], estimatedBytes: 1024, totalRows: 2048 };
+  assert.equal(isHistoryViewportHydrationDelta(base), true);
+  for (const patch of [{ delta: false }, { rowWindowApplied: false }, { changedEntries: [] },
+    { changedEntries: Array(513).fill({ uuid: 'a' }) }, { estimatedBytes: NaN },
+    { estimatedBytes: HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES + 1 }, { totalRows: 4097 }, { totalRows: undefined }]) {
+    assert.equal(isHistoryViewportHydrationDelta({ ...base, ...patch }), false);
+  }
+});
+
+test('input-pending observation stays independent of the last wheel owner', () => {
+  let pending = true;
+  const p = createHistoryForegroundPriority({ now: () => 0, hasPendingInput: () => pending });
+  p.mark('own', 500);
+  assert.equal(p.owner(), 'own'); assert.equal(p.hasPendingInput(), true);
+  pending = false; assert.equal(p.hasPendingInput(), false); assert.equal(p.active(), true);
 });
 
 test('queued input and foreground promotion both fail safe', async () => {

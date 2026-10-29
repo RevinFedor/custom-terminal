@@ -396,7 +396,7 @@ const ptyProcess = pty.spawn(shell, [], {
 1.  **Ref-защита от Stale Closure:** Колбэк `ResizeObserver` использует `activeRef.current`, который синхронизируется с состоянием активности терминала.
 2.  **effectiveActive Logic:** Терминал реагирует на ресайз и вызывает `safeFit()` только когда он действительно виден пользователю (`effectiveActive`). Это исключает «прыжки» и ошибки FitAddon, когда контейнер имеет нулевой размер или скрыт за Dashboard/Home.
 3.  **Delayed Fit:** При активации терминала (`visibility: hidden` -> `inherit`), вызов `safeFit` оборачивается в `requestAnimationFrame`. Это дает браузеру время отрисовать контейнер и гарантирует, что `getBoundingClientRect()` вернет актуальные размеры для xterm.js.
-4.  **Pinned Timeline settle:** `ResizeObserver` делает обычный `fit()` во время изменения ширины, но не обязан возвращать scrollback вниз. Когда закреплённый Timeline завершает width-transition, он отправляет `timeline:pinned-layout-settled`; активный Terminal повторяет `safeFit()` через два кадра и вызывает `scrollToBottom()`, чтобы после reflow пользователь оставался у нижнего prompt'а.
+4.  **Timeline поверх терминала (SOURCE27.10):** раскрытие меняет только ширину absolute-панели при внешнем slot32px и не уменьшает контейнер терминала. Старый pinned-layout путь и `timeline:pinned-layout-settled` удалены. Обычный `ResizeObserver` продолжает обрабатывать реальные изменения размеров терминала.
 
 ```typescript
 const activeRef = useRef(effectiveActive);

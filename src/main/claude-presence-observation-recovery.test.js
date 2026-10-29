@@ -55,7 +55,8 @@ function actualSource() {
 }
 
 function psSnapshot({ providerPid = null, shellPid = 100 } = {}) {
-  const rows = [`${shellPid} 1 ${shellPid} ${shellPid} /bin/zsh`];
+  // The production full-census parser requires the caller before filtering.
+  const rows = ['42 1 42 -1 electron-fixture', `${shellPid} 1 ${shellPid} ${shellPid} /bin/zsh`];
   if (providerPid !== null) {
     rows.push(`${providerPid} ${shellPid} ${providerPid} ${providerPid} claude`);
   }
@@ -79,6 +80,7 @@ function fixture({ windowSendThrows = false } = {}) {
   let presenceHandler = null;
   const context = vm.createContext({
     ...liveness,
+    process: { pid: 42 },
     console: {
       log: (...args) => logs.push(['log', ...args]),
       warn: (...args) => logs.push(['warn', ...args]),

@@ -131,6 +131,17 @@ UI показывает статичный timer, unknown/child attention отд
 
 ## Browser-консультация как второй тип target
 
+SOURCE25Oct: для лёгкой подписи источника в SC есть отдельный authenticated
+`GET /api/orchestrations/:runId/source`, capability `researchSourceLabel`
+в `/api/me.capabilities` (`version:1`, `readOnly:true`). Ответ — только
+`source:{runId,jobId,tabId,tabName}` из exact external-research record; `tabName`
+это сохранённое при запуске sourceTabName. Здесь нет reconcile, provider/result/
+History чтения, нового watcher, публикации или смены outcome. Отсутствующая
+attribution даёт404, отсутствующее имя —null; клиент не угадывает имя по runId.
+Обычный GET статуса по runId для этого не подходит, поскольку external status
+может запускать reconciliation. SC использует source только для отображения,
+не как execution authority. SOURCE endpoint не объявлять уже установленным.
+
 `runKind=external-research` использует тот же durable store, причинное дерево,
 inherited activity, History tracker и source-handoff, но не создаёт фиктивную
 Claude/Codex-вкладку. Внешний target отображается как `SC Desktop / provider`,
@@ -139,6 +150,12 @@ Pause/Resume несуществующий terminal runtime. Имя в live track
 History run является кнопкой: тот же `orchestration:open-research-job` открывает
 сохранённый SC Research detail по полному jobId, не браузер и не новый запрос.
 Успех ждёт rendered ACK; repeated click coalesces, ошибка видна в прежних деталях.
+
+В шапке tooltip исходящего Research и раскрытых History-деталях рядом с прежними
+действиями есть отдельные SC-стрелка и globe. Они переиспользуют History
+`ResearchSourceAction` с точным runId и фиксированными24px slots: открыть ту же
+SC-задачу либо её разговор в браузере. Native/response-observation и входящие
+requests этих кнопок не получают; Cancel и имя-ссылка сохраняют прежние действия.
 
 Подпись Research в tracker, его History и hover различает модель и effort:
 `6-astra/pro` показывает `ChatGPT · 6 Pro`, `6/xhigh` — `ChatGPT · 6 X High`,
@@ -355,6 +372,16 @@ Fresh Claude требует отдельной причинной границы
 
 ## Завершение и уведомление источника
 
+Намеренная отмена собственной зависимости не является исходом native turn
+источника. Шрам23Oct: API cancel отдельного review4196→753 ошибочно попал в
+renderer abnormal и снял Loop продолжающей работать4196. SOURCE сохраняет
+cancelled/interrupted/cancelled-by-api + suppressed как отдельный neutral release:
+не success, не parent idle и не новая доставка. Настоящий callback-handoff по-прежнему
+передаёт право только своему natural final; неиспользованный exact natural final
+или уже подготовленное продолжение после снятия зависимости проверяются прежними
+queue/owner/input guards. Ошибки/UNKNOWN и другие cancel не получают этого допуска.
+Подробности — `fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на штатный конец turn'а`.
+
 History/Timeline SOURCE компактно показывают доказанный External Research итог
 через display-only projection. History11.10 использует прозрачные tool-строки:
 однострочный Markdown excerpt под каждым ответом, Research/saved model без
@@ -390,6 +417,25 @@ browser также даёт job/conversation identity. В History видны т�
 уже доставленный текст, не вызывает GET для отметки прочтения. Разовый созданный
 исполнитель по-прежнему закрывается только когда больше не нужен.
 
+SOURCE27Oct: если SC вернул полный ответ, но `artifact_errors` непуст, сразу после
+заголовка completion указаны число недоставленных и общее число файлов; исходный
+текст/поля/manifest не меняются. Если количество сохранённых файлов неизвестно,
+общее число не выдумывается. Ошибка **возврата результата в source-вкладку** —
+другой исход: её новое operational сообщение указывает, что ответ сохранён, а
+доставка в конкретную AI-вкладку пока не подтверждена. Оно не говорит, что сам
+Research не завершился, не требует искать файлы или снова нажимать Send. Старые
+замороженные сообщения/UNKNOWN не переписываются новой формулировкой.
+
+Инцидент3314: Codex получил completion (`user_message`, exact transport MATCH),
+но пример `[imagePath: /synthetic/example.png]` внутри ответа был ошибочно заменён
+на `imageError`. Из-за разницы исходного и transport hash/length durable receipt
+отверг доказательство и создал ложное `external_completion_input_unconfirmed`.
+SOURCE отмечает точные границы замороженного тела ответа как текст в существующем
+authoring plan: путь, приведённый автором как пример, не становится вложением.
+Явные image markers вне этого тела сохраняют прежний порядок/staging. Тексты
+исторических запросов, их receipts и UNKNOWN не ретроактивно перезаписываются.
+Controlled Main/SQLite tests не являются подтверждением установленной версии.
+
 Предел inline совпадает с существующим result-reader250000символов. Truncated,
 отсутствующий или больший ответ даёт явный reference с точным run/session/job,
 без молчаливого усечения или объявления частичного текста полным. Ненормальный
@@ -409,6 +455,29 @@ settings без этого поля. Подготовленный SOURCE20.10 de
 false сохраняет отдельный opt-out; он не меняет `notifySource`, birth, исходные
 run/job/Send или доставку полного ответа. Incidents всё равно сохраняются в журнале.
 
+**Текущая SOURCE policy24Oct — agent-owned recovery.** Новые failure/operational
+сообщения возвращают вызывавшему агенту versioned envelope с exact job/epoch/
+browser/account/turn/document, причиной и исходной квитанцией Send. Обязательное
+«сообщи владельцу и жди» отменено: агент сам выполняет разрешённую ограниченную
+Browser-диагностику. `not_attempted` observer не является no-Send удалённой модели;
+положительный noSend требует author failure и всех явных пустых Send timestamps.
+UNKNOWN не даёт права на повтор, safety refusal не сопровождается обходом.
+Старые frozen/attempted/UNKNOWN notification bytes не мигрируются на новый текст.
+
+Новые born error outcomes и typed локальные channel failures проходят тот же
+durable completion owner, что success. Поздний exact final после локальной ошибки
+доступен отдельным явным чтением, но не переписывает уже возвращённый outcome.
+EIO внутри transport error-handler перевключает SAME read-first monitor, не создаёт
+новый provider intent. Недоступный source сохраняет отдельный delivery outcome;
+одновременный отказ всех процессов/storage не позволяет обещать немедленный callback.
+
+SOURCE `observe_external_turn` — отдельная observer-only capability после ручного
+Send/Edit→Send/Retry, не `continue` и не latest URL-import. Нужны существующий
+tab/document/timeOrigin, profile/account/CID, точный user/DOM anchor и baseline
+старых finals; ноль новых author действий, ручная страница не закрывается.
+Старый ready snapshot не удовлетворяет выбранный ход. Capability проверяется
+на Noted и SC; новый MCP без обновлённого Main/worker не означает поддержку.
+
 SOURCE22Oct принимает сохранённое SC UI-recovery state по epoch/revision, а не
 называет любой nonterminal queued «Запуском». Остановка подготовки, ожидание Retry,
 восстановление и требуемое действие показываются статично/amber; running-spinner
@@ -420,6 +489,13 @@ provider outcome; он не приглашает слепо повторить S
 notice получает next-new-chat hint вне неизменённых answer bytes; текущий ответ
 не становится ошибкой. Это consumer SOURCE с отдельными actual-module тестами:
 установка SC/extension сама по себе Noted не обновляет, rollout фиксируется отдельно.
+
+SOURCE23Oct сохраняет SC recoveryDisposition как typed phase/outcomes, code и
+nextAction во frozen notice и delivery reference. Ранний UI report не подменяет
+более поздний reader/owner отказ старым body; phase resolution/replacement
+отсекает stale notice до input. Diagnostic churn по-прежнему не создаёт новые
+source turns. Эти Source controls проверены на actual RunStore/SQLite в E28;
+доставка notice не является acceptance/deadline обязательством repair owner.
 
 Автоматический Research Telegram — отдельная политика от source-agent wake.
 SOURCE20Oct default-off применяется и к `onBlocked` operational delivery, и к
@@ -683,6 +759,11 @@ serialization-lane и уведомляет source. Draft не очищается
 child, но не перепривязывает прерванный parent к callback-turn. Только canonical
 continuation receipt меняет execution parent. Полный интервал original→latest
 повторно проверяется перед FIFO input, включая промежуточный manual ввод.
+Provisional Codex Resume допускает этот input только по отдельному exact Main
+input-only proof; response unknown не становится idle. Automatic Build agent-route
+получает application-ACK одного сохранённого intent, чтобы ожидание input proof
+на HEAD не удерживало самого continuation owner. Canonical binding и обычный
+manual continuation по-прежнему имеют свои прежние receipt/result границы.
 См. `fact-build-when-idle.md::Немедленный снимок и продолжение`.
 
 `Продолжить запрос` в hover-карточке — отдельное app-owned действие `continue`,

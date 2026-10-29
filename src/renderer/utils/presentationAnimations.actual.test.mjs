@@ -14,13 +14,21 @@ function files(directory) {
 }
 
 test('every authored inline infinite indicator opts into the retained animation pause', () => {
-  const missing = [], covered = [];
-  for (const file of files(path.join(root, 'components'))) {
+  const missing = [], covered = [], compositorDots = [];
+  const componentFiles = files(path.join(root, 'components'));
+  for (const file of componentFiles) {
     const source = fs.readFileSync(file, 'utf8');
     const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
     function visit(node) {
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
         const attributes = node.attributes.properties;
+        const className = attributes.find(a => ts.isJsxAttribute(a) && a.name.text === 'className');
+        const classes = className?.initializer?.getText(ast) || '';
+        if (classes.includes('noted-background-task-dot')) {
+          assert.ok(classes.includes('animate-glow-yellow') && classes.includes('noted-infinite-animation'),
+            'background-task dots keep the shared compositor glow and hidden-owner pause');
+          compositorDots.push(path.relative(root, file));
+        }
         const style = attributes.find(a => ts.isJsxAttribute(a) && a.name.text === 'style');
         const expression = style?.initializer && ts.isJsxExpression(style.initializer) ? style.initializer.expression : null;
         if (expression) {
@@ -33,7 +41,6 @@ test('every authored inline infinite indicator opts into the retained animation 
           inspect(expression);
           if (infinite) {
             const location = path.relative(root, file) + ':' + (ast.getLineAndCharacterOfPosition(node.getStart(ast)).line + 1);
-            const className = attributes.find(a => ts.isJsxAttribute(a) && a.name.text === 'className');
             if (className?.initializer?.getText(ast).includes('noted-infinite-animation')) covered.push(location);
             else missing.push(location);
           }
@@ -43,7 +50,12 @@ test('every authored inline infinite indicator opts into the retained animation 
     }
     visit(ast);
   }
-  assert.ok(covered.length >= 30, 'audit covers the actual existing inline indicators, including conditional loops');
+  assert.ok(covered.length > 0 && componentFiles.some(file => file.endsWith('/Workspace/HistoryPanel.tsx')),
+    'audit scans the actual renderer tree; moving animations to CSS must not fail a fixed inline-count floor');
+  assert.deepEqual(compositorDots.sort(), [
+    'components/Workspace/ClaudeSDK/BackgroundTasksBar.tsx',
+    'components/Workspace/HistoryPanel.tsx',
+  ]);
   assert.deepEqual(missing, [], 'a new inline loop needs the explicit pause marker on the same element');
 });
 

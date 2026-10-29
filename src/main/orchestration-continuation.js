@@ -4,7 +4,9 @@ const crypto = require('node:crypto');
 const { promptFingerprint } = require('./claude-prompt-carriers');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { agentPromptAuditMatchesHash } = require('./agent-prompt-audit-identity');
-const { canSubmitContinuationInput, continuationTargetExpectation, continuationTargetScopeMatches } = require('./orchestration-continuation-input');
+const { deferSendPreparation } = require('./agent-send-preparation');
+const { canSubmitContinuationInput, continuationTargetExpectation, continuationTargetScopeMatches,
+  continuationInputTransitionPending, continuationInputPreparation } = require('./orchestration-continuation-input');
 
 const CONTINUATION_SOURCE = 'orchestration-continue:';
 const OWNER = 'orchestration-continuation';
@@ -40,6 +42,10 @@ function partyMatches(state, expected) {
     && state.toolType === expected?.toolType
     && (state.sessionId === expected?.sessionId || state.acceptedResumeSourceSessionId === expected?.sessionId);
 }
+function partyPending(state) {
+  return state?.error !== 'response_owner_changed' && state?.exists !== false
+    && (state?.known !== true || !state.sessionId || !state.toolType);
+}
 
 function latestMatchesOriginal(latest, original, run) {
   if (latest?.result?.sourceVerified !== true || !latest.subject) return false;
@@ -70,27 +76,53 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
   const emitResult = result => { emit(result?.changed || (result?.run ? [result.run] : [])); return result; };
 
   async function prepareRequest(runId, operationId) {
+    try { return await proveRequestInput(runId, operationId); }
+    catch (error) {
+      if (['continuation_runtime_unknown', 'continuation_target_not_idle', 'continuation_state_changed'].includes(error.message)) {
+        throw deferSendPreparation(error.message);
+      }
+      throw error;
+    }
+  }
+  async function proveRequestInput(runId, operationId) {
     const run = clone(await store.getInternal(runId)), intent = run?.continuationIntent;
     if (terminal(run) || !intent || intent.operationId !== operationId || intent.cancelledAt
       || receipts.isDeliveryCancelled(intent.operationKey)) throw new Error('continuation_cancelled');
     const source = await readState(run.sourceTabId), target = await readState(run.targetTabId);
+    if (partyPending(source) || partyPending(target)) throw new Error('continuation_runtime_unknown');
     if (!partyMatches(source, intent.sourceExpected) || !partyMatches(target, intent.targetExpected)) throw new Error('continuation_history_changed');
     if (run.targetCwd && target.cwd && require('node:path').resolve(run.targetCwd) !== require('node:path').resolve(target.cwd)) throw new Error('continuation_history_changed');
-    if (!canSubmitContinuationInput(target) || !continuationTargetScopeMatches(intent.targetExpected, target)
-      || target.backgroundWorkCount > 0 || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) throw new Error('continuation_target_not_idle');
+    if (continuationInputTransitionPending(target) || !canSubmitContinuationInput(target) || !continuationTargetScopeMatches(intent.targetExpected, target)
+      || target.backgroundWorkCount > 0 || target.goalWork?.pending === true
+      || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) throw new Error('continuation_target_not_idle');
     const baseRun = { ...run, targetExecutionContext: intent.baseExecutionContext };
     const original = await readOriginal(baseRun, { target, baseLookup: intent.baseLookup });
+    if (original?.found === true && original.sourceVerified === true && original.complete === true) {
+      const accepted = emitResult(await store.acceptContinuationReadyResult(runId, continuationOwnerKey(run), original));
+      if (accepted.accepted) { await reconcile(runId, 'continuation-ready-before-input'); await deliver(runId); }
+      throw new Error('continuation_result_ready');
+    }
     const latest = await readLatest(baseRun, target);
     const restart = await readRestartHistoryProof({ run: baseRun, state: target, original, latest });
-    if (original?.found !== true || original.sourceVerified !== true || restart?.required && restart.covered !== true
-      || !latestMatchesOriginal(latest, original, baseRun) && restart?.covered !== true) throw new Error('continuation_history_changed');
     const sourceAfter = await readState(run.sourceTabId), targetAfter = await readState(run.targetTabId);
     const current = await store.getInternal(runId);
     if (terminal(current) || current?.continuationIntent?.operationId !== operationId
-      || current.continuationIntent.cancelledAt || receipts.isDeliveryCancelled(intent.operationKey)
-      || !partyMatches(sourceAfter, intent.sourceExpected) || !partyMatches(targetAfter, intent.targetExpected)
-      || sourceAfter.revision !== source.revision || targetAfter.revision !== target.revision
-      || !canSubmitContinuationInput(targetAfter) || !continuationTargetScopeMatches(intent.targetExpected, targetAfter)) throw new Error('continuation_state_changed');
+      || current.continuationIntent.cancelledAt || receipts.isDeliveryCancelled(intent.operationKey)) throw new Error('continuation_cancelled');
+    if (partyPending(sourceAfter) || partyPending(targetAfter)) throw new Error('continuation_runtime_unknown');
+    if (!partyMatches(sourceAfter, intent.sourceExpected) || !partyMatches(targetAfter, intent.targetExpected)
+      || run.targetCwd && targetAfter.cwd && require('node:path').resolve(run.targetCwd) !== require('node:path').resolve(targetAfter.cwd)) {
+      throw new Error('continuation_history_changed');
+    }
+    if (target.continuationInput?.admission?.mode === 'provisional-resume'
+      && (original?.found !== true || original.sourceVerified !== true || restart?.unknown || latest?.result?.sourceVerified !== true)) {
+      throw new Error('continuation_runtime_unknown');
+    }
+    if (original?.found !== true || original.sourceVerified !== true || restart?.required && restart.covered !== true
+      || !latestMatchesOriginal(latest, original, baseRun) && restart?.covered !== true) throw new Error('continuation_history_changed');
+    if (sourceAfter.revision !== source.revision || targetAfter.revision !== target.revision
+      || !canSubmitContinuationInput(targetAfter) || continuationInputTransitionPending(targetAfter)
+      || !continuationTargetScopeMatches(intent.targetExpected, targetAfter)) throw new Error('continuation_state_changed');
+    return continuationInputPreparation(targetAfter, intent.targetExpected);
   }
 
   async function confirm(runId) {
@@ -128,7 +160,7 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     return result;
   }
 
-  async function perform(runId) {
+  async function perform(runId, options = {}) {
     let run = clone(await store.getInternal(runId));
     if (!run || run.runKind && run.runKind !== 'agent') return reject(runId, 'continuation_not_agent', 'Это действие относится к поручению AI-вкладке.');
     if (run.status === 'completed' && run.resultComplete === true) {
@@ -159,6 +191,8 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     let targetExpected = { toolType: run.targetToolType, sessionId: run.sessionId || run.targetPromptProofSessionId };
     const source = await readState(run.sourceTabId);
     const target = await readState(run.targetTabId);
+    if (partyPending(source) || partyPending(target)) return reject(runId, 'continuation_runtime_unknown',
+      'Принадлежность процесса пока не подтверждена; сохранённое продолжение ждёт readiness.');
     if ([source, target].some(state => state?.continuationInput?.reason === 'continuation_runtime_changed')) {
       return reject(runId, 'continuation_runtime_unknown', 'Состояние изменилось во время проверки; повторите действие.',
         'continuation_runtime_changed');
@@ -170,8 +204,11 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       return reject(runId, 'continuation_history_changed', 'Рабочая директория исполнителя изменилась. Создайте новый запрос явно.');
     }
     const original = await readOriginal(run, { target });
-    if (original?.found !== true || original.sourceVerified !== true) return reject(runId, 'continuation_history_changed', 'Исходное поручение не подтверждено в текущей истории. Создайте новый запрос.');
-    if (target.backgroundWorkCount > 0 || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) {
+    if (original?.found !== true || original.sourceVerified !== true) return reject(runId,
+      target.continuationInput?.admission?.mode === 'provisional-resume' ? 'continuation_runtime_unknown' : 'continuation_history_changed',
+      'Исходное поручение пока не подтверждено в текущей истории; ввод не выполнен.',
+      original?.errorCode || original?.error || 'continuation_original_proof_pending');
+    if (target.backgroundWorkCount > 0 || target.goalWork?.pending === true || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) {
       return reject(runId, 'continuation_background_work', 'Сохраняется фоновая работа или Goal; новое продолжение не требуется. Проверьте её в самой вкладке.');
     }
     if (original.complete === true) {
@@ -187,7 +224,7 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       await deliver(runId);
       return { ok: true, resultReady: true, run: await store.get(runId) };
     }
-    if (!['found', 'absent'].includes(target.processStatus)) return reject(runId, 'continuation_runtime_unknown',
+    if (continuationInputTransitionPending(target) || !['found', 'absent'].includes(target.processStatus)) return reject(runId, 'continuation_runtime_unknown',
       'Состояние процесса исполнителя пока не подтверждено; повторите проверку.', 'continuation_process_unknown');
     if (target.busy === true) {
       const context = target.executionContext, expected = run.targetExecutionContext;
@@ -205,6 +242,11 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     targetExpected = continuationTargetExpectation(targetExpected, target);
     const latest = await readLatest(run, target);
     const restart = await readRestartHistoryProof({ run, state: target, original, latest });
+    if (target.continuationInput?.admission?.mode === 'provisional-resume'
+      && (restart?.unknown || latest?.result?.sourceVerified !== true)) {
+      return reject(runId, 'continuation_runtime_unknown', 'Точная история ввода пока не подтверждена; продолжение остаётся ожидающим.',
+        restart?.reason || latest?.code || 'continuation_history_proof_pending');
+    }
     if (restart?.required && restart.covered !== true || !latestMatchesOriginal(latest, original, run) && restart?.covered !== true) {
       return reject(runId, 'continuation_history_changed', 'Последний ход не относится к выбранному поручению. Создайте новый запрос, не продолжая чужую задачу.', latest?.code || 'continuation_history_changed');
     }
@@ -214,9 +256,10 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       || !canSubmitContinuationInput(afterTarget) || !continuationTargetScopeMatches(targetExpected, afterTarget)) {
       return reject(runId, 'continuation_state_changed', 'Вкладки изменились во время проверки. Continue не отправлен; повторите действие.');
     }
+    const prompt = run.continuationIntent ? run.continuationIntent.prompt || 'continue' : options.restartPrompt || 'continue';
     const claimed = emitResult(await store.beginRequestContinuation(runId, {
       ownerKey: continuationOwnerKey(run), sourceExpected, targetExpected,
-      promptHash: promptFingerprint('continue'), auditHash: promptAuditFingerprint('continue'), now: now(),
+      prompt, promptHash: promptFingerprint(prompt), auditHash: promptAuditFingerprint(prompt), now: now(),
       replaceProvenNoSubmit: run.continuationIntent?.state === 'blocked'
         && ['not-submitted', 'provider-not-accepted'].includes(receipts.get(run.continuationIntent.operationKey)?.state),
     }));
@@ -234,13 +277,20 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     try {
       await store.markRequestContinuationSending(runId, intent.operationId);
       senderInvoked = true;
-      const result = await send({ tabId: run.targetTabId, prompt: 'continue', workContextPrepared: true,
+      const result = await send({ tabId: run.targetTabId, prompt: intent.prompt || 'continue', workContextPrepared: true,
         handoffId: intent.handoffId, sendOperationKey: intent.operationKey, sendSurface: 'desktop-history',
         source: CONTINUATION_SOURCE + runId, ownership: 'project', queue: false,
         provider: sendExpectedTarget.toolType, sessionId: sendExpectedTarget.sessionId, expectedTarget: sendExpectedTarget,
+        ...(options.applicationQueueAcceptedResponse === true ? { applicationQueueAcceptedResponse: true } : {}),
         statusAtSend: afterTarget.processStatus === 'absent' ? 'inactive' : 'active',
         prepareSend: () => prepareRequest(runId, intent.operationId),
       }, run);
+      if (result?.deferred === true && result.success === false && result.submitted === false
+        && !result.deliveryUnknown && !result.pasteWritten && !result.enterWritten
+        && !receipts.get(intent.operationKey)?.attemptId) {
+        await store.resetRequestContinuationBeforeAdmission(runId, intent.operationId, result.code);
+        return { ok: true, deferred: true, code: result.code, run: await store.get(runId) };
+      }
       const confirmed = await confirm(runId);
       if (confirmed.confirmed) return { ok: true, resumed: true, run: await store.get(runId) };
       if (confirmed.deliveryConfirmed) return { ok: true, paused: true, run: await store.get(runId) };
@@ -263,9 +313,9 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
   }
 
   return {
-    continueRequest(runId) {
+    continueRequest(runId, options = {}) {
       if (inflight.has(runId)) return inflight.get(runId);
-      const work = perform(runId).finally(() => { if (inflight.get(runId) === work) inflight.delete(runId); });
+      const work = perform(runId, options).finally(() => { if (inflight.get(runId) === work) inflight.delete(runId); });
       inflight.set(runId, work); return work;
     },
     reconcile: confirm,

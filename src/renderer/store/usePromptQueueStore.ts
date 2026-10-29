@@ -19,6 +19,7 @@ import {
   haveSameComposerChips,
   normalizeComposerChips,
   serializeComposerDraft,
+  prepareComposerDraftTransport,
 } from '../utils/composerChips.mjs';
 import {
   getFirstDelayRemainingSeconds,
@@ -186,6 +187,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       !q.postPromptEnabled &&
       !q.postPromptText &&
       !q.loopPromptEnabled &&
+      !q.localLoopPromptText &&
       loopPromptMode(q) === 'all-work' &&
       !q.runAfterTabId &&
       // NOT `!q.panelCollapsed`: the panel now defaults to collapsed, so the
@@ -206,6 +208,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       postPromptEnabled: q.postPromptEnabled,
       postPromptText: q.postPromptText,
       loopPromptEnabled: q.loopPromptEnabled,
+      localLoopPromptText: q.localLoopPromptText || '',
       loopPromptArmedAt: q.loopPromptArmedAt,
       loopPromptEpoch: q.loopPromptEpoch,
       loopPromptMode: loopPromptMode(q),
@@ -533,6 +536,11 @@ export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'chip
   });
 }
 
+export function buildQueuedPromptTransport(item: Pick<QueuedPrompt, 'text' | 'chips' | 'imagePaths'>) {
+  return prepareComposerDraftTransport({ text: buildPromptImagePayload(item.text, item.imagePaths || []),
+    chips: item.chips || [], trim: false });
+}
+
 export function getQueuedPromptAttachmentState(
   item: Pick<QueuedPrompt, 'text' | 'images' | 'imagePaths' | 'attachmentState'>,
 ): QueuedPromptAttachmentState {
@@ -550,7 +558,7 @@ export type PromptQueuePendingDelivery = {
   triggerKey: string;
   conditionKey: string;
   causeKey: string | null;
-  loopCause?: { provider: string; sessionId: string; turnId: string };
+  loopCause?: { provider: string; sessionId: string; turnId: string; inputBoundary?: string | null };
   loopEpoch?: string;
   loopPromptMode?: LoopPromptMode;
   loopWaitId?: string;
@@ -610,6 +618,8 @@ export type TabQueue = {
   // Explicit opt-in: ordinary waits for all work; own-turn can review external waits.
   loopPromptMode?: LoopPromptMode;
   loopPromptText: string;
+  // Optional instructions appended only to this owner's shared Loop prompt.
+  localLoopPromptText?: string;
   loopPromptArmedAt: number | null;
   // Identity of an explicit arm/text edit; restart and outcome floors keep it.
   loopPromptEpoch?: string | null;
@@ -789,6 +799,7 @@ interface PromptQueueStore {
   setPostPromptText: (tabId: string, text: string) => void;
   setLoopPromptEnabled: (tabId: string, value: boolean, mode?: LoopPromptMode) => void;
   setLoopPromptText: (tabId: string, text: string) => void;
+  setLocalLoopPromptText: (tabId: string, text: string) => void;
   setPanelCollapsed: (tabId: string, value: boolean) => void;
 
   // First-chip armed hint helpers. consumeFirstChipHint clears the flag after
@@ -843,6 +854,7 @@ const EMPTY: TabQueue = {
   loopPromptEnabled: false,
   loopPromptMode: 'all-work',
   loopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
+  localLoopPromptText: '',
   loopPromptArmedAt: null,
   loopPromptEpoch: null,
   panelCollapsed: DEFAULT_RUN_AFTER_PANEL_COLLAPSED,
@@ -878,6 +890,7 @@ type PreHydrateQueueField =
   | 'loopPromptEnabled'
   | 'loopPromptMode'
   | 'loopPromptText'
+  | 'localLoopPromptText'
   | 'loopPromptArmedAt'
   | 'loopPromptEpoch'
   | 'runAfterTabId'
@@ -930,6 +943,7 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.loopPromptEnabled !== current.loopPromptEnabled) changed.add('loopPromptEnabled');
     if (baseline.loopPromptMode !== current.loopPromptMode) changed.add('loopPromptMode');
     if (baseline.loopPromptText !== current.loopPromptText) changed.add('loopPromptText');
+    if (baseline.localLoopPromptText !== current.localLoopPromptText) changed.add('localLoopPromptText');
     if (baseline.loopPromptArmedAt !== current.loopPromptArmedAt) changed.add('loopPromptArmedAt');
     if (baseline.loopPromptEpoch !== current.loopPromptEpoch) changed.add('loopPromptEpoch');
     if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
@@ -980,6 +994,7 @@ function mergeHydratedQueue(
   if (changed?.has('loopPromptEnabled')) merged.loopPromptEnabled = current.loopPromptEnabled;
   if (changed?.has('loopPromptMode')) merged.loopPromptMode = current.loopPromptMode;
   if (changed?.has('loopPromptText')) merged.loopPromptText = current.loopPromptText;
+  if (changed?.has('localLoopPromptText')) merged.localLoopPromptText = current.localLoopPromptText;
   if (changed?.has('loopPromptArmedAt')) merged.loopPromptArmedAt = current.loopPromptArmedAt;
   if (changed?.has('loopPromptEpoch')) merged.loopPromptEpoch = current.loopPromptEpoch;
   if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
@@ -1025,7 +1040,7 @@ export type PromptQueueCore = Pick<
   TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'runAfterTabId'
   | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'
-  | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptMode'
+  | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptMode' | 'localLoopPromptText'
 >;
 
 export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
@@ -1041,6 +1056,7 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
     loopPromptEnabled: q.loopPromptEnabled,
     loopPromptMode: loopPromptMode(q),
     loopPromptText: q.loopPromptText,
+    localLoopPromptText: q.localLoopPromptText || '',
   };
 }
 
@@ -1093,7 +1109,7 @@ export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
 }
 
 export function hasPendingPromptQueueContinuation(
-  queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText' | 'pendingDelivery'>,
+  queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText' | 'localLoopPromptText' | 'pendingDelivery'>,
 ): boolean {
   return !!queue.pendingDelivery || (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0
     && !promptQueueContextWasSkipped(queue))
@@ -1101,9 +1117,9 @@ export function hasPendingPromptQueueContinuation(
 }
 
 export function isLoopPromptActive(
-  queue: Pick<TabQueue, 'loopPromptEnabled' | 'loopPromptText'>,
+  queue: Pick<TabQueue, 'loopPromptEnabled' | 'loopPromptText' | 'localLoopPromptText'>,
 ): boolean {
-  return queue.loopPromptEnabled && queue.loopPromptText.trim().length > 0;
+  return queue.loopPromptEnabled && (queue.loopPromptText.trim().length > 0 || !!queue.localLoopPromptText?.trim());
 }
 
 export function wouldCreateRunAfterCycle(
@@ -1987,6 +2003,18 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    setLocalLoopPromptText: (tabId, text) => {
+      setAndPersist(state => {
+        const current = state.queues.get(tabId) ?? EMPTY;
+        if ((current.localLoopPromptText || '') === text) return state;
+        const queues = new Map(state.queues);
+        queues.set(tabId, { ...current, localLoopPromptText: text,
+          loopPromptEpoch: current.loopPromptEnabled ? newLoopPromptEpoch() : current.loopPromptEpoch,
+          loopPromptArmedAt: current.loopPromptEnabled ? Date.now() : current.loopPromptArmedAt });
+        return { queues };
+      });
+    },
+
     setPanelCollapsed: (tabId, value) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
@@ -2401,6 +2429,7 @@ type PersistedTabQueue = {
   loopPromptEnabled?: boolean;
   loopPromptMode?: LoopPromptMode;
   loopPromptText?: string;
+  localLoopPromptText?: string;
   loopPromptArmedAt?: number | null;
   loopPromptEpoch?: string | null;
   runAfterTabId?: string | null;
@@ -2593,6 +2622,7 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     loopPromptEnabled: !!entry.loopPromptEnabled,
     loopPromptMode: loopPromptMode(entry),
     loopPromptText: typeof entry.loopPromptText === 'string' ? entry.loopPromptText : '',
+    localLoopPromptText: typeof entry.localLoopPromptText === 'string' ? entry.localLoopPromptText : '',
     loopPromptArmedAt: typeof entry.loopPromptArmedAt === 'number' && Number.isFinite(entry.loopPromptArmedAt)
       ? Number(entry.loopPromptArmedAt)
       : null,

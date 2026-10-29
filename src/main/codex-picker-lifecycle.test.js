@@ -130,7 +130,10 @@ test('picker admission remains sealed to its exact existing generation and input
   const body = source.slice(start, source.indexOf("ipcMain.handle('codex:select-model-effort'", start));
   assert.match(body, /pickerInputAdmitted = false/);
   assert.match(body, /pickerInputAdmitted && hasCodexEstablishedComposerLifecycle\(tabId\)/);
-  assert.match(body, /pickerInputAdmitted = true;[\s\S]{0,90}const writeGuard/);
+  const admitted = body.indexOf('pickerInputAdmitted = true;');
+  const guard = body.indexOf('const writeGuard = (phase)', admitted);
+  assert.ok(admitted >= 0 && guard > admitted, 'owned picker admission must precede its write guard');
+  assert.match(body.slice(admitted, guard), /settingsObservationBeforePicker/);
 });
 
 test('retained unknown audit is not live busy after manual B completed, but active Enter proof still blocks', () => {

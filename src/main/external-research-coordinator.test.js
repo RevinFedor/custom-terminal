@@ -38,6 +38,44 @@ async function fixture() {
   return { dir, file, store };
 }
 
+test('persistence failure in transport error handling rearms the same read-first monitor without another start', async t => {
+  const h = await fixture(), timers = new Map(); let timerId = 0, reads = 0, starts = 0
+  t.after(async () => { await h.store.flush(); await fs.promises.rm(h.dir, { recursive: true, force: true }); })
+  const mark = h.store.markExternalResearchTransportWait.bind(h.store)
+  let failWrite = true
+  h.store.markExternalResearchTransportWait = async (...args) => {
+    if (failWrite) { failWrite = false; throw Object.assign(new Error('EIO'), { code: 'EIO' }); }
+    return mark(...args)
+  }
+  const coordinator = new ExternalResearchCoordinator({ store: h.store, longPollMs: 0, logger: { warn() {} },
+    setTimer: fn => { const id = ++timerId; timers.set(id, fn); return id }, clearTimer: id => timers.delete(id),
+    client: { status: async jobId => {
+      reads++; if (reads === 1) throw new TypeError('SC unavailable')
+      return { id: jobId, status: 'done', result: { text: 'SAME FULL' } }
+    }, start: async () => { starts++; assert.fail('rearm is observation, not a new author attempt') } } })
+  t.after(() => coordinator.stop())
+  await coordinator.watch('run-1')
+  assert.equal(coordinator.watchers.size, 0); assert.equal(timers.size, 1)
+  const retry = [...timers.values()][0]; timers.clear(); retry()
+  await coordinator.watchers.get('run-1').promise
+  assert.equal((await h.store.get('run-1')).status, 'completed')
+  assert.equal(reads, 2); assert.equal(starts, 0); assert.equal(timers.size, 0)
+})
+
+test('a new SC error has the same durable delivery authority as success; legacy and attempted callbacks are not upgraded', async t => {
+  const h = await fixture(); t.after(async () => { await h.store.flush(); await fs.promises.rm(h.dir, { recursive: true, force: true }); })
+  await h.store.applyExternalResearchSnapshot('run-1', { id: 'noted_run-1', status: 'error', stage: 'observation_failed', error: 'observer lost' })
+  const row = await h.store.getInternal('run-1'), local = require('./external-research-completion-delivery')
+  assert(local.hasBirth(row)); assert.equal(row.externalResearchDelivery.legacy, undefined)
+  row.notifySource = true // fixture defaults false; this changes no persisted send target.
+  assert(local.authorized(row)); assert(local.canAdmit(row))
+  const frozen = { ...row, externalResearchDelivery: undefined, notificationAttempt: 1 }
+  local.initializeDelivery(frozen); assert.equal(frozen.externalResearchDelivery, undefined)
+  const legacy = { ...row, externalResearchDelivery: undefined, externalResearchDeliveryBirth: undefined }
+  local.initializeDelivery(legacy)
+  assert.equal(legacy.externalResearchDelivery.legacy, true); assert.equal(local.canAdmit(legacy), false)
+})
+
 test('404 recovery starts one deterministic job, waits, and settles from SC done', async (t) => {
   const h = await fixture();
   t.after(async () => { await h.store.flush(); await fs.promises.rm(h.dir, { recursive: true, force: true }); });

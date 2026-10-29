@@ -5,10 +5,51 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
 import recordTimes from '../../shared/history-record-time.cjs';
-import { historyRecordTimeAttributes, historyRecordTimeLabel, placeHistoryRecordTime } from './historyRecordTimePresentation.mjs';
+import { historyEntryRecordTime, historyGroupRecordTimeAttributes, historyRecordTimeAttributes,
+  historyRecordTimeLabel, historyRecordTimeRangeLabel, placeHistoryRecordTime } from './historyRecordTimePresentation.mjs';
 import { reduceHistoryLiveProjection } from './historyLiveProjection.mjs';
 const at = '2026-10-07T07:46:18.647Z';
 const time = { version: 1, timestamp: at, kind: 'tool-call', scope: 'record' };
+
+test('local MCP/SC/question handoff uses saved submission time, then exact audit, never a generic timestamp', () => {
+  const entry = { uuid: 'local-prompt-tab-handoff', role: 'queued', handoffId: 'handoff',
+    optimisticAt: Date.parse(at), timestamp: '2099-01-01T00:00:00Z', statusChangedAt: Date.now() };
+  assert.equal(historyEntryRecordTime(entry).timestamp, at);
+  assert.equal(historyEntryRecordTime({ ...entry, auditTimestamp: '2026-10-07T07:47:00Z',
+    auditEntryUuid: 'exact-canonical' }).timestamp, '2026-10-07T07:47:00Z');
+  assert.equal(historyEntryRecordTime({ ...entry, recordTime: time }).timestamp, at);
+  for (const changed of [{ optimisticAt: undefined }, { optimisticAt: NaN }, { optimisticAt: 0 },
+    { optimisticAt: Infinity }, { optimisticAt: 9e15 }, { handoffId: undefined },
+    { role: 'user' }, { uuid: 'ordinary-user' }]) assert.equal(historyEntryRecordTime({ ...entry, ...changed }), undefined);
+  assert.equal(historyEntryRecordTime({ role: 'user', timestamp: at }), undefined);
+  assert.equal(historyEntryRecordTime({ ...entry, optimisticAt: undefined, auditTimestamp: at }), undefined,
+    'an unowned audit-looking timestamp is not canonical proof');
+});
+
+test('group range uses only its own published records/calls, not Worked or selected-caption state', () => {
+  const later = { ...time, timestamp: '2026-10-07T07:49:00Z' };
+  const entries = [{ uuid: 'A', recordTime: time, actions: [{ rawTool: { recordTime: later,
+    get args() { assert.fail('time aggregation must not scan payload'); } } }] },
+  { uuid: 'B', recordTime: { ...later, timestamp: '2026-10-07T07:51:00Z' }, responseTiming: { endTs: Date.now() } }];
+  const result = historyGroupRecordTimeAttributes(entries, 'group');
+  assert.equal(result['data-history-time-at'], at);
+  assert.equal(result['data-history-time-end-at'], '2026-10-07T07:51:00Z');
+  assert.equal(result['data-history-time-kind'], 'group');
+  assert.deepEqual(historyGroupRecordTimeAttributes([...entries, { uuid: 'unknown', timestamp: at }], 'group'), {});
+  assert.deepEqual(historyGroupRecordTimeAttributes([], 'group'), {});
+  assert.deepEqual(historyGroupRecordTimeAttributes(entries, ''), {});
+});
+
+test('group time formatting shares the day once, preserves midnight boundaries and rejects reversed/unknown ranges', () => {
+  const date = (day, hours, minutes) => new Date(2026, 9, day, hours, minutes).toISOString();
+  const source = timestamp => ({ version: 1, timestamp, kind: 'message', scope: 'record' });
+  const now = Date.parse(date(23, 8, 0));
+  assert.equal(historyRecordTimeRangeLabel(source(date(23, 7, 26)), source(date(23, 7, 29)), now), '| сегодня, 07:26 — 07:29');
+  assert.equal(historyRecordTimeRangeLabel(source(date(22, 23, 58)), source(date(23, 0, 1)), now), '| вчера, 23:58 — сегодня, 00:01');
+  assert.equal(historyRecordTimeRangeLabel(source(date(23, 7, 26)), source(date(23, 7, 26)), now), '| сегодня, 07:26');
+  assert.equal(historyRecordTimeRangeLabel(source(date(23, 7, 29)), source(date(23, 7, 26)), now), '');
+  assert.equal(historyRecordTimeRangeLabel({}, source(date(23, 7, 29)), now), '');
+});
 
 test('actual History stable-row comparison notices time-only enrichment but reuses equivalent metadata', () => {
   const source = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');

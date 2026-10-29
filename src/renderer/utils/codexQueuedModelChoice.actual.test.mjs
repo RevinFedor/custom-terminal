@@ -31,7 +31,7 @@ function harness({ active = false, replaceable = false, localPending = 0, fail =
     isLocalBusy: false, localBusyReason: null, providerState: state,
     codexIntentWaiting: presentation.codexSettingsIntentIsWaiting({ isCodex: true, isCommandRunning: true, providerState: state }),
     settingsActivity: { busy: active, target: active ? 'model' : null, replaceable },
-    claudeSettingActionsRef: actions, providerBindingRef: { current: 'T' },
+    claudeSettingActionsRef: actions, codexSettingsSaveRef: { current: null }, providerBindingRef: { current: 'T' },
     claudeSettingActionIsCurrent: seq => seq === actions.current.seq,
     beginControlAction() { throw Error('Codex must use its existing revisioned intent'); },
     console: { log: line => logs.push(line), warn: line => logs.push(line) },

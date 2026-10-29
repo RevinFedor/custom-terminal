@@ -1,12 +1,28 @@
 'use strict';
 const crypto=require('node:crypto');
 const {fingerprint}=require('./workflow-organization');
+const {createSelectionStopSourceClock}=require('./workflow-selection-stop-source');
 const copy=value=>JSON.parse(JSON.stringify(value));
 const fail=code=>{throw Object.assign(Error(code),{code,statusCode:409});};
 const id=value=>typeof value==='string'&&value.length>0&&value.trim()===value;
 const keys=(value,names)=>value&&typeof value==='object'&&!Array.isArray(value)
   &&Object.keys(value).every(name=>names.includes(name));
 const same=(a,b)=>fingerprint(a)===fingerprint(b);
+const diagnosticCode=value=>typeof value==='string'&&/^[a-z][a-z0-9_-]{0,95}$/.test(value)?value:null;
+const diagnosticErrorCode=value=>typeof value==='string'&&/^[a-zA-Z0-9_.:-]{1,96}$/.test(value)?value:null;
+const stopDiagnostic=(value,fallback)=>{
+  const diagnostic={version:1,stage:diagnosticCode(value?.stage)||fallback.stage,
+    reason:diagnosticCode(value?.reason)||fallback.reason};
+  if(typeof value?.admitted==='boolean')diagnostic.admitted=value.admitted;
+  for(const key of ['ownerChanged','launchChanged','scopeChanged']) {
+    if(typeof value?.[key]==='boolean')diagnostic[key]=value[key];
+    else if(Array.isArray(value?.[key])&&value[key].length<=24
+      &&value[key].every(field=>typeof field==='string'&&/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(field)))
+      diagnostic[key]=[...value[key]];
+  }
+  const code=diagnosticErrorCode(value?.errorCode);if(code)diagnostic.errorCode=code;
+  return diagnostic;
+};
 
 /** Arbitrary captured selection, NOT a global group. Uses the existing action
  * journal and exact file-close proof helpers. Physical Stop/Full remain Main
@@ -15,6 +31,17 @@ class WorkflowSelectionRuntime {
   constructor({database,organization,groupActions,captureOwner,observe,stop,recoverRuntime,log=()=>{}}) {
     Object.assign(this,{database,db:database.db,organization,groupActions,captureOwner,observe,stop,recoverRuntime,log});
     this.flights=new Map();
+    // Schema initialization belongs to this Main runtime, before effects.
+    // Forward action journals do not acquire new source-observation tables.
+    this.stopSourceClock={read:()=>fail('selection_stop_source_unavailable')};
+    try {
+      this.stopSourceClock=this.db.prepare('SELECT version FROM workflow_group_action_meta WHERE singleton=1').get()?.version===1
+        ?createSelectionStopSourceClock(this.db):{read:()=>fail('selection_action_forward_version')};
+    }catch{}
+    // Only exact Main-produced positive receipts whose journal write failed.
+    // One entry per unresolved target reservation; no observations or effects
+    // are replayed. This volatile cache is deliberately NOT restart authority.
+    this.pendingStopReceipts=new Map();
     this.closeActions=Object.create(groupActions);
     this.closeActions.command=mutationId=>this.closeCommand(mutationId);
     this.closeActions.signature=tabId=>this.signature(tabId);
@@ -68,16 +95,151 @@ class WorkflowSelectionRuntime {
       ...(execution.tabType==='file'?{fileFamily:this.groupActions.fileFamily(tabId)
         .map(row=>({row,signature:this.signature(row.tab_id)}))}:{})};
   }
-  current(member,{archived=false,runtimeOwner=member.runtimeOwner}={}) {
+  current(member,{archived=false,runtimeOwner=member.runtimeOwner,diagnostic=null}={}) {
     try {
+      // Optional, body-free first-failure collector. Keep the original order,
+      // short circuits and single capture; diagnostics never re-read an owner.
+      if(diagnostic)diagnostic.component='publication';
       const pub=this.organization.getPublication();
-      if(pub.version!==1||pub.migrationVersion!==1||pub.generation!==member.generation
-        ||!same(this.organization.getMembership(member.tabId),member.membership))return false;
+      if(diagnostic)diagnostic.component='publication.version';
+      if(pub.version!==1)return false;
+      if(diagnostic)diagnostic.component='publication.migrationVersion';
+      if(pub.migrationVersion!==1)return false;
+      if(diagnostic)diagnostic.component='publication.generation';
+      if(pub.generation!==member.generation)return false;
+      if(diagnostic)diagnostic.component='membership';
+      if(!same(this.organization.getMembership(member.tabId),member.membership))return false;
       if(archived)return true;
+      if(diagnostic)diagnostic.component='capture';
       const now=this.capture(member.tabId);
-      return now.placementId===member.placementId&&same(now.execution,member.execution)&&same(now.subject,member.subject)
-        &&same(now.runtimeOwner,runtimeOwner);
-    }catch{return false;}
+      if(diagnostic)diagnostic.component='placementId';
+      if(now.placementId!==member.placementId)return false;
+      if(diagnostic)diagnostic.component='execution';
+      if(!same(now.execution,member.execution))return false;
+      if(diagnostic)diagnostic.component='subject';
+      if(!same(now.subject,member.subject))return false;
+      if(diagnostic)diagnostic.component='runtimeOwner';
+      return same(now.runtimeOwner,runtimeOwner);
+    }catch(error){
+      if(diagnostic) {
+        diagnostic.threw=true;
+        try {const code=diagnosticErrorCode(error?.code);if(code)diagnostic.errorCode=code;}catch{}
+      }
+      return false;
+    }
+  }
+  readStopScope(member) {
+    const publication=this.organization.getPublication(),tab=this.organization.getTab(member.tabId);
+    const row=this.row(member.tabId),now=this.capture(member.tabId);
+    const workflow=this.organization.getWorkflow(now.membership.workflowId,{includeDeleted:true});
+    if(publication.version!==1||publication.migrationVersion!==1
+      ||!Number.isSafeInteger(publication.generation)||publication.generation<0
+      ||!tab||!row||tab.nativeRow?.id!==row.id||!workflow||workflow.deletedGeneration
+      ||![1,2].includes(tab.subjectVersion)||!Number.isSafeInteger(tab.revision)||!Number.isSafeInteger(workflow.revision))
+      fail('selection_stop_scope_unknown');
+    const storage={};
+    for(const key of ['id','tab_id','project_id','execution_subject_version','execution_subject_id',
+      'execution_namespace','execution_archived','cwd','command_type','restore_placement_id'])
+      storage[key]=row[key]??null;
+    return {version:1,generation:publication.generation,
+      target:{publication:{version:publication.version,migrationVersion:publication.migrationVersion},
+        tabRevision:tab.revision,subjectVersion:tab.subjectVersion,storage,sourceClock:this.stopSourceClock.read(member.tabId,row.id),workflow:copy(workflow),
+        namespace:now.namespace,placementId:now.placementId,subject:copy(now.subject),membership:copy(now.membership),
+        execution:{...copy(now.execution),runtime:null}},
+      executionRuntime:copy(now.execution.runtime),runtimeOwner:copy(now.runtimeOwner)};
+  }
+  captureStopScope(member) {
+    const read=()=>{
+      if(!this.current(member))fail('selection_action_owner_changed');
+      return this.readStopScope(member);
+    };
+    return this.db.inTransaction?read():this.db.transaction(read).immediate();
+  }
+  checkStopScope(member,scope,{runtimeOwner=member.runtimeOwner,matchExecutionRuntime}={}) {
+    const rejected=(reason,changed)=>({current:false,reason,...(changed?{changed}:{})});
+    try {
+      const read=()=>{
+        if(scope?.version!==1||!Number.isSafeInteger(scope.generation)||scope.generation<0)
+          return rejected('selection_stop_scope_invalid');
+        const now=this.readStopScope(member);
+        if(now.generation<scope.generation)return rejected('selection_stop_publication_rewound');
+        // Publication relaxation is limited to native v2 targets. The new
+        // source clock does not expand legacy's existing generation permission.
+        if(scope.target.subject.version!==2&&now.generation!==scope.generation)
+          return rejected('selection_stop_publication_changed');
+        if(!same(now.target.publication,scope.target.publication))return rejected('selection_stop_publication_changed');
+        if(!same(now.runtimeOwner,runtimeOwner))return rejected('selection_stop_runtime_owner_changed');
+        for(const key of ['tabRevision','subjectVersion','workflow','namespace','placementId','subject','membership','execution','sourceClock'])
+          if(!same(now.target[key],scope.target[key]))return rejected('selection_stop_scope_'+key.replace(/[A-Z]/g,c=>'_'+c.toLowerCase())+'_changed',[key]);
+        const beforeStorage=scope.target.storage,afterStorage=now.target.storage;
+        const changed=Object.keys(beforeStorage).filter(key=>!same(beforeStorage[key],afterStorage[key]));
+        if(changed.length||Object.keys(beforeStorage).length!==Object.keys(afterStorage).length)
+          return rejected('selection_stop_scope_storage_changed',changed);
+        // This adapter is Main-only, never an IPC-supplied claim. Its explicit
+        // true is required; a Promise/truthy object cannot authorize retirement.
+        const runtimeMatches=matchExecutionRuntime?matchExecutionRuntime(scope.executionRuntime,now.executionRuntime)===true
+          :same(scope.executionRuntime,now.executionRuntime);
+        return runtimeMatches?{current:true}:rejected('selection_stop_execution_runtime_changed');
+      };
+      return this.db.inTransaction?read():this.db.transaction(read).immediate();
+    }catch(error){return {...rejected('selection_stop_scope_read_failed'),
+      ...(diagnosticErrorCode(error?.code)?{errorCode:diagnosticErrorCode(error.code)}:{})};}
+  }
+  currentStopScope(member,scope,options) {return this.checkStopScope(member,scope,options).current;}
+  pendingStopReceipt(mutationId,tabId) {
+    const pending=this.pendingStopReceipts.get(tabId);
+    return pending?.mutationId===mutationId?pending:null;
+  }
+  pruneCompletedStopReceipt(tabId) {
+    const pending=this.pendingStopReceipts.get(tabId);
+    if(!pending)return;
+    const value=this.command(pending.mutationId),member=this.member(value,tabId),step=value.steps[tabId];
+    if(value.action==='stop'&&step?.state==='completed'&&step.started===true
+      &&fingerprint(member)===pending.memberHash&&same(step.receipt,pending.receipt))
+      this.pendingStopReceipts.delete(tabId);
+  }
+  retainStopReceipt(mutationId,member,receipt) {
+    const old=this.pendingStopReceipts.get(member.tabId),proof=copy(receipt),memberHash=fingerprint(member);
+    if(old&&(old.mutationId!==mutationId||old.memberHash!==memberHash||!same(old.receipt,proof)))
+      fail('selection_stop_retained_receipt_conflict');
+    if(!old)this.pendingStopReceipts.set(member.tabId,{mutationId,memberHash,receipt:proof});
+  }
+  persistStopReceipt(mutationId,tabId) {
+    const pending=this.pendingStopReceipt(mutationId,tabId);
+    if(!pending)fail('selection_stop_retained_receipt_missing');
+    const validate=current=>{
+      const member=this.member(current,tabId),step=current.steps[tabId],actual=pending.receipt;
+      if(current.action!=='stop'||fingerprint(member)!==pending.memberHash||!step?.started
+        ||!['started','completed'].includes(step.state)||actual.version!==1||actual.completed!==true
+        ||!same(actual.before,member.runtimeOwner)||step.state==='completed'&&!same(step.receipt,actual))
+        fail('selection_stop_retained_receipt_changed');
+      return step;
+    };
+    let phase='journal-read';
+    try {
+      // A commit can have succeeded before its caller saw an error. Recover
+      // that exact durable result using reads even if all writes now fail.
+      if(validate(this.command(mutationId)).state==='completed') {
+        this.pendingStopReceipts.delete(tabId);
+        return {success:true,completed:true,mutationId,tabId};
+      }
+      phase='journal-commit';
+      const result=this.update(mutationId,current=>{
+        const step=validate(current);
+        if(step.state!=='completed') {
+          step.state='completed';step.receipt=copy(pending.receipt);delete step.error;delete step.diagnostic;
+          this.db.prepare("UPDATE workflow_group_close_steps SET state='completed' WHERE mutation_id=? AND tab_id=?").run(mutationId,tabId);
+        }
+        return {success:true,completed:true,mutationId,tabId};
+      });
+      this.pendingStopReceipts.delete(tabId);
+      try {this.log('stop-settled',{mutationId,tabId,completed:true});}catch{}
+      return result;
+    }catch(error) {
+      const diagnostic=stopDiagnostic({errorCode:error?.code},{stage:phase,reason:'selection_stop_receipt_commit_failed'});
+      try {this.log('stop-held',{mutationId,tabId,error:'selection_stop_receipt_unknown',diagnostic});}catch{}
+      return {success:false,pending:true,mutationId,tabId,error:'selection_stop_receipt_unknown',diagnostic};
+    }
   }
   begin(request) {
     this.writable();
@@ -124,7 +286,8 @@ class WorkflowSelectionRuntime {
   receipt(mutationId) {
     const value=this.command(mutationId),results=value.members.map(member=>({tabId:member.tabId,namespace:member.namespace,
       state:value.steps[member.tabId]?.state||'admitted',
-      ...(value.steps[member.tabId]?.error?{error:value.steps[member.tabId].error}:{})}));
+      ...(value.steps[member.tabId]?.error?{error:value.steps[member.tabId].error}:{}),
+      ...(value.steps[member.tabId]?.diagnostic?{diagnostic:copy(value.steps[member.tabId].diagnostic)}:{})}));
     return {version:1,success:true,mutationId,action:value.action,completed:results.every(row=>row.state==='completed'),results};
   }
   reserve(value,member) {
@@ -156,9 +319,18 @@ class WorkflowSelectionRuntime {
       fail('selection_close_guard_changed');
     return {value,member,step};
   }
-  assertCloseGuard(guard) {
+  assertCloseGuard(guard,boundary) {
     const {member,step}=this.checkGuard(guard);
-    if(step.started&&member.execution.tabType!=='file'||!this.current(member))fail('selection_close_execution_changed');
+    const diagnostic={component:'started'};
+    if(step.started&&member.execution.tabType!=='file'||!this.current(member,{diagnostic})) {
+      // Static field names only: no compared values, IDs, paths or exception
+      // messages. The refusal itself binds the boundary; no PASS log needed.
+      try {this.log('close-guard-refused',{version:1,
+        boundary:boundary==='before_process_observation'||boundary==='after_process_observation'?boundary:'unspecified',
+        component:diagnostic.component,threw:diagnostic.threw===true,error:'selection_close_execution_changed',
+        ...(diagnostic.errorCode?{errorCode:diagnostic.errorCode}:{})});}catch{}
+      fail('selection_close_execution_changed');
+    }
   }
   async step({mutationId,tabId}) {
     const key=JSON.stringify([mutationId,tabId]);
@@ -172,6 +344,7 @@ class WorkflowSelectionRuntime {
     const value=this.command(mutationId),member=this.member(value,tabId),old=value.steps[tabId];
     if(old&&(!['prepared','started','completed'].includes(old.state)
       ||old.state==='started'&&old.started!==true))fail('selection_action_phase_unknown');
+    if(value.action==='stop'&&this.pendingStopReceipt(mutationId,tabId))return this.persistStopReceipt(mutationId,tabId);
     if(old?.state==='completed')return {success:true,completed:true,mutationId,tabId};
     if(value.action==='close') {
       if(old?.started)return {success:true,completed:false,closeGuard:this.guard(value,member),pending:true};
@@ -183,20 +356,34 @@ class WorkflowSelectionRuntime {
         return {success:true,completed:false,closeGuard:this.guard(current,member)};
       });
     }
-    if(old?.started)return {success:false,pending:true,error:'selection_stop_receipt_unknown',mutationId,tabId};
+    if(old?.started)return {success:false,pending:true,error:'selection_stop_receipt_unknown',mutationId,tabId,
+      ...(old.diagnostic?{diagnostic:copy(old.diagnostic)}:{})};
     if(!this.current(member))fail('selection_action_owner_changed');
     if(member.execution.tabType==='file')return this.update(mutationId,current=>{
       if(!this.current(member))fail('selection_action_owner_changed');
       current.steps[tabId]={state:'completed',receipt:{version:1,kind:'file-no-process',owner:member.runtimeOwner}};
       return {success:true,completed:true,mutationId,tabId};
     });
+    // A read-only receipt may have observed a completed commit after a lost
+    // commit ACK. Prune only that exact durable cached proof BEFORE a new Stop.
+    this.pruneCompletedStopReceipt(tabId);
+    const retained=this.pendingStopReceipts.get(tabId);
+    if(retained&&retained.mutationId!==mutationId)fail('selection_stop_retained_receipt_conflict');
+    // A known missing/forward/broken observer is a pre-effect rejection, not
+    // an UNKNOWN physical attempt. Original started commands never reach here.
+    const sourceBeforeObservation=this.stopSourceClock.read(tabId,this.row(tabId)?.id);
     let observation;
     try {observation=await this.observe(member);}catch{observation={known:false};}
     if(!this.current(member))fail('selection_action_owner_changed');
     if(observation?.known!==true)return {success:false,error:'selection_stop_process_unknown',mutationId,tabId};
     const acquired=this.update(mutationId,current=>{
       if(current.steps[tabId]?.started)return false;
-      if(!this.current(member))fail('selection_action_owner_changed');this.reserve(current,member);
+      if(!this.current(member))fail('selection_action_owner_changed');
+      // The first process observation is an await too. Preserve its original
+      // source witness instead of recapturing an ABA after that await.
+      const sourceNow=this.stopSourceClock.read(tabId,this.row(tabId)?.id);
+      if(!same(sourceBeforeObservation,sourceNow))fail('selection_stop_scope_source_clock_changed');
+      this.reserve(current,member);
       this.db.prepare("INSERT INTO workflow_group_close_steps VALUES(?,?,?,'selection-started')")
         .run(mutationId,tabId,crypto.randomUUID());
       current.steps[tabId]={state:'started',started:true};this.log('stop-started',{mutationId,tabId});return true;
@@ -204,18 +391,19 @@ class WorkflowSelectionRuntime {
     if(!acquired)return this.execute(mutationId,tabId);
     // The attestation is produced ONLY by the existing Main Stop owner after
     // its actual result + exact owned retirement checks, never by IPC input.
-    let actual;
-    try {actual=await this.stop(member,observation,runtimeOwner=>this.current(member,{runtimeOwner}));}catch{}
+    let actual,diagnostic;
+    try {actual=await this.stop(member,observation,runtimeOwner=>this.current(member,{runtimeOwner}));}
+    catch(error) {diagnostic=stopDiagnostic({errorCode:error?.code},{stage:'owner-call',reason:'selection_stop_owner_threw'});}
+    if(actual?.version===1&&actual.completed===true&&same(actual.before,member.runtimeOwner)) {
+      this.retainStopReceipt(mutationId,member,actual);
+      return this.persistStopReceipt(mutationId,tabId);
+    }
+    diagnostic||=stopDiagnostic(actual?.diagnostic,{stage:'attestation',reason:'selection_stop_attestation_missing'});
     return this.update(mutationId,current=>{
       const step=current.steps[tabId];
-      if(actual?.version===1&&actual.completed===true&&same(actual.before,member.runtimeOwner)) {
-        step.state='completed';step.receipt=copy(actual);delete step.error;
-        this.db.prepare("UPDATE workflow_group_close_steps SET state='completed' WHERE mutation_id=? AND tab_id=?").run(mutationId,tabId);
-        this.log('stop-settled',{mutationId,tabId,completed:true});
-        return {success:true,completed:true,mutationId,tabId};
-      }
-      step.error='selection_stop_receipt_unknown';this.log('stop-held',{mutationId,tabId,error:step.error});
-      return {success:false,pending:true,mutationId,tabId,error:step.error};
+      step.error='selection_stop_receipt_unknown';step.diagnostic=copy(diagnostic);
+      try {this.log('stop-held',{mutationId,tabId,error:step.error,diagnostic});}catch{}
+      return {success:false,pending:true,mutationId,tabId,error:step.error,diagnostic};
     });
   }
   archiveReplay(guard,request) {
@@ -373,10 +561,12 @@ class WorkflowSelectionRuntime {
       .run(value.mutationId,member.tabId);
   }
   ack({mutationId,tabId}) {
+    if(this.pendingStopReceipt(mutationId,tabId))return this.persistStopReceipt(mutationId,tabId);
     const value=this.command(mutationId),member=this.member(value,tabId),step=value.steps[member.tabId];
     // No renderer success/absent/history heuristic can manufacture this marker.
     return step?.state==='completed'?{success:true,completed:true,mutationId,tabId}
-      :{success:false,pending:true,mutationId,tabId,error:'selection_action_receipt_unknown'};
+      :{success:false,pending:true,mutationId,tabId,error:'selection_action_receipt_unknown',
+        ...(step?.diagnostic?{diagnostic:copy(step.diagnostic)}:{})};
   }
 }
 

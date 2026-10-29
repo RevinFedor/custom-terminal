@@ -5,6 +5,7 @@ const { createCodexRuntimePolicyController } = require('./codex-runtime-policies
 const { shouldSurfaceCodexStartupTimeout } = require('./codex-runtime-contract');
 const { createInputPreparation } = require('./agent-send-preparation');
 const { inspectCodexInputReadyTextCore, parseCodexVerifiedComposerFooter } = require('./codex-tui-readiness');
+const { codexStartupDiagnosticGroup } = require('./terminal-incident-reporting');
 const source = fs.readFileSync(process.env.NOTED_GOAL_STARTUP_MAIN_SOURCE || __dirname + '/main.js', 'utf8');
 const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
 const names = ['hasCodexPolicyInitializedComposer', 'getCodexStartupNoStateTimeout', 'maybeSurfaceCodexStartupNoStateTimeout'];
@@ -37,6 +38,7 @@ function fixture() {
     getCodexLiveInputControl: () => null, getCodexMcpStartupStatus: () => null,
     hasCodexPromptOrTurnInFlight: () => false, clearCodexLaunchAcceptancePending() {},
     clearCodexStartupNoStateTimeoutTimer() {}, reportTerminalIncident: (...args) => reports.push(args),
+    codexStartupDiagnosticGroup, getTerminalLifecycleGeneration: () => owner.lifecycleGeneration,
     getCodexRuntimeSessionId: () => 'S', getCodexPublicWriterFields: () => ({ writerConfirmed: false }),
     _webBroadcast: (...args) => events.push(args), emitCodexTuiNotReadyState: (...args) => events.push(args),
     console: { warn() {}, log() {} },

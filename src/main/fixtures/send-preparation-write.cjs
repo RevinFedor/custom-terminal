@@ -5,7 +5,7 @@ const fs = require('node:fs'), path = require('node:path'), vm = require('node:v
 const ts = require('typescript'), Database = require('better-sqlite3');
 const { createAgentSendReceiptStore, STORE_STATES } = require('../agent-send-receipt-store');
 const preparation = require('../agent-send-preparation');
-const { createCodexDraftRequestHarness, drainMicrotasks } = require('./codex-draft-request-observation.cjs');
+const { createCodexDraftRequestHarness, createFakeClock, drainMicrotasks } = require('./codex-draft-request-observation.cjs');
 const root = process.env.ACTUAL_SOURCE_DIR || path.join(__dirname, '..');
 const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
 const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
@@ -20,27 +20,36 @@ const source = names.map(name => {
   if (!node) throw new Error('Actual declaration missing: ' + name); return node.getText(ast);
 }).join('\n');
 
-function fixture(t, { open = true, throwEnter = false, deadlineOffset = null, returnable = false } = {}) {
+function fixture(t, { open = true, throwEnter = false, deadlineOffset = null, returnable = false, receiptFilename = null,
+  preparationMode = 'warm', deferAttempt = false, prompt = 'frozen', attachOwned = true } = {}) {
   let inputRevision = 1, stopRevision = 0, stages = 0, drains = 0, settingsCurrent = true;
   let proof = { success: true, hasDraft: open ? null : false, source: 'headless-main:cursor:10',
     ...(open ? { frameBlocker: 'synchronized-output-open' } : {}) };
-  const h = createCodexDraftRequestHarness({ rendererAvailable: false, getDraft: () => proof });
+  const h = createCodexDraftRequestHarness({ rendererAvailable: false, getDraft: () => proof,
+    ...(deadlineOffset !== null && deadlineOffset < 60000 ? { clock: createFakeClock(100000) } : {}) });
   const ctx = h.context, writes = [], events = [], audits = [];
   const term = { write(data) { writes.push(data); if (data === '\r' && throwEnter) throw Error('controlled Enter throw'); } };
-  const db = new Database(':memory:'), store = createAgentSendReceiptStore(db);
+  const db = new Database(receiptFilename || ':memory:'), store = createAgentSendReceiptStore(db);
   const identity = { operationKey: 'history:T:H', tabId: 'T', handoffId: 'H', provider: 'codex',
-    surface: 'desktop-history', requestFingerprint: 'immutable', promptHash: 'hash', promptLength: 6 };
+    surface: 'desktop-history', requestFingerprint: 'immutable',
+    promptHash: require('../prompt-audit-fingerprint').promptAuditFingerprint(prompt), promptLength: prompt.length };
   const returnControl = require('../history-send-return').historySendReturnControl(store);
   const returnIdentity = { tabId: 'T', handoffId: 'H', provider: 'codex', token: 'return-H' };
   if (returnable) returnControl.register(returnIdentity);
-  const attempt = store.beginAttempt(identity);
-  const scope = preparation.createSendPreparationScope({ ...identity, attemptId: attempt.attemptId }, h.clock.now());
   const ownedAttachments = { version: 1, refs: [{ assetId: 'frozen-A', path: '/controlled/A.png' }] };
-  store.stageAttemptContext(identity.operationKey, attempt.attemptId, { preflightScope: scope, ownedAttachments });
+  const attempt = {}; let scope = null;
+  const beginHead = () => {
+    Object.assign(attempt, store.beginAttempt(identity));
+    scope = preparation.createSendPreparationScope({ ...identity, attemptId: attempt.attemptId }, h.clock.now(), preparationMode);
+    store.stageAttemptContext(identity.operationKey, attempt.attemptId, { preflightScope: scope,
+      ...(attachOwned ? { ownedAttachments } : {}) });
+    return attempt;
+  };
+  if (!deferAttempt) beginHead();
   const initialOwner = () => ({ terminalToken: term, terminalRunSeq: 1, terminalLifecycleGeneration: 'L1',
     terminalStopRevision: stopRevision, inputRevision, mirrorToken: h.mirror, mirrorGeneration: h.mirror.generation });
   ctx.terminals.set('T', term); ctx.terminalCommandState.set('T', { runSeq: 1, isRunning: true });
-  const startup = deadlineOffset === null ? null : { launchId: 'COLD', terminalToken: term,
+  let startup = deadlineOffset === null ? null : { launchId: 'COLD', terminalToken: term,
     lifecycleGeneration: 'L1', runSeq: 1, stopRevision: 0, startedAt: h.clock.now() - (60000 - deadlineOffset),
     deadlineAt: h.clock.now() + deadlineOffset };
   Object.assign(ctx, { ...preparation, agentSendReceiptStore: store, AGENT_SEND_DURABLE_STATES: STORE_STATES,
@@ -90,6 +99,15 @@ function fixture(t, { open = true, throwEnter = false, deadlineOffset = null, re
     reconcileCodexWriterFromProcess: async () => ({}),
   });
   ctx.console.error = (...args) => h.logs.push(args.join(' '));
+  if (startup) {
+    // Bind the synthetic launch through the actual Main producer. Passing a
+    // look-alike object without its retained WeakMap lease is not live proof.
+    ctx.codexLastRunCommandPayload.set('T', { ...startup });
+    ctx.hasCodexEstablishedComposerLifecycle = () => false;
+    ctx.isCodexOperationalInputReady = () => false;
+    startup = ctx.captureCodexSendStartupFrameWait('T', 'COLD');
+    if (!startup) throw Error('Synthetic launch did not get its actual retained startup lease');
+  }
   vm.runInContext(source, ctx);
   vm.runInContext('globalThis.held = () => ptyWriteOwners.has(terminals.get("T"));', ctx);
   const opts = { source: 'codex-controlled', submit: true, skipRenderWait: true,
@@ -98,9 +116,10 @@ function fixture(t, { open = true, throwEnter = false, deadlineOffset = null, re
     codexStartupFrameWait: startup,
     settingsWriteGuard: () => ({ allowed: settingsCurrent, reason: 'settings-changed' }) };
   t.after(async () => { stopRevision++; h.setOwner({ terminalStopRevision: stopRevision }); h.notifyFrame();
-    await drainMicrotasks(100); db.close(); });
-  return { ...h, ctx, term, store, identity, attempt, scope, ownedAttachments, writes, events, opts, returnControl, returnIdentity,
-    start: more => ctx.safePasteAndSubmit(term, 'frozen', { ...opts, ...more }),
+    await drainMicrotasks(100); if (db.open) db.close(); });
+  return { ...h, ctx, term, store, identity, attempt, get scope() { return scope; }, beginHead,
+    ownedAttachments, writes, events, opts, returnControl, returnIdentity,
+    start: more => ctx.safePasteAndSubmit(term, prompt, { ...opts, sendAttemptId: attempt.attemptId, ...more }),
     get stages() { return stages; }, get drains() { return drains; }, get inputRevision() { return inputRevision; },
     frame(hasDraft = false) { proof = { success: true, hasDraft, source: 'headless-main:cursor:10',
       frameIdentity: { generation: 'G1', writeSeq: 40 } }; h.notifyFrame(); },

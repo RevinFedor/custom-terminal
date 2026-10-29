@@ -47,7 +47,7 @@ function codexRootFinalAnswerText(record) {
     .trim();
 }
 
-function observeCodexTurnRecord(tracker, record) {
+function observeCodexTurnRecord(tracker, record, observedFinalText = undefined) {
   const event = codexRecordEventType(record);
   const recordTurnId = codexRecordTurnId(record);
   if (event === 'task_started') {
@@ -57,11 +57,49 @@ function observeCodexTurnRecord(tracker, record) {
     return;
   }
 
-  const finalText = codexRootFinalAnswerText(record);
+  const finalText = observedFinalText === undefined ? codexRootFinalAnswerText(record) : observedFinalText;
   if (!finalText || !recordTurnId) return;
   if (tracker.currentTurnId && recordTurnId && tracker.currentTurnId !== recordTurnId) return;
   tracker.currentTurnHasFinalResult = true;
   tracker.currentTurnFinalResultTurnId = recordTurnId;
+}
+
+// Bounded shape-only observation. No text, reader, retry or outcome authority.
+function describeCodexFinalProof(tracker, record, finalText) {
+  const event = codexRecordEventType(record), payload = record?.payload;
+  if (!['task_started', 'task_complete', 'turn_aborted'].includes(event)
+    && !(record?.type === 'response_item' && payload?.type === 'message' && payload?.role === 'assistant')) return null;
+  const fields = [record?.payload?.turn_id, record?.payload?.internal_chat_message_metadata_passthrough?.turn_id,
+    record?.payload?.metadata?.turn_id, record?.turn_id];
+  const ids = fields.map(value => ({ type: value === null ? 'null' : typeof value,
+    value: typeof value === 'string' ? value.slice(0, 200) : null }));
+  const recordTurnId = codexRecordTurnId(record);
+  const content = Array.isArray(payload?.content) ? payload.content : null;
+  const parts = content?.slice(0, 256) || [];
+  const finalCandidate = record?.type === 'response_item' && payload?.type === 'message' && payload?.role === 'assistant';
+  const reason = finalCandidate ? payload.phase !== 'final_answer' ? 'phase-not-final'
+    : !finalText ? 'empty-final-text' : !recordTurnId ? 'explicit-turn-id-missing'
+      : tracker.currentTurnId && tracker.currentTurnId !== recordTurnId ? 'foreign-turn-id' : 'accepted-explicit-final'
+    : event === 'task_started' ? 'reset-at-start'
+      : hasNonEmptyCodexFinalResult(payload) ? 'inline-final'
+        : trackerHasFinalResultForEvent(tracker, payload) ? 'tracked-same-turn-final' : 'no-matching-final-proof';
+  const number = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const label = value => typeof value === 'string' ? value.slice(0, 200) : null;
+  return { observationOnly: true, reason,
+    record: { type: label(record.type), event: label(event), role: label(payload?.role), phase: label(payload?.phase),
+      timestamp: label(record.timestamp),
+      byteOffset: number(record.__byteOffset), eventSequence: number(record.__eventSequence), turnIdFields: ids,
+      contentType: Array.isArray(payload?.content) ? 'array' : typeof payload?.content,
+      partCount: content?.length ?? null, textPartCount: parts.filter(part => typeof part?.text === 'string').length,
+      textCodeUnits: parts.reduce((n, part) => n + (typeof part?.text === 'string' ? part.text.length : 0), 0),
+      contentTruncated: !!content && content.length > parts.length, finalTextLength: finalText?.length || 0,
+      inlineFinalType: typeof payload?.last_agent_message,
+      inlineFinalLength: typeof payload?.last_agent_message === 'string' ? payload.last_agent_message.trim().length : null,
+      hasProviderError: !!payload?.error && typeof payload.error === 'object' },
+    previous: { currentTurnId: label(tracker.currentTurnId),
+      currentTurnHasFinalResult: tracker.currentTurnHasFinalResult === true,
+      currentTurnFinalResultTurnId: label(tracker.currentTurnFinalResultTurnId),
+      lastEventType: label(tracker.lastEventType), lastEventTs: label(tracker.lastEventTs) } };
 }
 
 function trackerHasFinalResultForEvent(tracker, payload) {
@@ -159,11 +197,21 @@ function classifyCodexTurnRecord(tracker, record, options = null) {
       }
     } catch { /* diagnostic observer must never become a lifecycle gate */ }
   }
-  observeCodexTurnRecord(tracker, record);
+  const hasProofObserver = typeof options?.onFinalProofObservation === 'function';
+  const observedFinalText = hasProofObserver ? codexRootFinalAnswerText(record) : undefined;
+  const observation = hasProofObserver ? describeCodexFinalProof(tracker, record, observedFinalText) : null;
+  observeCodexTurnRecord(tracker, record, observedFinalText);
   const event = codexRecordEventType(record);
   const outcome = classifyCodexTurnEvent(event, record?.payload, {
     hasTrackedFinalResult: trackerHasFinalResultForEvent(tracker, record?.payload),
   });
+  if (observation) {
+    let watcherId = codexTurnObservationWatchers.get(tracker);
+    if (!watcherId) { watcherId = 'codex-turn-watcher-' + (++codexTurnObservationWatcherSequence); codexTurnObservationWatchers.set(tracker, watcherId); }
+    try { Promise.resolve(options.onFinalProofObservation({ ...observation, watcherId,
+      outcome: outcome ? { reason: outcome.reason, hasFinalResult: outcome.hasFinalResult } : null })).catch(() => {}); }
+    catch { /* observation must not change classification/publication */ }
+  }
   if (!outcome) return null;
   const result = {
     ...outcome,

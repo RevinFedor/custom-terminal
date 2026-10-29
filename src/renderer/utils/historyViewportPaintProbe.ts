@@ -7,7 +7,7 @@ export interface HistoryViewportPaintProbe {
   start(
     owner: HistoryViewportPaintOwner,
     hasMountedRow: () => boolean,
-    publishReady: () => void,
+    publishReady: () => boolean | void,
   ): boolean;
   isActive(owner: HistoryViewportPaintOwner): boolean;
   cancel(owner?: HistoryViewportPaintOwner): void;
@@ -55,7 +55,7 @@ export const createHistoryViewportPaintProbe = ({
   const start = (
     owner: HistoryViewportPaintOwner,
     hasMountedRow: () => boolean,
-    publishReady: () => void,
+    publishReady: () => boolean | void,
   ) => {
     if (sameOwner(activeOwner, owner)) return false;
     cancel();
@@ -77,8 +77,16 @@ export const createHistoryViewportPaintProbe = ({
         scheduledFrame = requestFrame(waitForMountedRow);
         return;
       }
+      // A real row may paint before the current measured primary window is
+      // covered. Rejection by the shared publisher is still pending work,
+      // not completion of this probe. Keep one frame and all owner guards.
+      const accepted = publishReady();
+      if (!stillOwnsProbe()) return;
+      if (accepted === false) {
+        scheduledFrame = requestFrame(waitForMountedRow);
+        return;
+      }
       activeOwner = null;
-      publishReady();
     };
 
     const waitForMountedRow = () => {

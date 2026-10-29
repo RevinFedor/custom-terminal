@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const {
   hasCodexComposerPromptGlyph,
-  parseCodexVerifiedComposerFooter,
+  hasCodexComposerStatusFooter,
   selectCodexCurrentInteractiveFrameText,
 } = require('./codex-tui-readiness');
 
@@ -60,7 +60,7 @@ function inspectCodexModelCapacityFrame(snapshot) {
     snapshot.codexActivePrompt?.row,
   );
   if (!hasCodexComposerPromptGlyph(currentFrameText)
-    || !parseCodexVerifiedComposerFooter(currentFrameText)) {
+    || !hasCodexComposerStatusFooter(currentFrameText)) {
     return Object.freeze({ capacity: false, reason: 'ready-composer-required' });
   }
 

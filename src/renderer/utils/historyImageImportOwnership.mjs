@@ -1,6 +1,6 @@
 import { insertComposerSnapshotAtSelection } from './composerChips.mjs';
 import { insertHistoryClipboardSnapshotAtSelection } from './composerClipboard.mjs';
-import { insertPromptImageAttachments, retainPromptImageRefsForText } from './promptImageAttachments.mjs';
+import { insertPromptImageAttachments, retainPromptImageRefsForText, replacePromptPendingImageMarkers } from './promptImageAttachments.mjs';
 
 export const HISTORY_IMAGE_PENDING_MARKER = '[Image saving…]';
 
@@ -9,7 +9,7 @@ export const HISTORY_IMAGE_PENDING_MARKER = '[Image saving…]';
 // label spinning forever, and never re-import the current (different) clipboard.
 export function expireReloadedHistoryImageImports(drafts = {}) {
   return Object.fromEntries(Object.entries(drafts).map(([tabId, text]) => [tabId,
-    String(text || '').replaceAll(HISTORY_IMAGE_PENDING_MARKER, '[imageError: image_import_interrupted]'),
+    replacePromptPendingImageMarkers(text, '[imageError: image_import_interrupted]'),
   ]));
 }
 

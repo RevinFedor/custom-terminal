@@ -106,6 +106,120 @@ test('one accepted continue binds the exact new answer without changing original
   assert.equal(saved.status, 'running');
 });
 
+test('install continuation freezes its native-child prompt across unknown delivery and reopen without replacing the old intent', async t => {
+  const h = await fixture(t), prompt = require('./build-continue-prompt').RESTART_PROMPT;
+  const original = structuredClone(await h.store.getInternal('R'));
+  h.setResult('unknown');
+  const first = await h.service.continueRequest('R', { restartPrompt: prompt });
+  assert.equal(first.pending, true); assert.equal(h.calls.sends.length, 1);
+  assert.equal(h.calls.sends[0].prompt, prompt);
+  const before = structuredClone((await h.store.getInternal('R')).continuationIntent);
+  assert.equal(before.prompt, prompt); assert.equal(before.promptHash, require('./claude-prompt-carriers').promptFingerprint(prompt));
+  assert.equal(before.auditHash, promptAuditFingerprint(prompt));
+  const receipt = structuredClone(h.receipts.get(before.operationKey));
+  assert.equal(receipt.state, 'delivery-unknown');
+  await h.reopen();
+  const second = await h.service.continueRequest('R', { restartPrompt: 'Другой текст не заменяет прежнюю отправку' });
+  assert.equal(second.code, 'continuation_delivery_unknown'); assert.equal(h.calls.sends.length, 1);
+  assert.deepEqual(h.receipts.get(before.operationKey), receipt);
+  const after = await h.store.getInternal('R');
+  assert.equal(after.continuationIntent.operationKey, before.operationKey);
+  assert.equal(after.continuationIntent.handoffId, before.handoffId);
+  assert.equal(after.continuationIntent.prompt, prompt);
+  assert.equal(after.sourceTabId, original.sourceTabId); assert.equal(after.promptHash, original.promptHash);
+});
+
+test('provisional/unknown source or target remains pending; confirmed mismatch and Goal keep their guards', async t => {
+  const h = await fixture(t), ready = { ...h.states.get('B') };
+  for (const state of [{ known: false, sessionId: null }, { known: true, sessionId: null, transitioning: true },
+    { known: false, error: 'response_state_changed' }]) {
+    h.states.set('B', { ...ready, ...state });
+    const result = await h.service.continueRequest('R'); assert.equal(result.code, 'continuation_runtime_unknown');
+    assert.equal(h.calls.sends.length, 0); assert.equal((await h.store.getInternal('R')).continuationIntent, undefined);
+  }
+  h.states.set('B', { ...ready, known: false, error: 'response_owner_changed' });
+  assert.equal((await h.service.continueRequest('R')).code, 'continuation_history_changed');
+  h.states.set('B', { ...ready, error: null, goalWork: { pending: true } });
+  assert.equal((await h.service.continueRequest('R')).code, 'continuation_background_work'); assert.equal(h.calls.sends.length, 0);
+  h.states.get('B').goalWork = null; assert.equal((await h.service.continueRequest('R')).resumed, true); assert.equal(h.calls.sends.length, 1);
+});
+
+test('deferred before FIFO reservation retains the same run intent across restart, never a second H/O', async t => {
+  const h = await fixture(t); h.setSendOverride(async () => ({ success: false, submitted: false, deferred: true,
+    code: 'build_continue_return_reservation_pending' }));
+  const first = await h.service.continueRequest('R'); assert.equal(first.deferred, true);
+  const before = (await h.store.getInternal('R')).continuationIntent;
+  assert.equal(before.state, 'prepared'); assert.equal(before.sendStartedAt, null); assert.equal(h.receipts.list().length, 0);
+  await h.reopen(); h.setSendOverride(null);
+  assert.equal((await h.service.continueRequest('R')).resumed, true);
+  const after = (await h.store.getInternal('R')).continuationIntent;
+  assert.equal(after.operationId, before.operationId); assert.equal(after.handoffId, before.handoffId);
+  assert.equal(h.receipts.list().length, 1); assert.equal((await h.store.getInternal('R')).continuationOrdinal, 1);
+});
+
+test('actual restored FIFO admission parks transient continuation owner unknown, while a proven foreign writer cancels before an attempt', async t => {
+  const h = await fixture(t); h.setSendOverride(async () => ({ submitted: false, applicationQueued: true }));
+  await h.service.continueRequest('R'); const intent = (await h.store.getInternal('R')).continuationIntent;
+  const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const tree = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
+  const declaration = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'admitQueuedAgentSend');
+  assert.ok(declaration);
+  const env = vm.createContext({ require, getBuildContinueOperations: () => ({ capturing: () => false }),
+    getOrchestrationRunStore: () => h.store, getOrchestrationContinuationService: () => h.service });
+  vm.runInContext(declaration.getText(tree) + '\nglobalThis.admit = admitQueuedAgentSend;', env);
+  const request = { tabId: 'B', source: 'orchestration-continue:R', sendOperationKey: intent.operationKey, handoffId: intent.handoffId };
+  const ready = { ...h.states.get('B') }; h.states.set('B', { ...ready, known: false, sessionId: null });
+  assert.equal(await env.admit(request), false); assert.equal(h.receipts.list().length, 0);
+  h.states.set('B', { ...ready, sessionId: 'foreign' });
+  const refused = await env.admit(request); assert.equal(refused.cancel, true); assert.equal(refused.reason, 'continuation_history_changed');
+  assert.equal(h.receipts.list().length, 0);
+});
+
+test('a verified install callback can bind the original incoming run without a generic continuation or changing its recipient', async t => {
+  const h = await fixture(t), before = structuredClone(await h.store.getInternal('R'));
+  const request = { tabId: 'B', prompt: 'installed; continue the same task', handoffId: 'build-install-return:job-one',
+    sendOperationKey: 'project:B:build-install-return:job-one', expectedTarget: { toolType: 'codex', sessionId: 'B' } };
+  h.commit(request);
+  const native = h.receipts.get(request.sendOperationKey), audit = native.auditIdentity;
+  const proof = { operationKey: native.operationKey, handoffId: native.handoffId, attemptId: native.attemptId,
+    sessionId: audit.sessionId, executionContext: native.receipt.auditExecutionContext,
+    userUuid: audit.entryUuid, sourceIdentity: audit.sourceIdentity,
+    resultPromptHash: require('./claude-prompt-carriers').promptFingerprint(request.prompt) };
+  const args = { operationId: 'voice-force-job-one', capturedAt: 1000,
+    originalContext: before.targetExecutionContext, proof, isCurrent: async () => h.receipts.get(native.operationKey).attemptId === native.attemptId };
+  await h.store.create({ runId: 'callback-child', sourceTabId: 'B', targetTabId: 'child', sourceToolType: 'codex',
+    targetToolType: 'codex', sourceSendTarget: { toolType: 'codex', sessionId: 'B' },
+    sourceExecutionContext: proof.executionContext, targetCwd: h.dir });
+  const result = await h.store.adoptInstallCallbackContinuation('R', args); assert.equal(result.confirmed, true);
+  assert.equal((await h.store.getInternal('callback-child')).parentRunId, 'R', 'children born on callback turn keep the original task dependency');
+  const current = await h.store.getInternal('R'); assert.equal(current.targetExecutionContext.turnId, 'new-turn');
+  assert.deepEqual(current.sourceSendTarget, before.sourceSendTarget); assert.equal(current.promptHash, before.promptHash);
+  assert.equal(current.continuationIntent, undefined); assert.equal(h.calls.sends.length, 0);
+  assert.equal(buildOrchestrationResultLookup(current).promptUserUuid, audit.entryUuid);
+  await h.reopen(); assert.equal((await h.store.adoptInstallCallbackContinuation('R', args)).idempotent, true);
+  assert.equal(h.receipts.list().length, 1);
+  await h.store.beginRecovery('R', 'interrupted', 'turn_aborted');
+  const nextProof = { ...proof, operationKey: 'project:B:build-install-return:job-two',
+    handoffId: 'build-install-return:job-two', attemptId: 'second-install-callback-A',
+    executionContext: { ...proof.executionContext, turnId: 'second-install-callback-T', startedAt: 3000 } };
+  const next = await h.store.adoptInstallCallbackContinuation('R', { operationId: 'voice-force-job-two', capturedAt: 2500,
+    originalContext: current.targetExecutionContext, proof: nextProof, isCurrent: async () => true });
+  assert.equal(next.confirmed, true); assert.equal(h.calls.sends.length, 0);
+  const afterSecond = await h.store.getInternal('R');
+  assert.equal(afterSecond.installCallbackContinuations[0].operationId, 'voice-force-job-one');
+  assert.equal(afterSecond.installCallbackContinuation.operationId, 'voice-force-job-two');
+});
+
+test('callback binding cannot commit across cancellation while canonical proof is being read', async t => {
+  const h = await fixture(t), old = (await h.store.getInternal('R')).targetExecutionContext;
+  const result = await h.store.adoptInstallCallbackContinuation('R', { operationId: 'voice-force-job-one', capturedAt: 1000,
+    originalContext: old, proof: { operationKey: 'same-O', handoffId: 'build-install-return:job-one', attemptId: 'same-A', sessionId: 'B',
+      executionContext: { ...old, turnId: 'callback-T', startedAt: 2000 }, userUuid: 'callback-U', resultPromptHash: 'a'.repeat(64) },
+    isCurrent: async () => { await h.store.patch('R', { status: 'cancelled', notificationSuppressed: true }); return true; } });
+  assert.equal(result.confirmed, false); assert.equal((await h.store.getInternal('R')).status, 'cancelled');
+  assert.equal((await h.store.getInternal('R')).installCallbackContinuation, undefined); assert.equal(h.calls.sends.length, 0);
+});
+
 test('concurrent and subsequent clicks cannot submit two continues', async t => {
   const h = await fixture(t), held = defer(), entered = defer();
   h.setBeforeSend(async () => { entered.resolve(); await held.promise; });
@@ -411,7 +525,7 @@ test('actual action -> common FIFO -> actual Main canonical publisher -> exact c
   let physical = 0, routed;
   const env = vm.createContext({ require, path, srcMainDir: __dirname, ...registry,
     ...require('./agent-send-preparation'),
-    agentSendReceiptStore: h.receipts, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
+    agentSendReceiptStore: h.receipts, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), buildContinueOperations: null,
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000, readAgentRuntimeSnapshot: null,
     AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES, AGENT_SEND_DURABLE_STATES: require('./agent-send-receipt-store').STORE_STATES,
     promptAuditFingerprint, crypto, Buffer, console: { log() {}, warn() {}, error() {} }, tabWorkContext: null, tabMessageService: null,

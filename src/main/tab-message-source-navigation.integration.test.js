@@ -13,6 +13,10 @@ const { HistoryReadClient } = require('./history-read-client');
 const { SessionTranscriptService } = require('./session-transcript-service');
 const { resolveTabMessageSourceLocation } = require('./tab-message-source-location');
 const Module = require('node:module');
+const createNodeProcess = require('./test-helpers/history-node-process.cjs');
+// Only the OS transport is adapted in this finite test host. The production
+// client/facade/reader/parser run unchanged; no ready Main/GUI is launched.
+const createTransport = data => { const child = createNodeProcess(data); child.unref = () => {}; return child; };
 
 test('real private HTTP -> persisted message -> transcript worker -> actual Codex parser finds the source without a send', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-source-message-'));
@@ -31,7 +35,7 @@ test('real private HTTP -> persisted message -> transcript worker -> actual Code
     {type:'response_item',payload:{type:'function_call_output',call_id:'actual-call',output:JSON.stringify(acceptance)}},
   ];
   await fs.writeFile(filePath,records.map(r => JSON.stringify(r)+'\n').join(''));
-  const reader = new HistoryReadClient({sessionsDir:directory,cacheDirectory:path.join(directory,'cache'),memoryBudgetMb:32});
+  const reader = new HistoryReadClient({sessionsDir:directory,cacheDirectory:path.join(directory,'cache'),memoryBudgetMb:32,createTransport});
   const transcript = new SessionTranscriptService({historyReader:reader});
   const before = db.prepare('SELECT * FROM tab_messages').all();
   const locator = id => resolveTabMessageSourceLocation(id, {
@@ -98,4 +102,44 @@ test('actual Claude tool-use/result carriers resolve a reply through the same se
   assert.equal(result.location.entryUuid,'assistant');
   assert.equal(result.location.toolUseId,'claude-call');
   assert.equal(result.location.method,'reply_to_message');
+});
+
+for (const explicit of [false, true]) test('audit: actual transcript facade locates every grouped Reply with outer requestId explicit=' + explicit, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-grouped-source-'));
+  const db = new Database(':memory:');
+  const messages = new TabMessageService({ db, resolveTab: async id => ({ tabId: id, projectId: 'P',
+    provider: 'codex', sessionId: id === 'B' ? 'S' : 'S-' + id, cwd: directory }), send: async () => ({ state: 'confirmed' }) });
+  await messages.initialize();
+  const drain = async () => { while (messages.lanes.size) await Promise.all([...messages.lanes.values()]); };
+  const ids = [];
+  for (const source of ['A', 'C']) { ids.push((await messages.sendMessage({ source, target: 'B', text: source, requestId: 'Q-' + source })).message.messageId); await drain(); }
+  const requestId = explicit ? 'caller-batch-key' : 'server-generated-key';
+  const args = { messageIds: ids, text: 'one text, two exact return addresses', ...(explicit ? { requestId } : {}) };
+  const reservation = await messages.replyToMessage({ responder: 'B', ...args, requestId }); await drain();
+  assert.equal(reservation.messages.length, 2);
+  const acceptance = messageApiAcceptance(reservation);
+  const records = [
+    { type: 'session_meta', payload: { id: 'S', cwd: directory } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'mcp__terminal__reply_to_message',
+      call_id: 'grouped-call', arguments: JSON.stringify(args) } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'grouped-call', output: JSON.stringify(acceptance) } },
+  ];
+  const file = path.join(directory, 'rollout-S.jsonl'), bytes = records.map(row => JSON.stringify(row) + '\n').join('');
+  await fs.writeFile(file, bytes);
+  const reader = new HistoryReadClient({ sessionsDir: directory, cacheDirectory: path.join(directory, 'cache'), memoryBudgetMb: 32, createTransport });
+  const transcript = new SessionTranscriptService({ historyReader: reader });
+  t.after(async () => { await reader.close(); messages.dispose(); db.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  for (const message of reservation.messages) {
+    const payload = { message, toolType: 'codex', sessionId: 'S', cwd: directory, tabId: 'B' };
+    const result = await transcript.getTabMessageSourceLocation(payload);
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(result.location.messageId, message.messageId);
+    assert.equal(result.location.toolUseId, 'grouped-call:canonical:0');
+    assert.equal(result.location.proof, 'accepted-message-id');
+    for (const changed of [{ requestId: 'foreign' }, { sourceTabId: 'foreign' }, { sourceSessionId: 'foreign' },
+      { targetTabId: 'foreign' }, { sourceProvider: 'claude' }, { replyToIds: ['not-requested'] }]) {
+      assert.equal((await transcript.getTabMessageSourceLocation({ ...payload, message: { ...message, ...changed } })).success, false);
+    }
+  }
+  assert.equal(await fs.readFile(file, 'utf8'), bytes, 'read-only locator cannot rewrite the carrier');
 });

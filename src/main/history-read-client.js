@@ -1,4 +1,5 @@
 'use strict';
+const { historyReadErrorFromRecord } = require('./history-read-error');
 
 const { randomUUID, createHash } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
@@ -51,6 +52,7 @@ class HistoryReadClient {
     this.sourceRewriteEpochs = new Int32Array(new SharedArrayBuffer(SLOTS * 4));
     this.snapshotAdmissions = new WeakMap();
     this.sourceEpochSlots = new Map();
+    this.sourceReadAliases = new Map();
     this.invalidations = []; this.invalidationSequence = 0;
     this.unsubscribe = codexData?._api?.observeCodexReadInvalidation?.(event => this.invalidate(event));
     this.unsubscribeOwnership = observeCodexProcessActionOwnership(payload => this.postWorkerEvent({ event: 'ownership', payload }));
@@ -118,6 +120,12 @@ class HistoryReadClient {
         this.readPhase('source-epoch-registration-begin', message.diagnostic || {});
         if (worker !== this.worker) return;
         const slot = registerSourceEpochSlot(this.sourceEpochSlots, message.filePath);
+        for (const backing of Array.isArray(message.backingPaths) ? message.backingPaths.slice(0, 2) : []) {
+          if (typeof backing !== 'string' || !backing.startsWith('/') || backing.length > 4096) continue;
+          let aliases = this.sourceReadAliases.get(backing);
+          if (!aliases) this.sourceReadAliases.set(backing, aliases = new Set());
+          aliases.add(message.filePath);
+        }
         this.postWorkerEvent({ event: 'source-epoch', filePath: message.filePath, slot });
         this.readPhase('source-epoch-registration-posted', message.diagnostic || {}); return;
       }
@@ -152,13 +160,13 @@ class HistoryReadClient {
           inboundMs: diagnostic ? diagnostic.receivedAbs - request.posted.abs : null,
           sessionQueueMs: diagnostic?.sessionQueueMs ?? null, coldAdmissionMs: diagnostic?.coldAdmissionMs ?? null,
           workerExecutionMs: diagnostic?.executionMs ?? null, serializationMs: diagnostic?.serializationMs ?? null,
+          replyPreparationMs: diagnostic?.replyPreparationMs ?? null, replyFenceMode: diagnostic?.replyFenceMode ?? null,
           // Starts BEFORE worker postMessage: includes cloning, transfer and main dispatch wait.
           deliveryMs: diagnostic ? received.abs - diagnostic.replyReadyAbs : null,
           resultBytes: diagnostic?.resultBytes ?? null, source: diagnostic?.source,
           counters: { ...this.diagnosticCounters } });
       }
-      if (message.error) request.finish(Object.assign(new Error(message.error.message), { code: message.error.code,
-        ...(typeof message.error.lineageReason === 'string' ? { lineageReason: message.error.lineageReason } : {}) }));
+      if (message.error) request.finish(historyReadErrorFromRecord(message.error));
       else request.finish(null, { value: message.result, readProof: message.readProof,
         reader: { clientId: this.clientId, generation: request.identity.workerGeneration } });
     });
@@ -204,15 +212,17 @@ class HistoryReadClient {
   }
   invalidate(event) {
     Atomics.add(this.sourceEpochs, 0, 1);
+    const readViewPaths = [...(this.sourceReadAliases.get(event.filePath) || [])];
+    const slots = new Set([event.filePath, ...readViewPaths].map(file => this.sourceEpochSlots.get(file)).filter(Boolean));
     const slot = this.sourceEpochSlots.get(event.filePath);
-    if (slot) Atomics.add(this.sourceEpochs, slot, 1);
+    for (const index of slots) Atomics.add(this.sourceEpochs, index, 1);
     if (!event.filePath || event.sourceAppend !== true || event.readRefresh === true) {
       Atomics.add(this.sourceRewriteEpochs, 0, 1);
-      if (slot) Atomics.add(this.sourceRewriteEpochs, slot, 1);
+      for (const index of slots) Atomics.add(this.sourceRewriteEpochs, index, 1);
     }
     // Synchronous, authoritative fence first; a queued IPC invalidation is
     // merely cache maintenance and cannot stand in for a shared epoch.
-    if (this.epochOwner) try { this.epochOwner.publish([0, ...(slot ? [slot] : [])]); }
+    if (this.epochOwner) try { this.epochOwner.publish([0, ...slots]); }
     catch (error) { this.failWorker?.(error); }
     this.invalidations.push({ ...event, sequence: ++this.invalidationSequence });
     if (this.invalidations.length > 2048) this.invalidations.shift();
@@ -220,7 +230,7 @@ class HistoryReadClient {
     this.diagnose('source-epoch-invalidation', { epoch: Atomics.load(this.sourceEpochs, 0), slot: slot || 0,
       reason: event.sourceAppend ? 'source-append' : event.readRefresh ? 'read-refresh' : 'source-change',
       sequence: this.invalidationSequence, pending: this.pending.size, counters: { ...this.diagnosticCounters } });
-    this.postWorkerEvent({ event: 'invalidate', ...event });
+    this.postWorkerEvent({ event: 'invalidate', ...event, readViewPaths });
   }
   lineageCommitted(sessionId) {
     // A new logical view can keep the same child bytes. Revoke an in-flight
@@ -351,7 +361,12 @@ class HistoryReadClient {
     const httpRead = httpReadCorrelation();
     const call = { callId: ++this.callSequence, ...(httpRead ? { httpRead } : {}) };
     const started = stamp();
-    const snapshot = method === 'readSessionSnapshot', attempts = snapshot ? 1 : 3;
+    const snapshot = method === 'readSessionSnapshot';
+    // A root/input capability is bound to one reader generation. In particular
+    // replace/undo/redo may have committed before a lost reply: do not replay.
+    const capability = ['openHistoryRoot', 'openHistoryPayload', 'readHistoryRootPage',
+      'forkHistoryRootLeaf', 'releaseHistoryRoot', 'historyInputDocument'].includes(method);
+    const attempts = snapshot || capability ? 1 : 3;
     for (let attempt = 0; attempt < attempts; attempt++) {
       control?.assertCurrent();
       call.attempt = attempt + 1;
@@ -386,7 +401,7 @@ class HistoryReadClient {
         control?.assertCurrent();
         if (this.workerUnavailable || this.epochOwner?.available === false) throw this.workerUnavailable
           || Object.assign(new Error('History source fence unavailable'), { code: 'HISTORY_READER_FENCE_UNAVAILABLE' });
-        if (snapshot && (this.workerGeneration !== envelope.reader?.generation || !this.worker)) return 'worker-generation-changed';
+        if ((snapshot || capability) && (this.workerGeneration !== envelope.reader?.generation || !this.worker)) return 'worker-generation-changed';
         const epochs = snapshot ? this.sourceRewriteEpochs : this.sourceEpochs;
         if (dependencies.some(source => source.epoch !== Atomics.load(epochs, source.slot))) return 'source-epoch-invalidated';
         if (this.invalidations.length && before < this.invalidations[0].sequence - 1) return 'invalidation-history-overflow';
@@ -413,12 +428,12 @@ class HistoryReadClient {
           // Timeline can legitimately be followed by a History read inside
           // one HTTP consumer. Only the terminal full History result retains
           // the cold lane to that consumer's transport settlement.
-          admitted = true; envelope.retainReader?.(method === 'getHistory' ? retainToConsumer : null);
+          admitted = true; envelope.retainReader?.(method === 'getHistory' ? retainToConsumer : null, capability);
           return method === 'getHistory' && payload.freshnessProof === true && !binary && result?.success
             ? { ...result, freshnessReader: envelope.reader } : result;
         }
       }
-      if (snapshot) throw Object.assign(new Error('History snapshot invalidated before publication'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+      if (snapshot || capability) throw Object.assign(new Error('History read invalidated before publication'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
       if (attempt < 2) this.count('retries');
       this.diagnose(attempt < 2 ? 'request-retry' : 'request-revoked', { ...call,
         reason: failure,
@@ -450,10 +465,11 @@ class HistoryReadClient {
       const posted = stamp(); const request = { identity, posted, sent: false, done: false };
       const signal = control?.signal;
       let acknowledged = false;
+      let retainCapabilities = false;
       const acknowledge = () => {
         if (acknowledged || !request.terminalReceived) return;
         acknowledged = true; signal?.removeEventListener('abort', acknowledge);
-        if (worker === this.worker) this.postWorkerEvent({ event: 'reply-consumed', id });
+        if (worker === this.worker) this.postWorkerEvent({ event: 'reply-consumed', id, retainCapabilities });
       };
       request.finish = (error, value) => {
         if (request.done) return;
@@ -462,7 +478,8 @@ class HistoryReadClient {
         if (!this.pending.size) worker.unref();
         if (error) { acknowledge(); reject(error); }
         else {
-          resolve({ ...value, releaseReader: acknowledge, retainReader: owner => {
+          resolve({ ...value, releaseReader: acknowledge, retainReader: (owner, retain = false) => {
+            retainCapabilities = retain === true;
             if (owner?.onSettled) {
               owner.onSettled(acknowledge);
               if (!acknowledged) signal?.addEventListener('abort', acknowledge, { once: true });

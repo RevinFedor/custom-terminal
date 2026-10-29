@@ -696,6 +696,19 @@ function UsagePopoverTopRow({
   );
 }
 
+function UsageSpinner({ icon: Icon, size, spinning = true, ...props }: {
+  icon: typeof RefreshCw;
+  size: number;
+  spinning?: boolean;
+  color?: string;
+}) {
+  if (!spinning) return <Icon size={size} {...props} className="noted-infinite-animation" style={{ animation: 'none' }} />;
+  // Keep the SVG still; the same-size HTML host owns the rotation and hidden pause.
+  return <span className="noted-infinite-animation" style={{ display: 'block', width: size, height: size, animation: 'spin 1s linear infinite', willChange: 'transform' }}>
+    <Icon size={size} {...props} style={{ display: 'block' }} />
+  </span>;
+}
+
 function UsageSourceRefreshRow({
   sourceText,
   loading,
@@ -764,9 +777,9 @@ function UsageSourceRefreshRow({
             flexShrink: 0,
           }}
         >
-          <RefreshCw size={11} className="noted-infinite-animation" style={{
-            animation: loading ? 'spin 1s linear infinite' : 'none',
-          }} />
+          {loading ? <span className="noted-infinite-animation" style={{ display: 'block', width: 11, height: 11, animation: 'spin 1s linear infinite', willChange: 'transform' }}>
+            <RefreshCw size={11} style={{ display: 'block' }} />
+          </span> : <RefreshCw size={11} className="noted-infinite-animation" style={{ animation: 'none' }} />}
           {loading ? 'updating' : 'refresh'}
         </button>
       </div>
@@ -1469,7 +1482,7 @@ function ClaudeUsageChip({
       >
         {compactLoading && !compactData ? (
           <>
-            <RefreshCw size={12} color="#777" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+            <UsageSpinner icon={RefreshCw} size={12} color="#777" />
             <span>…</span>
           </>
         ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactData ? (
@@ -1490,7 +1503,7 @@ function ClaudeUsageChip({
         ) : (
           <>
             {compactLoading
-              ? <RefreshCw size={12} color="#DA7756" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+              ? <UsageSpinner icon={RefreshCw} size={12} color="#DA7756" />
               : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
                 ? <RefreshCw size={12} color="#f87171" />
                 : <ClaudeSparkle size={13} color={compactWeeklyUsedPct != null ? '#DA7756' : '#777'} />}
@@ -1805,7 +1818,7 @@ function CodexDeviceLoginSection({
                 }}
               >
                 {busyProfileId === profile.profileId
-                  ? <Loader2 size={13} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+                  ? <UsageSpinner icon={Loader2} size={13} />
                   : <X size={13} />}
               </button>
             </div>
@@ -2365,7 +2378,7 @@ function CodexUsageChip({
           }}
         >
           {selectedProfileBusy
-            ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+            ? <UsageSpinner icon={Loader2} size={12} />
             : <LogOut size={12} />}
         </button>
       ) : selectedProfile?.status === 'signing_in' ? (
@@ -2391,7 +2404,7 @@ function CodexUsageChip({
           }}
         >
           {selectedProfileBusy
-            ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+            ? <UsageSpinner icon={Loader2} size={12} />
             : <X size={12} />}
         </button>
       ) : (
@@ -2418,7 +2431,7 @@ function CodexUsageChip({
             }}
           >
             {selectedProfileBusy
-              ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+              ? <UsageSpinner icon={Loader2} size={12} />
               : <LogIn size={12} />}
           </button>
           {selectedProfile?.canRemove && (
@@ -2499,7 +2512,7 @@ function CodexUsageChip({
       >
         {compactLoading && !compactUsageData ? (
           <>
-            <RefreshCw size={12} color="#777" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+            <UsageSpinner icon={RefreshCw} size={12} color="#777" />
             <span>…</span>
           </>
         ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactUsageData ? (
@@ -2515,7 +2528,7 @@ function CodexUsageChip({
         ) : (
           <>
             {compactLoading
-              ? <RefreshCw size={12} color={chipColor} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+              ? <UsageSpinner icon={RefreshCw} size={12} color={chipColor} />
               : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
                 ? <RefreshCw size={12} color="#f87171" />
                 : <CodexIcon size={15} muted={!compactHasWeekly && !compactHasFiveHour} />}
@@ -2568,7 +2581,7 @@ function CodexUsageChip({
                 }}
               >
                 {profileAction === 'new'
-                  ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
+                  ? <UsageSpinner icon={Loader2} size={12} />
                   : <Plus size={13} />}
               </button>
             )}
@@ -2705,7 +2718,7 @@ function SharedActivitySection({
               cursor: loading ? 'default' : 'pointer',
             }}
           >
-            <RefreshCw size={10} className="noted-infinite-animation" style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+            <UsageSpinner icon={RefreshCw} size={10} spinning={loading} />
           </button>
         )}
       </div>

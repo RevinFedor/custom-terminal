@@ -1,9 +1,32 @@
+import historyPrimaryRollout from '../../shared/history-primary-rollout.cjs';
+import { heldHistoryPrimaryRootLease } from './historyPrimaryHeldRootRegistry.mjs';
+import { heldTimelineView, isExplicitLegacyTimelineOwner } from './timelineViewReadModel.mjs';
 import { normalizeTerminalMessageTarget } from '../../shared/terminal-message-reference.mjs';
 import { timelineMessageSnapshotCache, makeTimelineSnapshotKey } from './timelineSnapshotCache.mjs';
 import { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
 
 export function copiedHistoryMessageIteration(rows, entry, owner, eligible) {
   if (!['user', 'assistant'].includes(entry.role)) return null;
+  const held = heldTimelineView(owner);
+  if (!held && owner.toolType === 'codex' && typeof window !== 'undefined' && typeof window.require === 'function'
+    && historyPrimaryRollout.historyPrimaryRootEnabled(window.require('node:process').env)
+    && !isExplicitLegacyTimelineOwner(owner)) return null;
+  if (held && !held.current) return null;
+  if (held?.current) {
+    // Both roots must already be held. The reader resolves a preceding user
+    // in paged History metadata, then the paged eligible Timeline ordinal.
+    return (async () => {
+      const client = held.current.client, release = client.retain();
+      try {
+        const historyRootLease = heldHistoryPrimaryRootLease(owner);
+        if (!historyRootLease) return null;
+        const result = await client.query('iteration', { historyRootLease,
+          historyEntryIdentity: entry.sourceIdentity || entry.uuid });
+        return Number.isSafeInteger(result.ordinal) && result.ordinal > 0 ? result.ordinal : null;
+      } catch (error) { console.warn('[TimelineRoot] copy-iteration-unavailable code=' + String(error?.code || error?.message)); return null; }
+      finally { await release(); }
+    })();
+  }
   const index = rows.findIndex(row => row.uuid === entry.uuid);
   if (index < 0) return null;
   let user = null;

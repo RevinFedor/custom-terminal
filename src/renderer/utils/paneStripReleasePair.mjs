@@ -16,6 +16,23 @@ const record=value=>value&&typeof value==='object'&&!Array.isArray(value);
 const fail=code=>{throw Object.assign(Error(code),{code,disposition:'not-applied'});};
 const pairMatches=(layout,field,otherLayout,otherField)=>same(dragPlacement(layout),dragPlacement(otherLayout))&&same(field,otherField);
 
+// An older IN can have the same field/placement as a later IN while OUT/IN
+// are still in the lane. Its canonical membership is a different phase. Read
+// only this pair's roots/followers from the already captured Main projection;
+// no extra catalog read, command history or retry authority is introduced.
+function pairMembershipAccepted(state,pair,canonical) {
+  const ids=new Set([...pair.intent.rootTabIds,...(pair.intent.placementTabIds||[])]);
+  for(const id of ids) {
+    const member=own(state.pendingTabWorkflowMembership,id);
+    if(member===undefined)continue;
+    if(!record(member)||member.tabId!==id||typeof member.workflowId!=='string'
+      ||!Number.isSafeInteger(member.revision)||member.revision<1||!record(canonical))return false;
+    const {localReleaseMutationId,localReleaseQueued,localReleaseExpectedMembershipRevision,...accepted}=member;
+    if(!same(own(canonical,id),accepted))return false;
+  }
+  return true;
+}
+
 /** One current released pair per workflow, plus only the immutable commands
  * still owned by the existing organization lane. No settled gesture history,
  * recovery writer or retry authority is created by this envelope. */
@@ -175,7 +192,7 @@ export function paneStripReleaseSnapshot(state) {
 /** Every read path observes the same pending owner. Matching canonical pair
  * retires it; an older command/generic/catalog publication cannot graft its
  * field onto a later released order. Unrelated workflow metadata stays live. */
-export function applyPaneStripReleasePublication(state,patch,publishedSpaces,publication,tabCatalog=state.tabCatalog,request) {
+export function applyPaneStripReleasePublication(state,patch,publishedSpaces,publication,tabCatalog=state.tabCatalog,request,tabWorkflowMembership=state.tabWorkflowMembership) {
   const envelope=readPaneStripReleasedPairs(state.paneStripReleasedPairs);
   if(request?.mutationId&&own(envelope.commands,request.mutationId)) {
     delete envelope.commands[request.mutationId];
@@ -191,7 +208,8 @@ export function applyPaneStripReleasePublication(state,patch,publishedSpaces,pub
       publicationRevision:publication?.revision};
     const current=state.spaces.find(item=>item.id===space.id)||space;
     const currentLayout=layoutOf(state,current);
-    if(pairMatches(published.layout,published.stripColorGroups,pending.layout,pending.field)) {
+    if(pairMatches(published.layout,published.stripColorGroups,pending.layout,pending.field)
+      &&pairMembershipAccepted(state,pending,tabWorkflowMembership)) {
       delete envelope.workflows[space.id];return space;
     }
     if(pending.status==='unreconciled'&&!pairMatches(currentLayout,current.stripColorGroups,pending.layout,pending.field))return space;

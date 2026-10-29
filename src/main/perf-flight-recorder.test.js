@@ -112,6 +112,36 @@ test('system load without an Electron hotspot does not waste a background profil
   assert.equal(captureDecision([], Date.now(), 'sustained-cpu', { ...pressure, appCpu: 150 }).allowed, true);
 });
 
+test('explicit manual capture survives exhausted automatic quota, with one durable slot and no refund', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-manual-quota-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createArtifactStore(dir), now = Date.now();
+  for (let i = 0; i < 4; i++) {
+    const name = 'incident-' + (now - 7200000 + i * 700000) + '-1.capture.json';
+    store.write(name, { group: 'responsiveness' });
+    fs.utimesSync(store.file(name), new Date(now - 7200000 + i * 700000), new Date(now - 7200000 + i * 700000));
+  }
+  assert.equal(store.reserveCaptureDetails('incident-' + now + '-1', now, 'ui-click').reason, 'rolling-quota-exhausted');
+  assert.equal(store.reserveCaptureDetails('incident-' + now + '-2', now, 'manual').allowed, true);
+  const reloaded = createArtifactStore(dir);
+  const refused = reloaded.reserveCaptureDetails('incident-' + (now + 1) + '-2', now + 1, 'manual');
+  assert.equal(refused.reason, 'manual-rolling-quota-exhausted');
+  assert.equal(refused.group, 'manual');
+  assert.equal(refused.remaining, 0);
+  assert.equal(reloaded.reserveCaptureDetails('incident-' + (now + 2) + '-2', now + 2, 'ui-click').reason, 'rolling-quota-exhausted');
+  assert.equal(reloaded.entries().filter(e => e.name.endsWith('.capture.json')).length, 5);
+  assert.equal(reloaded.reserveCaptureDetails('incident-' + (now + 86400010) + '-2', now + 86400010, 'manual').allowed, true);
+});
+
+test('manual receipt neither consumes nor renews automatic responsiveness slots', () => {
+  const now = 86400000, manual = { at: now - 1, group: 'manual' };
+  assert.equal(captureDecision([manual], now, 'ui-click').remaining, 3);
+  const old = { at: now - 2000, group: 'responsiveness' };
+  assert.equal(captureDecision([old, manual], now, 'ui-click').nextEligibleWallMs, old.at + 600000);
+  assert.equal(captureDecision([{}, {}, {}, {}, manual], now, 'ui-click').allowed, false);
+  assert.equal(captureDecision([{ at: now - 1 }], now, 'manual').allowed, false);
+});
+
 function artifactFixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-artifacts-unit-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

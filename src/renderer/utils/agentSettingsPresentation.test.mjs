@@ -65,3 +65,16 @@ test('replaceable queued intent is still pending but does not pretend a physical
   assert.deepEqual(settingsPresentation({ intentWaiting: true, localBusy: true, localTarget: 'quick',
     replaceQueuedIntent: true, activity: { busy: false } }), { busy: true, target: 'quick' });
 });
+
+test('cancelled intent stays cancelled across stale provider projections and does not pretend to be applied', () => {
+  const state = { codexSettingsIntentRevision: 21, codexSettingsIntentActionSequence: 8,
+    codexSettingsIntentStateVersion: 9, codexSettingsIntentModel: 'gpt-6.1-terra', codexSettingsIntentEffort: 'max',
+    codexSettingsIntentAppliedRevision: 19, codexSettingsIntentCancelled: { revision: 21, actionSequence: 8 } };
+  assert.equal(codexSettingsIntentIsWaiting({ isCodex: true, isCommandRunning: true, providerState: state }), false);
+  assert.deepEqual(codexSettingsSelection({ isCommandRunning: true, providerState: state,
+    effectiveSettings: { model: 'gpt-6.1-sol', effort: 'max' } }), { model: 'gpt-6.1-sol', effort: 'max' });
+  const old = { ...state, codexSettingsIntentStateVersion: 8 }; delete old.codexSettingsIntentCancelled;
+  const merged = mergeTabProviderSnapshot({ tabId: 'T', state }, 'T', old).state;
+  assert.deepEqual(merged.codexSettingsIntentCancelled, { revision: 21, actionSequence: 8 });
+  assert.equal(merged.codexSettingsIntentAppliedRevision, 19);
+});

@@ -4,13 +4,14 @@
 // No file IO or payload/DOM inspection on the Main or renderer input path.
 const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, sanitizeWorkCapsule, fitCausalRecord, sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
 const STRING_FIELDS = new Set(['sourceBoot', 'sourceKind', 'spanId', 'parentSpanId', 'name', 'kind', 'phase', 'state', 'outcome',
-  'actionId', 'readId', 'requestId', 'tabId', 'sessionId', 'fileIdentity', 'caller', 'mode', 'reason', 'threadCpuSource',
+  'actionId', 'readId', 'requestId', 'initAttemptId', 'cwdHash', 'tabId', 'sessionId', 'fileIdentity', 'caller', 'mode', 'reason', 'threadCpuSource',
   'threadCpuUnavailableReason', 'gcCoverage', 'cpuCoverage', 'keyClass', 'event', 'owner', 'visibility', 'incidentId',
   'targetSource', 'targetTag', 'historyOwner', 'summaryId']);
 const NUMBER_FIELDS = new Set(['sourceSeq', 'sourcePid', 'emittedAbs', 'enteredAbs', 'syncReturnedAbs', 'syncMs', 'settledAbs',
   'lifetimeMs', 'startAbs', 'durationMs', 'inputDelayMs', 'handlerMs', 'presentationMs', 'receivedAbs', 'threadCpuMs',
   'processCpuUserMs', 'processCpuSystemMs', 'sourceBytes', 'deltaBytes', 'recordsBefore', 'recordsAfter', 'snapshotRecords',
-  'rows', 'bytes', 'gcObservedOverlapMs', 'gcEntries', 'gcDropped', 'gcId', 'gcKind', 'gcFlags', 'observedAbs',
+  'rows', 'bytes', 'framingCopiedBytes', 'framingMaxCarryBytes', 'framingMaxCarryBlocks', 'framingLineAssemblies',
+  'gcObservedOverlapMs', 'gcEntries', 'gcDropped', 'gcId', 'gcKind', 'gcFlags', 'observedAbs',
   'gestureGeneration', 'visit', 'ringDropped', 'transportDrops', 'rateDrops', 'noWriterDrops', 'backpressureDrops',
   'revision', 'retainedEvictions', 'completedWorkOmitted', 'omittedFields', 'gcMaxMs', 'childPid', 'exitCode']);
 const BOOL_FIELDS = new Set(['returnedPromise', 'meta', 'ctrl', 'alt', 'shift', 'repeat', 'focused', 'enteredRecordMissing']);

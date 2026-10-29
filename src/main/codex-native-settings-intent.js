@@ -4,7 +4,7 @@ const { classifyCodexManualEnterFrame } = require('./codex-model-picker');
 const { parseCodexVerifiedComposerFooter } = require('./codex-tui-readiness');
 const { isCodexSettingsPickerVisible, parseCodexModelChangeAcknowledgement } = require('../shared/codex-native-picker-proof.cjs');
 
-function createCodexNativeSettingsIntentTracker({ getScope, getIntent, commit, now = Date.now } = {}) {
+function createCodexNativeSettingsIntentTracker({ getScope, getIntent, commit, readModelCatalog = () => [], now = Date.now } = {}) {
   const pending = new Map();
   const sameScope = (before, after) => after && before.terminal === after.terminal
     && before.mirror === after.mirror && before.ownerId === after.ownerId
@@ -64,8 +64,10 @@ function createCodexNativeSettingsIntentTracker({ getScope, getIntent, commit, n
         || Number(snapshot.writeSeq) !== Number(mirror.writeSeq)
         || Number(mirror.flushedSeq) !== Number(mirror.writeSeq)) return null;
       const frameText = (snapshot.lines || []).map(line => String(line?.text || '')).join('\n');
-      const acknowledged = parseCodexModelChangeAcknowledgement(candidate.output);
-      const footer = parseCodexVerifiedComposerFooter(frameText);
+      let catalog = [];
+      try { catalog = readModelCatalog() || []; } catch { /* No guessed model identity on a failed catalog read. */ }
+      const acknowledged = parseCodexModelChangeAcknowledgement(candidate.output, catalog);
+      const footer = parseCodexVerifiedComposerFooter(frameText, catalog);
       if (!acknowledged || !footer || isCodexSettingsPickerVisible(frameText)
         || acknowledged.model !== footer.model
         || (acknowledged.effort && acknowledged.effort !== footer.effort)

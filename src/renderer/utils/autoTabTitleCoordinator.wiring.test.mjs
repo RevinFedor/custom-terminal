@@ -8,6 +8,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const rendererRoot = path.resolve(here, '..');
 const coordinator = fs.readFileSync(path.join(here, 'autoTabTitleCoordinator.ts'), 'utf8');
 const titleGenerator = fs.readFileSync(path.join(here, 'generateTabTitle.ts'), 'utf8');
+const titleFacts = fs.readFileSync(path.join(rendererRoot, '../shared/timeline-entry-facts.mjs'), 'utf8');
 const store = fs.readFileSync(path.join(rendererRoot, 'store/useWorkspaceStore.ts'), 'utf8');
 const timeline = fs.readFileSync(path.join(rendererRoot, 'components/Workspace/Timeline.tsx'), 'utf8');
 const app = fs.readFileSync(path.join(rendererRoot, 'App.tsx'), 'utf8');
@@ -48,10 +49,12 @@ test('headless candidate selection keeps fresh and fork ownership rules', () => 
 });
 
 test('system source tags exclude automatic continuation from title, summary and semantic outline inputs', () => {
-  assert.match(titleGenerator, /import \{ isServicePromptEntry \} from '..\/..\/shared\/prompt-origin\.mjs'/);
-  assert.match(titleGenerator, /function isEligibleTabTitleEntry[\s\S]*?if \(isServicePromptEntry\(entry\)\) return false/);
-  assert.match(timeline, /isSystemPromptEntry\(entry\)/);
-  assert.match(timeline, /entryIsServicePrompt \? 'rotate\(45deg\)'/);
+  assert.match(titleGenerator, /isEligibleTimelineTitleEntry/);
+  assert.match(titleFacts, /isServicePromptEntry.*from '.\/prompt-origin\.mjs'/);
+  assert.match(titleFacts, /isEligibleTimelineTitleEntry[\s\S]*?isServicePromptEntry\(entry\)/);
+  assert.match(timeline, /const entryIsSystem = markerKind === 'system'/);
+  assert.match(timeline, /const entryUsesDiamond = markerKind === 'system' \|\| markerKind === 'terminal-mcp'/);
+  assert.match(timeline, /entryUsesDiamond \? 'rotate\(45deg\)'/);
   assert.match(timeline, /isSystem: entryIsSystem/);
   assert.match(webServer, /presentationSnapshot: withPromptOriginPresentation\(presentationSnapshot, source\)/);
   assert.match(main, /restoreConfirmedSystemPromptOrigins\(agentSendReceiptStartupReconcile\.records\.filter/);

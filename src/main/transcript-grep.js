@@ -16,6 +16,8 @@
 // стоит дороже, чем весь этот скан.
 
 const fs = require('fs');
+const { prepareCodexRolloutReadFile } = require('./codex-rollout-read-views');
+const { currentReadControl, createReadControl, withReadControl } = require('./history-read-control');
 
 const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024;
 // Строка транскрипта — это одна запись. У Codex вывод команды/патч легко даёт
@@ -186,6 +188,16 @@ async function scanTranscriptFile({
   kinds = null,
   chunkBytes = DEFAULT_CHUNK_BYTES,
 } = {}) {
+  if (filePath?.endsWith('.jsonl.zst')) {
+    const inherited = currentReadControl(), control = inherited || createReadControl();
+    try {
+      return await withReadControl(control, async () => {
+        const view = await prepareCodexRolloutReadFile(filePath, { control });
+        return scanTranscriptFile({ filePath: view.filePath, needle, caseSensitive, maxMatches, snippetChars, kinds, chunkBytes });
+      });
+    } catch (error) { return { matches: [], matchCount: 0, bytesScanned: 0, truncated: false, error: String(error?.code || error?.message || error) }; }
+    finally { if (!inherited) control.finish(); }
+  }
   const wanted = String(needle || '');
   const empty = { matches: [], matchCount: 0, bytesScanned: 0, truncated: false, error: null };
   if (!filePath || !wanted) return empty;

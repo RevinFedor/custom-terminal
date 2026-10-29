@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { maskPromptWebImageReferences } = require('../shared/prompt-web-images.cjs');
 
 const ASSET_ID_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -48,15 +49,18 @@ function buildCodexImagePastePlan(text, stageImagePath, {
       match.index = range.start;
       return match;
     });
-  } else imageMatches = input.matchAll(IMAGE_PATH_MARKER_RE);
+  } else imageMatches = maskPromptWebImageReferences(input).matchAll(IMAGE_PATH_MARKER_RE);
   const segments = [];
   const staged = [];
   const missing = [];
+  const outcomes = [];
   let replaced = 0;
   let cursor = 0;
+  let outputLength = 0;
 
   const pushText = (value) => {
     if (!value) return;
+    outputLength += value.length;
     const previous = segments[segments.length - 1];
     if (previous?.kind === 'text') {
       previous.text += value;
@@ -80,7 +84,8 @@ function buildCodexImagePastePlan(text, stageImagePath, {
     }
 
     replaced += 1;
-    const result = stageImagePath(rawPath);
+    const result = stageImagePath(rawPath, { marker: match[0], start: index, end: index + match[0].length });
+    const outputStart = outputLength;
     if (result?.success && typeof result.inputPath === 'string' && result.inputPath) {
       staged.push(result);
       segments.push({
@@ -89,12 +94,20 @@ function buildCodexImagePastePlan(text, stageImagePath, {
         sourcePath: result.path || String(rawPath || '').trim(),
         ...(includeSourceRanges ? { sourceRange: { start: index, end: index + match[0].length } } : {}),
       });
+      outputLength += result.inputPath.length;
+      outcomes.push({ occurrence: replaced, sourceRange: { start: index, end: index + match[0].length },
+        marker: match[0], sourcePath: rawPath.trim(), kind: 'image', text: result.inputPath,
+        outputRange: { start: outputStart, end: outputLength }, refIndex: staged.length - 1 });
     } else {
       missing.push({
         path: result?.path || String(rawPath || '').trim(),
         error: result?.error || 'stage_failed',
       });
-      pushText(`[imageError: ${missingCode} #${replaced}]`);
+      const emitted = `[imageError: ${missingCode} #${replaced}]`;
+      pushText(emitted);
+      outcomes.push({ occurrence: replaced, sourceRange: { start: index, end: index + match[0].length },
+        marker: match[0], sourcePath: rawPath.trim(), kind: 'unavailable', text: emitted,
+        outputRange: { start: outputStart, end: outputLength }, error: result?.error || 'stage_failed' });
     }
     cursor = index + match[0].length;
   }
@@ -108,7 +121,37 @@ function buildCodexImagePastePlan(text, stageImagePath, {
     replaced,
     staged,
     missing,
+    transform: { stage: 'staging', inputHash: crypto.createHash('sha256').update(input).digest('hex'),
+      inputLength: input.length, outputHash: crypto.createHash('sha256').update(segments.map(segment => segment.text).join('')).digest('hex'),
+      outputLength, outcomes },
   };
+}
+
+function buildUnavailableImagePathPlan(text, missing = [], authoringTransport = null) {
+  const unavailable = new Map(missing.map(item => [String(item?.path || '').trim(), item?.error || 'image_path_missing']));
+  const plan = buildCodexImagePastePlan(text, (rawPath, occurrence) => unavailable.has(rawPath.trim())
+    ? { success: false, path: rawPath.trim(), error: unavailable.get(rawPath.trim()) }
+    : { success: true, path: rawPath.trim(), inputPath: occurrence.marker },
+  { missingCode: 'queue_image_path_unavailable', authoringTransport });
+  const outcomes = plan.transform.outcomes.map(outcome => outcome.kind === 'image'
+    ? { ...outcome, kind: 'retained' } : outcome);
+  const imageRanges = outcomes.filter(outcome => outcome.kind === 'retained').map(outcome => ({
+    start: outcome.outputRange.start, end: outcome.outputRange.end,
+    path: /\[imagePath:\s*([^\]\r\n]+?)\s*\]/i.exec(outcome.marker)[1],
+  }));
+  let fileRanges = authoringTransport?.fileRanges;
+  if (fileRanges) {
+    const { editAuthoringTransport } = require('./structured-authoring');
+    let delta = 0;
+    const edits = outcomes.filter(outcome => outcome.kind === 'unavailable').map(outcome => {
+      const edit = { start: outcome.sourceRange.start + delta, end: outcome.sourceRange.end + delta, text: outcome.text };
+      delta += outcome.text.length - (outcome.sourceRange.end - outcome.sourceRange.start); return edit;
+    });
+    fileRanges = editAuthoringTransport(String(text), authoringTransport, edits).authoringTransport.fileRanges;
+  }
+  return { text: plan.text, transform: { ...plan.transform, stage: 'preflight', outcomes },
+    authoringTransport: { sourceHash: crypto.createHash('sha256').update(plan.text).digest('hex'), imageRanges,
+      ...(fileRanges ? { fileRanges } : {}) } };
 }
 
 function replaceUnavailableImagePathMarkers(
@@ -121,13 +164,19 @@ function replaceUnavailableImagePathMarkers(
       .map((item) => String(item?.path || '').trim()),
   );
   let slot = 0;
-  return String(text || '').replace(IMAGE_PATH_MARKER_RE, (marker, rawPath) => {
-    if (!isPortableImagePath(rawPath)) return marker;
+  const input = String(text || '');
+  let output = '', cursor = 0;
+  for (const match of maskPromptWebImageReferences(input).matchAll(IMAGE_PATH_MARKER_RE)) {
+    const marker = match[0], rawPath = match[1];
+    output += input.slice(cursor, match.index);
+    cursor = match.index + marker.length;
+    if (!isPortableImagePath(rawPath)) { output += marker; continue; }
     slot += 1;
-    return unavailablePaths.has(String(rawPath || '').trim())
+    output += unavailablePaths.has(String(rawPath || '').trim())
       ? `[imageError: ${missingCode} #${slot}]`
       : marker;
-  });
+  }
+  return output + input.slice(cursor);
 }
 
 class CodexImageTransport {
@@ -228,6 +277,7 @@ module.exports = {
   CodexImageTransport,
   aliasNameForRef,
   buildCodexImagePastePlan,
+  buildUnavailableImagePathPlan,
   isPortableImagePath,
   replaceUnavailableImagePathMarkers,
 };

@@ -61,6 +61,7 @@ function causalSenderFixture(causal) {
   const context = vm.createContext({ process: { env: { NOTED_E2E_TEST: 'true' } }, path, srcMainDir: __dirname,
     app: { once() {} }, require: name => {
       if(name.endsWith('perf-causal-context'))return {causal};
+      if(name.endsWith('perf-native-call'))return require('./perf-native-call');
       if(name.endsWith('perf-causal-transport'))return {createCausalTransport};
       assert.ok(name.endsWith('perf-thread-metrics'),'uncontrolled Main dependency '+name);
       return {createThreadMetrics:()=>null};

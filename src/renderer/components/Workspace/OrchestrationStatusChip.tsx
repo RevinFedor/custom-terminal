@@ -34,6 +34,10 @@ import { orchestrationRequestTime, orchestrationDetailRows, orchestrationLinkedN
 import { useBuildInstallStatus } from '../../hooks/useBuildInstallStatus';
 import { buildInstallVisibleInDock } from '../../utils/buildInstallPresentation.mjs';
 import { BuildInstallTracker } from './BuildInstallTracker';
+import { useBuildContinueStatus } from '../../hooks/useBuildContinueStatus';
+import { BuildContinueTracker, BuildContinuePreview, buildContinueVisible } from './BuildContinueTracker';
+import type { BuildContinueSelection } from './BuildContinueTracker';
+import { ResearchSourceAction } from './TabMessageSourceChip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -329,15 +333,29 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const messagePreviewRef = useRef<HTMLElement>(null);
   const messages = useTabMessages(tabId);
   const installs = useBuildInstallStatus(tabId);
+  const recovery = useBuildContinueStatus(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
+  const [selectedRecovery, setSelectedRecovery] = useState<BuildContinueSelection | null>(null);
   const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
-  const closeMessage = useCallback(() => setSelectedMessage(null), []);
+  const selectedRecoveryTarget = recovery.targets.find(target => target.operationKey === selectedRecovery?.operationKey);
+  const closeMessage = useCallback(() => { setSelectedMessage(null); setSelectedRecovery(null); }, []);
   const openMessage = useCallback((selection: MessageSelection) => {
     setSettingsOpen(false);
+    setSelectedRecovery(null);
     setSelectedMessage(current => current?.messageId === selection.messageId ? null : selection);
   }, []);
+  const openRecovery = useCallback((selection: BuildContinueSelection) => {
+    setSettingsOpen(false); setSelectedMessage(null);
+    setSelectedRecovery(current => current?.operationKey === selection.operationKey ? null : selection);
+  }, []);
+  useEffect(() => { closeMessage(); }, [tabId, closeMessage]);
+  useEffect(() => {
+    if (selectedRecovery && (!selectedRecoveryTarget || !selectedRecovery.history && !buildContinueVisible(selectedRecoveryTarget))) {
+      setSelectedRecovery(null);
+    }
+  }, [selectedRecovery, selectedRecoveryTarget]);
   const cancelMessage = async (messageId: string) => {
-    if (await messages.cancel(messageId)) {
+    if (await messages.dismiss(messageId)) {
       setSelectedMessage(current => current?.messageId === messageId ? null : current);
     }
   };
@@ -390,6 +408,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     // parent's outside-click listener in the middle of the same event.
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !event.defaultPrevented && !messagePreviewRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
         setHistoryOpen(false);
         setSettingsOpen(false);
       }
@@ -402,10 +422,10 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         closeMessage();
       }
     };
-    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('mousedown', onMouseDown);
     return () => {
-      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keydown', onKeyDown, true);
       document.removeEventListener('mousedown', onMouseDown);
     };
   }, [historyOpen, settingsOpen, closeMessage]);
@@ -417,13 +437,16 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     ...messages.threads.map(thread => ({ kind: 'message' as const, thread,
       at: tabMessageTimestamp(thread.question.createdAt), id: 'message:' + thread.question.messageId })),
     ...installs.jobs.map(job => ({ kind: 'install' as const, job, at: job.startedAt, id: 'install:' + job.id })),
-  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs]);
+    ...recovery.targets.filter(target => target.route.kind !== 'install-callback').map(target => ({ kind: 'continuation' as const, target,
+      at: target.capturedAt, id: 'continuation:' + target.operationId })),
+  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs, recovery.targets]);
   const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
   const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
   const statusInstalls = installs.jobs.filter(buildInstallVisibleInDock);
-  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || hasVisibleMessages || Boolean(messages.listError);
+  const statusRecovery = recovery.targets.filter(buildContinueVisible);
+  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || hasVisibleMessages || Boolean(messages.listError);
   const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
-    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null);
+    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null || selectedRecovery !== null);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     if (openingLinkedRuns.current.has(run.runId)) return;
@@ -602,6 +625,10 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         </span>}
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: compact ? 1 : 0,
           ...(compact ? { flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 } as const : {}) }}>
+          {isSource && run.runKind === 'external-research' && <>
+            <ResearchSourceAction runId={run.runId} iconOnly buttonStyle={requestRowActionStyle} />
+            <ResearchSourceAction runId={run.runId} iconOnly destination="browser" buttonStyle={requestRowActionStyle} />
+          </>}
           {(canCancelActiveRun || canCancelHandoff || canDetachResultProof) && actionButton(
             run,
             'detach',
@@ -664,6 +691,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         {messages.listError && <div role="alert" style={{ padding: 8, fontSize: 10, color: '#fbbf24' }}>Сообщения недоступны: {messages.listError}</div>}
         {!historyEntries.length && !messages.listError && <div style={{ padding: 10, fontSize: 11, color: '#888' }}>Запросов пока нет</div>}
         {historyEntries.map((entry) => {
+          if (entry.kind === 'continuation') return <BuildContinueTracker key={entry.id} target={entry.target} error={recovery.error} history
+            onOpen={openRecovery} selected={selectedRecovery?.operationKey === entry.target.operationKey} onCancel={recovery.cancel} />;
           if (entry.kind === 'install') return <BuildInstallTracker key={entry.id} job={entry.job} stale={installs.stale}
             error={installs.error} history onCancel={installs.cancel} />;
           if (entry.kind === 'message') return <TabMessageRow key={entry.id} thread={entry.thread} tabId={tabId}
@@ -823,6 +852,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
       <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} />
       {statusInstalls.map(job => <BuildInstallTracker key={job.id} job={job} stale={installs.stale} error={installs.error} onCancel={installs.cancel} />)}
+      {statusRecovery.map(target => <BuildContinueTracker key={target.operationKey} target={target} error={recovery.error}
+        disabled={!dock.visible || historyOpen || settingsOpen} onOpen={openRecovery}
+        selected={selectedRecovery?.operationKey === target.operationKey} onCancel={recovery.cancel} />)}
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list
@@ -862,7 +894,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                 side="left"
                 align="start"
                 boundarySelector="[data-split-pane-queue-host], [data-workspace-prompt-queue-host]"
-                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage)}
+                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage) || Boolean(selectedRecovery)}
                 always
               >
                 <RequestTrackerRow data-orchestration-active-run={run.runId}
@@ -976,6 +1008,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       {settingsPanel}
       {selectedMessage && selectedThread && <TabMessagePreview key={tabId + ':' + selectedMessage.messageId}
         selection={selectedMessage} thread={selectedThread} controller={messages} onClose={closeMessage} previewRef={messagePreviewRef} />}
+      {selectedRecovery && selectedRecoveryTarget && <BuildContinuePreview key={tabId + ':' + selectedRecovery.operationKey}
+        selection={selectedRecovery} target={selectedRecoveryTarget} error={recovery.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
     </div>
   );
 }

@@ -5,7 +5,7 @@ const { agentSendTargetPreconditionFailure } = require('../shared/agent-send-tar
 // This private adapter supplies INPUT admission evidence, never response-idle
 // evidence. Both ports already belong to Main; public display flags alone are
 // insufficient. Keep response busy=null visible to every response consumer.
-function createContinuationInputReader({ readResponseState, readRuntimeSnapshot, readSendDestination } = {}) {
+function createContinuationInputReader({ readResponseState, readRuntimeSnapshot, readSendDestination, readInputAdmission } = {}) {
   return async tabId => {
     const before = await readResponseState(tabId);
     const decorate = (state, destination) => destination?.sessionId === state.sessionId
@@ -15,6 +15,28 @@ function createContinuationInputReader({ readResponseState, readRuntimeSnapshot,
       ? readSendDestination?.(tabId, before.toolType, before.sessionId) : null);
     if (!before.known || before.exists === false || before.toolType !== 'codex'
       || before.processStatus !== 'found' || before.busy === true) return legacy();
+    if ((before.busy === null || before.busy === false) && typeof readInputAdmission === 'function') {
+      let admission;
+      try { admission = await readInputAdmission(tabId, {
+        toolType: before.toolType, sessionId: before.sessionId, cwd: before.cwd,
+      }); } catch { return { ...before, continuationInput: { ready: false, reason: 'continuation_input_reader_unavailable' } }; }
+      const after = await readResponseState(tabId);
+      if (!before.revision || before.revision !== after.revision || after.known !== true
+        || after.exists === false || before.sessionId !== after.sessionId || before.toolType !== after.toolType
+        || before.cwd !== after.cwd || before.busy !== after.busy || before.processStatus !== after.processStatus) {
+        return { ...after, known: false, continuationInput: { ready: false, reason: 'continuation_runtime_changed' } };
+      }
+      const target = admission?.target;
+      const ready = admission?.version === 1 && admission.kind === 'codex-continuation-input'
+        && admission.known === true && admission.ready === true && admission.isCurrent?.() === true
+        && target?.toolType === 'codex' && !!target.sessionId && !!target.terminalInstanceId && !!target.launchId
+        && !!target.lifecycleGeneration && (target.sessionId === after.sessionId
+          || target.acceptedResumeSourceSessionId === after.sessionId);
+      return { ...decorate(after, target), ...(admission?.ownerChanged ? { known: false, error: 'response_owner_changed' } : {}),
+        continuationInput: { ready, reason: ready ? null : admission?.reason || 'continuation_input_unproven',
+          target: ready ? target : null, ...(ready ? { admission } : {}) },
+        revision: JSON.stringify([after.revision, admission?.revision || null, ready]) };
+    }
     if (typeof readRuntimeSnapshot !== 'function') return { ...legacy(),
       continuationInput: { ready: false, reason: 'continuation_runtime_reader_unavailable' } };
 
@@ -59,9 +81,30 @@ function createContinuationInputReader({ readResponseState, readRuntimeSnapshot,
 function canSubmitContinuationInput(state) {
   if (!['found', 'absent'].includes(state?.processStatus)) return false;
   if (state.busy === false) return true; // Existing stopped/authoritative-idle path.
+  if (provisionalContinuationInput(state)) return true;
   return state.busy === null && state.toolType === 'codex' && state.processStatus === 'found'
     && state.transitioning === false && state.error === 'response_busy_unknown'
     && state.continuationInput?.ready === true && !!state.continuationInput.target;
+}
+
+function provisionalContinuationInput(state) {
+  const input = state?.continuationInput, admission = input?.admission;
+  return state?.known === true && state.toolType === 'codex' && state.processStatus === 'found'
+    && state.busy === null && state.error === 'response_busy_unknown'
+    && input?.ready === true && admission?.version === 1 && admission.kind === 'codex-continuation-input'
+    && admission.mode === 'provisional-resume' && admission.ready === true && admission.isCurrent?.() === true;
+}
+
+function continuationInputTransitionPending(state) {
+  return state?.transitioning === true && !provisionalContinuationInput(state);
+}
+
+function continuationInputPreparation(state, expected = null) {
+  const admission = state?.continuationInput?.admission;
+  if (expected?.continuationInputRequired === true && admission?.isCurrent?.() !== true) {
+    throw new Error('continuation_runtime_unknown');
+  }
+  return admission?.isCurrent?.() === true ? { continuationInputAdmission: admission } : {};
 }
 
 function continuationTargetExpectation(expected, state) {
@@ -70,6 +113,7 @@ function continuationTargetExpectation(expected, state) {
   if (state.busy !== null || !canSubmitContinuationInput(state)) return expected;
   const target = state.continuationInput.target;
   return { ...expected,
+    ...(state.continuationInput?.admission?.mode === 'provisional-resume' ? { continuationInputRequired: true } : {}),
     ...(target.terminalInstanceId ? { terminalInstanceId: target.terminalInstanceId } : {}),
     ...(target.launchId ? { launchId: target.launchId } : {}),
     lifecycleGeneration: target.lifecycleGeneration };
@@ -82,4 +126,4 @@ function continuationTargetScopeMatches(expected, state) {
 }
 
 module.exports = { createContinuationInputReader, canSubmitContinuationInput,
-  continuationTargetExpectation, continuationTargetScopeMatches };
+  continuationTargetExpectation, continuationTargetScopeMatches, continuationInputTransitionPending, continuationInputPreparation };

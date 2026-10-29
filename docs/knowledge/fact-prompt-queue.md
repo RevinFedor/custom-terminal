@@ -99,6 +99,8 @@ Sticky-панель справа-вверху доступна в любой в�
 
 Задержки в этом решении нет и быть не должно. Отложенное закрытие («подожди 140 мс, вдруг курсор вернётся») отвечает на вопрос «сколько ждать», хотя вопрос был «где курсор»: для медленного движения оно коротко, а после ухода держит окно открытым. `onMouseLeave` на панели тоже убран целиком — он срабатывает на границе за миг до того, как обход по геометрии успевает сказать «курсор в зазоре», и вместе они дают мигание на каждом переходе (общее правило — `methodology/сценарии-багов-design.md::2.7`). Блоки, открытые от панели, лежат прямо в `body` (панель обрезала бы их своим `overflow: hidden`), поэтому находятся по меткам picker/context/meta/editor/preview и точному owner-instance. Локальная и встроенная копии одной tab-очереди не владеют чужими portal'ами. Fullscreen backdrop не считается hover-территорией: удержание click-ребёнком принадлежит его open-state, не прямоугольнику на весь экран. Border-mounted controls и реальные зазоры включены. Новую click-поверхность нужно зарегистрировать владельцем и сообщить причину закрытия после commit, чтобы отмена освобождала hover без дополнительного mousemove. Выход из окна/blur сохраняют прежний профиль. В `RunAfterTabPicker` геометрия «кнопка ↔ список» закрывает только `openOnHover`; обычный click-open picker уходит по своему outside/Escape/trigger. Он отдельно flip/clamp'ится в viewport, включая левую границу.
 
+В hover-only picker закрытие после доказанного выхода выполняется прямо в событии, без промежуточного `requestAnimationFrame`. Реальный descendant кнопки/списка уже подтверждает принадлежность; только путь через зазор/наружу читает прежние два rect. Это не отменяет отдельный rAF проверки исчезнувшего click-ребёнка для return-gate: у него другая причина и ownership. У глобального preview остаются blur/save guard перед синхронным закрытием, resize и exact click-child holds.
+
 Шрам08.10: global backdrop останавливал mousedown до document outside-handler picker. Простое «не закрывать родителя при открытом ребёнке» оставляло picker навсегда открытым на этом клике. Backdrop пропускает только детский dismiss-жест своему handler и не использует последующий click для close-all; ребёнок уведомляет после DOM commit, parent проверяет актуальный pointer. Так же верхнее меню не отменяет лежащий под ним click-editor. Выбор вне родителя оставляет прежний return-gate, overlay-cancel сбрасывает его. Общий паттерн — `docs-global/ux-паттерны/всплывающие-окна.md::Дочернее окно по клику внутри hover-панели`.
 
 После клика по собственному дочернему portal **вне** родительской панели, если именно этот click убрал portal, preview получает один возврат: курсор может пройти через свободное место до повторного входа в родителя. После входа следующий уход снова закрывает меню мгновенно. Иначе выбор OnTab оставлял курсор на месте исчезнувшего списка и попытка вернуться закрывала очередь. Это не pin/focus и не расширение backdrop: capture связывает click с exact owner-element, один rAF проверяет его commit; фильтр, сохранивший popup, не вооружает будущий Escape. Blur/явное закрытие сбрасывают право возврата. Контракт общий для локальной очереди и глобального обзора.
@@ -322,7 +324,7 @@ Collapsed/expanded state принадлежит вкладке: default = expand
 
 Раскладок две, и правило одно на обе: одиночный режим — `Workspace.tsx::promptQueuePortalHostId` (слой 140 против 130 у `FloatingTerminalFrame`), режим панелей — `SplitPaneSurface.tsx::splitPaneQueueHostId` (то же число против бокового терминала и бокового чата панели). Панельная копия оставалась на 120 и была не видна под боковым окном своей панели: правило починили в одном месте, а живёт оно в двух. Выше полоски остаётся только рамка окна панели (`SPLIT_PANE_FOCUS_FRAME_Z = 200`) — граница не должна прерываться тем, что внутри неё лежит. Оба числа читает один тест (`topStripLayout.wiring.test.mjs`), потому что разойтись они могут молча.
 
-Unpinned Timeline (`timelinePinned=false`) — overlay, а не зарезервированная колонка. Если он раскрыт и пользователь кликает по терминалу, сайдбару или другой обычной области Workspace, `Workspace.tsx` закрывает `timelineTreeModeTabs[tabId]` обратно в rail. Исключение обязательно для `[data-history-timeline-pin-toggle]`: клик по StatusBar pin должен успеть превратить текущий overlay в pinned layout, а не сначала закрыть Timeline на capture-mousedown. Pinned Timeline (`timelinePinned=true`) не закрывается outside-click'ом — это уже layout mode.
+SOURCE27.10 Timeline всегда overlay, его внешний slot остаётся32px. Если он раскрыт и пользователь кликает по терминалу, сайдбару или другой обычной области Workspace, `Workspace.tsx` закрывает `timelineTreeModeTabs[tabId]` обратно в rail. Собственные меню Timeline/полосы и `[data-history-pin-toggle]` считаются внутренними действиями. Отдельных Timeline pin-state и pinned-исключения для outside-click больше нет; независимый History pin сохранён. См. [Expanded mode](fact-timeline.md#expanded-mode-chippreview).
 
 - **Resize-handle на СВОБОДНОЙ грани, не на опорной.** Panel раскрывается влево от rail: опорная правая грань остаётся у Timeline, не двигается → handle на ЛЕВОЙ грани, drag влево растит панель (dx инвертируется). Это прямое следствие `🧩 Code-Patterns/.../всплывающие-окна.md::Панель с resize: пользователь меняет размер вручную`. Handle на опорной грани оторвал бы панель от якоря.
 - **`ANCHOR_SIDE: 'left' | 'right'` — 1-флип-параметр на будущее.** Юзер заложил: меню в будущем может переехать влево. `ANCHOR_SIDE` управляет тремя вещами разом: какая грань pinned (`right:0` vs `left:0` внутри терминальной области), на какой грани handle (`left:0` vs `right:0`), и знак дельты в drag (`right` → `-dx`, `left` → `+dx`). При переезде меню — поменять одну константу, handle и направление роста подстроятся сами. Принцип «resize учитывает визуальное расположение, расширяется только в доступную сторону».
@@ -645,7 +647,41 @@ owner проходит общий Resume/readiness. Это не разрешен
 сохраняются. Явный Pause и карточка Stop внутри последовательности — отдельные
 действия: подтверждённая карточка Stop по-прежнему заканчивает свою очередь.
 
-**Окончательная ошибка по-прежнему DISARM, не skip-once.** Error, watchdog,
+**Адресная отмена отдельного поручения не останавливает родительский Loop.**
+23Oct4196 сняла review4196→753, продолжая свой Codex turn; общий fallback
+`orchestration-abnormal` ошибочно выключил Loop и показал persistent incident.
+SOURCE различает app-owned cancelled/interrupted/cancelled-by-api с suppressed
+уведомлением как neutral dependency release. Она сохраняет оба режима Loop,
+arm/очередь и настоящий busy, не создаёт success/idle или новый cause. После
+hydration и известного idle можно лишь перепроверить уже отложенный exact natural
+final либо существующую подготовку прежним executor; при новом busy ждать его
+final. Без такого основания Send нет. Cancel не Pause и не native Stop; unknown,
+failed/no-final и неподтверждённые прочие cancel остаются за прежними guards.
+Это renderer repair; live переключатель автоматически не включается.
+
+**Перегрузка Codex не отменяет Run After.** По прямому уточнению26Oct typed
+`model_capacity` сохраняет own/pivoted queue, Loop, cards, arm, сроки и onTab
+dependencies. Сам отказ не natural completion и не разрешает следующий prompt.
+Continue остаётся у прежнего Main capacity runtime с его finite N/delays, exact
+H/O, draft/Stop/owner и UNKNOWN guards; Root не создаёт второго retry. Disabled,
+exhausted и not-submitted оставляют сохранённое ожидание, не бесконечный повтор.
+`capacitySurfaceOnly` до typed результата — только presentation, в том числе
+после reload: он не переписывает workflow busy edge и не становится failure.
+Последующий exact Main natural final той же session/generation, другого turn
+снимает ожидание; ordered native start или fresh current-turn snapshot допускает
+совпавшие миллисекунды, но локальный Date.now не заменяет отсутствующий proof.
+Если final пришёл до no-input ACK старой подготовки, он остаётся непотреблённым
+и перепроверяется по её release, а не теряется и не запускает старый Loop cause.
+Новое busy/Stop/owner/arm и все прежние whole-work/receipt guards сохраняются.
+
+Просто игнорировать DISARM недостаточно: accepted automatic HEAD может ждать
+перед Continue и заблокировать его тем же hold. Main может временно отложить
+только exact **unattempted** automatic head, без cancellation/переписывания
+receipt truth; повторный Root demand после Main natural proof использует тот же
+H/O/body/arm. Manual, attempted/UNKNOWN и старый head без physical pin не
+пропускаются. Подробная граница — `fact-terminal-mcp.md::Main FIFO принятых Send`.
+
+**Окончательная ошибка по-прежнему DISARM, не skip-once.** Прочие error, watchdog,
 close и неподтверждённый результат выключают собственную автоматику и связанные
 внешние очереди, сохраняя тексты. `interrupt` Claude и доказанный `turn_aborted`
 Codex сохраняют внешние подписки и собственный Loop до следующего natural
@@ -669,7 +705,7 @@ in-flight owner. Сохранённые условия и сроки этим cl
 - **Store-безопасность:** `disarmQueuesForTrigger(triggerTabId, outcomeTs)` делает один immutable `Map`-commit и одну debounced SQLite-запись; timestamp защищает более позднюю ручную постановку от старого catch-up. Gemini `busy:false` остаётся reason-less штатным концом и не попадает в abnormal allowlist.
 
 **Тонкости которые держать в голове:**
-- Abnormal reason обрабатывается идемпотентно даже без нового `true→false` edge: live-исход текущего turn или восстановленный исход с временем не раньше постановки является достаточным доказательством отмены. Старый catch-up сам по себе не имеет права снимать более новый retry. Это закрывает порядок, где другой false-сигнал пришёл раньше, не создавая обратную гонку после рестарта.
+- Окончательный abnormal reason обрабатывается идемпотентно даже без нового `true→false` edge: live-исход текущего turn или восстановленный исход с временем не раньше постановки является достаточным доказательством отмены. Capacity с Main recovery не относится к этому DISARM-классу. Старый catch-up сам по себе не имеет права снимать более новый retry. Это закрывает порядок, где другой false-сигнал пришёл раньше, не создавая обратную гонку после рестарта.
 - **Loader отдельно:** остальные renderer-консьюмеры продолжают получать spinner-сигналы для presentation state; только workflow-map runner'а их игнорирует. Нельзя снова смешивать visual busy и источник результата автоматики.
 - **Натуральные reason-less пути не трогаем:** SDK-форвард и Gemini idle продолжают очередь. Lifecycle cleanup, который означает ненормальный исход (`pty-exit`, `terminal-kill`, `replace`, `close`), должен иметь явный reason и отменять связанные workflow.
 - **Codex, обычный ответ (не доказанный explicit compact выше):** rollout `task_complete` закрывает busy-state, но main сохраняет reason `task_complete` только когда есть непустой `last_agent_message` либо явно привязанный к тому же turn корневой assistant `final_answer`. Если нет обоих доказательств, исход становится `codex-no-final-result`: это «финальный результат не подтверждён», а не угаданный `403`, поэтому связанный Run after disarm'ится, тексты items сохраняются, и никакой следующий Enter не отправляется. `send-command-failed` и `send-command-error` имеют ту же окончательную семантику. `turn_aborted` выключает собственную автоматику Codex-tab'а, но сохраняет внешних owner'ов, которые ждут её будущий успешный ответ после продолжения. Точная причина ошибки может отсутствовать в rollout — см. `fact-codex.md::Loader и App Server`.
@@ -817,7 +853,7 @@ intent, не переписывает его новыми подсказками
 
 ## Loop: повторяемое продолжение после каждого ответа
 
-`Loop` — отдельное повторяемое продолжение, а не суффикс Post и не бесконечно размножаемая карточка очереди. Включение и момент постановки принадлежат конкретной вкладке, но текст один для приложения: встроенный системный промпт `Run After Loop` (`run-after-loop`) в Settings → AI → Системные промпты. Карандашик Loop редактирует ту же запись, а очереди содержат только runtime-проекцию. Модель/effort берутся у owner-агента; Flash/Pro, файлы и context-menu настройки здесь не показываются, потому что этот текст не вызывает отдельную API-модель.
+`Loop` — отдельное повторяемое продолжение, а не суффикс Post и не бесконечно размножаемая карточка очереди. Включение и момент постановки принадлежат конкретной вкладке. Общий текст приложения — встроенный системный промпт `Run After Loop` (`run-after-loop`) в Settings → AI → Системные промпты. По прямому Fedor23Oct карандаш открывает два явно подписанных поля: общий и дополнительные инструкции только этой вкладки. При отправке сначала идёт общий текст, затем локальный и app-owned completion protocol выбранного режима. Локальный текст по умолчанию пуст, хранится отдельно в очереди даже при OFF; его правка переармливает только этот Loop, а не соседние вкладки. Два прокручиваемых поля делят прежний бюджет высоты редактора. Модель/effort берутся у owner-агента; Flash/Pro, файлы и context-menu настройки здесь не показываются, потому что этот текст не вызывает отдельную API-модель.
 
 Первый запуск новой версии переносит прежний global app-state либо, при его отсутствии, самый новый legacy per-tab текст. Пользовательский текст и намеренно пустая строка сохраняются; неизменённый прежний default, в том числе с хвостовыми переносами, получает инструкцию blocked. После появления системной записи legacy app-state больше не участвует в выборе и не получает новые записи. Изменение текста в любом редакторе меняет остальные очереди и заново ставит временную границу включённым Loop. Hydration не затирает pre-load правку; подтвердившаяся правка Settings отменяет старый pending debounce карандашика. Content-only write и shutdown-flush сохраняют отдельно редактируемые name/color, не переписывая их старым snapshot.
 
@@ -826,12 +862,18 @@ intent, не переписывает его новыми подсказками
 Уточнение Fedor21Oct для SOURCE-кандидата: split имеет три части — слева `GitBranch`
 включает Loop после собственного ответа при внешнем MCP/Research ожидании, середина
 `Loop` включает обычное ожидание завершения всей связанной работы, справа карандаш
-редактирует общий текст. Это взаимоисключающие режимы одного Loop. Обычный — default,
+редактирует тексты обоих режимов (с23Oct — общий и локальный). Это взаимоисключающие режимы одного Loop. Обычный — default,
 в том числе для старой сохранённой настройки; внешнее ожидание требует явного выбора
 слева. Повтор выбранной части выключает Loop, другая часть переключает режим с новым
 arm, отзывающим прежнюю ещё не отправленную подготовку. ON и выбор переживают restart.
 Новый режим использует отдельный `await_dependencies`; обычный не зависит от его
 журнала. Ни один режим не снимает input/FIFO/UNKNOWN, Goal или install hold.
+В SOURCE23Oct обычный режим дополнительно ждёт собственные исходящие Send/Reply
+вопросы через отдельный durable message owner, не через inherited purple или fake
+child run. Reply/status ACK не является natural завершением обработки возврата;
+delivery failure/абсолютный30минутный deadline возвращает один сохранённый исход,
+не повторяет вопрос и не теряет поздний Reply. Exact flow и предел proof —
+[собственные вопросы и Loop](./fact-tab-messages.md#собственные-вопросы-и-обычный-loop-source2310).
 Граница SOURCE/private и оставшиеся проверки внешнего ожидания — в
 [рабочем плане](../tmp/loop-ожидание-mcp-план-20261021.md); installed приёмка этим
 описанием не заявляется.
@@ -1046,6 +1088,13 @@ History composer использует тот же marker/ref-контракт. C
 
 **Межприложенческий clipboard — один text-only wire format.** History и Run after принимают абсолютные `[imagePath: /...]`, сначала копируют каждый источник в durable asset store, затем одним изменением заменяют их локальными `[Image #N]` и перенумеровывают относительно уже имеющихся refs. Относительный marker остаётся обычным текстом. Настоящий bitmap-only clipboard проходит тот же финальный путь через `prompt-queue:save-clipboard-image`. В обратную сторону целый `[Image #N]` экспортируется как `[imagePath: <durable path>]`; окружающий текст и любое число картинок сохраняют порядок, а в pasteboard пишется только `text/plain`.
 
+Source27Oct исключает из этого local-marker wire полные HTTP(S) Markdown
+web-image/favicon ссылки. Pending/error/path/numbered markers внутри их title
+остаются частью буквального текста и не запускают image-save/import/validation.
+Run after и History используют те же диапазоны; соседний настоящий slot проверяется
+как раньше. Не переносить это исключение на произвольное тело служебного сообщения
+без exact bound authoring proof.
+
 Тот же экспорт разворачивает каждый целый `[Pasted Content N chars]` в точное тело sidecar-чипа. Разбор source-position based: одинаковые по длине вставки не сопоставляются «по первому тексту», а следуют порядку якорей. Missing sidecar даёт `[pasteError]`; разрезанный image-marker — `[imageError]`. Благодаря этому смешанное выделение `text + image + pasted content + image` является одним переносимым текстом, а не несколькими конкурирующими представлениями clipboard.
 
 Inline-миниатюра не читает `file://` из renderer: CSP custom-terminal это запрещает. `prompt-queue:get-image-preview-data-url` принимает только ref, который `PromptQueueAssetStore` доказал как managed, декодирует его через `nativeImage` и возвращает `data:image/...`. У IPC два варианта одного и того же validated asset: `thumbnail` ограничен 64 px по длинной стороне для 20×20 чипа, `detail` — 1024 px для раскрытого просмотра. Renderer кэширует их раздельно по variant + content-addressed `assetId`; загрузка event-driven, без polling. Поэтому клик по image-чипу открывает настоящую картинку через тот же preview-контракт, что `Pasted Content`, но геометрия принадлежит поверхности: History показывает image-card компактной ширины слева над input, тогда как Run after создаёт отдельную sibling-card слева от всего editor-блока title+body (на узком viewport — снизу). Preview не раздвигает и не прячется внутрь редактируемого поля. IPC при этом не превращается в произвольное чтение absolute path. У image-чипа нет стрелки раскрытия: сама миниатюра уже обозначает объект; стрелка остаётся только у текстового paste-чипа.
@@ -1069,6 +1118,16 @@ missing-image placeholder/Run After и не новая очередь. Wire/lega
 `fact-mobile-web.md::Mobile upload attachments`.
 
 Transport строится в строгом порядке: сначала image-marker'ы materialize только внутри editable `text`, затем prompt/paste chips сериализуются вокруг подготовленного текста. Обратный порядок опасен: литерал `[Image #1]` внутри opaque paste/prompt chip ошибочно выглядит как attachment slot и может присвоить чужой ref или превратиться в `imageError`.
+
+Этого порядка недостаточно, если затем Main снова сканирует всю expanded строку:
+абсолютный imagePath-пример внутри настоящего чипа тоже становился вложением и
+ломал durable audit. SOURCE27Oct автоматический Send, ручной Send-now и append
+Replay несут один producer plan с точными image ranges. Байты payload и прежний
+H/O расчёт сохранены; raw Post-текст сохраняет legacy markers, generated chip
+bodies остаются буквальными. Context owner переносит план по своим edits. При
+missing в preflight/staging прежний Main proof связывает разрешённый error transport
+с original request, в том числе без единой успешной картинки; это не новая arm
+или автоматический повтор старого UNKNOWN.
 
 Для Codex источник истины разделён только по представлению: live composer показывает native `[Image #N]`, очередь хранит durable asset. В момент Run after или Replay `buildQueuedPromptPayload` разворачивает slot в `[imagePath: <stable path>]`. Если slot не имеет доступного asset, он всегда становится `[imageError: queued_image_path_unavailable #N]`, даже когда весь `imagePaths` отсутствует (legacy/missing-all case).
 

@@ -204,15 +204,16 @@ test('animation completion checks actual hover even when no leave callback was d
   assert.equal(f.attributes.size,0); assert.equal(f.listeners.size,0);
 });
 
-test('dwell uses the shorter shared60ms/1.04 token; group badge has the same finite scale and actual hit box', () => {
+test('file/group chips share the finite60ms/1.1 scale and keep their actual hit box', () => {
   const css=fs.readFileSync(new URL('./TabLinkedFiles.css',import.meta.url),'utf8');
   const group=fs.readFileSync(new URL('./PaneStripCollapsedGroup.css',import.meta.url),'utf8');
-  assert.equal(hoverIntent.CHIP_HOVER_MS,60);assert.equal(hoverIntent.CHIP_HOVER_SCALE,1.04);
+  assert.equal(hoverIntent.CHIP_HOVER_MS,60);assert.equal(hoverIntent.CHIP_HOVER_SCALE,1.1);
   assert.match(css,/animation: tab-linked-file-hover-intent var\(--noted-chip-hover-ms\) linear/);
   const keyframes=css.match(/@keyframes tab-linked-file-hover-intent \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(keyframes); assert.match(keyframes,/from \{ transform: scale\(1\); \}/);
   assert.match(keyframes,/to \{ transform: scale\(var\(--noted-chip-hover-scale\)\); \}/);
   assert.match(group,/transform-origin:center/);assert.match(group,/scale\(var\(--noted-chip-hover-scale\)\)/);
+  assert.match(group,/animation:pane-strip-badge-hover-intent var\(--noted-chip-hover-ms\) linear/);
   assert.doesNotMatch(group,/::before|inset:0 0 -50% -50%|scale\(1\.5\)/);
   assert.doesNotMatch(keyframes,/width|height|padding|margin|infinite/);
   assert.doesNotMatch(source,/setTimeout|setInterval|requestAnimationFrame/);

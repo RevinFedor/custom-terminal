@@ -3,6 +3,8 @@ import {editPaneStripColorGroups,paneStripGroupDragBoundary,classifyPaneStripCol
 import {validatePaneStripColorGroups,paneStripColorGroupsBasis,paneStripLayoutOwner,gatherPaneStripSlots,paneStripSlotOrder,projectActivePaneStripGroups} from '../../shared/pane-strip-color-groups.cjs';
 import {captureSpaceLayout} from './workspaceSpacesModel.mjs';
 import {stableJson} from '../../shared/workflow-organization.cjs';
+import {paneStripCollapsedRuns} from './paneStripCollapseModel.mjs';
+import {capturePaneStripSettingsMembership} from './paneStripSettingsMembership.mjs';
 
 const fail=code=>{throw Object.assign(Error(code),{code});};
 const entriesKey=entries=>JSON.stringify(entries.map(({projectId,tabId})=>[projectId,tabId]));
@@ -34,6 +36,45 @@ export function readPaneStripOwnerEntries(state,{workflowId,windowId,paneIndex})
   const key=state.centerStripKey?.() || state.activeProjectId;
   const shown=state.activeSpaceTab || {projectId:state.activeProjectId,tabId:state.openProjects.get(state.activeProjectId)?.activeTabId};
   return state.centerStrips[key] || (shown?.tabId?[shown]:[]);
+}
+
+/** A single selected member is not a whole-group command. Reuse the strip's
+ * actual collapsed-run/representative rule, including chooser barriers and
+ * MRU fallback, before exposing that representative's group settings. */
+export function readPaneStripRepresentedGroup(state,lease,groups) {
+  if(lease.entries.length!==1||state.activeSpaceId!==lease.workflowId)return null;
+  const owner=paneStripLayoutOwner(captureSpaceLayout(state),{windowId:lease.windowId,paneIndex:lease.paneIndex,
+    centerKey:lease.paneIndex===null?(state.centerStripKey?.()||state.activeProjectId):null});
+  if(!owner)return null;
+  const shown=owner.pane?(owner.pane.selectedSlotId?'':owner.pane.tabId)
+    :(state.activeSpaceTab?.tabId||state.openProjects.get(state.activeProjectId)?.activeTabId||'');
+  const items=owner.slots.map(slot=>({...slot,kind:slot.tabId?'tab':'chooser'}));
+  const currentPane=lease.paneIndex===null?null:state.splitPanes.find(pane=>pane.windowId===lease.windowId);
+  const runs=paneStripCollapsedRuns(items,groups,shown,currentPane?.history?.map(entry=>entry.tabId)||[]);
+  return runs.find(run=>run.kind==='collapsed-group'&&run.representative===lease.entries[0].tabId)?.group||null;
+}
+
+/** A released B5 pair is already the strip's current presentation. Canonical
+ * membership alone can lag its ACK. This read grants only group settings;
+ * the original execution lease stays canonical and Main owns admission. Bare
+ * pending membership, an unreconciled pair or another owner is not a proof. */
+export function paneStripSelectionMembershipCurrent(state,owner,entries) {
+  const {workflowId}=owner;
+  if(entries.some(({tabId})=>(state.pendingTabWorkflowMembership?.[tabId]
+    ||state.tabWorkflowMembership?.[tabId])?.workflowId!==workflowId))return false;
+  const pendingIds=entries.filter(({tabId})=>state.tabWorkflowMembership?.[tabId]?.workflowId!==workflowId).map(entry=>entry.tabId);
+  if(!pendingIds.length)return true;
+  if(state.paneStripReleasedPairs?.version!==1)return false;
+  try {
+    const field=readPaneStripGroupState(state,workflowId),basis=paneStripColorGroupsBasis(field);
+    const placement={windowId:owner.windowId,paneIndex:owner.paneIndex,
+      centerKey:owner.paneIndex===null?(state.centerStripKey?.()||state.activeProjectId):null};
+    const live=paneStripLayoutOwner(captureSpaceLayout(state),placement);if(!live)return false;
+    const witness=capturePaneStripSettingsMembership(state,{workflowId,owner:placement,tabIds:pendingIds,
+      assignments:pendingIds.map(id=>field.groups.find(group=>group.tabIds.includes(id))?.id??null),
+      basis,beforeOrder:paneStripSlotOrder(live.slots)});
+    return pendingIds.every(id=>witness.hasReleasedProof(id));
+  } catch {return false;}
 }
 
 /** Read-only lease for the existing DnD owner. No subscription or DOM reads.

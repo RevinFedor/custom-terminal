@@ -1252,7 +1252,6 @@ function Terminal({
   onLinkClickRef.current = onLinkClick;
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
-  const pinnedTimelineSettleRafRef = useRef<number | null>(null);
 
   const writeTerminalData = (term: XTerminal, data: string) => new Promise<void>((resolve) => {
     if (!data) {
@@ -1673,14 +1672,13 @@ function Terminal({
   const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
   const timelineTreeMode = useUIStore((state) => state.timelineTreeModeTabs[tabId] ?? false);
   const timelineWidth = useUIStore((state) => state.timelineWidth);
-  const timelinePinned = useUIStore((state) => state.timelinePinned);
   // Right inset = how far Run after must step LEFT so nothing covers it.
   //
   // Both right-edge surfaces push it, and they stack: the expanded Timeline and
   // the Cmd+] side panel (transcript OR terminal — the same slot, so its width
-  // is whichever one is showing). Run after ALWAYS moves; the pin toggle only
-  // decides whether the CENTER surface also gives up space, which is a separate
-  // question. Previously only the Timeline counted, so opening the side panel
+  // is whichever one is showing). Timeline always overlays; the independent
+  // History pin still chooses whether its side panel reserves a column.
+  // Previously only the Timeline counted, so opening the side panel
   // left the strip behind it.
   const sideTerminalWidth = useUIStore((state) => state.sideTerminalWidth);
   const historyPanelWidth = useUIStore((state) => state.historyPanelWidth);
@@ -1712,7 +1710,6 @@ function Terminal({
   // the strip in place — exactly the reported "Cmd+] and Run after does not move".
   const sharedInsetArgs = {
     treeMode: timelineTreeMode,
-    pinned: timelinePinned,
     width: timelineWidth,
     sideTerminalOpen: promptQueueInputSurface === 'history' && sideTerminalOpen,
     sideTerminalWidth,
@@ -2282,35 +2279,6 @@ function Terminal({
       console.warn('[safeFit] ERROR:', e);
     }
   };
-
-  useEffect(() => {
-    const handlePinnedTimelineLayoutSettled = (event: Event) => {
-      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
-      if (detail?.tabId !== tabId) return;
-      if (!actualPresentationRef.current || !xtermInstance.current) return;
-
-      if (pinnedTimelineSettleRafRef.current !== null) {
-        cancelAnimationFrame(pinnedTimelineSettleRafRef.current);
-      }
-      pinnedTimelineSettleRafRef.current = requestAnimationFrame(() => {
-        safeFit();
-        pinnedTimelineSettleRafRef.current = requestAnimationFrame(() => {
-          pinnedTimelineSettleRafRef.current = null;
-          safeFit();
-          scrollToBottom();
-        });
-      });
-    };
-
-    window.addEventListener('timeline:pinned-layout-settled', handlePinnedTimelineLayoutSettled);
-    return () => {
-      window.removeEventListener('timeline:pinned-layout-settled', handlePinnedTimelineLayoutSettled);
-      if (pinnedTimelineSettleRafRef.current !== null) {
-        cancelAnimationFrame(pinnedTimelineSettleRafRef.current);
-        pinnedTimelineSettleRafRef.current = null;
-      }
-    };
-  }, [scrollToBottom, tabId]);
 
   // Both the eager and lazy xterm initializers feed the same live PTY. Keep
   // native Codex picker proof at component scope so the first lazy onData

@@ -22,6 +22,77 @@ test('app-added context binds exact logical→prepared transport→native attemp
   assert.equal(h.changes.filter(e => e.state === 'continued').length, 1, 'late/duplicate wakes cannot create a second release');
 });
 
+test('same native source-only receipt may learn its canonical UUID before natural final, including after restart', async t => {
+  const h = await installContextFixture(t, { sourceOnlyAudit: true });
+  await h.reconcile();
+  const frozen = h.read().entries[0].callbackBinding;
+  assert.equal(frozen.userUuid, null); assert.ok(frozen.sourceIdentity);
+  const settledAt = h.store.get(h.operationKey).settledAt;
+  const enriched = h.promoteAudit();
+  assert.equal(enriched.enriched, true); assert.equal(enriched.promoted, false);
+  assert.equal(enriched.record.settledAt, settledAt);
+  h.restore();
+  const proof = await h.callbackProof();
+  assert.ok(proof?.binding.userUuid, 'fresh exact callback proof survives canonical address enrichment');
+  assert.equal(proof.naturalFinal, false); assert.equal(h.blocked(), true);
+  await h.reconcile(); assert.equal(h.blocked(), true, 'delivery enrichment is not natural completion');
+  h.complete(); await h.reconcile(); assert.equal(h.blocked(), false);
+  assert.equal(h.read().entries[0].callbackProof.turnId, 'callback-T');
+  assert.deepEqual(h.read().entries[0].callbackBinding, frozen, 'historical binding remains unchanged');
+  h.restore(); await h.reconcile(); assert.equal(h.inputs.length, 0);
+  assert.equal(h.changes.filter(entry => entry.state === 'continued').length, 1);
+});
+
+test('canonical UUID enrichment during the exact final read releases once without another Send', async t => {
+  const h = await installContextFixture(t, { sourceOnlyAudit: true });
+  await h.reconcile(); h.complete();
+  h.state.onResult = () => { assert.equal(h.promoteAudit().enriched, true); h.state.onResult = null; };
+  await h.reconcile(); assert.equal(h.blocked(), false);
+  assert.equal(h.changes.filter(entry => entry.state === 'continued').length, 1); assert.equal(h.inputs.length, 0);
+});
+
+test('cancellation during a final read wins over same-receipt canonical enrichment', async t => {
+  const h = await installContextFixture(t, { sourceOnlyAudit: true });
+  await h.reconcile(); h.complete();
+  h.state.onResult = () => { assert.equal(h.promoteAudit().enriched, true); h.cancelRequest(); };
+  await h.reconcile(); h.restore(); await h.reconcile();
+  assert.equal(h.read().entries[0].state, 'cancelled'); assert.equal(h.blocked(), false);
+  assert.equal(h.changes.filter(entry => entry.state === 'continued').length, 0); assert.equal(h.inputs.length, 0);
+});
+
+for (const missing of [null, 'entryUuidAliases', 'sourceIdentityAliases']) {
+  test('canonical alias promotion keeps every pinned address: missing ' + missing, async t => {
+    // Native address facts are controlled; the existing receipt owner performs
+    // the real same-attempt alias upgrade and the Main reader proves its final.
+    const h = await installContextFixture(t, { initialAudit: { entryUuid: 'early-user', sourceIdentity: 'early-source' } });
+    await h.reconcile(); const frozen = h.read().entries[0].callbackBinding;
+    const enriched = h.promoteAudit({ entryUuidAliases: ['early-user'], sourceIdentityAliases: ['early-source'] });
+    assert.equal(enriched.enriched, true); assert.equal(enriched.promoted, false);
+    if (missing) h.state.transform = record => record && ({ ...record,
+      auditIdentity: { ...record.auditIdentity, [missing]: [] } });
+    h.complete(); h.restore(); await h.reconcile();
+    assert.equal(h.blocked(), !!missing); assert.equal(h.inputs.length, 0);
+    assert.deepEqual(h.read().entries[0].callbackBinding, frozen);
+    if (missing) assert.equal(await h.callbackProof(), null);
+    else assert.equal(h.read().entries[0].callbackProof.turnId, 'callback-T');
+  });
+}
+
+for (const field of ['operationKey', 'attemptId', 'requestFingerprint', 'promptHash', 'auditTimestamp', 'sourceIdentity']) {
+  test('canonical enrichment does not absorb changed ' + field + ' into the frozen callback', async t => {
+    const h = await installContextFixture(t, { sourceOnlyAudit: true });
+    await h.reconcile(); h.promoteAudit(); h.complete(); const reads = h.reads.length;
+    h.state.transform = record => {
+      if (!record) return record;
+      if (field === 'auditTimestamp' || field === 'sourceIdentity') return { ...record,
+        auditIdentity: { ...record.auditIdentity, [field]: field === 'auditTimestamp' ? '2040-01-01T00:00:00Z' : 'unrelated-native-source' } };
+      return { ...record, [field]: 'changed-' + field };
+    };
+    await h.reconcile(); assert.equal(h.blocked(), true); assert.equal(h.reads.length, reads);
+    assert.equal(await h.callbackProof(), null); assert.equal(h.inputs.length, 0);
+  });
+}
+
 test('producer refresh of an embedded context wrapper is proved by frozen base hash, without suffix matching', async t => {
   const logical = '<saved_prompt name="old" context-update-id="context-one">\nold content\n</saved_prompt>\n\nContinue callback work.';
   const h = await installContextFixture(t, { logical });
@@ -94,7 +165,7 @@ test('actual WebServer factory reads the same exact preparation owner and passes
   const end = webSource.indexOf('\nasync function readBuildInstallContinuations', start);
   assert.ok(start > 0 && end > start);
   let preparedReads = 0;
-  const context = vm.createContext({ path, srcMainDir: __dirname, buildInstallContinuations: null,
+  const context = vm.createContext({ path, srcMainDir: __dirname, buildInstallContinuations: null, buildContinueOperations: null,
     require: name => name === './project-manager' ? { db: {
       getAppState: () => JSON.parse(h.db.prepare('SELECT value FROM state').get().value),
       setAppState: (_key, value) => h.db.prepare('UPDATE state SET value=?').run(JSON.stringify(value)),

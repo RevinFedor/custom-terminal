@@ -13,17 +13,21 @@
  *  - Grouping reads ONLY fields that exist on both full rows and row-window
  *    stubs (family/bashWord/mcpServer/mcpMethod/messageId/hasContent/
  *    actionSummary / structural semanticTags) so grouping(any hydration window) === grouping(full).
- *  - Kill switch: `enabled: false` → identity projection.
+ *  - With `responseWork`, a default-closed chapter previews the latest proven
+ *    commentary (or the latest call before any commentary). Opening reveals
+ *    full text and the separately collapsible tool groups in source order.
+ *    The final reply and interactive/user boundaries stay outside.
+ *  - `enabled: false` disables tool groups. Without `responseWork` it remains
+ *    the original identity projection.
  *
- * What groups: consecutive assistant work actions form a broad noise/edit
- * block even when their concrete types change; an uninterrupted homogeneous
- * signature may additionally become the inner series. Caption text and
- * structurally owned reasoning ride with the broad block. User rows,
- * standalone replies and interactive questions remain hard boundaries.
+ * Legacy/nested grammar: consecutive assistant work actions share one broad block
+ * regardless of tool type. The next proven commentary starts a new block;
+ * one block therefore has at most one caption. A homogeneous signature may
+ * additionally become an inner series. User rows, standalone replies and
+ * interactive questions remain hard boundaries.
  *
- * Corpus grounding (docs/tmp/визуал-history-research-*.md): threshold 2 is
- * the user's pick; families are mandatory because 76% of Claude Bash / 65%
- * of Codex shell are reads and searches.
+ * Two calls still form a no-caption group; one call plus one caption also
+ * forms a group. Tool families remain labels, not outer group boundaries.
  */
 
 import {
@@ -35,6 +39,9 @@ import {
 import textPhases from '../../shared/history-text-phase.cjs';
 import { resolveHistoryOrchestrationPromptPresentation } from './historyOrchestrationPromptPresentation.mjs';
 import { resolveHistoryGroupCaption } from './historyGroupCaption.mjs';
+import { historyLivePresentationKey } from './historyLiveProjection.mjs';
+import { resolveHistoryResponseTailTiming } from './historyResponseTiming.mjs';
+import { historyGroupRecordTimeAttributes } from './historyRecordTimePresentation.mjs';
 
 /** Stub-safe provenance only: never read/parse a response body just to group
  * it. Pending application input and native question replies stay reachable. */
@@ -72,19 +79,14 @@ function hydratedSubject(raw, presentation = null) {
 }
 
 /**
- * Two collapsing CLASSES, not one list of families.
+ * Existing coarse action classifier and supported-family gate.
  *
- * `noise` — the work log: reads, searches, git/shell, MCP/web, plan updates,
- * agents, waits and generic tool calls. A run of them is one broad block no
- * matter how the types interleave; every type remains named in the header as
- * its own `×N` fragment. AskUser/Question deliberately stays outside — hiding
- * a live request for user input would break the interaction, not compress it.
+ * `noise` means reads, searches, git/shell, MCP/web, plan, agents and other
+ * supported tools. `edit` marks file changes. The outer projection maps BOTH
+ * to `work`; the coarse names no longer split a run. Question/AskUser stays
+ * outside: a request for input must never be hidden inside the work group.
  *
- * `edit` — every file mutation (Edit / Write / MultiEdit / Update, one verb).
- * Edits collapse only WITH EACH OTHER and never merge into the noise class:
- * which files changed and by how much is the one thing the user scans.
- *
- * Question/AskUser and non-action transcript rows keep their own row.
+ * The family-specific `×N` breakdown and each expanded raw call are retained.
  */
 const CLASS_BY_FAMILY = new Map([
   ['read', 'noise'], ['search', 'noise'], ['git', 'noise'],
@@ -97,14 +99,6 @@ const CLASS_BY_FAMILY = new Map([
 const GROUPABLE_FAMILIES = new Set(CLASS_BY_FAMILY.keys());
 
 const DEFAULT_THRESHOLD = 2;
-
-/**
- * How many noise CALLS an edit block may swallow between two of its edits
- * (re-read, grep, test run). Corpus: 1–3-call gaps are 38% of all gaps and
- * are the edit cycle itself; 4+ (13%) is a real detour that must stay its
- * own group. Cheap to tune.
- */
-const EDIT_GAP_MAX_NOISE = 3;
 
 const isObject = (value) => value !== null && typeof value === 'object';
 
@@ -270,13 +264,10 @@ const entryHasText = (entry) => {
 };
 
 /**
- * Caption vs standalone reply, both providers:
- *  - actions in the same entry → the text IS the caption of those calls;
- *  - Codex: `textPhase === 'commentary'` and short → caption of the NEXT
- *    entry's calls (positional linkage);
- *  - Claude: text-only entry sharing `messageId` with the NEXT entry → same
- *    model response as the calls → caption (structural linkage);
- *  - everything else with text → standalone reply (series boundary).
+ * Caption vs standalone reply: a short text can be captioned using explicit
+ * commentary, a same-row action, structural message ownership, or the existing
+ * adjacent-next-action fallback. Stable partial/final and oversized texts stay
+ * standalone; an untyped legacy final is not guessed from the preceding calls.
  */
 const contentLength = (entry) => {
   if (typeof entry?.content === 'string') return entry.content.trim().length;
@@ -308,11 +299,9 @@ export function isCaptionForNext(entry, nextEntry) {
 }
 
 /**
- * Detail under a collapsed group answers two related questions with one rule:
- * while the tail group grows it shows the newest meaningful status, and once
- * an outer boundary appears that final status stays frozen with the completed
- * unit. The append projector rebuilds only the open tail and reuses closed
- * prefix units, so no separate mutable "live caption" state is needed.
+ * New work groups contain at most one caption. Keep this collection helper
+ * tolerant of older cached groups with multiple captions until those views are
+ * replaced; it must still preserve their identities and never count tool data.
  */
 export function historyGroupCaptionEntries(entries, fallback = null) {
   const captions = [], seen = new Set();
@@ -337,26 +326,9 @@ export function historyGroupCaptionEntries(entries, fallback = null) {
  * text-only row, or non-assistant row).
  */
 /**
- * The collapsing class of one row: 'noise', 'edit', or null (never collapses).
- *
- * A row that mixes classes takes the class of its EDITS. Codex writes one
- * assistant record per exec call, and its normal working shape is «run a
- * script, apply the patch it built» — one record holding a shell run AND the
- * file changes. Refusing to collapse those (the old rule: any mix → null)
- * meant a session that edited 200 files never grouped a single one of them:
- * on the user's screenshot every second row was a lone «Bash node» + «Edit»
- * pair standing between two collapsed blocks, which is the exact wall this
- * feature exists to remove.
- *
- * The class is the edits' because an edit is never allowed to hide inside
- * noise: this row changed files, so it belongs to the edit block, and the
- * shell call that produced the change rides along inside it — the same
- * absorption rule that already lets an edit block swallow ≤3 noise calls
- * BETWEEN two edits, applied to a call sitting in the same record.
- *
- * A mix with no edits at all (never seen in the corpus, but structurally
- * possible) stays uncollapsed: without an edit there is no dominant class to
- * pick and merging would be a guess.
+ * Coarse class of one row: 'noise', 'edit', or null for an unsupported call.
+ * Composite rows containing a file change keep the legacy 'edit' class so
+ * none of their calls are lost. The outer grouping maps both classes to work.
  */
 export function entrySeriesFamily(entry) {
   if (!isObject(entry) || entry.role !== 'assistant') return null;
@@ -375,8 +347,43 @@ export function entrySeriesFamily(entry) {
   return key;
 }
 
+/** Calls in a text-bearing physical row can share one local disclosure only
+ * when every action is represented and has an exact navigation identity. */
+export function historyCompositeActionFacts(entry) {
+  if (!entryHasText(entry) || !Array.isArray(entry?.actions) || entry.actions.length < 2
+    || entrySeriesFamily(entry) === null) return null;
+  const facts = entryActionFacts(entry);
+  return facts.length === entry.actions.length && facts.every((fact, index) => {
+    const action = entry.actions[index];
+    const actualId = action?.rawTool?.toolUseId || action?.toolUseId;
+    const name = action?.rawTool?.toolName || (action?.tool === 'Task' ? 'Task' : '');
+    const family = action?.rawTool?.family;
+    return !!fact.toolUseId && !!actualId && fact.toolUseId === String(actualId)
+      && (!name || fact.toolName === String(name)) && (!family || fact.family === String(family));
+  }) ? facts : null;
+}
+
+// Preserve the existing family classifier for unsupported/interactive calls,
+// but work-block boundaries no longer distinguish file edits from other tools.
+// A complete/partial answer or an oversized text must remain a visible row,
+// including when the same physical record also carries an action.
+function entryWorkFamily(entry) {
+  if (entryHasText(entry) && (isStandaloneAnswer(entry) || contentLength(entry) > HISTORY_CAPTION_MAX_CHARS)) return null;
+  return entrySeriesFamily(entry) === null ? null : 'work';
+}
+
+function entryActionCount(entry) {
+  return Math.max(Array.isArray(entry?.actionSummary) ? entry.actionSummary.length : 0,
+    Array.isArray(entry?.actions) ? entry.actions.length : 0);
+}
+
+function entrySafeWorkFamily(entry) {
+  const family = entryWorkFamily(entry);
+  return family !== null && entryActionFacts(entry).length !== entryActionCount(entry) ? null : family;
+}
+
 /** One homogeneous action signature for the inner presentation level.
- * Outer groups intentionally merge all noise; inner groups are narrower:
+ * Outer groups intentionally merge all supported work; inner groups are narrower:
  * family + docs scope, and MCP additionally per server. */
 export function entryAggregateKey(entry) {
   if (!isObject(entry) || entry.role !== 'assistant') return null;
@@ -384,7 +391,7 @@ export function entryAggregateKey(entry) {
   // if the provider colocated a tool call in the same record. Otherwise the
   // inner file aggregate could still display `thinking` as its child through
   // a composite row — the same hierarchy lie as swallowing a separate row.
-  if (entry.thinking || entry.hasThinking === true) return null;
+  if (entry.thinking || entry.hasThinking === true || entryHasText(entry)) return null;
   const facts = entryActionFacts(entry);
   if (facts.length === 0) return null;
   let key = null;
@@ -417,6 +424,19 @@ function structuralPassengerMatch(entry, membership, expected) {
   const values = membership.get(messageId);
   if (!values || values.size === 0) return { known: false, matches: false };
   return { known: true, matches: values.has(expected) };
+}
+
+/** A short untyped legacy final must not disappear into a work caption.
+ * Explicit Codex commentary, an action in the same row, Claude messageId
+ * ownership, or the existing adjacent-next-action rule is sufficient proof. */
+function isWorkCaption(entry, nextEntry, membership) {
+  if (!isObject(entry) || entry.role !== 'assistant' || !entryHasText(entry)
+    || isStandaloneAnswer(entry) || contentLength(entry) > HISTORY_CAPTION_MAX_CHARS) return false;
+  const facts = entryActionFacts(entry);
+  if (entry.textPhase === 'commentary') return facts.length === 0 || entryWorkFamily(entry) !== null;
+  if (facts.length > 0) return entryWorkFamily(entry) !== null;
+  if (structuralPassengerMatch(entry, membership, 'work').matches) return true;
+  return isCaptionForNext(entry, nextEntry) && entryWorkFamily(nextEntry) !== null;
 }
 
 /** First action after a reasoning lead/tail, optionally through one caption.
@@ -521,6 +541,100 @@ export function buildHistoryInnerUnits(entries, options = {}) {
   return units;
 }
 
+/** Presentation-only response chapter. An untyped, structurally unproven
+ * answer stays outside: position after a tool is not evidence of commentary. */
+function responseWorkEntry(entry, next, memberships) {
+  if (!isObject(entry) || entry.role !== 'assistant' || entry.responseTiming
+    || entry.textPhase === 'final_answer') return false;
+  const family = entrySeriesFamily(entry);
+  const actionCount = entryActionCount(entry);
+  // Interactive questions/unsupported calls remain independent and reachable.
+  if (actionCount > 0 && (family === null || entryActionFacts(entry).length !== actionCount)) return false;
+  if (!entryHasText(entry)) return family !== null || isThinkingOnlyRow(entry);
+  if (entry.textPhase === 'commentary' || entry.textPhase === 'partial_answer') return true;
+  if (family !== null) return true;
+  const messageId = typeof entry.messageId === 'string' ? entry.messageId : '';
+  if (messageId && memberships.get(messageId)?.has('work')) return true;
+  return isCaptionForNext(entry, next) && entrySeriesFamily(next) !== null;
+}
+
+export function isHistoryDisplayGroupExpanded(keys, key) {
+  return keys.has(key);
+}
+export function setHistoryDisplayGroupExpanded(keys, key, open) {
+  if (isHistoryDisplayGroupExpanded(keys, key) === open) return keys;
+  const next = new Set(keys);
+  if (open) next.add(key);
+  else next.delete(key);
+  return next;
+}
+
+function buildResponseWorkUnits(list, options) {
+  const expandedKeys = options.expandedKeys instanceof Set ? options.expandedKeys
+    : new Set(Array.isArray(options.expandedKeys) ? options.expandedKeys : []);
+  const memberships = messageMembershipMap(list, entrySafeWorkFamily);
+  const baseOptions = { ...options, responseWork: false, separateCommentary: true, flatTools: true };
+  const units = [];
+  let index = 0;
+  let timedFinal = null;
+  while (index < list.length) {
+    if (!responseWorkEntry(list[index], list[index + 1], memberships)) {
+      let end = index + 1;
+      while (end < list.length && !responseWorkEntry(list[end], list[end + 1], memberships)) end++;
+      const plain = buildHistoryDisplayUnits(list.slice(index, end), baseOptions);
+      for (const unit of plain) units.push(unit.kind === 'entry' && unit.entry === timedFinal
+        ? { ...unit, suppressResponseTiming: true } : unit);
+      timedFinal = null;
+      index = end;
+      continue;
+    }
+    let end = index + 1;
+    while (end < list.length && responseWorkEntry(list[end], list[end + 1], memberships)) end++;
+    const members = list.slice(index, end);
+    const firstKey = historyLivePresentationKey(members[0]);
+    // An absent source/UUID cannot own stable collapse and navigation state.
+    if (firstKey === 'uuid:') {
+      units.push(...buildHistoryDisplayUnits(members, baseOptions));
+      index = end;
+      continue;
+    }
+    const key = 'work:' + firstKey;
+    const expanded = expandedKeys.has(key);
+    const timing = end < list.length
+      ? resolveHistoryResponseTailTiming(null, [list[end]]) : null;
+    if (timing) timedFinal = list[end];
+    const tail = end === list.length;
+    const firstTimestamp = typeof members[0]?.timestamp === 'string' && members[0].timestamp.length <= 64
+      ? members[0].timestamp : '';
+    let previewEntry = null, previewFact = null, previewRecordTime = null;
+    for (const member of members) {
+      if (entryHasText(member)) {
+        previewEntry = member;
+        previewFact = null;
+        previewRecordTime = member.recordTime || null;
+      } else if (!previewEntry) {
+        const facts = entryActionFacts(member);
+        if (!facts.length) continue;
+        previewFact = facts.at(-1);
+        const actions = Array.isArray(member.actionSummary) ? member.actionSummary : member.actions;
+        const lastAction = Array.isArray(actions) ? actions.at(-1) : null;
+        previewRecordTime = lastAction?.rawTool?.recordTime || lastAction?.recordTime || null;
+      }
+    }
+    units.push({ kind: 'group', key, level: 0, familyKey: 'response-work',
+      entries: members, facts: [], expanded, responseTiming: timing, activeTail: tail, firstTimestamp,
+      previewEntry, previewFact, previewRecordTime,
+      recordTimeAttributes: historyGroupRecordTimeAttributes(members, key) });
+    if (expanded) {
+      const children = buildHistoryDisplayUnits(members, baseOptions);
+      for (let n = 0; n < children.length; n++) units.push({ ...children[n],
+        responseWork: { key, first: n === 0, last: n === children.length - 1, activeTail: tail, firstTimestamp } });
+    }
+    index = end;
+  }
+  return units;
+}
+
 /**
  * Display unit shapes:
  *   { kind: 'entry', entry }                       — passthrough row
@@ -535,6 +649,7 @@ export function buildHistoryInnerUnits(entries, options = {}) {
  */
 export function buildHistoryDisplayUnits(entries, options = {}) {
   const list = Array.isArray(entries) ? entries : [];
+  if (options.responseWork === true) return buildResponseWorkUnits(list, options);
   const enabled = options.enabled !== false;
   const threshold = Math.max(2, Number(options.threshold) || DEFAULT_THRESHOLD);
   const expandedKeys = options.expandedKeys instanceof Set
@@ -549,7 +664,8 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
   // Claude's messageId is structural ownership: thinking/text/tool records of
   // one model response share it. It outranks position. Codex/live rows can
   // lack it, so the old look-ahead remains a conservative fallback.
-  const messageFamilies = messageMembershipMap(list, entrySeriesFamily);
+  const classifyFamily = options.separateCommentary === true ? entrySafeWorkFamily : entryWorkFamily;
+  const messageFamilies = messageMembershipMap(list, classifyFamily);
   while (index < list.length) {
     const entry = list[index];
     if (isHistoryResearchReplyEntry(entry)) {
@@ -578,29 +694,23 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       index += 1;
       continue;
     }
-    const familyKey = entrySeriesFamily(entry);
-    // A caption entry directly before a groupable run joins the run it
-    // captions (becomes the group headline).
-    let captionEntry = null;
+    const familyKey = classifyFamily(entry);
+    const firstCaption = options.separateCommentary === true
+      ? false : isWorkCaption(entry, list[index + 1], messageFamilies);
     let runFamily = familyKey;
-    if (familyKey === null && isCaptionForNext(entry, list[index + 1])) {
-      const nextFamily = entrySeriesFamily(list[index + 1]);
-      if (nextFamily !== null) {
-        captionEntry = entry;
-        runFamily = nextFamily;
-      }
+    if (entryHasText(entry) && !firstCaption) {
+      units.push({ kind: 'entry', entry });
+      index += 1;
+      continue;
     }
-    if (familyKey === null && !captionEntry && isThinkingOnlyRow(entry)) {
+    if (familyKey === null && firstCaption && entryActionFacts(entry).length === 0) runFamily = 'work';
+    if (familyKey === null && !firstCaption && isThinkingOnlyRow(entry)) {
       const messageId = typeof entry.messageId === 'string' ? entry.messageId : '';
       const structural = messageId ? messageFamilies.get(messageId) : null;
       if (structural?.size === 1) {
         runFamily = Array.from(structural)[0];
-      } else if (structural?.has('edit')) {
-        // Same dominance rule as a composite row: a response that both
-        // inspected and changed files belongs to the edit block.
-        runFamily = 'edit';
       } else if (!structural || structural.size === 0) {
-        runFamily = nextActionValueAfterPassengers(list, index, entrySeriesFamily);
+        runFamily = nextActionValueAfterPassengers(list, index, classifyFamily);
       }
     }
     if (runFamily === null) {
@@ -608,36 +718,25 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       index += 1;
       continue;
     }
-    // Extend the run: consecutive assistant rows of the same class key.
-    // A text-only row inside the run is allowed only as a caption of the
-    // row that follows it (same class); otherwise it ends the run.
-    //
-    // EDIT ABSORPTION (corpus: 3106 gaps between consecutive edits in 8
-    // production sessions): 38% of gaps are 1–3 noise calls — re-read the
-    // file, grep, run the test — i.e. the edit CYCLE itself, while 4+ is a
-    // real detour (13%). So an edit block swallows up to
-    // EDIT_GAP_MAX_NOISE noise rows BETWEEN two of its edits; the absorbed
-    // rows must be followed by another edit or they are returned to the
-    // stream (a noise TAIL after the last edit is not part of the block —
-    // prefix/suffix noise groups on its own terms). The reverse never
-    // happens: noise runs do not swallow single edits — an edit is always
-    // visible.
+    // Tools of any known family continue the same work block. Its first
+    // proven caption joins it; a second caption starts the next block. Work
+    // preceding the first caption is therefore retained with that caption.
     const members = [];
+    let hasCaption = false;
     let cursor = index;
     while (cursor < list.length) {
       const candidate = list[cursor];
-      const candidateFamily = entrySeriesFamily(candidate);
-      if (candidateFamily === runFamily) {
+      const candidateFamily = classifyFamily(candidate);
+      const candidateCaption = options.separateCommentary === true
+        ? false : isWorkCaption(candidate, list[cursor + 1], messageFamilies);
+      if (entryHasText(candidate)) {
+        if (!candidateCaption || hasCaption) break;
+        hasCaption = true;
         members.push(candidate);
         cursor += 1;
         continue;
       }
-      // Caption of the next same-class row keeps the run going.
-      if (
-        candidateFamily === null
-        && isCaptionForNext(candidate, list[cursor + 1])
-        && entrySeriesFamily(list[cursor + 1]) === runFamily
-      ) {
+      if (candidateFamily === runFamily) {
         members.push(candidate);
         cursor += 1;
         continue;
@@ -648,45 +747,10 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       if (candidateFamily === null && isThinkingOnlyRow(candidate)) {
         const structural = structuralPassengerMatch(candidate, messageFamilies, runFamily);
         const fallback = !structural.known
-          && nextActionValueAfterPassengers(list, cursor, entrySeriesFamily) === runFamily;
+          && nextActionValueAfterPassengers(list, cursor, classifyFamily) === runFamily;
         if (structural.matches || fallback) {
           members.push(candidate);
           cursor += 1;
-          continue;
-        }
-      }
-      // Edit block: look ahead — a short pocket of noise/caption rows that
-      // ends at another edit belongs to the block.
-      if (runFamily === 'edit') {
-        let probe = cursor;
-        let noiseSeen = 0;
-        while (probe < list.length) {
-          const pocketRow = list[probe];
-          const pocketFamily = entrySeriesFamily(pocketRow);
-          if (pocketFamily === 'edit') break;
-          if (pocketFamily === 'noise') {
-            noiseSeen += entryActionFacts(pocketRow).length;
-            if (noiseSeen > EDIT_GAP_MAX_NOISE) { probe = -1; break; }
-            probe += 1;
-            continue;
-          }
-          if (
-            pocketFamily === null
-            && isObject(pocketRow) && pocketRow.role === 'assistant'
-            && entryActionFacts(pocketRow).length === 0
-            && entryHasText(pocketRow)
-            && contentLength(pocketRow) <= HISTORY_CAPTION_MAX_CHARS
-            && !isStandaloneAnswer(pocketRow)
-          ) {
-            probe += 1;
-            continue;
-          }
-          probe = -1;
-          break;
-        }
-        if (probe > cursor && probe < list.length && entrySeriesFamily(list[probe]) === 'edit') {
-          for (let inner = cursor; inner < probe; inner += 1) members.push(list[inner]);
-          cursor = probe;
           continue;
         }
       }
@@ -695,21 +759,24 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     const callCount = members.reduce(
       (sum, member) => sum + entryActionFacts(member).length, 0,
     );
-    if (callCount < threshold || members.length === 0) {
-      // Below threshold: no group, and NO third text state. Text is either a
-      // group headline (inside a collapsed block) or an ordinary paragraph —
-      // a mini-caption glued onto a single card was a rejected in-between
-      // (wrong indents, wrong size, reads as belonging to nothing).
+    if ((callCount < threshold && !(hasCaption && callCount > 0)) || members.length === 0) {
+      // One real caption and one call form a real group; without a caption,
+      // retain the existing two-call threshold. Text without tools never
+      // creates an empty group and stays an ordinary paragraph.
       for (const member of members) units.push({ kind: 'entry', entry: member });
       index = Math.max(cursor, index + 1);
       continue;
     }
     const allMembers = members;
     const facts = allMembers.flatMap((member) => entryActionFacts(member));
-    const captions = historyGroupCaptionEntries(allMembers, captionEntry);
+    const captions = historyGroupCaptionEntries(allMembers);
     const detailEntry = captions.at(-1) || null;
     const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
       || allMembers[0]?.rewriteLayoutUuid || allMembers[0]?.uuid || String(index);
+    // Root identity stays fixed if a caption or another tool family turns a
+    // homogeneous direct series into a broad work block. Nested series retain
+    // their distinct `sub:` keys.
+    const key = 'grp:' + firstCallId;
     const aggregateKeys = new Set(facts.map((fact) => fact.aggregateKey).filter(Boolean));
     // A PURE homogeneous action run is already the user's second-level entity
     // and may live at the root without a redundant generic stack wrapper.
@@ -719,6 +786,8 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       && allMembers.every((member) => entryAggregateKey(member) !== null);
     if (pureHomogeneousRun) {
       const direct = makeInnerGroup(allMembers, facts, expandedKeys);
+      direct.key = key;
+      direct.expanded = expandedKeys.has(key);
       direct.captionEntry = detailEntry;
       direct.captionEntries = captions;
       units.push(direct);
@@ -741,7 +810,6 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       continue;
     }
 
-    const key = 'grp:' + firstCallId;
     const outerDocsKinds = new Set(facts.map((fact) => fact.docsKind || ''));
     const outerDocsKind = outerDocsKinds.size === 1
       ? Array.from(outerDocsKinds)[0]
@@ -773,7 +841,11 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       // members follow as their own indented rows under the rail.
       units.push({ ...groupUnit, expanded: true });
       const uniform = new Set(facts.map((fact) => fact.family)).size <= 1;
-      const children = buildHistoryInnerUnits(allMembers, { expandedKeys });
+      // The response-work chapter supplies the outer rail. Its tool group is
+      // the second level and opens directly to the original calls.
+      const children = options.flatTools === true
+        ? allMembers.map((entry) => ({ kind: 'entry', entry }))
+        : buildHistoryInnerUnits(allMembers, { expandedKeys });
       for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
         const child = children[childIndex];
         const parentGroup = {
@@ -818,12 +890,13 @@ const UNITS_CACHE_SIGNATURES_MAX = 4;
 
 function unitsCacheSignature(options = {}) {
   const enabled = options.enabled !== false;
-  if (!enabled) return 'off';
+  const mode = options.responseWork === true ? 'response:' : '';
+  if (!enabled && !mode) return 'off';
   const threshold = Math.max(2, Number(options.threshold) || DEFAULT_THRESHOLD);
   const keys = options.expandedKeys instanceof Set
     ? Array.from(options.expandedKeys)
     : (Array.isArray(options.expandedKeys) ? options.expandedKeys : []);
-  return threshold + ':' + (keys.length === 0 ? '' : keys.slice().sort().join(''));
+  return mode + (enabled ? threshold : 'off') + ':' + (keys.length === 0 ? '' : keys.slice().sort().join(''));
 }
 
 /** Cache lookup only — never builds. Null on miss. */
@@ -879,16 +952,18 @@ export function rememberHistoryDisplayUnitsCached(entries, options, units) {
 
 /**
  * A row a FUTURE append could pull into a group across it: groupable calls
- * (run may extend / dissolve into an edit block), reasoning-only rows (ride
+ * (a work block may extend), reasoning-only rows (ride
  * along), short caption-eligible text (may become the headline of a call
  * that has not arrived yet). Everything else — user rows, slash rows,
  * standalone replies, final answers and interactive questions — is a hard grouping boundary:
  * no chain the builder recognizes crosses it, in either direction.
  */
-function isGroupingConnectorRow(entry) {
+function isGroupingConnectorRow(entry, responseWork = false) {
   if (isHistoryResearchReplyEntry(entry)) return true;
   if (entrySeriesFamily(entry) !== null) return true;
   if (isThinkingOnlyRow(entry)) return true;
+  if (responseWork && isObject(entry) && entry.role === 'assistant'
+    && entryHasText(entry) && entry.textPhase !== 'final_answer' && !entry.responseTiming) return true;
   return isObject(entry)
     && entry.role === 'assistant'
     && entryHasText(entry)
@@ -916,7 +991,7 @@ function isGroupingConnectorRow(entry) {
  * `{ units, reusedUnits, rebuiltEntries }`.
  */
 export function buildHistoryDisplayUnitsAppended(prevEntries, prevUnits, nextEntries, options = {}, prevOptions = options) {
-  if (options.enabled === false) return null;
+  if (options.enabled === false && options.responseWork !== true) return null;
   if (!Array.isArray(prevEntries) || !Array.isArray(prevUnits) || !Array.isArray(nextEntries)) return null;
   if (prevEntries.length === 0 || prevUnits.length === 0) return null;
   // Reused units carry their expanded/collapsed shape — valid only when the
@@ -933,7 +1008,7 @@ export function buildHistoryDisplayUnitsAppended(prevEntries, prevUnits, nextEnt
   // unchanged prefix; everything at or before it cannot be regrouped by any
   // change at/after `commonPrefix`.
   let boundary = commonPrefix - 1;
-  while (boundary >= 0 && isGroupingConnectorRow(prevEntries[boundary])) boundary -= 1;
+  while (boundary >= 0 && isGroupingConnectorRow(prevEntries[boundary], options.responseWork === true)) boundary -= 1;
   if (boundary < 0) return null; // the whole prefix is one connector chain
   const restart = boundary + 1;
   // Nothing reusable is cheaper as a fast path than as a full build.
@@ -955,6 +1030,7 @@ export function buildHistoryDisplayUnitsAppended(prevEntries, prevUnits, nextEnt
           && (
             prevUnits[member].expandedGroup?.key === unit.key
             || prevUnits[member].parentGroup?.key === unit.key
+            || prevUnits[member].responseWork?.key === unit.key
             || (unit.level === 2 && prevUnits[member].expandedSubgroup?.key === unit.key)
           )
         ) {
@@ -963,7 +1039,7 @@ export function buildHistoryDisplayUnitsAppended(prevEntries, prevUnits, nextEnt
         }
         index = member - 1;
       }
-    } else if (unit.expandedGroup || unit.expandedSubgroup || unit.parentGroup) {
+    } else if (unit.expandedGroup || unit.expandedSubgroup || unit.parentGroup || unit.responseWork) {
       // A member without its header ahead of it — inconsistent input.
       return null;
     }
@@ -1041,6 +1117,12 @@ export function findHistoryHydrationStub(units, range, entryMargin, captionSelec
       // Research headers are counters only. Unlike tool-group captions, they
       // need no hidden body; expanded children hydrate as their own entry units.
       if (unit.familyKey === 'research') return null;
+      if (unit.familyKey === 'response-work') {
+        return unit.expanded !== true && unit.previewEntry?.rowStub === true
+          && unit.previewEntry?.previewTextComplete !== true
+          && !(typeof unit.previewEntry?.content === 'string' && unit.previewEntry.content.length > 0)
+          ? unit.previewEntry : null;
+      }
       // An explicit caption choice takes priority within the same visible
       // group; the ordinary member/body hydration policy stays unchanged.
       const choice = captionSelections?.get(unit.key);
@@ -1084,7 +1166,8 @@ export function findHistoryHydrationStub(units, range, entryMargin, captionSelec
   // Visible entry bodies and tool captions hydrate; counters-only SC headers do not.
   for (let index = start; index <= end; index += 1) {
     const found = anyStubOf(units[index]);
-    if (found) return { entry: found, index };
+    if (found) return { entry: found, index,
+      ...(units[index]?.familyKey === 'response-work' ? { caption: true } : {}) };
   }
   // Off-screen: walk outward until the walk has covered `margin` ENTRIES.
   let covered = 0;

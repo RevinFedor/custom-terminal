@@ -36,6 +36,7 @@ function createBrowserHost({ hostId, port, definitions, configurationDigest, ing
     state.ingressEpoch = ingress.storeEpoch; state.ingressBasis = p.ingressBasis(ingress);
     if (state.generation !== generation) state.lineage.push({ generation: state.generation, process: state.process });
     state.generation = generation; state.process = self; state.port = port; state.configurationDigest = configurationDigest;
+    state.wireCapabilities={profilePlanDigest:1,process:self,generation};
     journal.save(state);
   } catch (error) { journal.close(); throw error; }
   const tokenFile = path.join(dir, 'auth.json');

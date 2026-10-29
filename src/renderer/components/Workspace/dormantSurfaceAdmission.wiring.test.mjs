@@ -33,12 +33,13 @@ test('source completion is raw load/subscription proof, never visible loader sta
   assert.match(timeline, /phase: 'subscribe'/);
 });
 
-test('foreground bypass, unmount and bounded timeout cannot leak an admission lease', () => {
+test('foreground and owner cancellation preserve admission; a timeout only reports overdue work', () => {
   assert.match(surface, /dormantSurfaceAdmission\.promote\(admissionKey\)/);
   assert.match(surface, /wakeForeground\('external'\)/);
   assert.match(surface, /if \(focused\) wakeForeground\('focus'\)/);
   assert.match(surface, /dormantSurfaceAdmission\.cancel\(admissionKey, 'unmount'\)/);
-  assert.match(surface, /completeAdmission\('component-timeout'\)/);
+  assert.match(surface, /tracker\.lease\.reportOverdue\('component-timeout'\)/);
+  assert.doesNotMatch(surface, /completeAdmission\('component-timeout'\)/);
   assert.match(surface, /requirements\.size === 0[\s\S]{0,100}completeAdmission\('no-heavy-source'\)/);
   assert.match(surface, /tracker\.lease\.complete\(reason\)/);
   assert.match(surface, /reconcilePanePrewarmTracker\(tracker, currentConfig\)/,

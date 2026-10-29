@@ -285,7 +285,8 @@ export function RootGlobalArchive({onClose,presented=true}:{onClose:()=>void;pre
   },[namespace]);
   if(!presented)return null;
   return <div data-root-global-archive aria-label="История вкладок" style={{
-    position:'absolute',inset:0,zIndex:160,background:'#171717',overflow:'hidden',color:'#ccc',display:'flex',flexDirection:'column'}}>
+    position:'absolute',inset:0,zIndex:160,background:'#171717',overflow:'hidden',color:'#ccc',display:'flex',flexDirection:'column',
+    '--history-record-time-layer':161} as React.CSSProperties}>
     <div className="global-tab-archive" style={{height:'auto',flexShrink:0,padding:8,display:'flex',flexDirection:'row',gap:8,flexWrap:'wrap'}}>
       <button onClick={() => setService(!service)}>Индексы и очистка</button>
     </div>
@@ -536,7 +537,6 @@ export default function Workspace({
   const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
   const historyPinnedSetting = useUIStore((s) => s.historyPinned);
   const sideTerminalWidth = useUIStore((s) => s.sideTerminalWidth);
-  const timelinePinned = useUIStore((s) => s.timelinePinned);
   const setTabTerminalIsPrimary = useUIStore((s) => s.setTabTerminalIsPrimary);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
@@ -1266,29 +1266,31 @@ export default function Workspace({
     return () => window.removeEventListener('mousedown', onDown, true);
   }, [sidebarOpenForRender, activeProjectId]);
 
-  // Unpinned expanded Timeline is an overlay over the terminal. A click outside
-  // Timeline should return the workspace to the collapsed rail, but clicking
-  // the StatusBar pin must be allowed to convert the open overlay into pinned
-  // layout without the mousedown closing it first.
+  // Expanded Timeline overlays the center. Outside clicks return to the rail;
+  // its own menus and the independent History pin keep their existing actions.
   useEffect(() => {
     if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
-    if (!effectiveTab?.id || timelinePinned) return;
+    if (!effectiveTab?.id) return;
     const onDown = (e: MouseEvent) => {
       const tabId = effectiveTab.id;
       if (!useUIStore.getState().timelineTreeModeTabs[tabId]) return;
       const target = e.target as HTMLElement | null;
       if (!target) return;
+      // This tab's strip menu controls Timeline too. Keep it open through
+      // capture so the later click toggles the state the menu actually shows.
+      const stripMenu = target.closest('[data-split-strip-menu-button], [data-split-strip-menu]');
+      if (stripMenu?.getAttribute('data-split-strip-menu-owner') === tabId) return;
       if (target.closest([
         '[data-timeline]',
         '[data-timeline-context-menu]',
         '[data-cmd-hover-popover]',
-        '[data-history-timeline-pin-toggle]',
+        '[data-history-pin-toggle]',
       ].join(','))) return;
       setTimelineTreeMode(tabId, false);
     };
     window.addEventListener('mousedown', onDown, true);
     return () => window.removeEventListener('mousedown', onDown, true);
-  }, [workspaceView, currentView, effectiveTab?.id, timelinePinned, setTimelineTreeMode]);
+  }, [workspaceView, currentView, effectiveTab?.id, setTimelineTreeMode]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration).
   //
@@ -2590,7 +2592,6 @@ export default function Workspace({
                 presentationExternallyManaged
                 isOpen={true}
                 toolType={deferredTimelineOwner.toolType}
-                pinned={timelinePinned}
                 historySurfaceVisible={timelineRuntimeForRender.historySurfaceVisible}
               />
               <style>

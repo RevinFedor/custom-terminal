@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 const { Terminal } = require('@xterm/headless');
-const { inspectCodexNativeQuestions, createCodexNativeQuestionMirror } = require('./codex-native-question-mirror');
+const { inspectCodexNativeQuestions, createCodexNativeQuestionMirror, snapshotQuestionFailureFrame } = require('./codex-native-question-mirror');
 const { parseCodexVerifiedComposerFooter } = require('./codex-tui-readiness');
 const { extractCodexQueuedMessageProofs } = require('./terminal-history-preview');
 const { codexQueuedMessageMatchesAudit } = require('./codex-queued-message-proof');
@@ -130,6 +130,8 @@ function cellStyles(line) {
   const first = cells[0];
   return { hasDim: cells.some(c => !!c.isDim()),
     allTextDim: !!cells.length && cells.every(c => !!c.isDim()),
+    hasInverse: cells.some(c => !!c.isInverse()),
+    hasNonDefaultFg: cells.some(c => c.getFgColorMode() !== 0),
     hasNonDefaultBg: cells.some(c => c.getBgColorMode() !== 0),
     firstTextStyle: first ? `fg=${first.getFgColorMode()}:${first.getFgColor()},bg=${first.getBgColorMode()}:${first.getBgColor()}`
       + (first.isBold() ? ',bold' : '') + (first.isDim() ? ',dim' : '') : 'none' };
@@ -171,7 +173,7 @@ for (const form of Object.keys(formats)) test(`${form}: actual headless mixed-st
   assert.equal(inspectCodexNativeQuestions(f).kind, 'collapsed');
 });
 
-function mirrorHarness(form) {
+function mirrorHarness(form, {captureFailure} = {}) {
   let f = frame(expanded(form));
   let owner = { key: 'terminal:run:mirror:SID', sessionId: 'SID', lifecycleGeneration: 'L1' };
   let abortReason = null;
@@ -185,7 +187,7 @@ function mirrorHarness(form) {
     subscribeFrames: (_tab, callback) => { callbacks.add(callback); return () => callbacks.delete(callback); },
     withWriter: (_tab, work) => work({ abortReason: () => abortReason,
       write(bytes) { writes.push(bytes); h.onWrite?.(bytes); } }),
-    publish: (_tab, state) => published.push(state), log() {} });
+    publish: (_tab, state) => published.push(state), log() {}, captureFailure });
   return h;
 }
 for (const form of Object.keys(formats)) {
@@ -296,4 +298,163 @@ test('native model/effort/Fast footer and ordinary queued-message proof remain p
   assert.equal(proofs[0].text, 'Please continue.');
   assert.deepEqual(codexQueuedMessageMatchesAudit({ expectedText: 'Please continue.' }, proofs[0].text, proofs[0]),
     { reason: 'codex_tui_queue_exact' });
+});
+
+function accentOnlyFrame({free=false} = {}) {
+  const f=frame(expanded('mac',{progress:'  1 of 2',free}));
+  const title=f.lines.find(line=>line.text.trim()==='Second');
+  Object.assign(title,{firstTextStyle:'fg=2:7121919,bg=2:3355443',hasNonDefaultFg:true,
+    hasNonDefaultBg:true,hasDim:false,allTextDim:false});
+  const selected=f.lines.find(line=>/^\s*[›❯>]\s*1\./u.test(line.text));
+  if(selected)Object.assign(selected,{firstTextStyle:'fg=2:0,bg=2:7121919,bold',
+    hasNonDefaultBg:true,hasNonDefaultFg:true,hasDim:false,allTextDim:false});
+  if(free)f.cursorY=f.lines.findIndex(line=>line.text.includes('Type your answer'));
+  return f;
+}
+
+test('current native section accepts an accent-only title above its painted option group',()=>{
+  const r=inspectCodexNativeQuestions(accentOnlyFrame());
+  assert.equal(r.kind,'expanded');assert.equal(r.title,'Second');assert.equal(r.titleStyle,'accent-colour');
+  assert.equal(r.count,2);assert.equal(r.current,0);assert.equal(r.optionIndex,0);
+  assert.equal(r.choices.length,2);
+});
+test('accent-only free title still requires its real editor cursor and keeps the dim placeholder empty',()=>{
+  const f=accentOnlyFrame({free:true});
+  const r=inspectCodexNativeQuestions(f);
+  assert.equal(r.kind,'expanded');assert.equal(r.title,'Second');assert.equal(r.draft,'');
+  f.cursorY=0;assert.equal(inspectCodexNativeQuestions(f).kind,'unknown');
+});
+test('accent-only title supports a non-bold selected Other but not a common unselected menu background',()=>{
+  const f=accentOnlyFrame();
+  const first=f.lines.find(line=>line.text.includes('› 1.'));
+  first.text='    1. First';first.firstTextStyle='fg=0:-1,bg=2:3355443';first.hasNonDefaultBg=true;
+  const other=f.lines.find(line=>line.text.includes('2. Other'));
+  other.text='  > 2. Собственный ответ';other.firstTextStyle='fg=2:0,bg=2:7121919';
+  other.hasNonDefaultBg=true;other.hasNonDefaultFg=true;other.hasDim=false;other.allTextDim=false;
+  const r=inspectCodexNativeQuestions(f);
+  assert.equal(r.kind,'expanded');assert.equal(r.otherSelected,true);assert.equal(r.draft,'Собственный ответ');
+  other.firstTextStyle='fg=2:0,bg=2:3355443';
+  assert.equal(inspectCodexNativeQuestions(f).kind,'unknown','one common painted surface is not selection proof');
+});
+test('accent-only detection rejects missing section, unpainted selection and intervening prose',()=>{
+  for(const change of [
+    f=>{f.lines.find(line=>line.text.includes('1 of 2')).text='';},
+    f=>{const row=f.lines.find(line=>line.text.includes('› 1.'));row.hasNonDefaultBg=false;row.hasInverse=false;},
+    f=>{const title=f.lines.findIndex(line=>line.text.trim()==='Second');f.lines[title+1].text='not part of the title';},
+    f=>{const title=f.lines.find(line=>line.text.trim()==='Second');title.firstTextStyle+=',dim';},
+  ]) {
+    const f=accentOnlyFrame();change(f);
+    assert.equal(inspectCodexNativeQuestions(f).kind,'unknown');
+  }
+});
+test('actual headless colour-only wrapped title passes without promoting the bold selected choice',async t=>{
+  const terminal=new Terminal({cols:88,rows:18,allowProposedApi:true});t.after(()=>terminal.dispose());
+  const parts=['Working','• Queued follow-up inputs','','  1 of 2',
+    '\x1b[38;2;108;159;255;48;2;51;51;51m  Проверить правило без жирного заголовка\x1b[0m',
+    '\x1b[38;2;108;159;255;48;2;51;51;51m  и сохранить полный текст вопроса?\x1b[0m','',
+    '\x1b[1;38;2;0;0;0;48;2;108;159;255m  > 1. Да\x1b[0m','    2. Other','',
+    '\x1b[2m  enter submit   ^] skip   ⇧→ main prompt   ⇧← next question\x1b[0m'];
+  await new Promise(resolve=>terminal.write(parts.join('\r\n'),resolve));
+  const b=terminal.buffer.active;
+  const f={success:true,source:'headless-main',authoritativeFrameCommitted:true,
+    baseY:b.baseY,cursorY:b.cursorY,writeSeq:3281,flushedSeq:3281,
+    lines:parts.map((_part,row)=>({row,text:b.getLine(row).translateToString(true),
+      wrapped:b.getLine(row).isWrapped,...cellStyles(b.getLine(row))}))};
+  const r=inspectCodexNativeQuestions(f);
+  assert.equal(r.kind,'expanded');assert.equal(r.titleStyle,'accent-colour');
+  assert.equal(r.title,'Проверить правило без жирного заголовка и сохранить полный текст вопроса?');
+  assert.deepEqual(r.choices.map(item=>item.label),['Да','Other']);
+});
+
+test('failure snapshot detaches styled lines and explicitly limits rows/text/styles',()=>{
+  const f=frame('Second');
+  f.lines=Array.from({length:160},(_,row)=>({row,text:'x'.repeat(5000),styles:Array(9).fill('s'.repeat(400)),
+    firstTextStyle:'fg=2:7121919,bg=2:3355443',hasNonDefaultFg:true,hasNonDefaultBg:true}));
+  const saved=snapshotQuestionFailureFrame(f), before=JSON.stringify(saved);
+  assert.equal(saved.lines.length,128);assert.equal(saved.coverage.omittedRows,32);
+  assert.ok(saved.coverage.truncatedValues>0);assert.equal(saved.coverage.styleListsTruncated,128);
+  const strings=saved.lines.flatMap(row=>[row.text,row.firstTextStyle,...row.styles]);
+  assert.ok(strings.reduce((n,s)=>n+s.length,0)<=32768);
+  f.lines[159].text='changed';f.lines[159].styles[0]='changed';
+  assert.equal(JSON.stringify(saved),before);
+});
+
+test('unrecognized post-open frame is captured once before rejection without awaiting forensic persistence',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const captured=[];
+  const h=mirrorHarness('mac',{captureFailure:(_tab,detail)=>{captured.push(detail);return new Promise(()=>{});}});
+  h.frame=frame(collapsed('mac',2));const q=h.mirror.get('T');
+  h.onWrite=()=>{
+    const broken=accentOnlyFrame();broken.lines.find(line=>line.text.trim()==='Second').firstTextStyle+=',dim';
+    broken.writeSeq=broken.flushedSeq=3281;h.emit(broken);
+  };
+  const pending=h.mirror.control('T',{action:'open',targetId:q.targetId,requestId:'failure-open'});
+  t.mock.timers.tick(4000);
+  const result=await pending;
+  assert.equal(result.error,'semantic-frame-timeout');assert.equal(result.inputWritten,true);
+  assert.equal(result.submitted,false);assert.equal(result.deliveryUnknown,false);
+  assert.equal(captured.length,1);assert.equal(captured[0].requestId,'failure-open');
+  assert.equal(captured[0].observedFrame.writeSeq,3281);
+  assert.equal(captured[0].wait.inspection.reason,'native-question-title-unproven');
+  assert.equal(captured[0].expectedOwner.key,'terminal:run:mirror:SID');
+  assert.deepEqual(h.writes,['\x1b[1;2D']);assert.equal(h.callbacks.size,0);
+  const saved=JSON.stringify(captured[0].observedFrame);h.frame.lines[0].text='later frame';
+  assert.equal(JSON.stringify(captured[0].observedFrame),saved);
+});
+test('diagnostic throw cannot change original no-input refusal or trigger another question key',async()=>{
+  let captures=0;
+  const h=mirrorHarness('mac',{captureFailure:()=>{captures++;throw new Error('diagnostic unavailable');}});
+  h.frame=frame(collapsed('mac'));const q=h.mirror.get('T');
+  // Keep the public target but make the current native screen unrecognised.
+  h.frame=frame('not a question');
+  const result=await h.mirror.control('T',{action:'open',targetId:q.targetId,requestId:'no-input'});
+  assert.equal(result.error,'question_not_actionable');assert.equal(result.inputWritten,false);
+  assert.equal(captures,1);assert.deepEqual(h.writes,[]);
+});
+test('replacement question owner never receives the old operation forensic pin',async()=>{
+  let captures=0;const h=mirrorHarness('mac',{captureFailure:()=>{captures++;}});
+  h.frame=frame(collapsed('mac'));const q=h.mirror.get('T');
+  h.onWrite=()=>{h.owner={key:'replacement',sessionId:'SID2',lifecycleGeneration:'L2'};
+    h.emit(frame(expanded('mac'),{seq:11}));};
+  const result=await h.mirror.control('T',{action:'open',targetId:q.targetId,requestId:'owner-change'});
+  assert.equal(result.error,'question_owner_changed');assert.equal(captures,0);
+  assert.deepEqual(h.writes,['\x1b[1;2D']);
+});
+test('actual Main question diagnostic uses shared incident reporter without a fabricated Send identity',()=>{
+  const begin=mainSource.indexOf('  captureFailure(tabId, detail) {',mainSource.indexOf('const codexNativeQuestionMirror ='));
+  const end=mainSource.indexOf('\n  },',begin);
+  assert.ok(begin>0 && end>begin);
+  const calls=[];
+  const capture=vm.runInNewContext('({'+mainSource.slice(begin,end+5)+'}).captureFailure',
+    {reportTerminalIncident:(key,payload)=>{calls.push({key,payload});return Promise.resolve();}});
+  capture('T',{requestId:'R',reason:'semantic-frame-timeout',action:'open',inputWritten:true,submitted:false});
+  assert.equal(calls.length,1);assert.equal(calls[0].key,'native-question:T:R:semantic-frame-timeout');
+  const payload=calls[0].payload;
+  assert.equal(payload.silent,true);assert.equal(payload.incidentReason,'native-question-control-unconfirmed');
+  assert.equal(payload.context.requestId,'R');assert.equal(payload.context.submitted,false);
+  assert.equal(payload.historyEntry,undefined);assert.equal(payload.sendIdentity,undefined);
+});
+test('actual Main question writer correlates existing input IDs and distinguishes write-attempt from return',async()=>{
+  const factory=mainSource.indexOf('const codexNativeQuestionMirror =');
+  const begin=mainSource.indexOf('  withWriter(tabId, work) {',factory);
+  const end=mainSource.indexOf('\n  publish(tabId, state)',begin);
+  assert.ok(begin>0&&end>begin);
+  const writes=[];let inputId=40,shouldThrow=false;
+  const terminal={write(bytes){if(shouldThrow)throw new Error('synthetic write throw');writes.push(bytes);}};
+  const withWriter=vm.runInNewContext('({'+mainSource.slice(begin,end)+'}).withWriter',{
+    terminals:new Map([['T',terminal]]),withPtyWriteLock:(_terminal,work)=>work(),
+    flushHeadlessTerminalMirror:async()=>{},captureAgentInputIdentity:()=>({}),
+    validateAgentInputIdentity:()=>true,bumpTerminalInputRevision:()=>{},
+    recordComposerForensicPtyInput:()=>({id:++inputId}),
+  });
+  await withWriter('T',async writer=>{
+    writer.write('native-control');shouldThrow=true;
+    assert.throws(()=>writer.write('second-native-control'),/synthetic write throw/);
+    const observed=writer.readDiagnostic();
+    assert.equal(observed.writeAttempts,2);assert.equal(observed.writeReturns,1);
+    assert.equal(observed.firstInputId,41);assert.equal(observed.lastInputId,42);
+    assert.match(observed.coverage,/not fd callback or CLI acceptance/);
+    observed.writeAttempts=99;assert.equal(writer.readDiagnostic().writeAttempts,2);
+  });
+  assert.deepEqual(writes,['native-control']);
 });

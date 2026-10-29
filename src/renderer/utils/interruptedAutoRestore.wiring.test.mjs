@@ -96,7 +96,9 @@ test('an admitted empty Claude restart releases the old UUID guard without prema
 
 test('current launch failure stays visible without resurrecting the removed interrupted overlay', () => {
   const lifecycle = fs.readFileSync(path.join(renderer, 'components', 'Workspace', 'useAgentLifecycle.ts'), 'utf8');
-  const summary = lifecycle.slice(lifecycle.lastIndexOf('return useMemo<AgentLifecycleSummary | null>'));
+  const summaryStart = lifecycle.lastIndexOf('const lifecycle = useMemo<AgentLifecycleSummary | null>');
+  assert.ok(summaryStart >= 0, 'current lifecycle summary owner remains present');
+  const summary = lifecycle.slice(summaryStart);
   assert.match(summary, /if \(sessionStarting && sessionStarting\.tabId === tabId\)/);
   assert.match(summary, /getSessionStartingPresentation\(sessionStarting\)/);
   assert.match(summary, /presentation\.isError \? 'error'/);

@@ -29,11 +29,11 @@
 export const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 
 /**
- * Expanded Timeline covers the center only while UNPINNED — pinned, it is a
- * column and the center box is already narrower, so insetting would double-count.
+ * Expanded Timeline always overlays the center. Floating controls dodge it;
+ * the center surface itself keeps its width.
  */
-export function resolveTimelineInset({ treeMode, pinned, width }) {
-  if (!treeMode || pinned) return 0;
+export function resolveTimelineInset({ treeMode, width }) {
+  if (!treeMode) return 0;
   return Math.max(0, (Number(width) || 0) - TIMELINE_COLLAPSED_SLOT_WIDTH);
 }
 

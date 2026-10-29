@@ -424,9 +424,15 @@ export async function prepareAgentRuntimeForSend({
     expectedTarget = Object.freeze({ ...expectedTarget, launchId: expectedTarget.launchId || window.launchId });
     deadline = window.deadlineAt;
     console.log('[AgentScenario:send] startup-deadline tab=' + String(tabId).slice(-12)
-      + ' launch=' + window.launchId + ' deadlineAt=' + deadline);
+      + ' launch=' + window.launchId + ' lifecycle=' + window.lifecycleGeneration + ' deadlineAt=' + deadline
+      + ' operation=' + (sendOperationKey || '-') + ' attempt=' + (sendAttemptId || '-'));
   };
   const readinessTimeout = () => {
+    const readinessDeadline = { version: 1, stage: 'startup-readiness', effectiveDeadlineAt: deadline,
+      limitingDeadline: startupWait ? 'startup' : 'runtime-ready-wait',
+      startupDeadlineAt: startupWait?.deadlineAt ?? null, launchId: startupWait?.launchId || null,
+      lifecycleGeneration: startupWait?.lifecycleGeneration || null,
+      operationKey: sendOperationKey || null, attemptId: sendAttemptId || null };
     console.warn('[AgentScenario:send] readiness-expired tab=' + String(tabId).slice(-12)
       + ' launch=' + (startupWait?.launchId || '-') + ' deadlineAt=' + deadline
       + ' status=' + (presence?.status || 'unknown')
@@ -435,8 +441,9 @@ export async function prepareAgentRuntimeForSend({
       { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false, enterWritten: false,
         readinessStatus: presence?.status || 'unknown',
         readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
+        readinessDeadline,
         sendReceipt: { success: false, accepted: false, submitted: false, status: 'not-submitted',
-          pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout' } });
+          pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout', readinessDeadline } });
   };
   for (let pass = 0; ; pass += 1) {
     assertSendNotCancelled();
@@ -559,6 +566,8 @@ export async function proveAgentComposerForSend({
   returnDraftOnConflict,
   initialExactEmptyEvidence,
   codexStartupFrameWaitId: readyStartupFrameWaitId,
+  prompt,
+  presentationSnapshot,
   handoffId, sendAttemptId,
   assertSendNotCancelled,
 }: {
@@ -571,6 +580,8 @@ export async function proveAgentComposerForSend({
   returnDraftOnConflict?: boolean;
   initialExactEmptyEvidence?: Record<string, unknown> | null;
   codexStartupFrameWaitId?: string | null;
+  prompt?: string;
+  presentationSnapshot?: { imagePaths?: readonly unknown[]; promptChips?: readonly unknown[] };
   handoffId?: string;
   sendAttemptId?: string | null;
   assertSendNotCancelled: () => void;
@@ -674,6 +685,23 @@ export async function proveAgentComposerForSend({
         'agent_send_cancelled', 'agent_send_preparation_expired',
         'agent_send_preparation_superseded', 'agent_send_preparation_storage_unavailable',
       ].includes(visual.preparationFailure?.code) ? visual.preparationFailure.code : null;
+      // A short read transaction is not the lifetime of standalone Compact.
+      // Only a still-owned, typed pending-frame expiry may reach its existing
+      // Main preparation. This is NOT empty-composer evidence: Main rechecks
+      // the current frame before any write and must reject a real draft.
+      const pendingMainCompact = toolType === 'codex' && prompt?.trim() === '/compact'
+        && !presentationSnapshot?.imagePaths?.length && !presentationSnapshot?.promptChips?.length
+        && !visual.preparationFailure && visual.hasDraft === null
+        && visual.observation?.status === 'expired' && visual.proofReason === 'deadline'
+        && visual.source === 'headless-main:codex:observation-expired'
+        && ['synchronized-output-open', 'frame-not-flushed', 'post-resize-frame-not-observed']
+          .includes(visual.frameBlocker);
+      if (pendingMainCompact) {
+        console.log('[AgentScenario:send] pending Compact frame delegated to Main tab='
+          + String(tabId).slice(-12) + ' handoff=' + (handoffId || '-')
+          + ' blocker=' + visual.frameBlocker + ' emptyProof=false');
+        return { complete: false, codexStartupFrameWaitId, exactEmptyEvidence };
+      }
       return {
         complete: true,
         result: {

@@ -5,6 +5,21 @@ const { resolveAiToolOwner } = require('./ai-tool-owner');
 const SHUTDOWN_INTERRUPTED_SESSIONS_KEY = 'shutdown_interrupted_ai_sessions_v1';
 const SNAPSHOT_VERSION = 1;
 const SUPPORTED_PROVIDERS = new Set(['claude', 'codex']);
+const INSTALL_BINDING_PROTOCOL = 'voice-install-shutdown-binding-v1';
+let installBindingReader = null;
+function registerInstallShutdownBindings(reader) {
+  if (typeof reader !== 'function' || installBindingReader && installBindingReader !== reader) {
+    throw Error('install_shutdown_binding_owner_conflict');
+  }
+  installBindingReader = reader;
+  return () => { if (installBindingReader === reader) installBindingReader = null; };
+}
+function exactInstallBindings(value) {
+  if (!Array.isArray(value) || value.some(row => typeof row?.operationId !== 'string'
+    || !/^[a-f0-9]{64}$/.test(row.bindingDigest || '') || !/^[a-f0-9]{64}$/.test(row.evidenceDigest || ''))
+    || new Set(value.map(row => row.operationId)).size !== value.length) throw Error('install_shutdown_binding_invalid');
+  return value.map(row => ({ operationId: row.operationId, bindingDigest: row.bindingDigest, evidenceDigest: row.evidenceDigest }));
+}
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -14,7 +29,11 @@ function createShutdownInterruptedSnapshot(entries, {
   capturedAt = Date.now(),
   shutdownPid = process.pid,
   reason = 'shutdown',
+  installBindings = null,
 } = {}) {
+  // Main still owns the process census and durable snapshot write. The reader
+  // only adds identifiers of a cut already committed by the common executor.
+  const bindings = exactInstallBindings(installBindings || installBindingReader?.() || []);
   const targets = [];
   const unresolved = [];
   const seen = new Set();
@@ -49,6 +68,7 @@ function createShutdownInterruptedSnapshot(entries, {
     reason: cleanString(reason) || 'shutdown',
     targets,
     unresolved,
+    ...(bindings.length ? { installBindings: bindings } : {}),
   };
 }
 
@@ -145,6 +165,7 @@ function resolveStartupInterruptedSnapshot({
       resolvedAt: Number(resolvedAt) || Date.now(),
       targets,
       unresolved,
+      ...(exactSnapshot.installBindings ? { installBindings: exactInstallBindings(exactSnapshot.installBindings) } : {}),
     };
   }
 
@@ -186,6 +207,8 @@ function resolveStartupInterruptedSnapshot({
 module.exports = {
   SHUTDOWN_INTERRUPTED_SESSIONS_KEY,
   SNAPSHOT_VERSION,
+  INSTALL_BINDING_PROTOCOL,
+  registerInstallShutdownBindings,
   createShutdownInterruptedSnapshot,
   resolveStartupInterruptedSnapshot,
 };

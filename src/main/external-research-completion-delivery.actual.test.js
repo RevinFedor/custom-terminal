@@ -30,8 +30,11 @@ async function fixture(t,options={}){
  const effects={inputs:[],reads:0,starts:0,delays:[],wakes:0,sends:0,human:[],errors:[]};
  const hooks={failures:options.failures||0,body:options.body||'FULL exact expert result',source:{...sourceTarget,status:'busy',...options.source},
  ready:options.ready!==false,audit:options.audit!==false,beforeContent:null,beforeInfo:null,beforeEnqueue:null,afterEnqueue:null,beforeInput:null,failFreeze:0};
- const snapshot=()=>({id:'noted_R',status:'done',provider:'chatgpt',result:{text:hooks.body},conversationId:'same-CID',conversationUrl:'https://chatgpt.com/c/same-CID'});
+ const snapshot=()=>({id:'noted_R',status:hooks.status||'done',provider:'chatgpt',result:{text:hooks.body,...(options.externalResult||{})},
+ error:hooks.status==='error'?'provider_conversation_load_error':undefined,
+ conversationId:'same-CID',conversationUrl:'https://chatgpt.com/c/same-CID'});
  const server=http.createServer((req,res)=>{if(req.method!=='GET'||!req.url.startsWith('/research-status?')){effects.starts++;res.writeHead(409);return res.end('{}');}
+ if(hooks.httpReject){effects.reads++;res.writeHead(422,{'content-type':'application/json'});return res.end(JSON.stringify({code:'owned_request_rejected',error:'owned request rejected'}));}
  effects.reads++;if(hooks.failures-->0){res.writeHead(503,{'content-type':'application/json'});return res.end(JSON.stringify({code:'owned_final_read_unavailable',error:'owned read unavailable'}));}
  res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(snapshot()));});
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -39,7 +42,7 @@ async function fixture(t,options={}){
  const context=vm.createContext({...runApi,...contentApi,crypto,path,srcMainDir:__dirname,require:createRequire(webFile),console:{log(){},warn(){}},
  promptAuditFingerprint,agentPromptAuditMatchesHash,isResponseObservation,isScResearchTerminalStatus,
  isAgentSendProviderQueueAccepted:registry.isAgentSendProviderQueueAccepted,AGENT_SEND_RECEIPT_STATES:registry.RECEIPT_STATES,
- resolvedPort:7878,tabWorkContext:null,setTimeout,clearTimeout,orchestrationStartupRecovery:null,orchestrationNotificationInflight:new Set(),agentSendReceiptStartupReady:Promise.resolve({ready:true}),
+ resolvedPort:7878,tabWorkContext:options.contextPrefix ? {prepare:async(_tab,_handoff,prompt)=>({prompt:options.contextPrefix+prompt})} : null,setTimeout,clearTimeout,orchestrationStartupRecovery:null,orchestrationNotificationInflight:new Set(),agentSendReceiptStartupReady:Promise.resolve({ready:true}),
  getOrchestrationRunStore:()=>runs,getCompletionContentStore:()=>contents,getScExternalResearchClient:()=>client,getExternalResearchCoordinator:()=>coordinator,
  getExternalCompletionDelivery:()=>service,resolveOrchestrationSourceNotificationSendOptions,
  readScenarioDestination:async()=>({...hooks.source}),
@@ -100,6 +103,49 @@ async function fixture(t,options={}){
  return{effects,hooks,context,file,sql,root,get runs(){return runs;},get receipts(){return receipts;},get contents(){return contents;},get queue(){return queue;},get service(){return service;},get coordinator(){return coordinator;},get op(){return op;},
  run:()=>bounded(coordinator.watch('R')),reopen:async edit=>{await close();if(edit)edit(file);await open();},promote:()=>promote(receipts.get('history:source:orchestration-complete:R'))};
 }
+test('actual saved partial completion states file count first and preserves literal imagePath examples as text through Codex preparation',async t=>{
+ const body='FULL text: `[imagePath: /synthetic/example.png]` and original ending.\n';
+ const externalResult={artifact_status:'partial',artifacts:Array.from({length:13},()=>({})),artifact_errors:Array.from({length:8},()=>({code:'output_file_download_http'}))};
+ const h=await fixture(t,{body,externalResult,operationalPrompts:false});await h.service.deliver('R');
+ const request=h.effects.inputs.find(x=>x.completionDeliveryRef);assert(request);
+ assert.equal(request.prompt.split('\n')[1],'Ответ ChatGPT получен. Не скачаны 8 из 21 файла.');
+ assert(request.prompt.includes(body));const delivered=await h.runs.getInternal('R');assert.equal(delivered.externalResearchDelivery.phase,'delivered');
+ assert.equal(Object.values(delivered.externalResearchOperational?.notices||{}).filter(n=>n.origin==='noted-delivery').length,0);
+ const bound=require('./structured-authoring').bindStructuredAuthoringPresentation(request.presentationSnapshot,request.prompt,request.prompt);
+ let staged=0;const imagePlan=require('./codex-image-transport').buildCodexImagePastePlan(request.prompt,()=>{staged++;return{success:false};},{authoringTransport:bound.authoringTransport});
+ assert.equal(imagePlan.text,request.prompt);assert.equal(imagePlan.replaced,0);assert.equal(staged,0);
+ assert(!imagePlan.text.includes('[imageError:'));
+});
+test('completion keeps genuine pre-existing prefix image handling while leaving author answer markers untouched',async t=>{
+ const body='Answer example [imagePath: /synthetic/answer.png] is literal.';
+ const h=await fixture(t,{body,contextPrefix:'[imagePath: /synthetic/real-context.png]\n',operationalPrompts:false});await h.service.deliver('R');
+ const request=h.effects.inputs.find(x=>x.completionDeliveryRef),snapshot=request.presentationSnapshot;
+ const bound=require('./structured-authoring').bindStructuredAuthoringPresentation(snapshot,request.prompt,request.prompt);
+ const staged=[];const plan=require('./codex-image-transport').buildCodexImagePastePlan(request.prompt,source=>{staged.push(source);return{success:true,path:source,inputPath:'/tmp/owned-context.png'};},{authoringTransport:bound.authoringTransport});
+ assert.deepEqual(staged,['/synthetic/real-context.png']);assert.equal(plan.replaced,1);
+ assert(plan.text.includes('[imagePath: /synthetic/answer.png]'));assert(plan.text.startsWith('/tmp/owned-context.png\n'));
+});
+test('new terminal error uses actual modern FIFO/receipt delivery and survives restart without another source input',async t=>{
+ const h=await fixture(t,{terminal:false,operationalPrompts:false});h.hooks.status='error';
+ await h.run();
+ const r=await h.runs.getInternal('R');
+ assert.equal(r.status,'failed');assert.equal(r.externalResearchDelivery.legacy,undefined);
+ assert.equal(r.externalResearchDelivery.phase,'delivered',JSON.stringify(h.effects.errors));
+ assert.equal(h.effects.inputs.length,1);assert.match(h.effects.inputs[0].prompt,/external-research-recovery/);
+ assert.match(h.effects.inputs[0].prompt,/provider_conversation_load_error/);
+ const frozen=r.externalResearchDelivery.requestHash;
+ await h.reopen();await h.service.deliver('R');
+ assert.equal(h.effects.inputs.length,1);assert.equal(h.effects.starts,0);
+ assert.equal((await h.runs.getInternal('R')).externalResearchDelivery.requestHash,frozen);
+});
+test('local channel rejection also returns through modern delivery without fabricating a provider no-Send proof',async t=>{
+ const h=await fixture(t,{terminal:false,operationalPrompts:false});h.hooks.httpReject=true;
+ await h.run();const r=await h.runs.getInternal('R');
+ assert.equal(r.status,'failed');assert.equal(r.externalResearchLocalOutcome.state,'failed');
+ assert.equal(r.externalResearchDelivery.phase,'delivered',JSON.stringify(h.effects.errors));
+ assert.equal(h.effects.inputs.length,1);assert.match(h.effects.inputs[0].prompt,/owned request rejected/);
+ assert.match(h.effects.inputs[0].prompt,/"noSend":null/);assert.equal(h.effects.starts,0);
+});
 for(const toolType of ['codex','claude'])test(`provisional ${toolType} source keeps the launch pin and receives its full final after first SID materialization`,async t=>{
  const pin={toolType,terminalInstanceId:'terminal-A',launchId:'launch-A'};
  const h=await fixture(t,{sourceTarget:pin,materializedSessionId:'materialized-S',operationalPrompts:false});

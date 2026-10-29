@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 
 export const HISTORY_VIRTUOSO_VERSION = '4.18.7';
 export const HISTORY_VIRTUOSO_UPSTREAM_SHA256 = '6c6d738438d62d4346df8b0c301f6447abbc2cae507e6d40524837e44577393a';
-export const HISTORY_VIRTUOSO_PATCH_MARKER = '/* noted:history-virtuoso-measure-before-paint:v1 */';
+export const HISTORY_VIRTUOSO_PATCH_MARKER = '/* noted:history-virtuoso-measure-before-paint:v4 */';
 
 const pluginName = 'history-virtuoso-measurement';
 const modulePath = /(^|[\\/])react-virtuoso[\\/]dist[\\/]index\.mjs$/;
@@ -23,7 +23,7 @@ const listCall = `Mn(
   )`;
 
 const replacements = [
-  ['Mn signature', hookSignature, 'function Mn(t, e, n, o, r, s, i, l, c, opt, renderState) {'],
+  ['Mn signature', hookSignature, 'function Mn(t, e, n, o, r, s, i, l, c, opt, renderState, commitToken) {'],
   ['Mn measurement return', hookReturn, `  ${HISTORY_VIRTUOSO_PATCH_MARKER}
   const measured = De(d, n, c);
   E.useLayoutEffect(() => {
@@ -32,13 +32,58 @@ const replacements = [
     const list = measured.ref.current;
     if (n && list && list.offsetParent !== null)
       d(list);
-  }, [n, d, opt, renderState]);
+  }, [n, d, opt, renderState, commitToken]);
   return measured;
 }`],
   ['Hn list measurement call', listCall, listCall.replace(
     'A("skipAnimationFrameInResizeObserver")',
-    'A("skipAnimationFrameInResizeObserver"),\n    m?.historyMeasureBeforePaint,\n    n',
+    'A("skipAnimationFrameInResizeObserver"),\n    m?.historyMeasureBeforePaint,\n    n,\n    m?.historyOnPrimaryWindowCommit',
   )],
+  ['Hn current list state', 'const n = A("listState"), o = Ct("sizeRanges")',
+    'const n = A("listState"), latestListState = E.useRef(n), o = Ct("sizeRanges")'],
+  ['Hn list-state observation', '  on("deviation", (F) => {', `  latestListState.current = n;
+  on("listState", (value) => { latestListState.current = value; });
+  on("deviation", (F) => {`],
+  ['Hn admission before synchronous key', '      children: (e ? n.topItems : n.items).map((F) => {\n        const mt = F.originalIndex, q = C(mt + n.firstItemIndex, F.data, m);', `      children: (() => {
+        const render = () => {
+          primaryAdmission = typeof m?.historyPrimaryItemAdmission === "function"
+            ? (e ? n.topItems : n.items).map((item) => item.index === item.originalIndex + n.firstItemIndex
+              && m.historyPrimaryItemAdmission(item.index) === true) : null;
+          return (e ? n.topItems : n.items).map((F, primaryOffset) => {
+        if (primaryAdmission && primaryAdmission[primaryOffset] !== true) {
+          if (typeof m?.historyPrimaryPendingItem !== "function")
+            throw new Error("HISTORY_PRIMARY_PENDING_RENDERER_REQUIRED");
+          return m.historyPrimaryPendingItem(F.index, F.size);
+        }
+        const mt = F.originalIndex, q = C(mt + n.firstItemIndex, F.data, m);`],
+  ['Hn row transaction end', '\n      })\n    }\n  );\n}), hr =', `
+      });
+        };
+        return typeof m?.historyPrimaryRenderTransaction === "function"
+          ? m.historyPrimaryRenderTransaction(render) : render();
+      })()
+    }
+  );
+}), hr =`],
+  ['Hn committed primary range', '  return !e && n.totalCount === 0 && H !== null && H !== void 0 ?', `  let primaryAdmission = null;
+  E.useLayoutEffect(() => {
+    if (e || typeof m?.historyOnPrimaryWindowCommit !== "function") return;
+    const items = n.items;
+    const latest = latestListState.current;
+    const same = latest && Array.isArray(latest.items) && ["totalCount","firstItemIndex","offsetTop","offsetBottom","top","bottom"]
+      .every((key) => latest[key] === n[key]) && latest.items.length === items.length
+      && items.every((item, index) => ["index","originalIndex","offset","size","type"]
+        .every((key) => item[key] === latest.items[index][key]));
+    m.historyOnPrimaryWindowCommit({
+      totalCount: n.totalCount,
+      startIndex: items.length ? items[0].index : 0,
+      endIndex: items.length ? items[items.length - 1].index : 0,
+      itemCount: items.length,
+      ...(primaryAdmission ? { admittedCount: primaryAdmission.filter(Boolean).length } : {}),
+      stable: !!same && !z && (n.totalCount === 0 || N)
+    });
+  }, [e, n, N, z, m?.historyOnPrimaryWindowCommit, m?.historyPrimaryItemAdmission]);
+  return !e && n.totalCount === 0 && H !== null && H !== void 0 ?`],
 ];
 
 function patchError(reason) {
@@ -56,6 +101,11 @@ function patchError(reason) {
  * so the History owner can check current presentation/resize state at that time.
  * De, its ResizeObserver, and the existing size/scroll-state publications stay
  * intact. The list-state dependency excludes unrelated context/footer commits.
+ * Primary Hn rows require an exact synchronous admission before their real
+ * computeItemKey/itemContent callbacks. Unadmitted indices use status-only
+ * shells without measured-row attributes; the committed range still requests
+ * data. The bounded admission vector contains booleans for this actual window,
+ * never N physical keys. Legacy list/Table behavior is unchanged.
  * No scroll position writer is added here.
  */
 export function patchHistoryVirtuoso(source) {

@@ -58,7 +58,8 @@ test('actual intent guard joins only the exact pair/revision/action sequence unt
 
 test('Main intent scheduler composes the guard with the actual existing picker request', () => {
   const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'scheduleCodexModelEffortIntentReconcile');
-  assert.match(fn.getText(ast), /settingsWriteGuard:\s*createCodexModelEffortIntentWriteGuard\(tabId, intent\)/);
+  assert.match(fn.getText(ast), /observedWriteGuard\s*=\s*createCodexModelEffortIntentWriteGuard\(tabId, intent\)/);
+  assert.match(fn.getText(ast), /settingsWriteGuard:\s*observedWriteGuard/);
 });
 
 test('a replacement while queued behind another settings owner performs no old picker write', async t => {

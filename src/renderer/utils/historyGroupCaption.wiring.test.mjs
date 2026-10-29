@@ -20,7 +20,7 @@ test('caption choice is owner-scoped bounded metadata, not a new body cache',()=
   assert.match(panel,/groupCaptionSelectionsRef\.current\.clear\(\)/);
   assert.match(panel,/captionOwnerKey=\{historyOwnerKey\}/);
   assert.match(panel,/captionSelections: groupCaptionSelectionsRef\.current/);
-  assert.match(panel,/found\.caption === true \? stubEntry\.uuid : historyHydrationCenterForRange/);
+  assert.match(panel,/ordinaryHistoryHydrationDemand\([\s\S]*groupCaptionSelectionsRef\.current/);
 });
 
 test('one English-labelled number cycles separately from the group disclosure and dates follow the chosen text',()=>{

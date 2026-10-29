@@ -26,6 +26,12 @@ Copy одного сообщения сохраняет полный перен�
 Если одинаковый sourceKey обозначает разные исторические версии, replay сохраняет
 обе, а не использует picker-upsert, который заменил бы текущую версию старой.
 
+Для принятой failed/cancelled History заявки источник Copy — сохранённый original
+authoring, не trimmed/serialized bubble: иначе теряются крайние пробелы и исходные
+chip IDs. После payload eviction читается одна exact operation/attempt receipt;
+foreign/replaced owner не получает clipboard write. Это Copy, не автоматический Send
+или возврат в composer.
+
 Шрам: восстановление chip metadata по порядковому индексу ломалось, когда перед
 attached prompt был deferred wrapper без sidecar. Copy теперь сопоставляет полное
 представление чипа; одинаковое тело без совпавшей обёртки не заимствует чужой ID.

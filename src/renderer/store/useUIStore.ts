@@ -40,6 +40,7 @@ import {
 } from '../utils/composerDraftPersistence.mjs';
 import { expireReloadedHistoryImageImports, normalizeHistoryPendingImageImports } from '../utils/historyImageImportOwnership.mjs';
 import { restoreHistorySendDraft } from '../utils/historySendReturn.mjs';
+import { noteHistoryComposerDraftWrite } from '../utils/historyComposerDraftOwner.mjs';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { isGeminiModelId } from '../constants/geminiModels';
 
@@ -824,8 +825,6 @@ interface UIStore {
    *  existing app-state/localStorage migration remains lossless. */
   runAfterPickerProjectId: string | null;
   setRunAfterPickerProjectId: (workflowId: string | null) => void;
-  timelinePinned: boolean;
-  setTimelinePinned: (v: boolean) => void;
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
@@ -1643,47 +1642,26 @@ const initialFreezeCmdPopups = loadFreezeCmdPopups();
   } catch {}
 })();
 
-// timelinePinned — global layout mode: expanded Timeline reserves real
-// horizontal space instead of overlaying the terminal.
-const APP_STATE_KEY_TIMELINE_PINNED = 'timelinePinned';
-const loadTimelinePinned = (): boolean => {
+// Read-only migration seed for the independent History panel preference.
+// Timeline always overlays; its old stored layout values remain inert.
+const APP_STATE_KEY_LEGACY_LAYOUT_PINNED = 'timelinePinned';
+const loadLegacyPanelPinned = (): boolean => {
   try { return localStorage.getItem('noted-terminal-timeline-pinned') === 'true'; }
   catch { return false; }
 };
-const saveTimelinePinned = (v: boolean) => {
-  try { localStorage.setItem('noted-terminal-timeline-pinned', String(v)); } catch {}
-  try {
-    const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_TIMELINE_PINNED, value: v }).catch(() => {});
-  } catch {}
-};
-const initialTimelinePinned = loadTimelinePinned();
-(async () => {
-  try {
-    const { ipcRenderer } = window.require('electron');
-    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TIMELINE_PINNED);
-    if (v !== null && v !== undefined) {
-      const bool = parsePersistedBool(v);
-      if (useUIStore.getState().timelinePinned !== bool) {
-        useUIStore.setState({ timelinePinned: bool });
-        try { localStorage.setItem('noted-terminal-timeline-pinned', String(bool)); } catch {}
-      }
-    }
-  } catch {}
-})();
 
 // Legacy paneTabStripWrap/paneTabStripAutoReveal settings are intentionally not
 // loaded or mirrored anymore: window headers always wrap, including the first
 // frame and late SQLite hydration. Stored old values may remain inert.
 
 // historyPinned — global layout mode for Cmd+] / Option+] HistoryPanel. Defaults to the
-// legacy combined timelinePinned value so users keep their previous layout.
+// legacy combined layout value so History users keep their previous preference.
 const APP_STATE_KEY_HISTORY_PINNED = 'historyPinned';
 const loadHistoryPinned = (): boolean => {
   try {
     const own = localStorage.getItem('noted-terminal-history-pinned');
     if (own !== null) return own === 'true';
-    return loadTimelinePinned();
+    return loadLegacyPanelPinned();
   } catch { return false; }
 };
 const saveHistoryPinned = (v: boolean) => {
@@ -1699,7 +1677,7 @@ const initialHistoryPinned = loadHistoryPinned();
     const { ipcRenderer } = window.require('electron');
     let v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_HISTORY_PINNED);
     if (v === null || v === undefined) {
-      v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TIMELINE_PINNED);
+      v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_LEGACY_LAYOUT_PINNED);
     }
     if (v !== null && v !== undefined) {
       const bool = parsePersistedBool(v);
@@ -3079,7 +3057,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPromptReturnedSends: initialHistoryComposerDraftState.returnedByTab,
   restoreHistorySendDraft: input => {
     const result = restoreHistorySendDraft(get(), input, bytes => localStorage.setItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY, bytes));
-    if (result.patch) set(result.patch);
+    if (result.patch) {
+      noteHistoryComposerDraftWrite(useUIStore, input.tabId);
+      set(result.patch);
+    }
   },
   acknowledgeHistorySendDraftReturn: (tabId, token) => {
     const state = get();
@@ -3145,6 +3126,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     historyScrollPositions: { ...state.historyScrollPositions, [tabId]: scrollTop }
   })),
   setHistoryPromptDraft: (tabId, draft, options = {}) => set(state => {
+    noteHistoryComposerDraftWrite(useUIStore, tabId);
     const nextDrafts = { ...state.historyPromptDrafts };
     if (draft) nextDrafts[tabId] = draft;
     else delete nextDrafts[tabId];
@@ -3200,6 +3182,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     return patch;
   }),
   setHistoryPromptDraftChips: (tabId, chips) => set(state => {
+    noteHistoryComposerDraftWrite(useUIStore, tabId);
     const next = { ...state.historyPromptDraftChips };
     const normalized = normalizeComposerChips(chips) as HistoryPromptDraftChip[];
     if (normalized.length > 0) next[tabId] = normalized;
@@ -3215,6 +3198,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     return { historyPromptDraftChips: next, historyPromptDraftUpdatedAt: nextUpdatedAt };
   }),
   addHistoryPromptDraftChip: (tabId, chip) => set(state => {
+    noteHistoryComposerDraftWrite(useUIStore, tabId);
     const next = { ...state.historyPromptDraftChips };
     const current = state.historyPromptDraftChips[tabId] || [];
     const normalized = upsertComposerChip(current, chip) as HistoryPromptDraftChip[];
@@ -3229,6 +3213,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     };
   }),
   removeHistoryPromptDraftChip: (tabId, chipId) => set(state => {
+    noteHistoryComposerDraftWrite(useUIStore, tabId);
     const next = { ...state.historyPromptDraftChips };
     const normalized = removeComposerChip(
       state.historyPromptDraftChips[tabId] || [],
@@ -3249,6 +3234,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   appendHistoryPromptDraft: (tabId, text) => set(state => {
     const addition = String(text || '');
     if (!addition) return {};
+    noteHistoryComposerDraftWrite(useUIStore, tabId);
     const current = state.historyPromptDrafts[tabId] || '';
     const separator = !current
       ? ''
@@ -3662,8 +3648,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ runAfterPickerProjectId: projectId });
     saveRunAfterPickerProject(projectId);
   },
-  timelinePinned: initialTimelinePinned,
-  setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
   ...(initialPaneStripInterfacePreferences() as Pick<UIStore, 'paneStripSelectedFirst' | 'paneStripCloseOnClick' | 'paneStripInstantHover' | 'paneStripPreferenceStatus'>),

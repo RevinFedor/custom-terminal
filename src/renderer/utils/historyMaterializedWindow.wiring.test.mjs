@@ -16,7 +16,7 @@ test('hydration retains only the already presented physical window', () => {
 
 test('range publications coalesce to one settled centre', () => {
   assert.match(panel, /HISTORY_HYDRATION_RANGE_IDLE_MS/);
-  assert.match(panel, /historyHydrationCenterForRange/);
+  assert.match(panel, /ordinaryHistoryHydrationDemand/);
   assert.match(panel, /rangeChanged=\{\(range\)[\s\S]*scheduleHistoryHydrationRangeCheck\(\)/);
   assert.doesNotMatch(panel, /rangeChanged=\{\(range\)[\s\S]{0,800}maybeRequestHistoryHydration\('range-changed'\)/);
 });

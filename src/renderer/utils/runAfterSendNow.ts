@@ -5,7 +5,7 @@ import { AGENT_SETTINGS_INTENT_NONE } from './agentSendSettingsContract';
 import { serializeComposerDraft } from './composerChips.mjs';
 import { buildPromptQueueReceiptHandoffId } from './promptQueueReceiptIdentity.mjs';
 import { historyPromptHandoffInitialStatus, runHistoryPromptHandoff } from './historyPromptHandoffs';
-import { buildQueuedPromptPayload, usePromptQueueStore, type QueuedPrompt } from '../store/usePromptQueueStore';
+import { buildQueuedPromptTransport, usePromptQueueStore, type QueuedPrompt } from '../store/usePromptQueueStore';
 
 // The existing Cmd+Replay send scenario, shared with the remote explicit action.
 // No scheduling/condition/Post is applied to a selected manual Send-now.
@@ -18,7 +18,8 @@ export async function sendQueuedPromptNow(tabId: string, item: QueuedPrompt, ses
   const presence = await runtime.getPresence(tabId).catch(() => null);
   const statusAtSend = presence?.status || 'unknown';
   const sessionIdHint = sessionType === 'codex' ? tab.codexSessionId || null : tab.claudeSessionId || null;
-  const payload = buildQueuedPromptPayload(item);
+  const transport = buildQueuedPromptTransport(item);
+  const payload = transport.prompt;
   const handoffId = buildPromptQueueReceiptHandoffId({ kind: 'queue', itemId: item.id, payload });
   try {
   const result = await runHistoryPromptHandoff({ tabId, handoffId, toolType: sessionType, sessionIdHint,
@@ -28,7 +29,9 @@ export async function sendQueuedPromptNow(tabId: string, item: QueuedPrompt, ses
     send: exactHandoffId => sendAgentPromptScenario({ tabId, toolType: sessionType, runtime, sessionId: sessionIdHint,
       cwd: tab.cwd, prompt: payload, handoffId: exactHandoffId, source: 'prompt-queue', promptQueueAction: 'send-now',
       statusAtSend, queue: statusAtSend === 'busy', settingsIntent: AGENT_SETTINGS_INTENT_NONE, returnDraftOnConflict: false,
-      presentationSnapshot: { historySessionId: sessionIdHint, promptChips: item.chips || [], imagePaths: item.imagePaths || [] } }),
+      presentationSnapshot: { historySessionId: sessionIdHint, promptChips: item.chips || [], imagePaths: item.imagePaths || [],
+        authoringTransport: { sourceHash: window.require('node:crypto').createHash('sha256').update(payload).digest('hex'),
+          imageRanges: transport.imageRanges } } }),
   });
   // A non-transferred selected card cannot also become an automatic step
   // (possibly with a different Post body) after an uncertain manual action.

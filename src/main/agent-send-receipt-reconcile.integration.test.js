@@ -8,7 +8,13 @@ const http = require('node:http');
 const test = require('node:test');
 const ts = require('typescript');
 const Database = require('better-sqlite3');
-const { AgentSendQueue } = require('./agent-send-queue');
+const queueSource = process.env.ACTUAL_QUEUE_SOURCE;
+const queueModule = queueSource ? (() => {
+  const Module = require('node:module'), selected = new Module(path.join(__dirname, 'agent-send-queue.js'), module);
+  selected.filename = path.join(__dirname, 'agent-send-queue.js'); selected.paths = module.paths;
+  selected._compile(fs.readFileSync(queueSource, 'utf8'), selected.filename); return selected.exports;
+})() : require('./agent-send-queue');
+const { AgentSendQueue } = queueModule;
 const { createAgentSendReceiptStore, STORE_STATES } = require('./agent-send-receipt-store');
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
@@ -79,7 +85,7 @@ async function fixture(t, options = {}) {
   await tick();
   queue.enqueue({ identity: identity(follower), request: follower });
   await tick();
-  if (!options.activeState) {
+  if (!options.activeState && !options.keepAuditPending) {
     const startup = store.reconcileStartup();
     const decisions = await reconcileAgentSendStartupRecords(startup.records.filter(record =>
       ['audit-pending', 'delivery-unknown'].includes(record.state)), { allRecords: startup.records });
@@ -286,6 +292,47 @@ test('explicit release re-audits exact head, preserves UNKNOWN/submitted/frozen 
   assert.equal(h.scans, scans, 'ACK recovery/reopen does not rerun the auditor or input');
   assert.deepEqual(h.sent, ['head-429', 'task-440']);
   assert.equal((await h.release({ ...request, requestId: 'different-release' })).status, 409);
+});
+
+test('explicit release also handles submitted audit-pending/native-queued after an inconclusive exact audit', async t => {
+  const h = await fixture(t, { keepAuditPending: true });
+  const before = h.store.get(h.head.sendOperationKey);
+  assert.equal(before.state, 'audit-pending');
+  const result = await h.release(); await tick();
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.released, true);
+  assert.equal(result.body.release.deliveryState, 'audit-pending');
+  assert.deepEqual(h.store.get(h.head.sendOperationKey), before, 'only FIFO disposition changes, never audit truth');
+  assert.deepEqual(h.sent, ['head-429', 'task-440']);
+  assert.equal(result.body.receipt.inputSlot.state, 'retired');
+  assert.equal(result.body.receipt.exactAuditConfirmed, false);
+  const replay = await h.release(); assert.equal(replay.body.idempotent, true);
+  assert.deepEqual(h.sent, ['head-429', 'task-440']);
+});
+
+for (const cancel of [true, false]) test('actual desktop queue recovery confirmation ' + (cancel ? 'cancels without action' : 'uses the same FIFO owner'), async t => {
+  const h = await fixture(t, { keepAuditPending: true });
+  const handlers = new Map(); let dialogs = 0;
+  const ast = ts.createSourceFile('main.js', mainSource, ts.ScriptTarget.Latest, true);
+  const handler = ast.statements.find(node => ts.isExpressionStatement(node)
+    && ts.isCallExpression(node.expression) && node.expression.arguments[0]?.text === 'agent:release-send-queue-head');
+  assert.ok(handler);
+  vm.runInNewContext(handler.getText(ast), { ipcMain: { handle: (name, fn) => handlers.set(name, fn) },
+    agentSendReceiptStore: h.store, path, srcMainDir: __dirname, mainWindow: {},
+    dialog: { showMessageBox: async (_window, options) => { dialogs++;
+      assert.equal(options.defaultId, 1); assert.equal(options.cancelId, 1);
+      return { response: cancel ? 1 : 0 };
+    } }, require: () => ({ releaseAgentSendQueueHeadForApi: h.context.releaseAgentSendQueueHeadForApi }) });
+  const invoke = handlers.get('agent:release-send-queue-head');
+  const input = { tabId: 'T', handoffId: h.head.handoffId, ...h.exact, requestId: 'desktop-manual-release' };
+  assert.equal((await invoke(null, { ...input, attemptId: 'foreign' })).success, false);
+  assert.equal(dialogs, 0);
+  const original = h.store.get(h.head.sendOperationKey);
+  const result = await invoke(null, input); await tick();
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(result.cancelled === true, cancel);
+  assert.deepEqual(h.store.get(h.head.sendOperationKey), original);
+  assert.deepEqual(h.sent, cancel ? ['head-429'] : ['head-429', 'task-440']);
 });
 
 test('explicit unknown release keeps the original idle admission and cannot revive a cancelled follower', async t => {

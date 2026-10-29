@@ -2,6 +2,15 @@
 
 ## Текущий порядок UI-проверок
 
+Для Send обзор кода не заменяет проверку порядка событий: exact H/O/A и время
+из лога → тот же finite actual-producer/FIFO/receipt/presentation fixture →
+SAME PRE→GREEN → regression → отдельно разрешённый installed user flow.
+Проверять неизвестность и ДО, и ПОСЛЕ admission, ошибку settings с cleanup,
+смену owner внутри публикации, real SQLite BUSY/reopen. Нельзя случайно уравнять
+разные production fingerprints или добавить фиктивный lexical binding в VM:
+такие PASS скрыли ошибки29Oct. Reviewer полезен как автор контрпримера, но
+его согласие и число зелёных тестов не заменяют фактический пользовательский путь.
+
 Private Noted E2E с userData/CODEX_HOME/CLAUDE_CONFIG_DIR в своём physical root
 автоматически публикует accounting receipt для `Home → Storage → Test runs`.
 Это не новый ручной grant и не основание удалять весь завершившийся процессом
@@ -30,6 +39,17 @@ file:///отдельный package), iPhone в iOS Simulator. Синтетиче
 артефактами фаз и launch receipt либо свежей identity разрешённого reuse.
 Reuse не разрешает перезапуск/закрытие родительского runtime или лишние окна.
 Чтение старого отчёта не становится новым прогоном; без исполнения — NOT RUN.
+
+`TabMessageTracker.actual.test.mjs` импортирует `scripts/tab-message-ui-regression.mjs`:
+без специального режима это два настоящих private offscreen Electron cases, не
+pure Source-сосед. Для imports/assets/fixture-port preflight существует явный
+`TAB_MESSAGE_UI_PREFLIGHT=1`: тот же runner собирает Source900/350, проверяет
+настоящий PNG и возвращается ДО импорта Playwright/launch. Receipt обязательно
+содержит `preflightOnly:true, guiExecuted:false`; его PASS не GUI-приёмка. Обычный
+режим сохраняет runtime/resource/cleanup контракт. CURRENT Research-view проверяют
+через Research header/disclosure/bounded full-body scroller, не старый ChatGPT
+sender-bubble; raw Copy/Rewind, Markdown, identity и native MCP violet остаются
+отдельными assertions. PNG не заменяется stub ради сборки.
 
 Для performance17.10 выбран один переиспользуемый full Noted/private DB с
 genuine длинными JSONL и built renderer без Vite/HMR. Direct Electron spawn
@@ -68,6 +88,15 @@ Clipboard — общий ресурс даже у private DEV. `availableFormats
 backup.16.10 тестовый restore после такого capture очистил исходные форматы:
 при неполном снимке запрещены последующие write/clear/restore. Для retake того
 прогона clipboard полностью исключён; targeted insertText не требует его менять.
+
+macOS full-fidelity custody требует native NSPasteboard items/types/data, включая
+lazy providers и multi-item copy. Сначала проверить adapter на отдельном private
+pasteboard, затем сохранить полные bytes на диск ДО тестового Copy. Restore
+разрешён только для ещё принадлежащего тесту changeCount; новый пользовательский
+Copy сохраняется. После write с неподтверждённой проверкой backup удерживается,
+повтор restore не допускается. Source/private-board proof не восстанавливает
+потерянный оригинал прежнего прогона и не закрывает native Copy всего сценария.
+См. [нативный контракт](../methodology/дизайн-принципы.md#cross-platform-clipboard-abstraction-lossy-на-macos--full-fidelity-preservation-требует-native-nspasteboard).
 
 ### Изолированный Codex с существующим auth-профилем
 

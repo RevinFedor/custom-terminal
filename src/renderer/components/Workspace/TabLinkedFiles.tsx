@@ -166,7 +166,7 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
         aria-expanded={mode==='menu'?open:undefined} onClick={event=>{stop(event);cancelHoverIntent();if(mode==='navigate'){onOpen(chosen);return;}if(pinned){dismissed.current=true;close();}
           else{dismissed.current=false;setOpen(true);setPinned(true);}}}>+{files.length - 1}</button>}
     </span>
-    {mode==='menu' && open && createPortal(<><div ref={bridge} data-linked-files-hover-bridge aria-hidden="true"
+    {mode==='menu' && open && createPortal(<><div ref={bridge} data-linked-files-hover-bridge data-tab-menu-owner-id={ownerTabId} aria-hidden="true"
       style={{ position: 'fixed', zIndex: 100009 }} onMouseEnter={enter} onMouseLeave={leave}
       onPointerDown={stop} onMouseDown={stop} onClick={stop} onDoubleClick={stop} onAuxClick={stop} />
       <div ref={popup} className="tab-linked-files-popup" style={{ fontSize, lineHeight: TAB_CARD_LINE_HEIGHT,

@@ -1,5 +1,20 @@
+import { ordinaryHistoryHydrationDemand, ordinaryHistoryDeltaFillsViewport } from '../../utils/historyOrdinaryHydrationWindow.mjs';
+import { historyPrimaryPromptAdoptionFingerprint } from '../../utils/historyPrimaryPromptAdoption.mjs';
+import { registerHeldHistoryPrimaryRoot } from '../../utils/historyPrimaryHeldRootRegistry.mjs';
+import { canonicalPromptRecoveryIdentities, canonicalPromptRecoveryReadError, captureCanonicalPromptRecoveryOwner,
+  isCanonicalPromptRecoveryReadError, readCanonicalPromptRecoveryProof } from '../../utils/canonicalPromptRecovery.mjs';
+import { useCanonicalPromptRecoveryOwner } from '../../utils/useCanonicalPromptRecoveryOwner';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import * as historyPrimaryTransport from '../../utils/historyReadTransport.mjs';
+import { HistoryPrimaryRootReadModel, applyHistoryPrimaryToolCoverage, selectHistoryPrimaryLocalRows, historyPrimaryColdReadWakeAllowed, historyPrimaryToolClaimFingerprint, historyPrimaryLiveClaimFingerprint } from '../../utils/historyPrimaryRootReadModel.mjs';
+import { captureHistoryPrimaryPanelWitness, captureHistoryPrimarySettingsCachePublication, createHistoryPrimaryPanelInputTransaction,
+  historyPrimaryPanelInputFingerprint, readHistoryPrimaryPanelAddress,
+  collectHistoryPrimaryMountedSearchSubjects } from '../../utils/historyPrimaryPanelBindings.mjs';
+import { normalizeHistoryPrimaryRequestClass, mergeHistoryPrimaryRequestClass, historyPrimaryCompositionRequestClass, historyPrimaryRequestPayload } from '../../utils/historyPrimaryRequestRouting.mjs';
+import type { HistoryPrimaryRequestClass } from '../../utils/historyPrimaryRequestRouting.mjs';
+import { HistoryPrimaryRootSurface } from './HistoryPrimaryRootSurface';
+import historyPrimaryRollout from '../../../shared/history-primary-rollout.cjs';
 import { dispatchHistoryFileActionContextMenu } from '../../utils/historyFileActionContextMenu.mjs';
 import { codexGoalPresentation } from '../../utils/codexGoalPresentation.mjs';
 import { researchReplyFromProjection } from '../../utils/researchResultPresentation.mjs';
@@ -9,6 +24,13 @@ import { useResearchRunModels, type SavedResearchModels } from '../../utils/useR
 import { timelineResearchModelLabel } from '../../utils/timelineEntryPreview.mjs';
 import { ResearchResultContent } from './ResearchResultContent';
 import { HistoryBackgroundScrollStrip } from './HistoryBackgroundScrollStrip';
+import { HistoryAgentCatalogWindow, type HistoryAgentCatalogCounts } from './HistoryAgentCatalogWindow';
+import { createHistoryPrimaryAgentCatalogOwner, type HistoryPrimaryAgentCatalogSnapshot } from '../../utils/historyPrimaryAgentCatalogOwner.mjs';
+import { createHistoryAgentCatalogCurrent, createHistoryAgentCatalogMainFact, createHistoryAgentCatalogMainFactsMap, createHistoryAgentCatalogMainFactsSet } from '../../utils/historyAgentCatalogCurrent.mjs';
+import { createHistoryAgentCatalogSourceOwner } from '../../utils/historyAgentCatalogSourceOwner.mjs';
+import { copyHistoryPrimaryMetadataOrigin } from '../../utils/historyPrimaryMetadataOrigin.mjs';
+import { HistoryAgentCatalogLivenessContext, createHistoryAgentCatalogMembershipDemand,
+  useHistoryAgentCatalogMember } from './HistoryAgentCatalogLiveness';
 import { HISTORY_TOP_CHROME_INSET } from '../../utils/promptQueueChrome.mjs';
 import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
 import { createHistoryRevealTrace } from '../../utils/historyRevealTrace.mjs';
@@ -21,18 +43,22 @@ import {
 } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
 import HistoryAgentLaunchParameters, { type SubagentLaunchSettings, type SubagentLaunchServiceTier, type SubagentRequestServiceTier } from './HistoryAgentLaunchParameters';
+import HistoryAgentLaunchTimestamp from './HistoryAgentLaunchTimestamp';
 import CodexNativeQuestionMirror from './CodexNativeQuestionMirror';
 import { projectNativeQuestionReply } from '../../../shared/native-question-reply.mjs';
 import { getAutomaticContinuationKind } from '../../../shared/prompt-origin.mjs';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest, consumeInputSearchRequest} from '../../utils/historySearchMarkers';
+import {openHistoryPagedSearch} from '../../utils/historyPagedSearchClient.mjs';
+import type {HistoryPagedSearchClient} from '../../utils/historyPagedSearchClient.mjs';
 import {setHistorySearchHighlights, clearHistorySearchHighlights} from '../../utils/historySearchHighlights.mjs';
-import {currentUIActionId, uiPerformancePhase, uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
+import {currentUIActionId, uiPerformancePhase, uiPerformancePhaseForAction,
+  createHistoryCommitWitnessDiagnostics, uiPerformanceDiagnosticsEnabled} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Repeat2, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
 import { ComposerEditor, openComposerInputSearch } from '../ComposerEditor';
@@ -174,6 +200,9 @@ import {
 import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
+  collectPromptWebImageReferences,
+  hasPromptPendingImageMarker,
+  maskPromptWebImageReferences,
   getPromptImageMarkerHighlightRanges,
   getPromptImageStatusTokenRanges,
   hasMalformedPromptImageMarker,
@@ -224,6 +253,7 @@ import {
   promptChipDisplayLabel,
   retainPasteChipsForText,
   serializeComposerDraft,
+  prepareComposerDraftTransport,
   shouldCreatePasteChip,
   splitPromptChipPresentation,
   upsertComposerChip,
@@ -303,6 +333,10 @@ import { createHistoryWheelTailIntent } from '../../utils/historyWheelTailIntent
 import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
 import { createHistoryResizeController } from '../../utils/historyResizeController.mjs';
+import { createHistoryPrimarySelectedAddress } from '../../utils/historyPrimarySelectedAddress.mjs';
+import { createHistoryPresentationPositionOwner, createHistoryPresentationPositionQuery } from '../../utils/historyPresentationPosition.mjs';
+import { createHistoryPrimarySparsePublicationOwner } from '../../utils/historyPrimarySparsePublication.mjs';
+import { canBindHistoryPreparedPositionFrame, createHistoryPreparedPositionSource } from '../../utils/historyPreparedPosition.mjs';
 import {
   chooseHistoryGestureReleaseAnchorMode,
   chooseHistoryMaterializedApplyOwner,
@@ -312,17 +346,21 @@ import {
 } from '../../utils/historyGestureAnchor.mjs';
 import {
   HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES,
+  HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES,
   historyForegroundPriority,
   isHistoryLightweightServiceDelta,
+  isHistoryViewportHydrationDelta,
   shouldBypassHistoryApplyPriority,
 } from '../../utils/historyForegroundPriority.mjs';
 import {
+  HISTORY_SURFACE_PRESENTATION_EVENT,
   advanceHistoryPresentationProof,
   createHistoryPresentationProof,
   historyPresentationOwnsWrite,
   resolveHistoryViewportPaintProof,
 } from '../../utils/historyPresentationOwnership.mjs';
 import { flushHistoryDurableWithRetry } from '../../utils/historyDurableFlush.mjs';
+import { createHistoryPrimaryLiveCoverageOwner, type HistoryPrimaryLiveFoldCommit } from '../../utils/historyPrimaryLiveCoverageOwner.mjs';
 import {
   applyHistoryLiveToolResultsToEntry,
   buildHistoryLivePresentation,
@@ -354,12 +392,15 @@ import {
   buildHistoryDisplayUnitsAppended,
   buildHistoryDisplayUnitsCached,
   rememberHistoryDisplayUnitsCached,
-  findHistoryHydrationStub,
   historyDisplayUnitUuid,
   isGroupUnit,
   peekHistoryDisplayUnitsCached,
   resolveHistoryDisplayTarget,
+  isHistoryDisplayGroupExpanded,
+  setHistoryDisplayGroupExpanded,
+  historyCompositeActionFacts,
 } from '../../utils/historyDisplayUnits.mjs';
+import { createHistoryCompositeGroupState } from '../../utils/historyCompositeGroupState.mjs';
 import {
   peekHistoryDisplayUnitsBaseline,
   rememberHistoryDisplayUnitsBaseline,
@@ -369,7 +410,7 @@ import {
   isHistoryAtContentBottom,
 } from '../../utils/historyBottomGeometry.mjs';
 import { isHistoryHydrationTargetStub } from '../../utils/historyHydrationTarget.mjs';
-import { historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
+import { historyEntryRecordTime, historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
 import recordTimes from '../../../shared/history-record-time.cjs';
 import { HistoryRecordTimeOverlay } from './HistoryRecordTimeOverlay';
 import type { HistoryRecordTime } from './ClaudeSDK/sdkHistoryParser';
@@ -379,7 +420,7 @@ import {
 } from '../../utils/historyToolNavigation.mjs';
 import {
   collectHistoryMaterializedWindowUuids,
-  historyHydrationCenterForRange,
+  HISTORY_ORDINARY_REVISIT_BUFFER_UNITS,
   retainHistoryMaterializedWindow,
 } from '../../utils/historyMaterializedWindow.mjs';
 import { stabilizeHistoryRevealAnchor } from '../../utils/historyRevealAnchor.mjs';
@@ -392,18 +433,25 @@ import { attachTerminalMessageChip } from '@gt-editor/markdown-editor';
 import { jumpToTerminalMessageReference } from '../../utils/tabMessageSourceJump';
 import {
   acceptHistoryPromptHandoffProviderQueue,
-  adoptHistoryPromptHandoffCanonicalEntry,
+  adoptHistoryPromptHandoffCanonicalEntryIfCurrent,
   advanceHistoryPromptHandoffTransportPhase,
   historyPromptHandoffAcceptsAuditIdentity,
   beginHistoryPromptHandoff,
+  beginHistorySendReceiptRead,
   bindHistoryPromptHandoffSendIdentity,
   prepareHistoryPromptHandoffPresentation,
   consumeHistoryPromptHandoff,
+  consumeHistoryPromptHandoffIfCurrent,
+  captureHistoryReceiptRecoveryOwner,
   dismissReceiptlessHistoryPromptPresentation,
   applyHistoryQueuedMessageMerge,
   durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry,
   durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
+  historyPromptFailureHasRecoveryOwner,
+  historyPromptHandoffRecoveryFields,
+  historyReceiptNeedsCanonicalProjection,
+  recordHistorySendPresentationDismissal,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HISTORY_PROMPT_SENT_PRESENTATION_MS,
   historyPromptHandoffAuditProofFromSendResult,
@@ -414,6 +462,7 @@ import {
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
   hydrateHistoryPromptHandoffFromDurableReceipt,
+  settleExistingHistoryPromptHandoffFromDurableReceipt,
   hydrateHistoryPromptHandoffImages,
   legacyOrchestrationCompletionMatchesCanonicalEntry,
   reconcileHistoryPromptHandoffRows,
@@ -428,6 +477,8 @@ import {
 import { saveHistorySendRecovery, removeHistorySendRecovery } from '../../utils/historySendRecovery.mjs';
 import { historySendTimerState } from '../../utils/historySendTiming.mjs';
 import { historySendReturnEnabled, historySendPresentationAction } from '../../utils/historySendReturn.mjs';
+import { beginComposerReturnPreparation, finishComposerReturnPreparation,
+  composerReturnPreparationView } from '../../utils/historyComposerReturnPreparation.mjs';
 import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromptPresentationDismissal.mjs';
 import { recordHistorySendReturnControl, isHistorySendReturned, isHistorySendReturnRestored } from '../../utils/historyPromptHandoffs';
 import { releaseReturnedHistoryPreparation } from '../../utils/agentActionCoordinator.mjs';
@@ -455,6 +506,8 @@ import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
   historyCompactTailTiming,
+  historyResponseWorkTailTiming,
+  historyResponseWorkClock,
   resolveHistoryResponseTailTiming,
 } from '../../utils/historyResponseTiming.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
@@ -505,6 +558,10 @@ import {
   HistoryCollapsedGroupRow,
   HistoryGroupFoot,
   HistoryGroupRail,
+  HistoryResponseWorkHeader,
+  HistoryResponseWorkPreview,
+  HistoryResponseWorkMember,
+  HistoryCompositeWorkActions,
   HistoryTranscriptPresentation,
   historyTurnsToTranscriptSteps,
   mergeHistoryTranscriptSteps,
@@ -512,6 +569,7 @@ import {
 } from './HistoryTranscriptPresentation';
 
 import { captureClipboardWriteContext, writeMeasuredClipboardText } from '../../utils/composerClipboardDiagnostics.mjs';
+import { captureHistoryComposerDraftOwner } from '../../utils/historyComposerDraftOwner.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 const writeHistoryClipboardText = (text: string, context?: ReturnType<typeof captureClipboardWriteContext>) =>
@@ -519,7 +577,7 @@ const writeHistoryClipboardText = (text: string, context?: ReturnType<typeof cap
 const historyServicePromptFingerprint = (text: string): string => (
   window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
 );
-export const HISTORY_SURFACE_PRESENTATION_EVENT = 'history-panel:external-presentation';
+export { HISTORY_SURFACE_PRESENTATION_EVENT };
 
 const HISTORY_SLASH_COMMANDS = [
   {
@@ -601,15 +659,20 @@ const historyVirtuosoUnitKey = (unit: any): string => (
 
 const historyMeasuredUnitKey = (unit: any): string => {
   if (isGroupUnit(unit)) {
+    if (unit?.familyKey === 'response-work') {
+      return ['response-work:v2', historyVirtuosoUnitKey(unit), unit.expanded === true ? 'open'
+        : unit.previewEntry || unit.previewFact ? 'closed:line' : 'closed:empty'].join('|');
+    }
     const members = Array.isArray(unit?.entries) ? unit.entries : [];
     return [
       'group',
       historyVirtuosoUnitKey(unit),
       // Markdown changes the caption's physical height, not its group UUID.
-      unit?.expanded === true ? 'open' : unit?.familyKey === 'research' ? 'closed' : 'closed:caption-markdown:v2',
+      unit?.expanded === true ? 'open' : unit?.familyKey === 'research' ? 'closed' : 'closed:caption-markdown:v4:one-comment:90pct',
       members.length,
       members.at(-1)?.rewriteLayoutUuid || members.at(-1)?.uuid || '',
       unit?.parentGroup?.key || '',
+      ...(unit?.responseWork?.key ? ['response-work:' + unit.responseWork.key] : []),
     ].join('|');
   }
   const entry = unit?.entry || {};
@@ -625,6 +688,8 @@ const historyMeasuredUnitKey = (unit: any): string => {
     Array.isArray(entry.imagePaths) ? entry.imagePaths.length : 0,
     unit?.expandedGroup?.key || '',
     unit?.expandedSubgroup?.key || '',
+    ...(unit?.responseWork?.key ? ['response-work:' + unit.responseWork.key] : []),
+    ...(unit?.suppressResponseTiming ? ['time-in-work-header'] : []),
   ].join('|');
 };
 
@@ -724,6 +789,11 @@ interface FullHistoryEntry {
   queueStatus?: HistoryPromptHandoffStatus;
   deliveryStatus?: 'editable-last-prompt';
   handoffId?: string;
+  applicationQueueId?: number | null;
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
+  authoringSnapshot?: { editorText: string; chips: readonly Record<string, any>[];
+    imagePaths: readonly HistoryPromptDraftImageRef[] };
   applicationQueueMerge?: QueuedMessageMergeGuard | null;
   applicationQueuePosition?: number;
   statusReason?: string;
@@ -789,9 +859,10 @@ interface FullHistoryEntry {
     bodyProjectionHash?: string;
     bodyStart?: number;
     bodyEnd?: number;
+    artifactSummary?: { missing: number; total: number | null };
     runKind?: string;
     source?: 'loop' | 'system' | 'terminal-mcp';
-    systemSource?: 'build-install-return' | 'codex-capacity-retry';
+    systemSource?: 'build-install-return' | 'codex-capacity-retry' | 'tab-message-outcome';
     auditSourceIdentity?: string;
   }>;
   livePendingThinking?: boolean;
@@ -801,10 +872,10 @@ interface FullHistoryEntry {
     endTs: number;
     durationMs: number;
   };
-  // Grouping identity (display-units projection). Claude: one model response
-  // spans several records with one message id — text sharing it with tool
-  // calls is a CAPTION, not a standalone reply. Codex: `textPhase` marks
-  // commentary (caption) vs partial/final answer (standalone presentation).
+  // Presentation identity: Claude messageId can link split text and calls;
+  // Codex textPhase distinguishes commentary, partial and final answers.
+  // Main History uses full working text; nested/legacy captions retain their
+  // separate compatibility grammar.
   messageId?: string;
   textPhase?: 'commentary' | 'partial_answer' | 'final_answer';
   // Row-window stub metadata (main ships identity + grouping facts only).
@@ -992,9 +1063,8 @@ interface HistoryVirtuosoContext {
   terminalPreview: TerminalHistoryPreview | null;
   terminalPreviewCanonicalMaterialized: boolean;
   onHandoffDomCommit?: (node?: HTMLDivElement | null) => void;
-  // One response-level clock at the physical transcript tail. It is not a
-  // display unit: second ticks stay inside the Footer and cannot rebuild
-  // grouping, hydration or Virtuoso item geometry.
+  // The response clock remains local to the timer component. During a work
+  // chapter it can move into that header without rebuilding grouping on ticks.
   responseTiming: HistoryResponseTailTiming | null;
   // Scroll-seek replaces the normal Virtuoso item wrapper. Preserve the same
   // physical display-unit identity on its placeholder so exit can hand the
@@ -1025,8 +1095,10 @@ const reconcileCodexEffectiveSettings = (
   tabId: string,
   sessionId: string,
   entries: FullHistoryEntry[],
+  prepared?: { effective: ReturnType<typeof deriveCodexEffectiveSettingsFromHistory> },
 ) => {
-  const effective = deriveCodexEffectiveSettingsFromHistory(entries);
+  const effective = prepared ? prepared.effective : deriveCodexEffectiveSettingsFromHistory(entries);
+  if (prepared && effective === undefined) throw new Error('HISTORY_PRIMARY_SETTINGS_PROOF_REQUIRED');
   if (!effective) return;
   const state = useWorkspaceStore.getState();
   // History loads are async. A native Rewind/resume can hand the tab to a new
@@ -1087,7 +1159,7 @@ export interface HistoryInitialSourceSignal {
   ownerKey: string;
   generation: number;
   phase: 'load' | 'subscribe';
-  status: 'success' | 'cached' | 'failure';
+  status: 'success' | 'cached' | 'failure' | 'deferred';
 }
 
 interface HistoryPanelProps {
@@ -1177,6 +1249,8 @@ interface HistoryPanelProps {
 }
 
 interface PromptHandoffMeta {
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
   text: string;
   submittedAt: number;
   sessionId?: string;
@@ -1261,7 +1335,7 @@ const HISTORY_USER_TEXT_COLLAPSED_CHARS = 400;
 
 const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
   timing: HistoryResponseTailTiming;
-  placement?: 'tail' | 'entry';
+  placement?: 'tail' | 'entry' | 'work';
 }) => {
   // The one-second clock is deliberately local to the running tail instance.
   // Completed entry instances never tick. Keeping the clock out of
@@ -1294,6 +1368,7 @@ const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
           : 'Общее время завершённого ответа'}
       className="hp-history-response-tail"
     >
+      {timing.state === 'running' && timing.phase !== 'compacting' && <HistorySpinner size={12} />}
       {timing.state === 'running' ? (
         <CompositedTextShimmer className="hp-history-response-tail-label" variant="working">{label}</CompositedTextShimmer>
       ) : (
@@ -1307,6 +1382,7 @@ const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
     </div>
   );
 });
+
 
 const openTerminalHistoryPreviewContextMenu = (
   event: React.MouseEvent<HTMLDivElement>,
@@ -1532,7 +1608,7 @@ const historyDraftImageNotice = (
   text: string,
   images?: HistoryPromptDraftImageRef[]
 ): HistoryDraftImageNotice | null => {
-  if (String(text || '').includes(HISTORY_IMAGE_PENDING_MARKER)) {
+  if (hasPromptPendingImageMarker(text)) {
     return {
       message: 'Saving image attachment…',
       blocking: true,
@@ -1624,7 +1700,8 @@ const renderHistoryPromptHighlight = (
   }
   const addMatches = (re: RegExp, color: string, fontWeight = 650) => {
     let match: RegExpExecArray | null;
-    while ((match = re.exec(text)) !== null) {
+    const imageAuthoring = maskPromptWebImageReferences(text);
+    while ((match = re.exec(imageAuthoring)) !== null) {
       decorated.push({
         start: match.index,
         end: match.index + match[0].length,
@@ -1671,9 +1748,10 @@ const renderHistoryPromptHighlight = (
 
 const renderSentHistoryPromptHighlight = (text: string) => {
   const ranges: Array<{ start: number; end: number; id: number }> = [];
+  const authoring = maskPromptWebImageReferences(text);
   const markerRe = /(?<!\\)\[Image\s+#?(\d+)\]/gi;
   let match: RegExpExecArray | null;
-  while ((match = markerRe.exec(text)) !== null) {
+  while ((match = markerRe.exec(authoring)) !== null) {
     ranges.push({
       start: match.index,
       end: match.index + match[0].length,
@@ -1840,6 +1918,7 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
     );
     if (
       (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed')
+      && !historyPromptFailureHasRecoveryOwner(entry)
       && ageMs >= LOCAL_PROMPT_FAILURE_TTL_MS
     ) {
       continue;
@@ -1925,6 +2004,12 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.queueStatus !== right.queueStatus ||
     left.deliveryStatus !== right.deliveryStatus ||
     left.handoffId !== right.handoffId ||
+    left.applicationQueueId !== right.applicationQueueId ||
+    left.sendOperationKey !== right.sendOperationKey ||
+    left.sendAttemptId !== right.sendAttemptId ||
+    left.authoringSnapshot?.editorText !== right.authoringSnapshot?.editorText ||
+    !haveSameComposerChips(left.authoringSnapshot?.chips || [], right.authoringSnapshot?.chips || []) ||
+    !haveSamePromptImageRefs(left.authoringSnapshot?.imagePaths || [], right.authoringSnapshot?.imagePaths || []) ||
     left.applicationQueuePosition !== right.applicationQueuePosition ||
     JSON.stringify(left.applicationQueueMerge || null) !== JSON.stringify(right.applicationQueueMerge || null) ||
     left.statusReason !== right.statusReason ||
@@ -2157,7 +2242,7 @@ function runHistoryScrollConvergence(opts: {
   /** Signed distance from the intended position; null while unmeasurable. */
   measureDrift: () => number | null;
   /** Re-issue the jump. false = target no longer exists, abort. */
-  jump: () => boolean;
+  jump: () => boolean | Promise<boolean>;
   /** Cancel reason, or null to keep going. Position ownership check. */
   cancelled: () => string | null;
   onSettled: (outcome: HistoryConvergenceOutcome) => void;
@@ -2172,7 +2257,7 @@ function runHistoryScrollConvergence(opts: {
   let prevDrift: number | null = null;
   let lastDrift: number | null = null;
 
-  const step = () => {
+  const step = async () => {
     const cancelReason = opts.cancelled();
     if (cancelReason) {
       opts.onAborted({ attempts, reason: cancelReason });
@@ -2204,7 +2289,18 @@ function runHistoryScrollConvergence(opts: {
 
     jumpedLastFrame = false;
     if (!atDesired) {
-      if (!opts.jump()) {
+      let jumped: boolean;
+      try { jumped = await opts.jump(); }
+      catch (error) {
+        opts.onAborted({ attempts, reason: String((error as any)?.code || 'target-read-failed') });
+        return;
+      }
+      const cancelledAfterRead = opts.cancelled();
+      if (cancelledAfterRead) {
+        opts.onAborted({ attempts, reason: cancelledAfterRead });
+        return;
+      }
+      if (jumped !== true) {
         opts.onAborted({ attempts, reason: 'target-lost' });
         return;
       }
@@ -2321,13 +2417,16 @@ const HistoryAgentInspectorContext = React.createContext<HistoryAgentInspectorCo
 const SubAgentBlock = memo(({
   action,
   entryUuid,
-  live,
+  live: currentLive,
+  callIdentity,
 }: {
   action: TaskAction;
   entryUuid: string;
   live: boolean;
+  callIdentity: string;
 }) => {
   const inspector = React.useContext(HistoryAgentInspectorContext);
+  const live = useHistoryAgentCatalogMember('call', callIdentity, currentLive);
   // Codex subagent live status: the loader is INHERITED by the card while the
   // in-process agent works; interrupted is amber, not an error red.
   // `subagentStatus` is durable transcript history, not a live lease. A
@@ -2822,11 +2921,31 @@ type HistoryAgentChip = HistoryBackgroundChip & {
   status: 'running' | 'completed' | 'interrupted';
 };
 
+interface HistoryAgentCatalogDock {
+  status: 'pending' | 'ready' | 'error';
+  counts: HistoryAgentCatalogCounts | null;
+  // This is only the genuine CURRENT domain, never a historical roster.
+  // Its exact local count does not prove historical completeness.
+  currentAgents: readonly HistoryAgentChip[];
+  currentChips: readonly HistoryBackgroundChip[];
+  currentError?: { code?: string } | null;
+  rows: readonly HistoryAgentChip[];
+  pageStart: number;
+  backgroundRows: readonly HistoryBackgroundChip[];
+  backgroundStart: number;
+  backgroundPageSize: number;
+  selected: { kind: 'found' | 'missing' | 'unknown'; key: string | null; record?: HistoryBackgroundChip | null };
+  error?: { code?: string } | null;
+  errorStage?: 'source' | 'model' | 'read' | 'presentation' | null;
+  requestPage: (request: { section: 'roster' | 'background'; offset: number; limit: number }) => void;
+}
+
 const EMPTY_HISTORY_AGENTS: HistoryAgentChip[] = [];
 
 interface HistoryBackgroundAgentProof {
   provider: 'claude' | 'codex';
   toolUseId: string;
+  label?: string;
   agentId?: string;
   agentSessionId?: string;
   sessionId?: string | null;
@@ -2913,6 +3032,7 @@ const collectHistoryBackgroundChips = (
   }
   const chips: HistoryBackgroundChip[] = [];
   const seenBackgroundTaskCalls = new Set<string>();
+  const seenSubagentCalls = new Set<string>();
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i];
     if (!Array.isArray(entry.actions)) continue;
@@ -2983,6 +3103,7 @@ const collectHistoryBackgroundChips = (
         hasResult: action.result != null,
       });
       if (running) {
+        if (callIdentity) seenSubagentCalls.add(callIdentity);
         chips.push({
           key: 'task:' + (action.toolUseId || entry.uuid),
           kind: 'subagent',
@@ -3004,6 +3125,26 @@ const collectHistoryBackgroundChips = (
         });
       }
     }
+  }
+  // Native resume/send_input may restore an exact child whose spawn card is
+  // outside this History window (or predates this parent process). The Main
+  // lease is already the authority for normal Task chips; do not require a
+  // full History read just to give that same accepted child a visible face.
+  for (const [callIdentity, agent] of exactActiveSubagents || []) {
+    if (seenSubagentCalls.has(callIdentity) || !agentProcessAlive) continue;
+    if (chipToolType !== 'codex' || agent.provider !== 'codex'
+      || !agent.agentSessionId || agent.sessionId !== currentSessionId
+      || !currentProcessGeneration || agent.generation !== currentProcessGeneration) continue;
+    chips.push({
+      key: 'task:' + agent.toolUseId,
+      kind: 'subagent',
+      label: String(agent.label || 'Агент').slice(0, 120),
+      entryUuid: '',
+      startedAt: Number(agent.startedAt) || 0,
+      status: 'running',
+      agentSessionId: agent.agentSessionId,
+      launchSettings: agent.launchSettings,
+    });
   }
   // Main sees the raw provider acceptance before a durable History refresh is
   // allowed during a busy turn. Those exact records keep a newly started
@@ -3119,6 +3260,22 @@ const collectHistoryAgentChips = (
   // entered the current hydration window. Keep that active agent addressable;
   // the durable record will enrich the same key later.
   for (const [key, live] of liveByKey) byKey.set(key, live);
+  // The same Main-only face survives own completion. Otherwise the selected
+  // Inspector collapses on count2→1→0 merely because no spawn was hydrated.
+  for (const terminal of terminalFacts?.values() || []) {
+    const key = 'task:' + terminal.toolUseId;
+    if (byKey.has(key) || !terminal.agentSessionId || !(Number(terminal.completedAt) > 0)) continue;
+    const startedAt = Number(terminal.startedAt) || 0;
+    const completedAt = Number(terminal.completedAt);
+    byKey.set(key, {
+      key, kind: 'subagent', label: String(terminal.label || 'Агент').slice(0, 120),
+      entryUuid: '', agentSessionId: terminal.agentSessionId,
+      startedAt, completedAt,
+      durationMs: startedAt > 0 ? Math.max(0, completedAt - startedAt) : undefined,
+      status: terminal.status === 'interrupted' ? 'interrupted' : 'completed',
+      launchSettings: terminal.launchSettings,
+    });
+  }
   return Array.from(byKey.values()).sort((left, right) => {
     if (left.status === 'running' && right.status !== 'running') return -1;
     if (right.status === 'running' && left.status !== 'running') return 1;
@@ -3135,12 +3292,7 @@ const HistoryBackgroundTaskCallContext = React.createContext<ReadonlySet<string>
 
 const HistoryBackgroundDot = () => (
   <span
-    className="noted-infinite-animation inline-block w-[6px] h-[6px] rounded-full shrink-0"
-    style={{
-      background: '#d97706',
-      animation: 'sdk-bg-task-pulse 1.4s ease-in-out infinite',
-      boxShadow: '0 0 4px rgba(217, 119, 6, 0.4)',
-    }}
+    className="noted-infinite-animation animate-glow-yellow noted-background-task-dot inline-block w-[6px] h-[6px] rounded-full shrink-0"
   />
 );
 
@@ -3182,6 +3334,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     requestTier: SubagentRequestServiceTier | null;
     loading: boolean;
   }>({ ownerKey: '', settings: null, serviceTier: null, requestTier: null, loading: false });
+  const [unavailableOwnerKey, setUnavailableOwnerKey] = useState('');
 
   useEffect(() => {
     if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0;
@@ -3200,6 +3353,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     offsetRef.current = 0;
     setSteps([]);
     setPending(true);
+    setUnavailableOwnerKey('');
     setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, requestTier: null, loading: true });
     const finishMetadataLoading = () => setLaunchSnapshot(previous =>
       previous.ownerKey !== launchOwnerKey || !previous.loading ? previous : { ...previous, loading: false });
@@ -3238,6 +3392,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
         });
         if (cancelled) return;
         if (res?.success && Array.isArray(res.steps)) {
+          setUnavailableOwnerKey(previous => previous ? '' : previous);
           const settings: SubagentLaunchSettings | null = res.launchSettings?.version === 1
             && res.launchSettings.provider === toolType
             && (toolType !== 'codex' || res.launchSettings.sessionId === resolvedThreadId)
@@ -3299,6 +3454,12 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
           shouldDrain = res.pending === true && nextOffset > previousOffset;
         } else {
           finishMetadataLoading();
+          if (res?.reason === 'child-root-identity-mismatch') {
+            setSteps(previous => previous.length ? [] : previous);
+            setPending(false);
+            offsetRef.current = 0;
+            setUnavailableOwnerKey(launchOwnerKey);
+          }
           if (chip?.status !== 'running') setPending(false);
         }
       } catch {
@@ -3332,6 +3493,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
   }, [chipKey, tabId, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
 
   return { steps, pending,
+    unavailable: !!chipKey && unavailableOwnerKey === launchOwnerKey,
     launchMetadataPending: !!chipKey && (launchSnapshot.ownerKey !== launchOwnerKey || launchSnapshot.loading),
     launchSettings: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.settings : null,
     requestServiceTier: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.requestTier : null,
@@ -3382,7 +3544,7 @@ const HistoryBackgroundDetailPane = memo(({
   const followBottomRef = useRef(true);
   const restoredScrollRef = useRef(false);
   const programmaticScrollRef = useRef(false);
-  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings, launchServiceTier, requestServiceTier, launchMetadataPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const { steps: liveSteps, pending: stepsPending, unavailable: stepsUnavailable, launchSettings: ownLaunchSettings, launchServiceTier, requestServiceTier, launchMetadataPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
   const creationLaunchSettings = chip.launchSettings?.version === 1
     && chip.launchSettings.provider === toolType
     && (toolType !== 'codex' || chip.launchSettings.sessionId === chip.agentSessionId)
@@ -3566,6 +3728,7 @@ const HistoryBackgroundDetailPane = memo(({
           ? <HistoryAgentLaunchParameters settings={creationLaunchSettings || ownLaunchSettings}
               provider={toolType} serviceTier={launchServiceTier} requestServiceTier={requestServiceTier} loading={launchMetadataPending} taskLabel={chip.label} />
           : <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>}
+        {chip.kind === 'subagent' && <HistoryAgentLaunchTimestamp startedAt={chip.startedAt} />}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, marginLeft: 'auto' }}>
         <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
         <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', minWidth: 0 }}>
@@ -3630,7 +3793,9 @@ const HistoryBackgroundDetailPane = memo(({
         }}
         style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '6px 10px', fontSize: '0.82em', color: '#aaa' }}
       >
-        {chip.kind === 'subagent' && (stepsPending && presentedSteps.length === 0 ? (
+        {chip.kind === 'subagent' && (stepsUnavailable ? (
+          <div style={{ color: '#666' }}>История агента недоступна: источник не соответствует выбранному агенту.</div>
+        ) : stepsPending && presentedSteps.length === 0 ? (
           <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, color: '#777' }}>
             <HistorySpinner size={14} />
             Загружаем историю агента…
@@ -3715,26 +3880,38 @@ const HistoryBackgroundDetailPane = memo(({
 
 const HistoryAgentRoster = memo(({
   agents,
+  catalog,
   selectedKey,
   onSelect,
   onClose,
 }: {
   agents: HistoryAgentChip[];
+  catalog?: HistoryAgentCatalogDock | null;
   selectedKey: string | null;
   onSelect: (agentKey: string) => void;
   onClose: () => void;
 }) => {
-  const running = agents.filter((agent) => agent.status === 'running');
-  const completed = agents.filter((agent) => agent.status === 'completed');
-  const interrupted = agents.filter((agent) => agent.status === 'interrupted');
-  const renderSection = (label: string, records: HistoryAgentChip[]) => {
-    if (records.length === 0) return null;
-    return (
-      <div>
-        <div style={{ padding: '5px 10px 3px', color: '#666', fontSize: '0.72em', textTransform: 'uppercase', letterSpacing: 0.7 }}>
-          {label}
-        </div>
-        {records.map((agent) => {
+  // Legacy/Claude/composite retain their real array branch. Primary pages
+  // already carry the original section ordering and exact catalog counts.
+  const [currentPageOffset, setCurrentPageOffset] = useState(0);
+  const currentRoster = useMemo(() => {
+    if (!catalog || catalog.status === 'ready') return null;
+    const current = catalog.currentAgents || EMPTY_HISTORY_AGENTS;
+    const running = current.filter(agent => agent.status === 'running');
+    const completed = current.filter(agent => agent.status === 'completed');
+    const interrupted = current.filter(agent => agent.status === 'interrupted');
+    return { rows: [...running, ...completed, ...interrupted], counts: {
+      total: current.length, roster: current.length, running: running.length,
+      completed: completed.length, interrupted: interrupted.length,
+      background: 0, backgroundAgents: 0,
+    } };
+  }, [catalog?.status, catalog?.currentAgents]);
+  const currentPageStart = Math.min(currentPageOffset, Math.max(0, (currentRoster?.rows.length || 0) - 64));
+  const requestCurrentPage = useCallback((request: { offset: number }) => setCurrentPageOffset(request.offset), []);
+  const running = catalog ? [] : agents.filter((agent) => agent.status === 'running');
+  const completed = catalog ? [] : agents.filter((agent) => agent.status === 'completed');
+  const interrupted = catalog ? [] : agents.filter((agent) => agent.status === 'interrupted');
+  const renderAgent = (agent: HistoryAgentChip) => {
           const selected = selectedKey === agent.key;
           const interrupted = agent.status === 'interrupted';
           const duration = Number(agent.durationMs) > 0
@@ -3749,7 +3926,7 @@ const HistoryAgentRoster = memo(({
               onClick={() => onSelect(agent.key)}
               style={{
                 width: '100%', minWidth: 0, display: 'flex', alignItems: 'center', gap: 7,
-                padding: '5px 10px', border: 'none', background: selected ? 'rgba(129, 140, 248, 0.10)' : 'transparent',
+                height: catalog ? 28 : undefined, boxSizing: 'border-box', padding: '5px 10px', border: 'none', background: selected ? 'rgba(129, 140, 248, 0.10)' : 'transparent',
                 color: '#bdbdbd', cursor: 'pointer', textAlign: 'left', fontSize: '0.82em',
               }}
               onMouseEnter={(event) => { if (!selected) event.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
@@ -3769,24 +3946,38 @@ const HistoryAgentRoster = memo(({
               </span>
             </button>
           );
-        })}
-      </div>
-    );
+  };
+  const renderSection = (label: string, records: HistoryAgentChip[]) => {
+    if (records.length === 0) return null;
+    return <div>
+      <div style={{ padding: '5px 10px 3px', color: '#666', fontSize: '0.72em', textTransform: 'uppercase', letterSpacing: 0.7 }}>{label}</div>
+      {records.map(renderAgent)}
+    </div>;
   };
   return (
     <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', borderTop: '1px solid #2a2a2a', background: '#111' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '5px 10px', borderBottom: '1px solid #222', color: '#bdbdbd', fontSize: '0.85em' }}>
         <Bot size={12} style={{ color: '#818cf8' }} />
-        <span style={{ flex: 1 }}>Agents · {agents.length}</span>
-        <button type="button" onClick={onClose} aria-label="Close agents list" style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 2 }}>
-          <X size={13} />
-        </button>
+        <span style={{ flex: 1 }}>Agents · {catalog ? catalog.status === 'ready' ? catalog.counts?.total ?? '…' : '…' : agents.length}</span>
+        <button type="button" onClick={onClose} aria-label="Close agents list" style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 2 }}><X size={13} /></button>
       </div>
-      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingBottom: 4 }}>
-        {renderSection('Running', running)}
-        {renderSection('Completed', completed)}
-        {renderSection('Interrupted', interrupted)}
-      </div>
+      {currentRoster && <div role="status" data-history-agent-current-roster
+        style={{ padding: '3px 10px', color: '#777', fontSize: '0.75em' }}>
+        Сейчас доступно: {currentRoster.counts.total}. {catalog?.currentError ? 'Текущие данные не подтверждены.'
+          : catalog?.status === 'error' ? 'История пока недоступна.' : 'История загружается…'}
+      </div>}
+      {currentRoster ? <HistoryAgentCatalogWindow counts={currentRoster.counts.total ? currentRoster.counts : null}
+        rows={currentRoster.rows.slice(currentPageStart, currentPageStart + 64)} pageStart={currentPageStart}
+        status={catalog!.status} error={catalog?.currentError?.code || catalog?.error?.code}
+        onRequestPage={requestCurrentPage} renderRow={renderAgent} /> : catalog ? <HistoryAgentCatalogWindow counts={catalog.counts} rows={catalog.rows}
+        pageStart={catalog.pageStart} status={catalog.status} error={catalog.error?.code}
+        onRequestPage={catalog.requestPage} renderRow={renderAgent} /> : (
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingBottom: 4 }}>
+          {renderSection('Running', running)}
+          {renderSection('Completed', completed)}
+          {renderSection('Interrupted', interrupted)}
+        </div>
+      )}
     </div>
   );
 });
@@ -3794,6 +3985,7 @@ const HistoryAgentRoster = memo(({
 const HistoryBackgroundTasksBar = memo(({
   chips,
   agents,
+  catalog,
   selectedKey,
   rosterOpen,
   onToggleDetail,
@@ -3807,6 +3999,7 @@ const HistoryBackgroundTasksBar = memo(({
 }: {
   chips: HistoryBackgroundChip[];
   agents: HistoryAgentChip[];
+  catalog?: HistoryAgentCatalogDock | null;
   selectedKey: string | null;
   rosterOpen: boolean;
   onToggleDetail: (chipKey: string) => void;
@@ -3823,6 +4016,7 @@ const HistoryBackgroundTasksBar = memo(({
   // 1s tick keeps elapsed labels live while anything runs.
   const [, force] = React.useReducer((x: number) => x + 1, 0);
   const [inspectorHeight, setInspectorHeight] = useState(260);
+  const [currentChipPageOffset, setCurrentChipPageOffset] = useState(0);
   const { start: startInspectorResize } = usePointerGesture();
   const beginInspectorResize = useCallback((event: React.PointerEvent<HTMLElement>) => {
     const startY = event.clientY;
@@ -3836,21 +4030,52 @@ const HistoryBackgroundTasksBar = memo(({
     });
   }, [inspectorHeight, startInspectorResize]);
   useEffect(() => {
-    if (chips.length === 0 && !agents.some((agent) => agent.status === 'running')) return;
+    if (chips.length === 0 && (catalog ? !catalog.counts?.running : !agents.some((agent) => agent.status === 'running'))) return;
     const handle = window.setInterval(() => force(), 1000);
     return () => window.clearInterval(handle);
-  }, [agents, chips.length]);
-  if (chips.length === 0 && agents.length === 0) return null;
-  const detailItems = new Map<string, HistoryBackgroundChip>();
-  for (const chip of chips) detailItems.set(chip.key, chip);
-  for (const agent of agents) detailItems.set(agent.key, agent);
-  const expandedChip = selectedKey
-    ? detailItems.get(selectedKey) || null
-    : null;
-  const runningAgentCount = agents.reduce((sum, agent) => sum + (agent.status === 'running' ? 1 : 0), 0);
-  const popoverOpen = rosterOpen || !!expandedChip;
+  }, [agents, chips.length, catalog?.counts?.running]);
+  const agentCount = catalog ? catalog.status === 'ready' ? catalog.counts?.total : undefined : agents.length;
+  // CURRENT navigation is synchronous even before any historical source
+  // exists. Its bounded page must not depend on a historical read completing.
+  const catalogReady = catalog?.status === 'ready';
+  const currentChips = catalog?.currentChips || chips;
+  const backgroundPageSize = catalog?.backgroundPageSize || 32;
+  const currentPageStart = Math.min(currentChipPageOffset,
+    Math.max(0, Math.floor((currentChips.length - 1) / backgroundPageSize) * backgroundPageSize));
+  const backgroundPageStart = catalogReady ? catalog.backgroundStart : currentPageStart;
+  const backgroundPageTotal = catalogReady ? catalog.counts?.background || 0 : currentChips.length;
+  const displayChips = catalog ? catalogReady ? catalog.backgroundRows
+    : currentChips.slice(currentPageStart, currentPageStart + backgroundPageSize) : chips;
+  const requestBackgroundPage = (offset: number) => {
+    if (catalogReady) catalog.requestPage({ section: 'background', offset, limit: backgroundPageSize });
+    else setCurrentChipPageOffset(offset);
+  };
+  if (displayChips.length === 0 && agentCount === 0 && !selectedKey && !rosterOpen) return null;
+  // A page is not membership. Only the selected exact-key query supplies a
+  // primary detail, and UNKNOWN keeps that same-owner record mounted.
+  let expandedChip: HistoryBackgroundChip | null = null;
+  if (catalog) {
+    const retained = selectedKey && catalog.selected.key === selectedKey ? catalog.selected.record || null : null;
+    // A newly completed CURRENT record has the result now. Until a fresh
+    // combined proof exists it takes precedence over an older running detail.
+    expandedChip = catalogReady ? retained : selectedKey
+      ? catalog.currentAgents?.find(agent => agent.key === selectedKey)
+        || currentChips.find(chip => chip.key === selectedKey) || retained : null;
+  } else {
+    const detailItems = new Map<string, HistoryBackgroundChip>();
+    for (const chip of chips) detailItems.set(chip.key, chip);
+    for (const agent of agents) detailItems.set(agent.key, agent);
+    expandedChip = selectedKey ? detailItems.get(selectedKey) || null : null;
+  }
+  const runningAgentCount = catalog ? catalog.status === 'ready' ? catalog.counts?.running || 0
+    : catalog.currentAgents?.filter(agent => agent.status === 'running').length
+      ?? chips.filter(chip => chip.kind === 'subagent').length
+    : agents.reduce((sum, agent) => sum + (agent.status === 'running' ? 1 : 0), 0);
+  const popoverOpen = rosterOpen || !!expandedChip || !!catalog && !!selectedKey;
   return (
-    <div style={{ position: 'relative', width: '100%', minWidth: 0 }}>
+    <div data-history-agent-catalog-state={catalog?.status}
+      data-history-agent-error-stage={catalog?.currentError ? 'presentation' : catalog?.errorStage || undefined}
+      style={{ position: 'relative', width: '100%', minWidth: 0 }}>
       {popoverOpen && (
         <div
           data-history-agent-popover
@@ -3882,11 +4107,12 @@ const HistoryBackgroundTasksBar = memo(({
           {rosterOpen ? (
             <HistoryAgentRoster
               agents={agents}
+              catalog={catalog}
               selectedKey={selectedKey}
               onSelect={onSelectAgent}
               onClose={onToggleRoster}
             />
-          ) : expandedChip && (
+          ) : expandedChip ? (
             <HistoryBackgroundDetailPane
               chip={expandedChip}
               onJumpToCard={onJumpToCard}
@@ -3896,11 +4122,17 @@ const HistoryBackgroundTasksBar = memo(({
               cwd={cwd}
               sessionId={sessionId}
             />
+          ) : catalog && selectedKey && (
+            <div role="status" data-history-agent-detail-pending style={{ padding: '6px 10px', color: '#777', fontSize: '0.82em' }}>
+              {catalog.status === 'error' || catalog.currentError ? 'Не удалось прочитать выбранного агента.' : 'Загружаем выбранного агента…'}
+              <button type="button" onClick={() => onToggleDetail(selectedKey)} aria-label="Close agent pane"
+                style={{ float: 'right', background: 'none', border: 'none', color: '#777', cursor: 'pointer' }}><X size={13} /></button>
+            </div>
           )}
         </div>
       )}
       <HistoryBackgroundScrollStrip>
-        {agents.length > 0 && (
+        {(agentCount === undefined || agentCount > 0) && (
           <button
             type="button"
             onClick={onToggleRoster}
@@ -3914,14 +4146,17 @@ const HistoryBackgroundTasksBar = memo(({
           >
             {runningAgentCount > 0 ? <HistoryBackgroundDot /> : <Bot size={11} style={{ color: '#818cf8' }} />}
             <span>Agents</span>
-            <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums' }}>{agents.length}</span>
+            <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums' }}>{agentCount ?? '…'}</span>
           </button>
         )}
-        {chips.map((chip, index) => {
+        {catalog && backgroundPageStart > 0 && <button type="button" aria-label="Предыдущие фоновые задачи"
+          onClick={() => requestBackgroundPage(Math.max(0, backgroundPageStart - backgroundPageSize))}
+          style={{ padding: '2px 6px', color: '#999', background: 'none', border: 'none', cursor: 'pointer' }}>‹</button>}
+        {displayChips.map((chip, index) => {
           const expanded = chip.key === selectedKey && !rosterOpen;
           return (
-            <React.Fragment key={chip.key}>
-              {(index > 0 || agents.length > 0) && (
+            <React.Fragment key={chip.key + ':' + index}>
+              {(index > 0 || agentCount === undefined || agentCount > 0) && (
                 <span
                   aria-hidden
                   className="self-stretch shrink-0"
@@ -3959,6 +4194,11 @@ const HistoryBackgroundTasksBar = memo(({
             </React.Fragment>
           );
         })}
+        {catalog && backgroundPageStart + displayChips.length < backgroundPageTotal && (
+          <button type="button" aria-label="Следующие фоновые задачи"
+            onClick={() => requestBackgroundPage(backgroundPageStart + backgroundPageSize)}
+            style={{ padding: '2px 6px', color: '#999', background: 'none', border: 'none', cursor: 'pointer' }}>›</button>
+        )}
       </HistoryBackgroundScrollStrip>
     </div>
   );
@@ -4043,12 +4283,12 @@ const findHistoryToolInnerScroller = (
 // movement that never belonged to the feed.
 const historyInnerOwnedWheelEvents = new WeakSet<Event>();
 
-const openHistoryEntryContextMenu = (
+const openHistoryEntryContextMenu = async (
   event: React.MouseEvent<HTMLDivElement>,
   entry: FullHistoryEntry,
   toolType?: 'claude' | 'gemini' | 'codex',
   tabId?: string,
-  iteration: number | null = null,
+  iteration: number | null | Promise<number | null> = null,
   readSessionId?: string,
 ) => {
   const selection = window.getSelection();
@@ -4071,6 +4311,7 @@ const openHistoryEntryContextMenu = (
     '[HistoryEntryMenu] open role=' + entry.role +
     ' id=' + (entry.uuid ? entry.uuid.slice(0, 8) : 'none'),
   );
+  const resolvedIteration = await iteration;
   ipcRenderer.send('show-history-entry-context-menu', {
     copyText: historyEntryDetailsText(entry, toolType),
     diagnostic: historyEntryCopyDiagnostic(entry, tabId, toolType),
@@ -4079,7 +4320,7 @@ const openHistoryEntryContextMenu = (
       // This is an action-time metadata lookup, not a whole-workspace selector.
       tabName: tabId ? [...useWorkspaceStore.getState().openProjects.values()]
         .find(workspace => workspace.tabs.has(tabId))?.tabs.get(tabId)?.name : undefined,
-      iteration,
+      iteration: resolvedIteration,
       readSessionId: readSessionId || entry.entryRef?.viewOwnerSessionId || entry.viewOwnerSessionId,
       timeLabel: entry.timestamp && Number.isFinite(Date.parse(entry.timestamp))
         ? new Date(entry.timestamp).toLocaleString() : undefined,
@@ -4106,7 +4347,7 @@ const HistoryCollapsiblePrompt = ({
   const visibleText = needsCollapse && !open ? preview + '…' : text;
   const body = markdown
     ? <CBMarkdown text={visibleText} preview={needsCollapse && !open} />
-    : <p className="cb-msg-text">{renderSentHistoryPromptHighlight(visibleText)}</p>;
+    : <p className="cb-msg-text"><HistoryInlineTextPart text={visibleText} highlight /></p>;
   if (!needsCollapse) return body;
   const toggle = (
     <button
@@ -4266,7 +4507,47 @@ const HistoryPromptActionPopover = ({
  * целиком, иначе каждый кусок обрезался бы по своему порогу и в одном пузыре
  * оказалось бы несколько многоточий.
  */
-const HistoryInlineTextPart = ({ text }: { text: string }) => <>{text}</>;
+const HistoryInlineTextPart = ({ text, highlight = false }: { text: string; highlight?: boolean }) => {
+  const references = collectPromptWebImageReferences(text);
+  const renderText = (value: string) => highlight ? renderSentHistoryPromptHighlight(value) : value;
+  if (references.length === 0) return <>{renderText(text)}</>;
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    nodes.push(renderText(text.slice(cursor, reference.start)));
+    nodes.push(<HistoryWebImageReference key={`${reference.start}:${reference.source}`}
+      source={reference.source} url={reference.url} />);
+    cursor = reference.end;
+  }
+  nodes.push(renderText(text.slice(cursor)));
+  return <>{nodes}</>;
+};
+
+// A remote Markdown image/fav-icon has no managed attachment bytes. Reuse the
+// existing red image token + preview, but never request local-image IPC or fetch
+// a remote URL just to render History. Its exact source remains Copy/Send text.
+const HistoryWebImageReference = ({ source, url }: { source: string; url: string }) => {
+  const [open, setOpen] = useState(false);
+  const anchor = useRef<HTMLElement | null>(null);
+  const close = useCallback(() => setOpen(false), []);
+  return <>
+    <HistoryComposerToken kind="image" label="image" error
+      buttonRef={node => { anchor.current = node; }}
+      onClick={trigger => {
+        if (open) trigger.blur();
+        setOpen(current => !current);
+      }} />
+    {open && <HistoryChipPopover anchor={anchor.current} onClose={close}>
+      <PastedContentPreview text={source} clampToViewport={false} body={
+        <div data-history-web-image-unavailable>
+          <div style={{ color: '#f87171' }}>Веб-изображение не загружено: ссылка не является вложением.</div>
+          <div style={{ overflowWrap: 'anywhere' }}>{url}</div>
+          <div>Ссылка сохранена в тексте сообщения. Её загрузка не требуется для отправки.</div>
+        </div>
+      } />
+    </HistoryChipPopover>}
+  </>;
+};
 
 const HistoryImageTokenThumbnail = ({ src }: { src?: string }) => {
   const [failed, setFailed] = useState(false);
@@ -4979,6 +5260,25 @@ const HistorySendTimer = memo(({ sendInputTiming, status, changedAt }: {
   </span> : null;
 });
 
+function HistorySendQueueReleaseAction({ onRelease }: { onRelease: () => Promise<boolean> }) {
+  const [pending, setPending] = useState(false);
+  const [released, setReleased] = useState(false);
+  const inflight = useRef(false);
+  if (released) return null;
+  return <Tooltip content="Перепроверить квитанцию и продолжить очередь без повторной отправки этого сообщения">
+    <button type="button" className="hp-user-message-status-dismiss" data-history-send-release
+      style={{ width: 'auto', flex: '0 0 auto', lineHeight: 1, whiteSpace: 'nowrap', padding: '0 3px', fontSize: 10, cursor: 'default' }}
+      aria-label="Продолжить очередь без повторной отправки" disabled={pending}
+      onMouseDown={event => { event.preventDefault(); event.stopPropagation(); }} onClick={async event => {
+        event.preventDefault(); event.stopPropagation();
+        if (inflight.current) return;
+        inflight.current = true; setPending(true);
+        try { if (await onRelease()) setReleased(true); }
+        finally { inflight.current = false; setPending(false); }
+      }}>{pending ? 'Проверяю…' : 'Продолжить очередь'}</button>
+  </Tooltip>;
+}
+
 const HistoryUserEntry = memo(({
   entry,
   tabId,
@@ -4997,6 +5297,7 @@ const HistoryUserEntry = memo(({
   forceExpanded,
   onDismissPromptPresentation,
   onMergeQueuedPrompt,
+  onReleaseSendQueue,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -5015,6 +5316,7 @@ const HistoryUserEntry = memo(({
   forceExpanded?: boolean;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
   onMergeQueuedPrompt?: (entry: FullHistoryEntry) => Promise<void>;
+  onReleaseSendQueue?: (entry: FullHistoryEntry) => Promise<boolean>;
 }) => {
   const [copied, setCopied] = useState(false);
   const [mergePending, setMergePending] = useState(false);
@@ -5143,13 +5445,48 @@ const HistoryUserEntry = memo(({
     event.stopPropagation();
   };
 
-  const copyPrompt = (event: React.MouseEvent<HTMLButtonElement>) => {
+  const copyOwnerRef = useRef(entry);
+  copyOwnerRef.current = entry;
+  const copyPrompt = async (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
+    const isRecovery = isLocalPromptEntry(entry) && ['failed', 'cancelled'].includes(entry.queueStatus || '');
+    let authoringSnapshot = isRecovery ? entry.authoringSnapshot : undefined;
+    if (isRecovery && !authoringSnapshot) {
+      const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === entry.handoffId
+        && value.sendOperationKey === entry.sendOperationKey && value.sendAttemptId === entry.sendAttemptId);
+      if (handoff) authoringSnapshot = historyPromptHandoffRecoveryFields(handoff).authoringSnapshot;
+      else if (entry.sendOperationKey) {
+        // Addressed read of the previous owner after bounded RAM eviction;
+        // never scan History or treat an absent receipt as a new Send.
+        try {
+          const result = await ipcRenderer.invoke('agent:list-send-receipts', {
+            tabId, handoffId: entry.handoffId, operationKey: entry.sendOperationKey,
+          });
+          const matches = result?.success === true ? result.records?.filter((record: any) => record.tabId === tabId
+            && record.handoffId === entry.handoffId && record.operationKey === entry.sendOperationKey
+            && (record.attemptId ?? null) === (entry.sendAttemptId ?? null)
+            && record.provider === toolType && record.surface === 'desktop-history'
+            && record.receipt?.authoringSnapshot && ['not-submitted', 'provider-not-accepted'].includes(record.state)) : [];
+          if (matches?.length === 1) authoringSnapshot = matches[0].receipt.authoringSnapshot;
+        } catch (error: any) {
+          console.warn('[HistoryPanel] exact Copy snapshot read failed handoff=' + entry.handoffId
+            + ' error=' + String(error?.message || error));
+        }
+        if (copyOwnerRef.current.handoffId !== entry.handoffId
+          || copyOwnerRef.current.sendOperationKey !== entry.sendOperationKey
+          || copyOwnerRef.current.sendAttemptId !== entry.sendAttemptId) return;
+        if (!authoringSnapshot) {
+          useUIStore.getState().showToast('Исходный текст сообщения пока недоступен. Карточка сохранена.', 'error');
+          return;
+        }
+      }
+    }
     const copiedMessage = researchReply ? buildResearchReplyClipboardPayload(entry, orchestrationPrompt) : buildHistoryMessageClipboardPayload({
       text: entry.content,
       chips: entry.promptChips,
       imagePaths: entry.imagePaths,
+      authoringSnapshot,
     });
     const clipboardResult = writeElectronComposerSnapshotClipboard(copiedMessage);
     setCopied(clipboardResult.textCopied);
@@ -5260,7 +5597,7 @@ const HistoryUserEntry = memo(({
       tone={serviceBody.questionReply ? 'info' : 'default'}
       data-history-question-reply={serviceBody.questionReply?.provider}
       entryUuid={entry.uuid}
-      {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':user', 'user')}
+      {...historyRecordTimeAttributes(historyEntryRecordTime(entry), entry.uuid + ':user', 'user')}
       className={researchReply ? 'hp-history-user--orchestration hp-history-research-entry' : orchestrationStyle ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
       data-history-mcp-as-user={mcpAsUser || undefined}
       data-history-prompt-origin={loopPrompt ? 'loop' : continuePrompt ? 'codex-capacity-retry' : undefined}
@@ -5315,6 +5652,12 @@ const HistoryUserEntry = memo(({
               ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
               : undefined}
           />}
+          {toolType === 'codex' && isLocalPromptEntry(entry) && !!entry.applicationQueueId && !!entry.sendOperationKey && !!entry.sendAttemptId
+            && ['queued', 'audit-pending', 'delivery-unknown'].includes(queueStatus || '')
+            && entry.statusReason !== 'durable-input-slot-retired' && onReleaseSendQueue && (
+              <HistorySendQueueReleaseAction key={entry.sendOperationKey + ':' + entry.sendAttemptId}
+                onRelease={() => onReleaseSendQueue(entry)} />
+            )}
         </span>
       ) : undefined}
       actions={(
@@ -5497,21 +5840,36 @@ const HistoryUserEntry = memo(({
   );
 });
 
+type HistoryCompositeReveal = (anchor: HTMLElement | null, opening: boolean, commit: () => void,
+  source?: 'header' | 'rail' | 'foot') => void;
+
 const HistoryAssistantEntry = memo(({
   entry,
+  suppressResponseTiming = false,
+  compositeGroupState,
+  onCompositeReveal,
+  isTurnBusy = false,
 }: {
   entry: FullHistoryEntry;
+  suppressResponseTiming?: boolean;
+  compositeGroupState?: ReturnType<typeof createHistoryCompositeGroupState>;
+  onCompositeReveal?: HistoryCompositeReveal;
+  isTurnBusy?: boolean;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveBackgroundUuids = React.useContext(HistoryBackgroundLiveContext);
   const liveBackgroundTaskCalls = React.useContext(HistoryBackgroundTaskCallContext);
+  const entryBackgroundLive = useHistoryAgentCatalogMember('entry', entry.uuid, liveBackgroundUuids.has(entry.uuid));
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
   }, []);
 
   const hasAssistantContent = !!entry.content;
   const hasAssistantActions = !!entry.actions?.length;
+  const compositeFacts = useMemo(() => compositeGroupState ? historyCompositeActionFacts(entry) : null,
+    [entry, compositeGroupState]);
+  const canGroupCompositeActions = !!compositeGroupState && !!compositeFacts;
   const completedResponseTiming = useMemo(
     () => resolveHistoryResponseTailTiming(null, [entry]) as HistoryResponseTailTiming | null,
     [entry],
@@ -5533,6 +5891,13 @@ const HistoryAssistantEntry = memo(({
       setCopied(false);
     }, 900);
   };
+  const wrapCompositeActions = (children: React.ReactNode) => canGroupCompositeActions ? (
+    <HistoryCompositeWorkActions entry={entry} facts={compositeFacts!} store={compositeGroupState!}
+      liveBackgroundUuids={liveBackgroundUuids} isTurnBusy={isTurnBusy}
+      onReveal={onCompositeReveal || applyHistoryRevealUpdate}>
+      {children}
+    </HistoryCompositeWorkActions>
+  ) : children;
 
   return (
     <ConversationMessage
@@ -5547,7 +5912,7 @@ const HistoryAssistantEntry = memo(({
           </Tooltip>
         </MessageActionRail>
       ) : undefined}
-      footer={completedResponseTiming ? (
+      footer={completedResponseTiming && !suppressResponseTiming ? (
         <HistoryResponseTailTimer timing={completedResponseTiming} placement="entry" />
       ) : undefined}
       className={isStandaloneToolRow ? 'hp-assistant-tool-only' : undefined}
@@ -5560,7 +5925,7 @@ const HistoryAssistantEntry = memo(({
         </div>
       )}
 
-      {entry.actions?.map((action, index) => {
+      {wrapCompositeActions(entry.actions?.map((action, index) => {
         if (isRawAction(action)) {
           const toolName = String(action.rawTool.toolName || '');
           const toolResult = action.rawTool.result;
@@ -5568,7 +5933,7 @@ const HistoryAssistantEntry = memo(({
             ? ''
             : toolResult;
           const backgroundRunning = action.rawTool.backgroundStatus === 'running'
-            && liveBackgroundUuids.has(entry.uuid);
+            && entryBackgroundLive;
           const presentation = historyActionPresentationMeta({
             toolName,
             args: action.rawTool.args || {},
@@ -5615,12 +5980,14 @@ const HistoryAssistantEntry = memo(({
           );
         }
         if (isTaskAction(action)) {
+          const callIdentity = historySubagentCallIdentity(action.toolUseId);
           return (
             <SubAgentBlock
               key={'task' + index}
               action={action}
               entryUuid={entry.uuid}
-              live={liveBackgroundTaskCalls.has(historySubagentCallIdentity(action.toolUseId))}
+              callIdentity={callIdentity}
+              live={liveBackgroundTaskCalls.has(callIdentity)}
             />
           );
         }
@@ -5643,7 +6010,7 @@ const HistoryAssistantEntry = memo(({
             </span>
           </div>
         );
-      })}
+      }))}
 
     </ConversationMessage>
   );
@@ -5727,6 +6094,11 @@ const HistoryEntry = memo(({
   onDismissRewindPresentation,
   onDismissPromptPresentation,
   onMergeQueuedPrompt,
+  onReleaseSendQueue,
+  suppressResponseTiming,
+  compositeGroupState,
+  onCompositeReveal,
+  isTurnBusy,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -5746,6 +6118,11 @@ const HistoryEntry = memo(({
   onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
   onMergeQueuedPrompt?: (entry: FullHistoryEntry) => Promise<void>;
+  onReleaseSendQueue?: (entry: FullHistoryEntry) => Promise<boolean>;
+  suppressResponseTiming?: boolean;
+  compositeGroupState?: ReturnType<typeof createHistoryCompositeGroupState>;
+  onCompositeReveal?: HistoryCompositeReveal;
+  isTurnBusy?: boolean;
 }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
@@ -5793,6 +6170,7 @@ const HistoryEntry = memo(({
         forceExpanded={forceExpanded}
         onDismissPromptPresentation={onDismissPromptPresentation}
         onMergeQueuedPrompt={onMergeQueuedPrompt}
+        onReleaseSendQueue={onReleaseSendQueue}
       />
     );
   }
@@ -5872,17 +6250,15 @@ const HistoryEntry = memo(({
     );
   }
 
-  return <HistoryAssistantEntry entry={entry} />;
+  return <HistoryAssistantEntry entry={entry} suppressResponseTiming={suppressResponseTiming}
+    compositeGroupState={compositeGroupState} onCompositeReveal={onCompositeReveal} isTurnBusy={isTurnBusy} />;
 });
 
 // The feed's quietest voice — service text, as opposed to content.
 //
-// One number, used by BOTH the CSS below (`.hp-history-group-detail`, the «└ …»
-// line under a collapsed group header) and by the inline-styled status chip on
-// the composer's border. They are the same kind of text — a caption ABOUT
-// something rather than the something — so they must not be sized separately;
-// picking a number for one of them by eye is how the chip twice ended up as loud
-// as the chat text itself.
+// Composer service labels keep their own ratio. The readable commentary under
+// a tool group is deliberately larger (0.9em, Fedor 29 Oct); changing that
+// caption must not enlarge the status labels or their reserved overlay slot.
 const HISTORY_SERVICE_TEXT_RATIO = 0.82;
 // …and its WEIGHT. The reference line sets none, i.e. it inherits the feed's
 // ordinary text weight — a caption is quieter than what it annotates, so it has
@@ -6334,10 +6710,8 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
      in flow so it cannot cover the final line or change measured height. */
   justify-content: flex-end;
 }
-/* Collapsed group unit: fixed two-line geometry (header + detail line). The
-   detail line NEVER disappears on completion — its content changes from the
-   live operation to the member digest (owner contract: constant tail
-   geometry). */
+/* A collapsed group without commentary is only a header; a real caption adds
+   the detail line when it arrives. Measured geometry has its own shape key. */
 .hp-history-group {
   /* Root rows have one symmetric rhythm, regardless of whether the row is a
      card, thinking, or a collapsed group. The wrapper gives a group 2px and
@@ -6509,6 +6883,7 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 .hp-history-response-tail-label {
   white-space: nowrap;
 }
+.hp-history-response-tail[data-state="running"] { gap: 6px; }
 .hp-history-send-timer {
   color: var(--cb-text, #e0e0e0);
   font-variant-numeric: tabular-nums;
@@ -6553,6 +6928,63 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   min-height: 18px;
   padding: 4px 0 0;
 }
+.hp-history-response-work-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  margin: 8px 0;
+  padding: 2px var(--hp-horizontal-padding, 4px);
+  border-radius: 4px;
+  color: var(--cb-text, #e0e0e0);
+  font-size: 0.9em;
+  font-weight: 600;
+  line-height: 1.45;
+  cursor: pointer;
+  user-select: none;
+}
+.hp-history-response-work-head:hover,
+.hp-history-response-work-head:focus-visible { background: rgba(255, 255, 255, 0.03); }
+.hp-history-response-work-head .hp-history-response-tail { min-height: 20px; padding: 0; font-size: 1em; }
+/* Keep the work rail distinct from the bright pane edge with a small inset;
+   reserve its click area without adding a full nested-content indentation. */
+.hp-history-response-member {
+  position: relative;
+  display: flow-root;
+  margin-left: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.28);
+}
+.hp-history-response-member > .hp-history-group-rail-control { left: -4px; width: 8px; }
+.hp-history-response-member[data-history-group-rail-hot="1"] { border-left-color: rgba(255, 255, 255, 0.55); }
+.hp-history-response-member [data-history-group] > .hp-history-group {
+  padding-left: var(--hp-horizontal-padding, 4px);
+  padding-right: var(--hp-horizontal-padding, 4px);
+}
+.hp-history-work-preview {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 var(--hp-horizontal-padding, 4px);
+  color: var(--cb-prose, #e0e0e0);
+  font-size: 1em;
+  line-height: 1.45;
+}
+.hp-history-work-preview-branch { flex: 0 0 auto; color: #8f8d88; }
+.hp-history-work-preview-text {
+  flex: 1;
+  min-width: 0;
+  height: 1.45em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.hp-history-work-preview-text[data-history-work-preview-error="1"] { color: #f87171; }
+.hp-history-work-preview-text .cb-prose-preview,
+.hp-history-work-preview-text .cb-prose-preview :is(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, pre, code, table, thead, tbody, tr, th, td) {
+  display: inline; margin: 0; padding: 0; border: 0; white-space: nowrap;
+}
+.hp-history-work-preview-text .cb-prose-preview :is(p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, tr)::after { content: ' '; }
 .hp-history-group-detail {
   display: flex;
   align-items: flex-start;
@@ -6560,10 +6992,8 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   min-height: 18px;
   padding: 0 4px 0 26px;
   color: #8f8d88;
-  /* The reference for every service caption in this panel — see
-     HISTORY_SERVICE_TEXT_RATIO. Interpolated rather than written as a literal so
-     the composer's status chip, which is styled inline, cannot drift from it. */
-  font-size: ${HISTORY_SERVICE_TEXT_RATIO}em;
+  /* Readable work commentary, independently of the composer's service status. */
+  font-size: 0.9em;
   /* Full subject list, wrapped — never «file.md, file2.md · 3 more». */
   overflow-wrap: anywhere;
   line-height: 1.4;
@@ -7606,6 +8036,7 @@ function AgentHistoryControls({
   onSwapPrimarySurface,
   terminalIsPrimary = false,
   lifecycleStatus,
+  returnPreparation,
   operationalPhase,
   onHeightChange,
   onRuntimeSnapshotChange,
@@ -7663,7 +8094,8 @@ function AgentHistoryControls({
     text: string,
     submittedAt: number,
     identity?: DurablePromptIdentity,
-  ) => boolean;
+    options?: { signal?: AbortSignal },
+  ) => boolean | Promise<boolean>;
   rewindLocked: boolean;
   rewindPhase?: RewindOperationPhase;
   rewindMessage?: string;
@@ -7694,6 +8126,7 @@ function AgentHistoryControls({
   // Pane stacked in a column → short surface, so the input starts at one row.
   compactComposer?: boolean;
   promptBandRightInset?: number;
+  returnPreparation?: { label: string; count: number } | null;
 }) {
   // Owning the tab's input is not the same as being the centered surface: the
   // terminal-primary layout keeps this composer live in the side panel. Fall
@@ -8543,30 +8976,44 @@ function AgentHistoryControls({
     } satisfies DurablePromptIdentity;
   }, [tabId]);
 
+  const promptRecoveryOwnerKey = JSON.stringify([tabId, toolType, sessionId, cwd]);
+  const promptRecoveryOwnerRef = useCanonicalPromptRecoveryOwner(promptRecoveryOwnerKey);
   const hasDurablePendingPrompt = useCallback((pending: MidstreamPromptRecovery) => (
     hasDurablePrompt(
       pending.serializedText,
       pending.submittedAt,
       durableIdentityForPending(pending),
+      { signal: captureCanonicalPromptRecoveryOwner(promptRecoveryOwnerRef, promptRecoveryOwnerKey).signal },
     )
-  ), [durableIdentityForPending, hasDurablePrompt]);
+  ), [durableIdentityForPending, hasDurablePrompt, promptRecoveryOwnerKey, promptRecoveryOwnerRef]);
 
   const refreshDurablePromptProof = useCallback(async (
     pending: MidstreamPromptRecovery,
     reason: string,
     options: { forceRefresh?: boolean } = {},
   ) => {
-    if (!options.forceRefresh && hasDurablePendingPrompt(pending)) return true;
+    const owner = captureCanonicalPromptRecoveryOwner(promptRecoveryOwnerRef, promptRecoveryOwnerKey);
+    if (!options.forceRefresh) {
+      const durable = await hasDurablePendingPrompt(pending);
+      owner.assertCurrent();
+      if (durable) return true;
+    }
     try {
       await onHistoryRefresh(reason);
     } catch (e: any) {
+      if (isCanonicalPromptRecoveryReadError(e)) throw e;
+      if (!owner.isCurrent()) throw canonicalPromptRecoveryReadError(e);
       console.warn('[' + runtime.logPrefix + '] durable prompt refresh failed tab='
         + tabId.slice(-12)
         + ' reason=' + reason
         + ' error=' + String(e?.message || e));
+      throw canonicalPromptRecoveryReadError(e);
     }
-    return hasDurablePendingPrompt(pending);
-  }, [hasDurablePendingPrompt, onHistoryRefresh, runtime.logPrefix, tabId]);
+    owner.assertCurrent();
+    const durable = await hasDurablePendingPrompt(pending);
+    owner.assertCurrent();
+    return durable;
+  }, [hasDurablePendingPrompt, onHistoryRefresh, runtime.logPrefix, tabId, promptRecoveryOwnerKey, promptRecoveryOwnerRef]);
 
   useEffect(() => {
     tabIdRef.current = tabId;
@@ -8984,6 +9431,9 @@ function AgentHistoryControls({
       }
 
       const requestTabId = tabId;
+      const recoveryOwner = promptRecoveryOwnerRef.current;
+      if (!recoveryOwner || recoveryOwner.key !== promptRecoveryOwnerKey || !recoveryOwner.isCurrent()) return;
+      let keepPendingProof = false;
       interruptRecoveryInFlightRef.current.add(pending.handoffId);
       console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.serializedText.length + ' chips=' + pending.chips.length);
       historyDiag('INTERRUPT_RECOVERY_START tab=' + tabId.slice(-12) +
@@ -8996,6 +9446,7 @@ function AgentHistoryControls({
       (async () => {
         const attempt = 1;
         if (tabIdRef.current !== requestTabId) return;
+        recoveryOwner.assertCurrent();
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12)
           + ' attempt=' + attempt
           + ' source=authoritative-stop-event');
@@ -9003,6 +9454,7 @@ function AgentHistoryControls({
         try {
             const draft = await readTerminalDraft('interrupt-recovery');
             withdrawnDraft = draft;
+            recoveryOwner.assertCurrent();
             if (draft.stale || tabIdRef.current !== requestTabId) return;
             if (draft.successorActive) {
               historyDiag('INTERRUPT_RECOVERY_DEFER tab=' + tabId.slice(-12)
@@ -9017,8 +9469,7 @@ function AgentHistoryControls({
                 presentationText: pending.serializedText,
                 transportText: pending.transportText,
               });
-              const confirmedOwnership = resolveInterruptedPromptOwnership({
-                durablePromptExists: authoringProof
+              const durablePromptExists = authoringProof
                   ? await refreshDurablePromptProof(pending, 'interrupt-exact-draft', {
                       // The prompt can disappear from Claude's active branch on
                       // interrupt after an older History snapshot already saw
@@ -9026,13 +9477,17 @@ function AgentHistoryControls({
                       // branch read before durable ownership is allowed to win.
                       forceRefresh: true,
                     })
-                  : hasDurablePendingPrompt(pending),
+                  : await hasDurablePendingPrompt(pending);
+              recoveryOwner.assertCurrent();
+              const confirmedOwnership = resolveInterruptedPromptOwnership({
+                durablePromptExists,
                 returnedDraftExists: true,
                 returnedDraftMatchesHandoff: authoringProof,
               });
               if (confirmedOwnership === 'durable') {
                 if (draft.draftTransfer) {
                   await adoptAgentDraftTransferOnce(draft.draftTransfer, 'durable:' + requestTabId, () => null);
+                  recoveryOwner.assertCurrent();
                 }
                 historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
                   ' handoff=' + pending.handoffId +
@@ -9051,12 +9506,16 @@ function AgentHistoryControls({
                 && currentImages.length === 0;
 
               if (authoringProof && composerStillEmpty) {
-                const restoreAuthoring = () => setHistoryPromptDraft(requestTabId, pending.rawText, {
+                const restoreAuthoring = () => {
+                  recoveryOwner.assertCurrent();
+                  return setHistoryPromptDraft(requestTabId, pending.rawText, {
                     images: pending.images,
                     chips: pending.chips,
                   });
+                };
                 if (draft.draftTransfer) await adoptAgentDraftTransferOnce(draft.draftTransfer, 'history:' + requestTabId, restoreAuthoring);
                 else restoreAuthoring();
+                recoveryOwner.assertCurrent();
                 setDraftWarning(runtime.label + ' returned an interrupted prompt; its text and chips were restored.');
                 console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
                   + ' source=authoring-snapshot chars=' + pending.rawText.length
@@ -9070,12 +9529,13 @@ function AgentHistoryControls({
                   ' chars=' + pending.rawText.length +
                   ' chips=' + pending.chips.length +
                   ' images=' + pending.images.length);
-                requestAnimationFrame(() => promptTextareaRef.current?.focus());
+                requestAnimationFrame(() => { if (recoveryOwner.isCurrent()) promptTextareaRef.current?.focus(); });
                 return;
               }
 
               if (draft.draftTransfer) {
                 await recoverAgentDraftTransferToHistory(draft, requestTabId, useUIStore);
+                recoveryOwner.assertCurrent();
               } else {
                 let pendingImages = useUIStore.getState().historyPromptDraftPendingImages[requestTabId] || [];
                 const nextText = prependPromptTextOnce(current, draft.text, (edit) => {
@@ -9109,19 +9569,26 @@ function AgentHistoryControls({
                 ' chars=' + draft.text.length +
                 ' images=' + draft.images +
                 ' ownership=' + confirmedOwnership);
-              requestAnimationFrame(() => promptTextareaRef.current?.focus());
+              requestAnimationFrame(() => { if (recoveryOwner.isCurrent()) promptTextareaRef.current?.focus(); });
               return;
             }
         } catch (e: any) {
+          if (isCanonicalPromptRecoveryReadError(e)) keepPendingProof = true;
+          if (!recoveryOwner.isCurrent()) return;
           await recoverAgentDraftTransferToHistory(withdrawnDraft, requestTabId, useUIStore);
+          recoveryOwner.assertCurrent();
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery probe-failed tab=' + tabId.slice(-12) + ' attempt=' + attempt + ': ' + String(e?.message || e));
+          // The point read is unknown/cancelled/failed, not a known negative.
+          // Retain its pending intent after safely recovering the staged draft;
+          // never fall through to another query or fresh History read.
+          if (isCanonicalPromptRecoveryReadError(e)) return;
         }
         if (tabIdRef.current !== requestTabId) return;
+        recoveryOwner.assertCurrent();
+        const durablePromptExists = await refreshDurablePromptProof(pending, 'interrupt-empty-draft');
+        recoveryOwner.assertCurrent();
         const ownership = resolveInterruptedPromptOwnership({
-          durablePromptExists: await refreshDurablePromptProof(
-            pending,
-            'interrupt-empty-draft',
-          ),
+          durablePromptExists,
           returnedDraftExists: false,
         });
         if (ownership === 'durable') {
@@ -9139,11 +9606,12 @@ function AgentHistoryControls({
           ' sentChars=' + pending.serializedText.length);
       })()
         .catch((e: any) => {
+          if (isCanonicalPromptRecoveryReadError(e)) keepPendingProof = true;
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
         })
         .finally(() => {
-          if (tabIdRef.current === requestTabId) {
-            if (midstreamPromptRecoveryRef.current === pending) midstreamPromptRecoveryRef.current = null;
+          if (recoveryOwner.isCurrent() && tabIdRef.current === requestTabId) {
+            if (!keepPendingProof && midstreamPromptRecoveryRef.current === pending) midstreamPromptRecoveryRef.current = null;
             interruptRecoveryInFlightRef.current.delete(pending.handoffId);
           }
         });
@@ -9153,7 +9621,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [hasDurablePendingPrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
+  }, [hasDurablePendingPrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId, promptRecoveryOwnerKey, promptRecoveryOwnerRef]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
@@ -9645,7 +10113,7 @@ function AgentHistoryControls({
         if (!presentationText) return;
         // Direct/external callers obey the same image-import gate as Enter.
         // A blocked Enter is never remembered for automatic submission later.
-        if (rawDraftSnapshot.includes(HISTORY_IMAGE_PENDING_MARKER)) return;
+        if (hasPromptPendingImageMarker(rawDraftSnapshot)) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
         sendIncidentStatusAtSend = statusAtSend;
@@ -9790,14 +10258,17 @@ function AgentHistoryControls({
         }
         const sendDraftImages = preparedPrompt.images;
         sendIncidentImages = sendDraftImages.length;
-        let sendPayload = serializeComposerDraft({
+        const draftTransport = prepareComposerDraftTransport({
           text: preparedPrompt.payload,
           chips: sendDraftChips,
-        }).trim();
+        });
+        let sendPayload = draftTransport.prompt;
+        const sourceAuthoringTransport = { sourceHash: historyServicePromptFingerprint(sendPayload),
+          imageRanges: draftTransport.imageRanges };
         // The copied incident must contain what the PTY scenario attempted to
         // send, not only the compact chip labels visible in the editor.
         sendIncidentPromptText = sendPayload;
-        const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload);
+        const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload, sourceAuthoringTransport);
         markSendPreparation('context-ready');
         if (isHistorySendReturned(actionTabId, handoffId)) {
           await settleTabWorkContext(actionTabId, handoffId, { submitted: false });
@@ -9969,6 +10440,7 @@ function AgentHistoryControls({
             historySessionId: sessionId || null,
             promptChips: promptChipsForHistory,
             imagePaths: sendDraftImages,
+            authoringTransport: contextPrepared.authoringTransport || sourceAuthoringTransport,
           },
           authoringSnapshot: { editorText: rawDraftSnapshot, chips: sendDraftChips, imagePaths: sendDraftImages },
         });
@@ -10803,7 +11275,7 @@ function AgentHistoryControls({
     [draftImages, prompt]
   );
   const derivedDraftWarning = derivedDraftImageNotice?.message || null;
-  const historyImagePastePending = prompt.includes(HISTORY_IMAGE_PENDING_MARKER);
+  const historyImagePastePending = hasPromptPendingImageMarker(prompt);
   const draftImagePreflightKey = useMemo(
     () => historyDraftImagePreflightKey(tabId, prompt, draftImages),
     [draftImages, prompt, tabId],
@@ -11401,7 +11873,7 @@ function AgentHistoryControls({
     // Keep the existing clipboard admission contract: native bitmap IPC reads
     // the OS clipboard, so this repair does not add simultaneous live imports.
     // Removing a slot still permits another paste while the old promise runs.
-    if (current.includes(HISTORY_IMAGE_PENDING_MARKER)) {
+    if (hasPromptPendingImageMarker(current)) {
       setDraftWarning('Wait for the current image to finish saving.');
       return;
     }
@@ -12011,6 +12483,7 @@ function AgentHistoryControls({
   // in the same place.
   const hasFloatingStatus = showStatusText
     || !!activeLifecycle
+    || !!returnPreparation
     || (!!visibleDraftWarning && !!inlineDraftNoticeMeta)
     || rewindPreviewActive;
   const historyComposerFloatingStatus = !hasFloatingStatus ? null : (
@@ -12039,21 +12512,14 @@ function AgentHistoryControls({
         background: 'var(--cb-composer-bg, #0f0f0f)',
         borderRadius: 4,
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-        // EXACTLY the size of a group header's second line (`.hp-history-group-detail`,
-        // 0.82em of the transcript font — the «└ …» caption under «Searched 5
-        // queries»). That line is the quietest service text in the feed, and this
-        // chip is the same kind of thing: an annotation of the frame, not content.
-        //
-        // Two earlier values were both wrong for the same reason — they were
-        // picked as absolute numbers instead of derived from that one reference.
+        // Quiet service annotation of the composer frame, not work commentary.
+        // Keep the accepted 0.82 ratio when the group caption grows to 0.9em.
         // 0.9em is a tool-card LABEL, a step louder, and at the default 13px it
         // lands within a pixel of the chat text itself, so the chip read as a
         // message rather than as a caption (user, twice: «почему он по размеру
         // такой, как у меня текст в чате»).
         //
-        // No `Math.max` floor here on purpose: a floor would hold the chip at
-        // 10px while the reference line kept shrinking with the user's transcript
-        // setting, and the two would visibly diverge again at small sizes.
+        // No `Math.max` floor: keep scaling with the user's transcript setting.
         fontSize: historyTranscriptFontSize * HISTORY_SERVICE_TEXT_RATIO,
         // Set on the CONTAINER so every part inside inherits it — status, timer,
         // hints, badges. Each part used to carry its own 600-750, which is how the
@@ -12106,6 +12572,16 @@ function AgentHistoryControls({
         )}
 
         <AgentLifecycleActions lifecycle={activeLifecycle} />
+
+        {returnPreparation && (
+          <span role="status" aria-live="polite" aria-busy="true"
+            data-history-input-preparation="return-prompt"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+              minWidth: 0, color: '#b8b6b1', pointerEvents: 'none' }}>
+            <HistorySpinner size={11} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{returnPreparation.label}</span>
+          </span>
+        )}
 
         {visibleDraftWarning && inlineDraftNoticeMeta && (
           <Tooltip content={visibleDraftWarning}>
@@ -12968,20 +13444,13 @@ const HISTORY_VIRTUOSO_COMPONENTS = {
 // HistoryPanel below. Split mode may show several real panels at once, so a
 // module singleton would make one pane suppress or nudge another.
 
-// Row-level hydration window. Rows within this radius of what the user is
-// reading arrive with content; the rest arrive as identity stubs (see
-// applyHistoryRowWindow in main). 750 rows each way is far more than a
-// screen — several flings' worth — so ordinary reading never waits for a
-// hydration round-trip, while a 15.5K-row giant still ships ~1.5MB of stubs
-// instead of ~150MB of presentation.
-const HISTORY_HYDRATION_RADIUS_ROWS = 750;
-// The tail is always hydrated whatever the user is looking at: the composer,
-// tail-pin, live projection and background chips all read it.
-const HISTORY_HYDRATION_TAIL_ROWS = 300;
-// Refetch when the viewport comes within this many rows of the hydrated
-// span's edge. Must be well below the radius so the request is issued while
-// there are still hydrated rows to scroll through.
-const HISTORY_HYDRATION_REFETCH_MARGIN_ROWS = 250;
+// Desktop ordinary History requests a small tail and a viewport-sized window.
+// Explicit jumps use the same minimum radius; live rows remain Main-owned.
+const HISTORY_HYDRATION_RADIUS_ROWS = 16;
+// A cold tail includes the viewport itself plus the neighbouring buffer.
+// Sixteen total rows left only four beyond the measured 12-row mount and
+// forced a read on the second ordinary wheel. Keep 32, not the former 300.
+const HISTORY_HYDRATION_TAIL_ROWS = 32;
 // Range publications also come from our own React/Virtuoso measurements. A
 // settled reading position, not every publication, owns one hydration centre.
 const HISTORY_HYDRATION_RANGE_IDLE_MS = 180;
@@ -13169,7 +13638,6 @@ function HistoryPanel({
   const sideTerminalOpenForInset = useUIStore((s) => s.sideTerminalOpenTabs[tabId] ?? false);
   const sideTerminalWidthForInset = useUIStore((s) => s.sideTerminalWidth);
   const timelineTreeModeForInset = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
-  const timelinePinnedForInset = useUIStore((s) => s.timelinePinned);
   const timelineWidthForInset = useUIStore((s) => s.timelineWidth);
   const historyPinnedForInset = useUIStore((s) => s.historyPinned);
   const centerRightInset = resolveCenterRightInset({
@@ -13179,7 +13647,6 @@ function HistoryPanel({
     // for both surfaces.)
     isSidePanel: agentSidePanel,
     treeMode: timelineTreeModeForInset,
-    pinned: timelinePinnedForInset,
     width: timelineWidthForInset,
     sideTerminalOpen: sideTerminalOpenForInset,
     sideTerminalWidth: sideTerminalWidthForInset,
@@ -13194,6 +13661,7 @@ function HistoryPanel({
   const requestedHistoryScrollUuid = useUIStore((s) => s.historyScrollToUuid);
   const historyScrollTargetTabId = useUIStore((s) => s.historyScrollTargetTabId);
   const requestedHistoryToolTarget = useUIStore((s) => s.historyScrollToolTarget);
+  const requestedHistoryScrollGeneration = useUIStore((s) => s.historyScrollRequestGeneration);
   const historyScrollToolTarget = historyScrollTargetTabId === tabId ? requestedHistoryToolTarget : null;
   // Persistent panes all stay mounted. A process-global UUID therefore is not
   // a navigation request — it is an invitation for every hidden History to
@@ -13488,6 +13956,37 @@ function HistoryPanel({
     () => makeHistorySnapshotKey(historySnapshotOwner),
     [historySnapshotOwner],
   );
+  const primaryRootRef = useRef<HistoryPrimaryRootReadModel | null>(null);
+  const primaryCompositeOwnerRef = useRef('');
+  const [primaryRoot, setPrimaryRoot] = useState<HistoryPrimaryRootReadModel | null>(null);
+  useEffect(() => registerHeldHistoryPrimaryRoot({ tabId, toolType, sessionId, cwd },
+    () => primaryRootRef.current?.header || null), [tabId, toolType, sessionId, cwd]);
+  const [primaryRootRevision, setPrimaryRootRevision] = useState(0);
+  type PrimaryTerminalPreviewMembership = {
+    root: HistoryPrimaryRootReadModel;
+    ownerKey: string;
+    generation: number;
+    previewId: string;
+    identity: string;
+    expectedHash: string | null;
+    result: Awaited<ReturnType<HistoryPrimaryRootReadModel['readTerminalPreviewMembership']>>;
+  };
+  const [primaryTerminalPreviewMembership, setPrimaryTerminalPreviewMembership] =
+    useState<PrimaryTerminalPreviewMembership | null>(null);
+  const primaryTerminalPreviewMembershipRef = useRef<PrimaryTerminalPreviewMembership | null>(null);
+  const publishPrimaryTerminalPreviewMembership = useCallback((next: PrimaryTerminalPreviewMembership | null) => {
+    primaryTerminalPreviewMembershipRef.current = next;
+    setPrimaryTerminalPreviewMembership(next);
+  }, []);
+  const primaryPresentationRef = useRef<any>(null);
+  const primarySurfaceWitnessRef = useRef<any>(null);
+  const primaryCompositionAppliedRef = useRef<any>(null);
+  const primarySuppressionCountAppliedRef = useRef<number | null>(null);
+  const primaryRequestVersionRef = useRef(0);
+  const primaryColdReadFailureRef = useRef<{ ownerKey: string; kind: 'source-changed' | 'fatal' } | null>(null);
+  const primaryLocalRowsRef = useRef<FullHistoryEntry[]>([]);
+  const [primaryCaptionRevision, setPrimaryCaptionRevision] = useState(0);
+  const [primarySuppressionRevision, setPrimarySuppressionRevision] = useState(0);
   const historyOwnerDomId = useMemo(
     () => historyOwnerDigest(historyOwnerKey),
     [historyOwnerKey],
@@ -13506,6 +14005,8 @@ function HistoryPanel({
     ownerKey: string;
     generation: number;
     trailingRefresh: boolean;
+    trailingRequestClass: HistoryPrimaryRequestClass | null;
+    activeRequestClass: HistoryPrimaryRequestClass;
     promise: Promise<boolean>;
     controller: AbortController;
   } | null>(null);
@@ -13546,7 +14047,14 @@ function HistoryPanel({
     }
   }, [isOpen]);
 
-  const firstRenderSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
+  const primaryRootReadEnabled = historyPrimaryRollout.historyPrimaryRootEnabled(
+    typeof window !== 'undefined' && typeof window.require === 'function'
+      ? window.require('node:process').env : {},
+  );
+  const primaryPhysicalCandidate = primaryRootReadEnabled && toolType === 'codex' && !!sessionId
+    && primaryCompositeOwnerRef.current !== historyOwnerKey;
+  const firstRenderSnapshot = primaryPhysicalCandidate ? undefined
+    : historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
   const [payloadGeneration, setPayloadGeneration] = useState(firstRenderSnapshot?.payloadGeneration || '');
   const payloadGenerationRef = useRef({ ownerKey: historyOwnerKey, value: firstRenderSnapshot?.payloadGeneration || '' });
   const physicalFileIdentityRef = useRef({ ownerKey: historyOwnerKey,
@@ -13563,6 +14071,7 @@ function HistoryPanel({
     expectedChildSessionId: string | null;
     entries: FullHistoryEntry[];
     capturedAt: number;
+    catalogSource?: ReturnType<ReturnType<typeof createHistoryAgentCatalogSourceOwner>['capture']>;
   } | null>(null);
   // True while the visible rows are a display-only rewind prefix that has
   // not yet been replaced by the child owner's durable projection. A failed
@@ -13693,6 +14202,20 @@ function HistoryPanel({
   );
   const historyLoadSequenceRef = useRef(0);
   const historyRevisionRef = useRef<HistoryDurableRevision | null>(firstRenderSnapshot?.revision || null);
+  const historyCommitDiagnosticsRef = useRef<ReturnType<typeof createHistoryCommitWitnessDiagnostics> | null>(null);
+  if (uiPerformanceDiagnosticsEnabled() && !historyCommitDiagnosticsRef.current) {
+    historyCommitDiagnosticsRef.current = createHistoryCommitWitnessDiagnostics();
+  }
+  // Only the selected canonical sample crosses adoption -> React data commit.
+  // The full prepared compatibility inventory keeps its separate owner below.
+  const primaryCanonicalDiagnosticRef = useRef<Readonly<{
+    root: HistoryPrimaryRootReadModel;
+    header: NonNullable<HistoryPrimaryRootReadModel['header']>;
+    dataSubject: Readonly<object>;
+    ownerKey: string;
+    generation: number;
+    fact: NonNullable<HistoryPrimaryRootReadModel['metadata']>['canonicalMetadataFact'];
+  }> | null>(null);
   const isTurnBusyRef = useRef(isTurnBusy);
   isTurnBusyRef.current = isTurnBusy;
   const deferredTranscriptRefreshRef = useRef(false);
@@ -13710,10 +14233,22 @@ function HistoryPanel({
   const committedHistoryEntriesRef = useRef<{ ownerKey: string; entries: FullHistoryEntry[] }>({
     ownerKey: '', entries: [],
   });
+  // One immutable data-commit witness, not an inventory or paint certificate.
+  const primaryReceiptCommitRef = useRef<Readonly<{
+    root: HistoryPrimaryRootReadModel;
+    dataSubject: Readonly<object>;
+    presentationDataSubject: Readonly<object>;
+    ownerKey: string;
+    generation: number;
+  }> | null>(null);
   const liveProjectionRef = useRef<{
     ownerKey: string;
     entries: FullHistoryEntry[];
   }>({ ownerKey: historyOwnerKey, entries: [] });
+  // Membership of the committed cut is separate from the live revisions that
+  // actually reached its data-commit boundary. A later streaming update must
+  // survive the old cut until the existing commit observes that new fold.
+  const primaryLiveCommitRef = useRef<HistoryPrimaryLiveFoldCommit<FullHistoryEntry> | null>(null);
   // Dedup for LIVE_ORPHANS diagnostics: one line per distinct unmatched-live
   // composition, not one per reconciliation pass.
   const liveOrphanDigestRef = useRef('');
@@ -13721,18 +14256,161 @@ function HistoryPanel({
     ownerKey: string;
     results: Map<string, HistoryLiveToolResult>;
   }>({ ownerKey: historyOwnerKey, results: new Map() });
-  // Seed this existing ref once. useRef(new Set(snapshot.flatMap(...))) also
-  // scanned every durable row on later renders, then discarded the result.
-  // Owner reset and committed reconciliation below remain its only writers.
-  const durableSourceIdentitiesRef = useRef<Set<string>>(null!);
-  if (durableSourceIdentitiesRef.current === null) {
+  // Legacy/composite still owns its native inventory. Primary starts with
+  // unproved current-claim coverage, never an invented empty durable history.
+  const durableSourceIdentitiesRef = useRef<Set<string> | null>(null);
+  if (!primaryPhysicalCandidate && durableSourceIdentitiesRef.current === null) {
     durableSourceIdentitiesRef.current = new Set(
       ((firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [])
         .flatMap((entry) => historyLivePresentationIdentities(entry)),
     );
   }
   const presentationEntriesRef = useRef(entries);
+  const primaryAgentCatalogModeRef = useRef(primaryPhysicalCandidate);
+  primaryAgentCatalogModeRef.current = primaryPhysicalCandidate;
+  const primaryAgentSourceOwner = useMemo(() => createHistoryAgentCatalogSourceOwner<FullHistoryEntry>({
+    isLocal: entry => isLocalPromptEntry(entry) || isLocalRewindEntry(entry) || isLocalCompactErrorEntry(entry),
+    onReleaseError: (error: any) => historyDiag('AGENT_CATALOG_SOURCE_RELEASE_UNKNOWN tab=' + tabId.slice(-12)
+      + ' code=' + String(error?.code || 'UNKNOWN')),
+  }), [tabId]);
+  const primarySparsePublicationOwner = useMemo(() => createHistoryPrimarySparsePublicationOwner<FullHistoryEntry>({
+    isLocal: entry => isLocalPromptEntry(entry) || isLocalRewindEntry(entry) || isLocalCompactErrorEntry(entry),
+    agentSourceOwner: primaryAgentSourceOwner,
+    agentCatalogEnabled: () => primaryAgentCatalogModeRef.current,
+    onReleaseError: (error: any) => historyDiag('PREPARED_RELEASE_UNKNOWN tab=' + tabId.slice(-12)
+      + ' code=' + String(error?.code || 'UNKNOWN')),
+  }), [tabId, primaryAgentSourceOwner]);
+  // Existing native Np publication remains an explicit compatibility adapter.
+  // Every actual local/status/removal/adoption writer synchronously mirrors
+  // only its CURRENT native locals into this independently owned subject.
+  const publishHistoryRows = useCallback((next: FullHistoryEntry[], owns = () => true,
+    sourceHint: ReturnType<typeof primaryAgentSourceOwner.capture> = null) => {
+    const original = presentationEntriesRef.current;
+    const scope = { ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current };
+    try {
+      primarySparsePublicationOwner.publishCompatibility(next, scope, {
+        sourceHint,
+        // Native classification precedes the ORIGINAL full caller witness;
+        // its final fence is the same original cheap publication owner.
+        owns: () => owns() === true && presentationEntriesRef.current === original
+          && historyOwnerKeyRef.current === scope.ownerKey && historyOwnerGenerationRef.current === scope.generation,
+      });
+    } catch (error: any) {
+      if (error?.code === 'HISTORY_READ_CANCELLED') return false;
+      throw error;
+    }
+    presentationEntriesRef.current = next;
+    return true;
+  }, [primarySparsePublicationOwner]);
+  const primaryLocalPublicationAtRender = primarySparsePublicationOwner.publishCompatibility(entries, {
+    ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+  });
   presentationEntriesRef.current = entries;
+  const primaryPreparedCompatibilityRef = useRef<{
+    origin: ReturnType<HistoryPrimaryRootReadModel['retainPreparedPresentation']>['capability'];
+    entries: NonNullable<HistoryPrimaryRootReadModel['metadata']>['entries'];
+  } | null>(null);
+  // This is the exact React DATA publication, independent of canonical
+  // receipts and of the retained coordinate owner's measured/paint boundary.
+  const primaryPresentationDataCommitRef = useRef<Readonly<{
+    publication: NonNullable<ReturnType<typeof primarySparsePublicationOwner.current>>;
+    ownerKey: string;
+    generation: number;
+  }> | null>(null);
+  useLayoutEffect(() => {
+    primarySparsePublicationOwner.publishCompatibility(presentationEntriesRef.current, {
+      ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+    });
+    return () => { primarySparsePublicationOwner.clear(); primaryPreparedCompatibilityRef.current = null;
+      rewindPrefixHandoffRef.current?.catalogSource?.close(); rewindPrefixHandoffRef.current = null;
+      primaryPresentationDataCommitRef.current = null; };
+  }, [primarySparsePublicationOwner]);
+  const primaryLiveCoverageEnabledRef = useRef(primaryPhysicalCandidate);
+  primaryLiveCoverageEnabledRef.current = primaryPhysicalCandidate;
+  const primaryLiveCoverageOwner = useMemo(() => createHistoryPrimaryLiveCoverageOwner({
+    readCurrent: ({ verifyValues = true } = {}) => {
+      const root = primaryLiveCoverageEnabledRef.current
+        && primaryCompositeOwnerRef.current !== historyOwnerKeyRef.current ? primaryRootRef.current : null;
+      const live = liveProjectionRef.current, ownerKey = historyOwnerKeyRef.current;
+      const generation = historyOwnerGenerationRef.current, committed = primaryLiveCommitRef.current;
+      if (committed) {
+        try {
+          if (committed.root !== root || committed.dataSubject !== root?.getReceiptDataSubject()
+            || committed.ownerKey !== ownerKey || committed.generation !== generation
+            || committed.live !== live || committed.entries !== live.entries
+            || committed.fingerprints.length !== live.entries.length
+            || verifyValues && live.entries.some((entry, index) => committed.fingerprints[index] !== historyPrimaryLiveClaimFingerprint(entry)))
+            primaryLiveCommitRef.current = null;
+        } catch (error) { primaryLiveCommitRef.current = null; throw error; }
+      }
+      return { root, live, ownerKey, generation, commit: primaryReceiptCommitRef.current,
+        liveCommit: primaryLiveCommitRef.current };
+    },
+    fingerprint: historyPrimaryLiveClaimFingerprint,
+    publish: (remaining, live, proof) => {
+      const committedLive = primaryLiveCommitRef.current;
+      const owns = () => proof.owns() === true && !!committedLive && primaryLiveCommitRef.current === committedLive
+        && committedLive.live === live && committedLive.dataSubject === proof.dataSubject
+        && liveProjectionRef.current === live
+        && historyOwnerKeyRef.current === proof.ownerKey
+        && historyOwnerGenerationRef.current === proof.generation
+        && primaryRootRef.current === proof.root
+        && primaryReceiptCommitRef.current?.dataSubject === proof.dataSubject
+        && proof.root.getReceiptDataSubject() === proof.dataSubject;
+      if (!owns()) return null;
+      if (remaining.length > 0 && !isTurnBusyRef.current) {
+        const digest = remaining
+          .map(entry => (historyLivePresentationIdentities(entry)[0] || entry.uuid || '?').slice(-64))
+          .join(',').slice(0, 240);
+        if (liveOrphanDigestRef.current !== digest) {
+          liveOrphanDigestRef.current = digest;
+          historyDiag('LIVE_ORPHANS tab=' + tabId.slice(-12)
+            + ' count=' + remaining.length + ' durable=' + proof.header.canonicalEntryCount + ' ids=' + digest);
+        }
+      } else if (remaining.length === 0) liveOrphanDigestRef.current = '';
+      if (remaining === live.entries) return live;
+      const adoptedSettings = proof.rows.filter(row => row.entry.role === 'slash' && row.coveredIdentity);
+      if (adoptedSettings.length > 0) historyDiag('LIVE_SETTINGS_ADOPT tab=' + tabId.slice(-12)
+        + ' count=' + adoptedSettings.length
+        + ' remaining=' + remaining.filter(entry => entry.role === 'slash').length
+        + ' uuids=' + adoptedSettings.slice(0, 4).map(row => row.entry.uuid).join(','));
+      if (!owns()) return null;
+      const next = { ownerKey: proof.ownerKey, entries: remaining };
+      // Removing proved rows preserves the already committed revisions of the
+      // remaining fold. No new data commit or paint authority is invented.
+      const fingerprints = Object.freeze(remaining.map(historyPrimaryLiveClaimFingerprint));
+      if (!owns()) return null;
+      primaryLiveCommitRef.current = Object.freeze({ ...committedLive!, live: next,
+        entries: remaining, fingerprints });
+      liveProjectionRef.current = next;
+      setLiveEntries(remaining);
+      return next;
+    },
+    onError: (error: any) => console.warn('[HistoryPrimary] LIVE_COVERAGE_FAILED tab='
+      + tabId.slice(-12) + ' code=' + String(error?.code || 'UNKNOWN')),
+  }), [tabId]);
+  useEffect(() => {
+    primaryLiveCoverageOwner.activate();
+    return () => primaryLiveCoverageOwner.dispose();
+  }, [primaryLiveCoverageOwner]);
+  useEffect(() => {
+    if (!primaryPhysicalCandidate || !primaryRoot) return;
+    const root = primaryRoot, ownerKey = historyOwnerKey, generation = historyOwnerGenerationRef.current;
+    const valid = () => primaryRootRef.current === root && historyOwnerKeyRef.current === ownerKey
+      && historyOwnerGenerationRef.current === generation;
+    const unsubscribeMetadata = root.onMetadata(() => {
+      if (valid()) primaryLiveCoverageOwner.wake('metadata');
+    });
+    const unsubscribeWake = root.onReceiptReadWake(event => {
+      if (valid() && root.header === event.header && root.getReceiptDataSubject() === event.dataSubject)
+        primaryLiveCoverageOwner.wake('external-open');
+    });
+    primaryLiveCoverageOwner.wake('subject');
+    return () => {
+      unsubscribeMetadata(); unsubscribeWake();
+      primaryLiveCoverageOwner.cancelOwner(root, ownerKey, generation);
+    };
+  }, [primaryPhysicalCandidate, primaryRoot, historyOwnerKey, fileRewriteEpoch, primaryLiveCoverageOwner]);
   const historyPresentationApplyGuardRef = useRef<(reason: string) => void>(() => {});
   useEffect(() => {
     const captureDelayedWriterPrefix = (
@@ -13760,11 +14438,13 @@ function HistoryPanel({
         ));
       if (prefix.length === 0) return;
 
+      rewindPrefixHandoffRef.current?.catalogSource?.close();
       rewindPrefixHandoffRef.current = {
         sourceSessionId: String(data.previousSessionId),
         expectedChildSessionId: String(data.sessionId),
         entries: prefix,
         capturedAt: Date.now(),
+        catalogSource: primaryAgentCatalogModeRef.current ? primaryAgentSourceOwner.capture(prefix) : null,
       };
       historyDiag('REWIND_PREFIX_CAPTURE_DELAYED tab=' + tabId.slice(-12)
         + ' op=' + preview!.opId
@@ -13816,7 +14496,7 @@ function HistoryPanel({
         now
       );
       if (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed') {
-        return ageMs < LOCAL_PROMPT_FAILURE_TTL_MS;
+        return historyPromptFailureHasRecoveryOwner(entry) || ageMs < LOCAL_PROMPT_FAILURE_TTL_MS;
       }
       return true;
     });
@@ -13845,6 +14525,9 @@ function HistoryPanel({
     durableEntries: FullHistoryEntry[],
     ownerKey = historyOwnerKeyRef.current,
   ) => {
+    // The primary live reader is woken only after the existing data-commit
+    // witness below is published. Other compatibility consumers retain rows.
+    if (primaryLiveCoverageEnabledRef.current) return;
     const live = liveProjectionRef.current;
     const reconciled = reconcileCommittedHistoryLiveProjection(
       live.ownerKey === ownerKey ? live.entries : [],
@@ -13898,8 +14581,24 @@ function HistoryPanel({
     liveToolResultsRef.current = { ownerKey, results: remaining };
     setLiveToolResults(remaining);
   }, []);
-  const hasUnmatchedLiveForOwner = useCallback((ownerKey: string) => {
+  const hasUnmatchedLiveForOwner = useCallback(async (ownerKey: string): Promise<boolean | null> => {
     const live = liveProjectionRef.current;
+    const hasLiveResults = liveToolResultsRef.current.ownerKey === ownerKey
+      && liveToolResultsRef.current.results.size > 0;
+    if (live.ownerKey !== ownerKey || live.entries.length === 0) return hasLiveResults;
+    if (primaryLiveCoverageEnabledRef.current) {
+      const generation = historyOwnerGenerationRef.current;
+      const result = await primaryLiveCoverageOwner.readUnmatched(ownerKey);
+      if (historyOwnerKeyRef.current !== ownerKey || historyOwnerGenerationRef.current !== generation) return null;
+      // Tool-result coverage keeps its separate authority. Known current tool
+      // work remains unmatched even when row identity coverage is UNKNOWN;
+      // this does not retry or convert the failed row observation to absence.
+      const currentTools = liveToolResultsRef.current;
+      if (currentTools.ownerKey === ownerKey && currentTools.results.size > 0) return true;
+      if (typeof result !== 'boolean') return null;
+      const currentResult = primaryLiveCoverageOwner.peekUnmatched(ownerKey);
+      return typeof currentResult === 'boolean' ? currentResult : null;
+    }
     const durableIdentities = new Set(
       rawServerEntriesRef.current
         .flatMap((entry) => historyLivePresentationIdentities(entry)),
@@ -13910,11 +14609,8 @@ function HistoryPanel({
         return identities.length === 0
           || !identities.some((identity) => durableIdentities.has(identity));
       });
-    return hasUnmatchedProjection || (
-      liveToolResultsRef.current.ownerKey === ownerKey
-      && liveToolResultsRef.current.results.size > 0
-    );
-  }, []);
+    return hasUnmatchedProjection || hasLiveResults;
+  }, [primaryLiveCoverageOwner]);
   const historyPayloadContextValue = useMemo(
     () => (sessionId ? { tabId, toolType, sessionId, cwd,
       payloadGeneration: ownerChangedBeforeLayoutHandoff ? firstRenderSnapshot?.payloadGeneration || '' : payloadGeneration } : null),
@@ -13978,9 +14674,10 @@ function HistoryPanel({
       const agents = Array.isArray(detail?.agents) ? detail.agents : [];
       const tasks = Array.isArray(detail?.tasks) ? detail.tasks : [];
       const normalizedAgents: HistoryBackgroundAgentProof[] = agents
-        .map((agent: any): HistoryBackgroundAgentProof => ({
+        .map((agent: any): HistoryBackgroundAgentProof => createHistoryAgentCatalogMainFact({
           provider: agent?.provider === 'codex' ? 'codex' : 'claude',
           toolUseId: String(agent?.toolUseId || ''),
+          ...(agent?.label ? { label: String(agent.label).slice(0, 120) } : {}),
           agentId: String(agent?.agentId || ''),
           agentSessionId: String(agent?.agentSessionId || ''),
           sessionId: agent?.sessionId ? String(agent.sessionId) : null,
@@ -13988,9 +14685,9 @@ function HistoryPanel({
           startedAt: Number(agent?.startedAt) || 0,
           ...(agent?.launchSettings?.version === 1 ? { launchSettings: agent.launchSettings } : {}),
         }))
-        .filter((agent) => !!agent.toolUseId);
+        .filter((agent: HistoryBackgroundAgentProof) => !!agent.toolUseId);
       const normalizedTasks: HistoryBackgroundTaskProof[] = tasks
-        .map((task: any): HistoryBackgroundTaskProof => ({
+        .map((task: any): HistoryBackgroundTaskProof => createHistoryAgentCatalogMainFact({
           provider: 'claude',
           toolUseId: String(task?.toolUseId || ''),
           taskId: String(task?.taskId || ''),
@@ -14003,7 +14700,7 @@ function HistoryPanel({
           generation: task?.generation ? String(task.generation) : null,
           startedAt: Number(task?.startedAt) || 0,
         }))
-        .filter((task) => !!task.toolUseId);
+        .filter((task: HistoryBackgroundTaskProof) => !!task.toolUseId);
       const terminalBackgroundToolUseIds = Array.isArray(detail?.terminalBackgroundToolUseIds)
         ? detail.terminalBackgroundToolUseIds.map((value: unknown) => String(value || '')).filter(Boolean)
         : [];
@@ -14015,8 +14712,9 @@ function HistoryPanel({
           agents: normalizedAgents,
           terminalSubagents: (Array.isArray(detail?.terminalSubagents) ? detail.terminalSubagents : [])
             .filter((agent: any) => agent?.provider === 'codex' && agent?.toolUseId && Number(agent.completedAt) > 0)
-            .map((agent: any): HistoryBackgroundAgentProof => ({ provider: 'codex',
+            .map((agent: any): HistoryBackgroundAgentProof => createHistoryAgentCatalogMainFact({ provider: 'codex',
               toolUseId: String(agent.toolUseId), agentSessionId: String(agent.agentSessionId || ''),
+              ...(agent.label ? { label: String(agent.label).slice(0, 120) } : {}),
               sessionId: agent.sessionId || null, generation: agent.generation || null,
               startedAt: Number(agent.startedAt) || 0, completedAt: Number(agent.completedAt),
               ...(agent.launchSettings?.version === 1 ? { launchSettings: agent.launchSettings } : {}),
@@ -14043,9 +14741,11 @@ function HistoryPanel({
   }, [tabId]);
   const exactActiveSubagents = useMemo(() => {
     if (mainBackgroundWork.tabId !== tabId) return null;
-    const exact = new Map<string, HistoryBackgroundAgentProof>();
+    const exact = createHistoryAgentCatalogMainFactsMap<string, HistoryBackgroundAgentProof>();
     for (const agent of mainBackgroundWork.agents) {
       if (agent.provider !== toolType) continue;
+      if (toolType === 'codex' && (!sessionId || agent.sessionId !== sessionId
+        || !agentProcessGeneration || agent.generation !== agentProcessGeneration)) continue;
       if (agent.sessionId && sessionId && agent.sessionId !== sessionId) continue;
       if (agent.generation && agentProcessGeneration
         && agent.generation !== agentProcessGeneration) continue;
@@ -14056,7 +14756,7 @@ function HistoryPanel({
   }, [agentProcessGeneration, mainBackgroundWork, sessionId, tabId, toolType]);
   const exactActiveBackgroundTasks = useMemo(() => {
     if (mainBackgroundWork.tabId !== tabId || toolType !== 'claude') return null;
-    const exact = new Map<string, HistoryBackgroundTaskProof>();
+    const exact = createHistoryAgentCatalogMainFactsMap<string, HistoryBackgroundTaskProof>();
     for (const task of mainBackgroundWork.tasks) {
       if (task.sessionId && sessionId && task.sessionId !== sessionId) continue;
       if (task.generation && agentProcessGeneration
@@ -14068,9 +14768,14 @@ function HistoryPanel({
   }, [agentProcessGeneration, mainBackgroundWork, sessionId, tabId, toolType]);
   const terminalBackgroundTaskCalls = useMemo(() => (
     mainBackgroundWork.tabId === tabId && toolType === 'claude'
-      ? new Set(mainBackgroundWork.terminalBackgroundToolUseIds.map(historySubagentCallIdentity))
+      ? createHistoryAgentCatalogMainFactsSet(mainBackgroundWork.terminalBackgroundToolUseIds.map(historySubagentCallIdentity))
       : null
   ), [mainBackgroundWork, tabId, toolType]);
+  const terminalAgentFacts = useMemo(() => mainBackgroundWork.tabId === tabId
+    ? createHistoryAgentCatalogMainFactsMap((mainBackgroundWork.terminalSubagents || []).filter(agent => agent.provider === toolType
+      && agent.sessionId === sessionId && agent.generation === agentProcessGeneration)
+      .map(agent => [historySubagentCallIdentity(agent.toolUseId), agent])) : undefined,
+  [mainBackgroundWork, tabId, toolType, sessionId, agentProcessGeneration]);
   // Chips must see the SAME rows the transcript shows, durable + live. A Codex
   // subagent is durable only after the rollout is re-read, but its spawn is
   // already on screen through the live stream — computing chips from durable
@@ -14083,10 +14788,10 @@ function HistoryPanel({
     ? liveEntries
     : EMPTY_HISTORY_ENTRIES;
   const chipSourceEntries = useMemo(
-    () => (chipLiveEntries.length === 0
+    () => (primaryPhysicalCandidate ? EMPTY_HISTORY_ENTRIES : chipLiveEntries.length === 0
       ? entries
       : buildHistoryLivePresentation(entries, chipLiveEntries) as FullHistoryEntry[]),
-    [entries, chipLiveEntries],
+    [primaryPhysicalCandidate, entries, chipLiveEntries],
   );
   // Chips belong to the tab whose rows they were computed from.
   //
@@ -14122,11 +14827,95 @@ function HistoryPanel({
   // durable read will later confirm. Live rows therefore establish this owner
   // for liveness on their own; only the cached-rows path keeps waiting.
   const chipsLiveOwnerProven = chipLiveEntries.length > 0;
-  const mainBackgroundOwnerProven = (exactActiveBackgroundTasks?.size || 0) > 0;
+  const mainBackgroundOwnerProven = (exactActiveBackgroundTasks?.size || 0) > 0
+    || (exactActiveSubagents?.size || 0) > 0
+    || (mainBackgroundWork.tabId === tabId && toolType === 'codex'
+      && !!sessionId && !!agentProcessGeneration
+      && (mainBackgroundWork.terminalSubagents || []).some(agent => agent.provider === 'codex'
+        && agent.sessionId === sessionId && agent.generation === agentProcessGeneration
+        && Number(agent.completedAt) > 0));
   const chipsOwnerSettled = presentedOwnerKey === historyOwnerKey
     && (chipsFreshOwnerKey === historyOwnerKey || chipsLiveOwnerProven || mainBackgroundOwnerProven);
+  const primaryAgentSourceAtRender = primaryLocalPublicationAtRender.agentCatalog || null;
+  const primaryAgentCurrentRows = primaryAgentSourceAtRender?.rows || primaryLocalPublicationAtRender.rows;
+  const primaryAgentSelectionEpochRef = useRef(0);
+  const primaryAgentCurrentSelectedRef = useRef<{
+    ownerKey: string; generation: number; key: string; epoch: number; record: HistoryBackgroundChip;
+  } | null>(null);
+  const [primaryAgentCatalogSnapshot, setPrimaryAgentCatalogSnapshot] = useState<HistoryPrimaryAgentCatalogSnapshot | null>(null);
+  const primaryAgentCatalogOwner = useMemo(() => createHistoryPrimaryAgentCatalogOwner({
+    onChange: setPrimaryAgentCatalogSnapshot,
+    onReleaseError: (error: any) => historyDiag('AGENT_CATALOG_RELEASE_UNKNOWN tab=' + tabId.slice(-12)
+      + ' code=' + String(error?.code || 'UNKNOWN')),
+  }), [tabId, primaryPhysicalCandidate]);
+  useEffect(() => () => primaryAgentCatalogOwner.close(), [primaryAgentCatalogOwner]);
+  const primaryAgentMembershipDemand = useMemo(() => createHistoryAgentCatalogMembershipDemand(primaryAgentCatalogOwner),
+    [primaryAgentCatalogOwner]);
+  useEffect(() => () => primaryAgentMembershipDemand.close(), [primaryAgentMembershipDemand]);
+  const primaryAgentCatalogContext = useMemo(() => Object.freeze({
+    isTurnBusy, agentProcessAlive, currentSessionId: sessionId || '',
+    currentProcessGeneration: agentProcessGeneration, chipToolType: toolType,
+    exactActiveSubagents, exactActiveBackgroundTasks, terminalBackgroundTaskCalls, terminalFacts: terminalAgentFacts,
+  }), [isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType,
+    exactActiveSubagents, exactActiveBackgroundTasks, terminalBackgroundTaskCalls, terminalAgentFacts]);
+  const primaryAgentCatalogInputs = useMemo(() => Object.freeze({
+    source: primaryAgentSourceAtRender, publication: primaryLocalPublicationAtRender,
+    ownerKey: historyOwnerKey, generation: historyOwnerGenerationRef.current,
+    rows: primaryAgentCurrentRows, live: chipLiveEntries, rawLiveOwner: liveProjectionRef.current,
+    context: primaryAgentCatalogContext, settled: chipsOwnerSettled,
+  }), [primaryAgentSourceAtRender, primaryLocalPublicationAtRender, historyOwnerKey,
+    primaryAgentCurrentRows, chipLiveEntries, primaryAgentCatalogContext, chipsOwnerSettled]);
+  const primaryAgentCatalogInputsRef = useRef(primaryAgentCatalogInputs);
+  primaryAgentCatalogInputsRef.current = primaryAgentCatalogInputs;
+  const primaryAgentCurrentSelectionEpochAtRender = primaryAgentSelectionEpochRef.current;
+  // Synchronous CURRENT presentation has its own original owner/witness. A
+  // failed or not-yet-open historical source must not hide an already held
+  // completed result. These collectors never see historical metadata here.
+  const primaryAgentCurrentFace = (() => {
+    const empty = (status: 'pending' | 'error' = 'pending', error: any = null) => ({
+      status, chips: EMPTY_HISTORY_CHIPS, agents: EMPTY_HISTORY_AGENTS, error, isCurrent: () => false,
+    });
+    if (!primaryPhysicalCandidate) return empty();
+    const input = primaryAgentCatalogInputs, epoch = primaryAgentCurrentSelectionEpochAtRender;
+    const owns = () => primaryAgentCatalogModeRef.current
+      && primaryAgentCatalogInputsRef.current === input
+      && primaryAgentSelectionEpochRef.current === epoch
+      && historyOwnerKeyRef.current === input.ownerKey
+      && historyOwnerGenerationRef.current === input.generation
+      && liveProjectionRef.current === input.rawLiveOwner
+      && primarySparsePublicationOwner.current() === input.publication
+      && input.publication.entries.deref() === presentationEntriesRef.current
+      && primaryAgentSourceOwner.current() === input.source;
+    if (!input.settled || !owns()) return empty();
+    const nativeInput = { rows: input.rows, live: input.live, context: input.context };
+    try {
+      const witness = historyPrimaryPromptAdoptionFingerprint(nativeInput);
+      if (!owns()) return empty();
+      const currentChipSourceEntries = buildHistoryLivePresentation(input.rows as FullHistoryEntry[],
+        input.live) as FullHistoryEntry[];
+      const context = input.context;
+      const chips = collectHistoryBackgroundChips(currentChipSourceEntries,
+        context.isTurnBusy, context.agentProcessAlive, context.currentSessionId,
+        context.currentProcessGeneration, context.chipToolType, context.exactActiveSubagents,
+        context.exactActiveBackgroundTasks, context.terminalBackgroundTaskCalls);
+      const agents = collectHistoryAgentChips(currentChipSourceEntries, chips, context.terminalFacts);
+      // Literal native getters/coercions ran above. The ORIGINAL complete
+      // native witness precedes the final cheap original owner/epoch fence.
+      if (historyPrimaryPromptAdoptionFingerprint(nativeInput) !== witness || !owns()) return empty();
+      return { status: 'ready' as const, chips, agents, error: null, isCurrent: () => {
+        // A later combined-catalog proof can itself reenter native code.
+        // Recheck this ORIGINAL witness; never recapture a changed value as
+        // authority for the already collected CURRENT result.
+        try { return historyPrimaryPromptAdoptionFingerprint(nativeInput) === witness && owns(); }
+        catch { return false; }
+      } };
+    } catch (error) { return owns() ? empty('error', error) : empty(); }
+  })();
+  const primaryAgentCatalogCurrentSnapshot = primaryAgentCatalogSnapshot?.ownerKey === historyOwnerKey
+    && primaryAgentCatalogSnapshot.generation === primaryAgentCatalogInputs.generation
+    ? primaryAgentCatalogSnapshot : null;
   const backgroundHistoryChips = useMemo(
-    () => (chipsOwnerSettled
+    () => primaryPhysicalCandidate ? primaryAgentCurrentFace.chips : (chipsOwnerSettled
       ? collectHistoryBackgroundChips(
         chipSourceEntries,
         isTurnBusy,
@@ -14139,27 +14928,95 @@ function HistoryPanel({
         terminalBackgroundTaskCalls,
       )
       : EMPTY_HISTORY_CHIPS),
-    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType, exactActiveSubagents, exactActiveBackgroundTasks, terminalBackgroundTaskCalls],
+    [primaryPhysicalCandidate, primaryAgentCurrentFace, chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType, exactActiveSubagents, exactActiveBackgroundTasks, terminalBackgroundTaskCalls],
   );
-  const liveBackgroundUuids = useMemo(
-    () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
-    [backgroundHistoryChips],
+  const historyAgentChips = useMemo(
+    () => (!primaryPhysicalCandidate && chipsOwnerSettled
+      ? collectHistoryAgentChips(chipSourceEntries, backgroundHistoryChips, terminalAgentFacts)
+      : EMPTY_HISTORY_AGENTS),
+    [primaryPhysicalCandidate, backgroundHistoryChips, chipSourceEntries, chipsOwnerSettled, terminalAgentFacts],
   );
-  const liveBackgroundTaskCalls = useMemo(
-    () => new Set(
-      backgroundHistoryChips
-        .filter((chip) => chip.kind === 'subagent')
-        .map((chip) => historySubagentCallIdentity(chip.key.replace(/^task:/, '')))
-        .filter(Boolean),
-    ),
-    [backgroundHistoryChips],
-  );
+  // The dock selection survives running → completed because both faces use
+  // the same `task:<toolUseId>` key. It resets only when the selected action
+  // genuinely leaves this session/owner.
+  const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
+  const [agentRosterOpen, setAgentRosterOpen] = useState(false);
+  const requestAgentCatalogPage = useCallback((request: { section: 'roster' | 'background'; offset: number; limit: number }) => {
+    primaryAgentCatalogOwner.requestPage(request);
+  }, [primaryAgentCatalogOwner]);
+  const primaryAgentCatalogDock = useMemo<HistoryAgentCatalogDock | null>(() => {
+    if (!primaryPhysicalCandidate) return null;
+    const snapshot = primaryAgentCatalogCurrentSnapshot;
+    const input = primaryAgentCatalogInputs, epoch = primaryAgentCurrentSelectionEpochAtRender;
+    const ownsDock = () => primaryAgentCatalogModeRef.current
+      && primaryAgentCatalogInputsRef.current === input
+      && primaryAgentSelectionEpochRef.current === epoch
+      && historyOwnerKeyRef.current === input.ownerKey
+      && historyOwnerGenerationRef.current === input.generation
+      && liveProjectionRef.current === input.rawLiveOwner
+      && primarySparsePublicationOwner.current() === input.publication
+      && input.publication.entries.deref() === presentationEntriesRef.current
+      && primaryAgentSourceOwner.current() === input.source;
+    const sameInput = snapshot?.subject === input;
+    const selectedMatches = snapshot?.selected.key === expandedBackgroundChipKey;
+    const combined = sameInput && snapshot.status === 'ready' && selectedMatches
+      && primaryAgentCatalogOwner.isCurrent(snapshot)
+      && ownsDock();
+    const currentFace = primaryAgentCurrentFace.isCurrent() && ownsDock();
+    const ready = combined && currentFace;
+    const retained = ownsDock();
+    const selected = snapshot?.selected;
+    const cached = primaryAgentCurrentSelectedRef.current;
+    const retainedCurrent = retained && cached?.ownerKey === input.ownerKey && cached.generation === input.generation
+      && cached.epoch === epoch && cached.key === expandedBackgroundChipKey ? cached.record : null;
+    const retainedCatalog = retained && selected?.key === expandedBackgroundChipKey && 'record' in selected
+      ? selected.record as unknown as HistoryBackgroundChip | null : null;
+    return {
+      status: ready ? 'ready' : sameInput && snapshot.status === 'error' ? 'error' : 'pending',
+      counts: ready ? snapshot.counts : null,
+      currentAgents: currentFace ? primaryAgentCurrentFace.agents : EMPTY_HISTORY_AGENTS,
+      currentChips: currentFace ? primaryAgentCurrentFace.chips : EMPTY_HISTORY_CHIPS,
+      currentError: retained ? primaryAgentCurrentFace.error : null,
+      rows: (ready ? snapshot.rows : []) as unknown as readonly HistoryAgentChip[], pageStart: snapshot?.pageStart || 0,
+      backgroundRows: (ready ? snapshot.backgroundRows : []) as unknown as readonly HistoryBackgroundChip[],
+      backgroundStart: snapshot?.backgroundStart || 0, backgroundPageSize: snapshot?.backgroundPageSize || 32,
+      selected: { kind: ready ? selected?.kind || 'unknown' : 'unknown', key: expandedBackgroundChipKey,
+        record: ready ? retainedCatalog : retainedCurrent || retainedCatalog },
+      error: retained ? snapshot?.error as { code?: string } | null : null, errorStage: retained ? snapshot?.errorStage || null : null,
+      requestPage: requestAgentCatalogPage,
+    };
+  }, [primaryPhysicalCandidate, primaryAgentCatalogCurrentSnapshot, primaryAgentCatalogInputs,
+    primaryAgentCurrentFace, primaryAgentCurrentSelectionEpochAtRender, primaryAgentCatalogOwner,
+    primarySparsePublicationOwner, primaryAgentSourceOwner,
+    expandedBackgroundChipKey, requestAgentCatalogPage]);
+  useLayoutEffect(() => {
+    // One already selected native record may outlive CURRENT retirement while
+    // history is still UNKNOWN. Do not retain its input/face/roster closure.
+    const input = primaryAgentCatalogInputs, epoch = primaryAgentCurrentSelectionEpochAtRender;
+    const key = expandedBackgroundChipKey;
+    const owns = () => primaryAgentCatalogInputsRef.current === input
+      && primaryAgentSelectionEpochRef.current === epoch
+      && historyOwnerKeyRef.current === input.ownerKey
+      && historyOwnerGenerationRef.current === input.generation;
+    if (!owns()) return;
+    if (!primaryPhysicalCandidate || !key) { primaryAgentCurrentSelectedRef.current = null; return; }
+    const previous = primaryAgentCurrentSelectedRef.current;
+    if (previous && (previous.ownerKey !== input.ownerKey || previous.generation !== input.generation
+      || previous.key !== key || previous.epoch !== epoch)) primaryAgentCurrentSelectedRef.current = null;
+    const record = primaryAgentCatalogDock?.currentAgents.find(agent => agent.key === key)
+      || primaryAgentCatalogDock?.currentChips.find(chip => chip.key === key);
+    if (!record || !primaryAgentCurrentFace.isCurrent() || !owns()) return;
+    primaryAgentCurrentSelectedRef.current = { ownerKey: input.ownerKey, generation: input.generation, key, epoch, record };
+  }, [primaryPhysicalCandidate, primaryAgentCatalogInputs, primaryAgentCurrentSelectionEpochAtRender,
+    expandedBackgroundChipKey, primaryAgentCatalogDock, primaryAgentCurrentFace]);
+  const primaryAgentCurrentChipsAtPublish = primaryPhysicalCandidate
+    ? primaryAgentCatalogDock?.currentChips || EMPTY_HISTORY_CHIPS : backgroundHistoryChips;
   // Observable trace of the background zone. Both the presence AND the
   // absence of chips are acceptance conditions of the E2E scenarios, and a
   // silently-empty strip is indistinguishable from a strip that was never
   // computed — so the line prints on every change of the live set, including
   // the transition to zero, together with the gates that produced it.
-  const backgroundChipsDigest = backgroundHistoryChips
+  const backgroundChipsDigest = primaryAgentCurrentChipsAtPublish
     .map((chip) => chip.kind + ':' + chip.key)
     .join(',');
   // The TAB LOADER means "an agent is working here", not "something is
@@ -14168,9 +15025,13 @@ function HistoryPanel({
   // must not spin the tab, or a long-running shell reads as an active agent
   // from the tab list. Only subagent chips are broadcast outward.
   const backgroundAgentChipCount = useMemo(
-    () => backgroundHistoryChips.filter((chip) => chip.kind === 'subagent').length,
-    [backgroundHistoryChips],
+    () => primaryAgentCatalogDock?.status === 'ready'
+      ? primaryAgentCatalogDock.counts!.backgroundAgents
+      : primaryAgentCurrentChipsAtPublish.filter(chip => chip.kind === 'subagent').length,
+    [primaryAgentCatalogDock, primaryAgentCurrentChipsAtPublish],
   );
+  const backgroundChipCount = primaryAgentCatalogDock?.status === 'ready'
+    ? primaryAgentCatalogDock.counts!.background : primaryAgentCurrentChipsAtPublish.length;
   useEffect(() => {
     // `count` is the STRIP (subagents + background Bash). `agents` is what
     // actually drives the tab loader. Printing only the first number made two
@@ -14179,7 +15040,7 @@ function HistoryPanel({
     // the trace conflated two different questions. `owner` says whether this
     // tab is allowed to make liveness claims at all right now.
     historyDiag('BACKGROUND_CHIPS tab=' + tabId.slice(-12)
-      + ' count=' + backgroundHistoryChips.length
+      + ' count=' + backgroundChipCount
       + ' agents=' + backgroundAgentChipCount
       + ' owner=' + (chipsOwnerSettled ? 'settled' : 'handoff')
       // Which fact established the owner: rows read from disk, or the live
@@ -14190,42 +15051,79 @@ function HistoryPanel({
       + ' turnBusy=' + (isTurnBusy ? '1' : '0')
       + ' processAlive=' + (agentProcessAlive ? '1' : '0')
       + ' processGeneration=' + (agentProcessGeneration || '-')
-      + ' keys=' + (backgroundChipsDigest || '-'));
-  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
-  const historyAgentChips = useMemo(
-    () => (chipsOwnerSettled
-      ? collectHistoryAgentChips(chipSourceEntries, backgroundHistoryChips, mainBackgroundWork.tabId === tabId
-          ? new Map((mainBackgroundWork.terminalSubagents || []).filter(agent => agent.provider === toolType
-            && agent.sessionId === sessionId && agent.generation === agentProcessGeneration)
-            .map(agent => [historySubagentCallIdentity(agent.toolUseId), agent])) : undefined)
-      : EMPTY_HISTORY_AGENTS),
-    [backgroundHistoryChips, chipSourceEntries, chipsOwnerSettled, mainBackgroundWork, tabId, toolType, sessionId, agentProcessGeneration],
+      + ' keys=' + (backgroundChipsDigest || '-')
+      + (primaryPhysicalCandidate ? ' catalog=' + (primaryAgentCatalogCurrentSnapshot?.status || 'pending') : ''));
+  }, [tabId, backgroundChipsDigest, backgroundChipCount, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration,
+    primaryPhysicalCandidate, primaryAgentCatalogCurrentSnapshot?.status]);
+  const liveBackgroundUuids = useMemo(
+    () => new Set(primaryAgentCurrentChipsAtPublish.map((chip) => chip.entryUuid)),
+    [primaryAgentCurrentChipsAtPublish],
   );
-  // The dock selection survives running → completed because both faces use
-  // the same `task:<toolUseId>` key. It resets only when the selected action
-  // genuinely leaves this session/owner.
-  const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
-  const [agentRosterOpen, setAgentRosterOpen] = useState(false);
-  const availableDetailKeys = useMemo(() => new Set([
+  const liveBackgroundTaskCalls = useMemo(
+    () => new Set(
+      primaryAgentCurrentChipsAtPublish
+        .filter((chip) => chip.kind === 'subagent')
+        .map((chip) => historySubagentCallIdentity(chip.key.replace(/^task:/, '')))
+        .filter(Boolean),
+    ),
+    [primaryAgentCurrentChipsAtPublish],
+  );
+  const primaryAgentLiveness = useMemo(() => primaryPhysicalCandidate ? {
+    demand: primaryAgentMembershipDemand,
+    membership: primaryAgentCatalogDock?.status === 'ready'
+      ? primaryAgentCatalogCurrentSnapshot?.membership || null : null,
+  } : null, [primaryPhysicalCandidate, primaryAgentMembershipDemand,
+    primaryAgentCatalogCurrentSnapshot, primaryAgentCatalogDock]);
+  const availableDetailKeys = useMemo(() => primaryPhysicalCandidate ? null : new Set([
     ...backgroundHistoryChips.map((chip) => chip.key),
     ...historyAgentChips.map((agent) => agent.key),
-  ]), [backgroundHistoryChips, historyAgentChips]);
+  ]), [primaryPhysicalCandidate, backgroundHistoryChips, historyAgentChips]);
+  useLayoutEffect(() => { if (primaryPhysicalCandidate) primaryAgentCatalogOwner.select(expandedBackgroundChipKey); },
+    [primaryPhysicalCandidate, primaryAgentCatalogOwner, expandedBackgroundChipKey]);
   useEffect(() => {
     if (!expandedBackgroundChipKey || !chipsOwnerSettled) return;
-    if (!availableDetailKeys.has(expandedBackgroundChipKey)) {
-      setExpandedBackgroundChipKey(null);
+    const missing = primaryPhysicalCandidate
+      ? primaryAgentCatalogCurrentSnapshot?.subject === primaryAgentCatalogInputs
+        && primaryAgentCatalogCurrentSnapshot.status === 'ready'
+        && primaryAgentCatalogCurrentSnapshot.selected.kind === 'missing'
+        && primaryAgentCatalogCurrentSnapshot.selected.key === expandedBackgroundChipKey
+      : !availableDetailKeys?.has(expandedBackgroundChipKey);
+    if (missing) {
+      if (!primaryPhysicalCandidate) { setExpandedBackgroundChipKey(null); return; }
+      const input = primaryAgentCatalogInputs, proof = primaryAgentCatalogCurrentSnapshot;
+      const key = expandedBackgroundChipKey, epoch = primaryAgentSelectionEpochRef.current;
+      const ownsSelection = (current: string | null) => current === key
+        && primaryAgentSelectionEpochRef.current === epoch && primaryAgentCatalogModeRef.current
+        && primaryAgentCatalogInputsRef.current === input
+        && historyOwnerKeyRef.current === input.ownerKey
+        && historyOwnerGenerationRef.current === input.generation;
+      setExpandedBackgroundChipKey((current) => {
+        if (!ownsSelection(current) || !primaryAgentCatalogOwner.isCurrent(proof)) return current;
+        // The fresh catalog proof can call native getters which reenter
+        // selection. Check the original selection epoch again before clearing.
+        return ownsSelection(current) ? null : current;
+      });
     }
-  }, [availableDetailKeys, chipsOwnerSettled, expandedBackgroundChipKey]);
+  }, [primaryPhysicalCandidate, primaryAgentCatalogCurrentSnapshot, primaryAgentCatalogInputs,
+    primaryAgentCatalogOwner, availableDetailKeys, chipsOwnerSettled, expandedBackgroundChipKey]);
   useEffect(() => {
-    setExpandedBackgroundChipKey(null);
+    primaryAgentSelectionEpochRef.current++;
+    const epoch = primaryAgentSelectionEpochRef.current, ownerKey = historyOwnerKey;
+    const generation = primaryAgentCatalogInputs.generation;
+    if (primaryPhysicalCandidate) setExpandedBackgroundChipKey((current) =>
+      primaryAgentSelectionEpochRef.current === epoch && primaryAgentCatalogModeRef.current
+        && historyOwnerKeyRef.current === ownerKey && historyOwnerGenerationRef.current === generation ? null : current);
+    else setExpandedBackgroundChipKey(null);
     setAgentRosterOpen(false);
   }, [historyOwnerKey]);
   const openHistoryAgent = useCallback((agentKey: string) => {
     if (!agentKey) return;
+    primaryAgentSelectionEpochRef.current++;
     setExpandedBackgroundChipKey(agentKey);
     setAgentRosterOpen(false);
   }, []);
   const toggleHistoryDetail = useCallback((detailKey: string) => {
+    primaryAgentSelectionEpochRef.current++;
     setAgentRosterOpen(false);
     setExpandedBackgroundChipKey((current) => current === detailKey ? null : detailKey);
   }, []);
@@ -14248,15 +15146,26 @@ function HistoryPanel({
     window.addEventListener('history-panel:open-agent', onOpenAgent);
     return () => window.removeEventListener('history-panel:open-agent', onOpenAgent);
   }, [openHistoryAgent, tabId]);
-  const ownerLiveEntries = liveProjectionRef.current.ownerKey === historyOwnerKey
-    ? liveEntries
-    : [];
+  // Empty publications can themselves have new array identities. The shared
+  // empty value must stay stable across those too, including retained owners.
+  const ownerLiveEntries = liveProjectionRef.current.ownerKey === historyOwnerKey && liveEntries.length > 0
+    ? liveEntries : EMPTY_HISTORY_ENTRIES;
   const terminalPreviewCanonicalIdentity =
     terminalPreviewClearHandoff?.canonicalIdentity || '';
+  // Canonical presence is a source fact, independent of the prepared local
+  // composition. It only filters this compatibility projection; clearing the
+  // Footer below separately requires current prepared membership/integrity.
   const terminalPreviewCanonicalInDurableProjection = !!terminalPreviewCanonicalIdentity
-    && renderEntries.some((entry) => (
-      historyTerminalPreviewHasCanonicalIdentity(entry, terminalPreviewCanonicalIdentity, historyLivePresentationIdentities)
-    ));
+    && (primaryPhysicalCandidate
+      ? primaryTerminalPreviewMembership?.root === primaryRootRef.current
+        && primaryRootRef.current?.closed === false
+        && primaryTerminalPreviewMembership?.result.header === primaryRootRef.current?.header
+        && primaryTerminalPreviewMembership?.ownerKey === historyOwnerKey
+        && primaryTerminalPreviewMembership?.generation === historyOwnerGenerationRef.current
+        && primaryTerminalPreviewMembership?.identity === terminalPreviewCanonicalIdentity
+        && primaryTerminalPreviewMembership?.result.canonicalPresent === true
+      : renderEntries.some((entry) => historyTerminalPreviewHasCanonicalIdentity(
+        entry, terminalPreviewCanonicalIdentity, historyLivePresentationIdentities)));
   // Main's canonical-materialized event already proves the exact JSONL record.
   // During a busy turn the full History refresh is intentionally deferred, so
   // keep that exact live row as the replacement target until the durable
@@ -14282,6 +15191,7 @@ function HistoryPanel({
   // dual presentation and its materialization race.
   const settingsPresentationKeysRef = useRef({ ownerKey: historyOwnerKey,
     generation: historyOwnerGenerationRef.current, keys: new Map<string, string>() });
+  const primarySettingsCachePublicationRef = useRef<ReturnType<typeof captureHistoryPrimarySettingsCachePublication>>(null);
   const mergedTranscriptEntries = useMemo(
     () => {
       if (settingsPresentationKeysRef.current.ownerKey !== historyOwnerKey
@@ -14289,8 +15199,13 @@ function HistoryPanel({
         settingsPresentationKeysRef.current = { ownerKey: historyOwnerKey,
           generation: historyOwnerGenerationRef.current, keys: new Map() };
       }
-      return buildHistoryLivePresentation(renderEntries, visibleLiveEntries,
+      const cacheWasEmpty = settingsPresentationKeysRef.current.keys.size === 0;
+      const output = buildHistoryLivePresentation(renderEntries, visibleLiveEntries,
         { settingsPresentationKeys: settingsPresentationKeysRef.current.keys });
+      primarySettingsCachePublicationRef.current = captureHistoryPrimarySettingsCachePublication(
+        primaryRootRef.current, renderEntries, output,
+        { cacheWasEmpty, ownerKey: historyOwnerKey, ownerGeneration: historyOwnerGenerationRef.current });
+      return output;
     },
     [historyOwnerKey, renderEntries, visibleLiveEntries],
   ) as FullHistoryEntry[];
@@ -14301,6 +15216,15 @@ function HistoryPanel({
     [mergedTranscriptEntries, rewindPreview],
   );
   const displayEntries = rewindPreviewResult.entries;
+  const primaryLocalRows = primaryPhysicalCandidate
+    ? selectHistoryPrimaryLocalRows(primaryLocalPublicationAtRender.rows.slice(),
+      entry => isLocalPromptEntry(entry) || isLocalRewindEntry(entry) || isLocalCompactErrorEntry(entry))
+    : [];
+  if (primaryLocalRows.length !== primaryLocalRowsRef.current.length
+    || primaryLocalRows.some((entry, index) => entry !== primaryLocalRowsRef.current[index])) {
+    primaryLocalRowsRef.current = primaryLocalRows;
+  }
+
   const displayEntriesRef = useRef(displayEntries);
   displayEntriesRef.current = displayEntries;
   const transcriptEntries = displayEntries;
@@ -14330,13 +15254,17 @@ function HistoryPanel({
       && displayEntries.some((entry) => Number(entry.responseTiming?.intervalId) === intervalId);
     return isBoundToVisibleResponse ? null : liveResponseTailTiming;
   }, [displayEntries, liveResponseTailTiming, compactOperationalPhase, tabId, toolType, sessionId]);
+  // Context compaction has its own operational clock and must not be
+  // attributed to the previous response's work chapter.
+  const responseWorkTailTiming = historyResponseWorkTailTiming(responseTailTiming) as HistoryResponseTailTiming | null;
   // ===== Display units: series collapsing (последняя ступень проекции) =====
-  // Approved contract (docs/tmp/визуал-history.md::Вердикт): the unit list is
-  // presentation-only; group keys are internal; everything that crosses this
-  // boundary (anchors, hydration, jumps, search) speaks entry uuids and gets
-  // translated to unit indices HERE. Kill switch: historyGroupActionsEnabled.
+  // Legacy compatibility keeps its display-unit projection for the remaining
+  // Timeline/geometry/metadata owners (OPEN). Primary navigation, physical
+  // keys and paint use addresses of the held presentation cut below.
   const historyGroupActionsEnabled = useUIStore((s) => (s as any).historyGroupActionsEnabled !== false);
   const [expandedGroupKeys, setExpandedGroupKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const compositeRevealSequenceRef = useRef(0);
+  const compositeGroupState = useMemo(() => createHistoryCompositeGroupState(), [historyOwnerKey]);
   const groupCaptionSelectionsRef = useRef(new Map<string, string>());
   const groupCaptionOwnerRef = useRef(historyOwnerKey);
   if (groupCaptionOwnerRef.current !== historyOwnerKey) {
@@ -14352,10 +15280,60 @@ function HistoryPanel({
   }
   // Previous (rows, options, units) triple for the incremental append path —
   // owner-scoped: another tab's rows must never serve as a diff baseline.
+  const primaryLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey && liveToolResults.size > 0
+    ? liveToolResults : null;
+  const primarySettingsPresentationKeysRef = useRef<[string, string][]>([]);
+  const primarySettingsPresentationKeys = primaryPhysicalCandidate
+    ? Array.from(settingsPresentationKeysRef.current.keys.entries()) : [];
+  if (primarySettingsPresentationKeys.length !== primarySettingsPresentationKeysRef.current.length
+    || primarySettingsPresentationKeys.some(([identity, key], index) => (
+      identity !== primarySettingsPresentationKeysRef.current[index]?.[0]
+      || key !== primarySettingsPresentationKeysRef.current[index]?.[1]
+    ))) {
+    primarySettingsPresentationKeysRef.current = primarySettingsPresentationKeys;
+  }
+  const primaryPresentation = useMemo(() => ({
+    localEntries: primaryLocalRowsRef.current,
+    liveEntries: ownerLiveEntries,
+    liveToolResults: primaryLiveToolResults,
+    rewindPreview,
+    // One visible commentary per tool group; no enclosing Working/Worked chapter.
+    grouping: { enabled: historyGroupActionsEnabled, responseWork: false, threshold: 2, expandedKeys: Array.from(expandedGroupKeys) },
+    captionSelections: Array.from(groupCaptionSelectionsRef.current.entries()),
+    settingsPresentationKeys: primarySettingsPresentationKeysRef.current,
+  }), [primaryLocalRowsRef.current, ownerLiveEntries, primaryLiveToolResults, historyOwnerKey, rewindPreview, historyGroupActionsEnabled,
+    expandedGroupKeys, primaryCaptionRevision, primarySuppressionRevision, primarySettingsPresentationKeysRef.current]);
+  primaryPresentationRef.current = primaryPresentation;
+  const primaryInputTransaction = useMemo(() => createHistoryPrimaryPanelInputTransaction(() => {
+    const root = primaryRootRef.current;
+    return {
+      witness: primarySurfaceWitnessRef.current,
+      root, header: root?.header, ownerKey: historyOwnerKeyRef.current, entries: presentationEntriesRef.current,
+      ownerGeneration: historyOwnerGenerationRef.current,
+      live: liveProjectionRef.current, results: liveToolResultsRef.current,
+      rewind: useUIStore.getState().historyRewindPreviews[tabId],
+      presentation: primaryPresentationRef.current, suppressions: suppressedPromptsRef.current,
+      captions: groupCaptionSelectionsRef.current,
+    };
+  }, historyPrimaryToolClaimFingerprint), [tabId]);
+  const primaryInputsCurrent = primaryInputTransaction.current;
+  const settingsCachePublication = primarySettingsCachePublicationRef.current;
+  if (settingsCachePublication) {
+    primarySettingsCachePublicationRef.current = null;
+    const rebased = primaryInputTransaction.rebaseSettingsCache(settingsCachePublication,
+      primaryCompositionAppliedRef.current, primaryPresentation);
+    if (rebased) {
+      primarySurfaceWitnessRef.current = rebased;
+      primaryCompositionAppliedRef.current = primaryPresentation;
+      primaryInputTransaction.invalidate();
+      historyDiag('PRIMARY_SETTINGS_CACHE_PUBLISHED tab=' + tabId.slice(-12)
+        + ' keys=' + primaryPresentation.settingsPresentationKeys.length + ' semanticReopen=0');
+    }
+  }
   const displayUnitsPrevRef = useRef<{
     ownerKey: string;
     entries: FullHistoryEntry[];
-    options: { enabled: boolean; threshold: number; expandedKeys: ReadonlySet<string> };
+    options: { enabled: boolean; responseWork: boolean; threshold: number; expandedKeys: ReadonlySet<string> };
     units: unknown[];
   } | null>(null);
   // Пробуждение панели начинает не с нуля: базовая строка прошлого визита
@@ -14372,6 +15350,7 @@ function HistoryPanel({
     () => {
       const unitOptions = {
         enabled: historyGroupActionsEnabled,
+        responseWork: false,
         threshold: 2,
         expandedKeys: expandedGroupKeys,
       };
@@ -14439,6 +15418,7 @@ function HistoryPanel({
     entries: displayEntries,
     options: {
       enabled: historyGroupActionsEnabled,
+      responseWork: false,
       threshold: 2,
       expandedKeys: expandedGroupKeys,
     },
@@ -14454,8 +15434,10 @@ function HistoryPanel({
   const displayUnitItemKeysRef = useRef(displayUnitItemKeys);
   displayUnitItemKeysRef.current = displayUnitItemKeys;
   const seekUnitKeyAt = useCallback(
-    (index: number) => displayUnitItemKeysRef.current[index] || '',
-    [],
+    (index: number) => primaryPhysicalCandidate
+      ? primaryRootRef.current?.addressAt(index)?.physicalKey || ''
+      : displayUnitItemKeysRef.current[index] || '',
+    [primaryPhysicalCandidate],
   );
   const topChromeInset = mainSurface && enableClaudePtyControls && !previewMode ? HISTORY_TOP_CHROME_INSET : 0;
   const displayUnitLayoutKeys = useMemo(
@@ -14475,7 +15457,8 @@ function HistoryPanel({
     const protectedUuids = collectHistoryMaterializedWindowUuids(
       displayUnitsRef.current,
       visibleRangeRef.current,
-      { captionSelections: groupCaptionSelectionsRef.current },
+      { captionSelections: groupCaptionSelectionsRef.current,
+        overscanUnits: toolType === 'codex' && !primaryRootRef.current ? HISTORY_ORDINARY_REVISIT_BUFFER_UNITS : 8 },
     );
     const retained = retainHistoryMaterializedWindow(
       presentationEntriesRef.current,
@@ -14490,11 +15473,15 @@ function HistoryPanel({
         + ' rejected=' + retained.rejected);
     }
     return retained.entries as FullHistoryEntry[];
-  }, [tabId]);
+  }, [tabId, toolType]);
   // uuid → unit index for every entry uuid (members of collapsed groups map
   // to their group's unit). THE translation layer: no uuid-consumer below may
   // scan units itself.
   const unitIndexByUuid = useMemo(() => {
+    // Primary owns an independent paged coordinate publication below. This is
+    // an actual absent owner, never an empty or proxy Map. Composite/legacy
+    // callers keep the original exact native Map and its duplicate grammar.
+    if (primaryPhysicalCandidate) return null;
     const map = new Map<string, number>();
     for (let index = 0; index < displayUnits.length; index += 1) {
       const unit = displayUnits[index] as any;
@@ -14508,9 +15495,97 @@ function HistoryPanel({
       }
     }
     return map;
-  }, [displayUnits]);
+  }, [displayUnits, primaryPhysicalCandidate]);
   const unitIndexByUuidRef = useRef(unitIndexByUuid);
   unitIndexByUuidRef.current = unitIndexByUuid;
+
+  // Coordinates describe THIS native current projection, including current
+  // locals, hidden group members and duplicate physical positions. They are
+  // independent of canonical Root readiness and never confer paint/Input or
+  // writer authority. Existing Np/unit/key arrays remain their own OPEN owner.
+  const primaryPositionFrame = useMemo(() => Object.freeze({
+    ownerKey: historyOwnerKey, rewriteEpoch: fileRewriteEpoch,
+    // Native compatibility remains owned by the actual list. The selected
+    // coordinate frame retains identity without becoming another Np owner.
+    entries: new WeakRef(displayEntries), units: new WeakRef(displayUnits), itemKeys: new WeakRef(displayUnitItemKeys),
+  }), [historyOwnerKey, fileRewriteEpoch, displayEntries, displayUnits, displayUnitItemKeys]);
+  const primaryPositionFrameRef = useRef(primaryPositionFrame);
+  primaryPositionFrameRef.current = primaryPositionFrame;
+  const primaryPositionModeRef = useRef(primaryPhysicalCandidate);
+  primaryPositionModeRef.current = primaryPhysicalCandidate;
+  const primaryPositionOwner = useMemo(() => createHistoryPresentationPositionOwner({
+    invoke: ipcRenderer.invoke.bind(ipcRenderer),
+    onSettled: (publication) => {
+      // A new completed coordinate publication is a real metadata wake. A
+      // failed/UNKNOWN publication never retries itself or clears highlights.
+      if (publication.status === 'ready') mountedSearchDemandRef.current?.();
+    },
+    onError: (error: any) => historyDiag('POSITION_PUBLICATION_FAILED tab=' + tabId.slice(-12)
+      + ' code=' + String(error?.code || 'UNKNOWN')),
+  }), [tabId]);
+  const primaryResizePosition = useMemo(() => createHistoryPresentationPositionQuery(primaryPositionOwner), [primaryPositionOwner]);
+  const primaryAnchorPosition = useMemo(() => createHistoryPresentationPositionQuery(primaryPositionOwner), [primaryPositionOwner]);
+  const primaryMountedPosition = useMemo(() => createHistoryPresentationPositionQuery(primaryPositionOwner), [primaryPositionOwner]);
+  const primaryTimelinePosition = useMemo(() => createHistoryPresentationPositionQuery(primaryPositionOwner), [primaryPositionOwner]);
+  useLayoutEffect(() => {
+    primaryPositionOwner.activate();
+    return () => {
+      primaryResizePosition.clear(); primaryAnchorPosition.clear(); primaryMountedPosition.clear(); primaryTimelinePosition.clear();
+      primaryPositionOwner.clear();
+    };
+  }, [primaryPositionOwner, primaryResizePosition, primaryAnchorPosition, primaryMountedPosition, primaryTimelinePosition]);
+  useLayoutEffect(() => {
+    if (!primaryPhysicalCandidate || historyOwnerKeyRef.current !== historyOwnerKey) {
+      primaryPositionOwner.clear(); return;
+    }
+    const frame = primaryPositionFrame;
+    const generation = historyOwnerGenerationRef.current;
+    const witness = Object.freeze({ frame, ownerKey: historyOwnerKey, generation });
+    // No full-payload hashing or N scan occurs in these per-chunk guards.
+    // Grouping's immutable row/publication contract supplies the exact frame;
+    // each actual query separately retains its original gesture/model/cut.
+    const owns = () => primaryPositionModeRef.current
+      && historyOwnerKeyRef.current === witness.ownerKey
+      && historyOwnerGenerationRef.current === witness.generation
+      && primaryPositionFrameRef.current === frame
+      && displayUnitsRef.current === frame.units.deref() && displayUnitItemKeysRef.current === frame.itemKeys.deref()
+      && displayEntriesRef.current === frame.entries.deref();
+    const existing = primaryPositionOwner.capture();
+    // Root readiness/replacement does not change the shown frame. Preserve
+    // its SAME running/pending resize, anchor and search intents.
+    if (existing?.frame === frame && primaryPositionOwner.owns(existing)) return;
+    const units = frame.units.deref(), itemKeys = frame.itemKeys.deref();
+    if (!units || !itemKeys || !owns()) return;
+    const controller = new AbortController();
+    const publication = primaryLocalPublicationAtRender;
+    const prepared = primarySparsePublicationOwner.matches(publication, entries,
+      { ownerKey: historyOwnerKey, generation }) ? publication.prepared : null;
+    const compatibility = primaryPreparedCompatibilityRef.current;
+    const metadata = prepared && compatibility?.origin === prepared.capability ? compatibility.entries : null;
+    const currentRows = [...publication.rows, ...visibleLiveEntries];
+    const input = { prepared, metadata, sparse: publication.sparse, currentRows, units, owns };
+    void (async () => {
+      // This admission borrows the remaining native graph only before one
+      // registration. Unmigrated live/settings/rewind clones retain their
+      // explicitly named native adapter; errors never trigger a second open.
+      const selected = await canBindHistoryPreparedPositionFrame(input, { signal: controller.signal });
+      if (controller.signal.aborted || !owns()) return;
+      if (selected) {
+        const source = createHistoryPreparedPositionSource({ ...input,
+          invoke: ipcRenderer.invoke.bind(ipcRenderer), itemKeys });
+        if (!primaryPositionOwner.publish({ source, frame, witness, owns })) source.discard();
+      } else {
+        historyDiag('POSITION_NATIVE_COMPATIBILITY_OPEN tab=' + tabId.slice(-12)
+          + ' reason=unmigrated-row-transformation units=' + units.length);
+        primaryPositionOwner.publish({ units, itemKeys, frame, witness, owns });
+      }
+    })().catch((error: any) => {
+      if (error?.code !== 'HISTORY_READ_CANCELLED') historyDiag('POSITION_ADMISSION_FAILED tab=' + tabId.slice(-12)
+        + ' code=' + String(error?.code || 'UNKNOWN'));
+    });
+    return () => controller.abort();
+  }, [primaryPhysicalCandidate, historyOwnerKey, historyOwnerVisitState, primaryPositionFrame, primaryPositionOwner,
+    primarySparsePublicationOwner]);
   // Expand the group containing `uuid` (no-op when visible already). Returns
   // true when an expansion actually happened — jump loops then re-resolve on
   // the next frame against the new unit list.
@@ -14522,12 +15597,7 @@ function HistoryPanel({
       + ' uuid=' + uuid.slice(0, 8)
       + ' group=' + groupKey.slice(0, 24)
       + ' reason=' + reason);
-    setExpandedGroupKeys((previous) => {
-      if (previous.has(groupKey)) return previous;
-      const next = new Set(previous);
-      next.add(groupKey);
-      return next;
-    });
+    setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, groupKey, true));
     return true;
   }, [tabId]);
   const visibleTerminalPreview = terminalPreview?.tabId === tabId
@@ -14540,6 +15610,16 @@ function HistoryPanel({
   const historyMeasureBeforePaint = useCallback(() => historyOwnerKeyRef.current === historyOwnerKey
     && historyPresentationProofRef.current.presented
     && historyResizeRef.current?.active() !== true, [historyOwnerKey]);
+  // The live clock belongs to the work header when the admitted tail is in a
+  // work chapter. If that tail is not loaded yet, keep the existing footer as
+  // an honest fallback instead of hiding the only activity indicator.
+  const lastResponseWorkUnit = primaryPhysicalCandidate
+    ? primaryRoot?.unitAt((primaryRoot?.totalCount || 0) - 1)
+      || (primaryRoot && primaryCompositionAppliedRef.current === primaryPresentation ? displayUnits.at(-1) : null)
+    : displayUnits.at(-1);
+  const activeClockInWork = !!responseWorkTailTiming && !!lastResponseWorkUnit
+    && !!historyResponseWorkClock((lastResponseWorkUnit as any).familyKey === 'response-work'
+      ? lastResponseWorkUnit : (lastResponseWorkUnit as any).responseWork, responseWorkTailTiming);
   const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
     () => ({
       historyMeasureBeforePaint,
@@ -14547,10 +15627,10 @@ function HistoryPanel({
       terminalPreview: visibleTerminalPreview,
       terminalPreviewCanonicalMaterialized,
       onHandoffDomCommit: onHistoryHandoffRowMounted,
-      responseTiming: responseTailTiming,
+      responseTiming: activeClockInWork ? null : responseTailTiming,
       seekUnitKeyAt,
     }),
-    [historyMeasureBeforePaint, topChromeInset, visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, seekUnitKeyAt, onHistoryHandoffRowMounted],
+    [historyMeasureBeforePaint, topChromeInset, visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, activeClockInWork, seekUnitKeyAt, onHistoryHandoffRowMounted],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -14567,7 +15647,7 @@ function HistoryPanel({
   const viewportAwaitingFirstRange = !surfaceLoading
     && viewportProofRequired
     && !(ownerChangedBeforeLayoutHandoff && retainedRewriteMount?.anchorPreserved)
-    && displayEntries.length > 0
+    && (primaryPhysicalCandidate ? (primaryRoot?.totalCount || 0) > 0 : displayEntries.length > 0)
     && viewportReadyOwnerKey !== historyOwnerKey;
   const visibleSurfaceLoading = surfaceLoading || viewportAwaitingFirstRange || historyResizePhase === 'settling';
   // Loader changes must not cancel the very post-paint probe that clears it.
@@ -14578,12 +15658,13 @@ function HistoryPanel({
     ? HISTORY_SETTLED_VIEWPORT_BUFFER
     : HISTORY_INITIAL_VIEWPORT_BUFFER;
   const armHistoryViewportPaintProof = useCallback(() => {
-    if (displayEntriesRef.current.length === 0) return;
+    if (primaryPhysicalCandidate ? !primaryRootRef.current?.totalCount : displayEntriesRef.current.length === 0) return;
     viewportReadyOwnerKeyRef.current = '';
     setViewportReadyOwnerKey('');
     setViewportProofRequired(true);
     surfacePresentedOwnerRef.current = '';
-  }, []);
+  }, [primaryPhysicalCandidate]);
+  const historyViewportProofRefusalRef = useRef({ range: '', surface: '', other: '' });
   const consumeHistoryViewportPaintProof = useCallback(({
     ownerKey,
     generation,
@@ -14599,7 +15680,36 @@ function HistoryPanel({
     domRows: number;
     source: string;
   }) => {
-    if (historyResizeRef.current?.active()) return false;
+    const refusalSlot = source.startsWith('range-paint-probe:') ? 'range'
+      : source === 'surface-presented' ? 'surface' : 'other';
+    const refuse = (reason: string) => {
+      const root = primaryRootRef.current;
+      const key = [ownerKey, generation, presentationVisit, source, reason,
+        root?.header?.leaseId, root?.rangeRevision].join(':');
+      if (historyViewportProofRefusalRef.current[refusalSlot] !== key) {
+        historyViewportProofRefusalRef.current[refusalSlot] = key;
+        historyDiag('VIEWPORT_PROOF_REJECT tab=' + tabId.slice(-12)
+          + ' owner=' + historyOwnerDigest(ownerKey) + ' generation=' + generation
+          + ' presentationVisit=' + presentationVisit + ' source=' + source
+          + ' reason=' + reason + ' lease=' + (root?.header?.leaseId?.slice(-12) || '-')
+          + ' range=' + (root?.rangeRevision ?? '-'));
+      }
+      return false;
+    };
+    if (historyResizeRef.current?.active()) return refuse('resize');
+    if (primaryPhysicalCandidate) {
+      const root = primaryRootRef.current;
+      // All retained/range/row paint publishers pass this common gate. A
+      // same-owner DOM row cannot replace the exact measured root commit.
+      if (!root) return refuse('root-missing');
+      // A still-pending measured window is a cheap rejection; it must not
+      // repeatedly hash a full local/live payload merely to wait for coverage.
+      if (!root.hasCurrentPresentationCoverage({
+        ownerKey, generation, visit: presentationVisit, presented: true,
+      })) return refuse('window-uncovered');
+      if (!primaryInputsCurrent()) return refuse('inputs-superseded');
+      if (proof === 'painted-empty-state' ? root.totalCount !== 0 : root.totalCount === 0) return refuse('row-kind');
+    }
     const result = resolveHistoryViewportPaintProof({
       currentOwnerKey: historyOwnerKeyRef.current,
       currentGeneration: historyOwnerGenerationRef.current,
@@ -14612,7 +15722,8 @@ function HistoryPanel({
       proof,
       domRows,
     });
-    if (!result.accepted) return false;
+    if (!result.accepted) return refuse('owner-visit-or-row');
+    historyViewportProofRefusalRef.current[refusalSlot] = '';
     if (result.changed) {
       viewportReadyOwnerKeyRef.current = result.readyOwnerKey;
       setViewportReadyOwnerKey(result.readyOwnerKey);
@@ -14626,7 +15737,7 @@ function HistoryPanel({
         + ' source=' + source);
     }
     return true;
-  }, [tabId]);
+  }, [tabId, primaryPhysicalCandidate, primaryInputsCurrent]);
   const publishHistorySurfacePresented = useCallback(({
     ownerKey,
     generation,
@@ -14660,6 +15771,8 @@ function HistoryPanel({
     const acceptedProofKey = ownerKey + ':' + generation + ':pv' + presentationVisit;
     if (surfacePresentedOwnerRef.current === acceptedProofKey) return true;
     surfacePresentedOwnerRef.current = acceptedProofKey;
+    historyCommitDiagnosticsRef.current?.present({ ownerKey, sessionId: sessionId || null,
+      generation, presentationVisit });
     const detail = {
       tabId,
       sessionId: sessionId || null,
@@ -14684,27 +15797,154 @@ function HistoryPanel({
     }));
     return true;
   }, [consumeHistoryViewportPaintProof, sessionId, tabId, toolType]);
-  // Virtuoso now renders display UNITS. Every uuid-to-index consumer (anchor
-  // restore, Timeline jump, search, hydration seeding) must receive UNIT
-  // indices — this map is the single translation and already resolves a uuid
-  // hidden inside a collapsed group to the group's own row.
+  // Legacy consumers translate UUIDs to display-unit indices with this
+  // compatibility map. The primary branch resolves exact point addresses
+  // from its held root, including UUIDs hidden in collapsed groups.
   const displayEntryIndexByUuid = unitIndexByUuid;
   const displayEntryIndexByUuidRef = useRef(displayEntryIndexByUuid);
   displayEntryIndexByUuidRef.current = displayEntryIndexByUuid;
+  const primaryHeader = primaryRoot?.header || null;
+  const primaryHeaderPending = primaryPhysicalCandidate && !primaryHeader;
+  const readCurrentPrimaryTerminalPreviewMembership = useCallback((identity: string) => {
+    const proof = primaryTerminalPreviewMembershipRef.current;
+    const root = primaryRootRef.current;
+    const handoff = terminalPreviewClearHandoffRef.current;
+    if (!proof || !root || root.closed || proof.root !== root || proof.result.header !== root.header
+      || proof.ownerKey !== historyOwnerKeyRef.current || proof.generation !== historyOwnerGenerationRef.current
+      || proof.identity !== identity || handoff?.canonicalIdentity !== identity || proof.previewId !== handoff?.previewId
+      || proof.expectedHash !== (handoff?.canonicalTextHash || null)
+      || primaryInputsCurrent() !== true) return null;
+    return proof.result;
+  }, [primaryInputsCurrent]);
+  useEffect(() => {
+    const handoff = terminalPreviewClearHandoffRef.current;
+    if (!primaryPhysicalCandidate || !handoff?.canonicalIdentity) {
+      if (primaryTerminalPreviewMembershipRef.current) publishPrimaryTerminalPreviewMembership(null);
+      return;
+    }
+    if (!primaryRoot || primaryRoot.closed || primaryRoot !== primaryRootRef.current || !primaryHeader
+      || primaryRoot.header !== primaryHeader || primaryInputsCurrent() !== true) return;
+    if (readCurrentPrimaryTerminalPreviewMembership(handoff.canonicalIdentity)) return;
+    const root = primaryRoot, header = primaryHeader, ownerKey = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current;
+    const identity = handoff.canonicalIdentity, previewId = handoff.previewId;
+    const expectedHash = handoff.canonicalTextHash || null;
+    const controller = new AbortController();
+    const owns = () => !controller.signal.aborted && !root.closed && primaryRootRef.current === root && root.header === header
+      && historyOwnerKeyRef.current === ownerKey && historyOwnerGenerationRef.current === generation
+      && terminalPreviewClearHandoffRef.current?.previewId === previewId
+      && terminalPreviewClearHandoffRef.current?.canonicalIdentity === identity
+      && (terminalPreviewClearHandoffRef.current?.canonicalTextHash || null) === expectedHash
+      && primaryInputsCurrent() === true;
+    void root.readTerminalPreviewMembership(identity, { signal: controller.signal, owns }).then(result => {
+      if (!owns() || result.header !== header) return;
+      publishPrimaryTerminalPreviewMembership({ root, ownerKey, generation, previewId, identity, expectedHash, result });
+    }).catch((error: any) => {
+      if (!owns()) return;
+      historyDiag('TERMINAL_PREVIEW_MEMBERSHIP_UNKNOWN tab=' + tabId.slice(-12)
+        + ' preview=' + previewId.slice(-18) + ' code=' + String(error?.code || error?.message || error));
+    });
+    return () => controller.abort();
+  }, [primaryPhysicalCandidate, primaryRoot, primaryHeader, primaryPresentation,
+    primaryInputsCurrent, readCurrentPrimaryTerminalPreviewMembership, publishPrimaryTerminalPreviewMembership,
+    historyOwnerKey, terminalPreviewCanonicalIdentity, terminalPreviewClearHandoff?.previewId,
+    terminalPreviewClearHandoff?.canonicalTextHash, tabId]);
+  useLayoutEffect(() => {
+    const root = primaryRootRef.current;
+    if (!primaryPhysicalCandidate || !root || root !== primaryRoot || !primaryHeader
+      || root.header !== primaryHeader || primaryInputsCurrent()) return;
+    // Initial-point resolution and the explicit empty DOM may intentionally
+    // have no Surface. Release only this adopted flight so its existing
+    // trailing semantic composition can install the current local input.
+    root.finishPresentation({ status: 'superseded', requiredClass: 'semantic', reason: 'panel-composition-moved' });
+  }, [primaryPhysicalCandidate, primaryRoot, primaryHeader, primaryRootRevision, primaryPresentation, primaryInputsCurrent]);
+  const primaryInitialMountKey = retainedRewriteMount?.listKey || (presentationExternallyManaged
+    ? historyOwnerKey + ':mount:' + presentationRestoreTick
+    : historyOwnerKey + ':visit:' + historyOwnerVisitState) + (fileRewriteEpoch ? ':file:' + fileRewriteEpoch : '');
+  const primaryInitialMountKeyRef = useRef(primaryInitialMountKey);
+  primaryInitialMountKeyRef.current = primaryInitialMountKey;
+  const primaryInitialMountedRef = useRef('');
+  const [primaryJumpResolution, setPrimaryJumpResolution] = useState<any>(null);
+  const [primaryAnchorResolution, setPrimaryAnchorResolution] = useState<any>(null);
+  const initialReadingAnchor = useMemo(() => getHistoryReadingAnchor(scrollPositionKey),
+    [scrollPositionKey, primaryInitialMountKey]);
+  useEffect(() => {
+    if (!primaryPhysicalCandidate || !primaryRoot?.header || !historyScrollToUuid || !primaryInputsCurrent()) return;
+    const root = primaryRoot, header = root.header, owner = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current, request = requestedHistoryScrollGeneration;
+    const controller = new AbortController();
+    const owns = () => !controller.signal.aborted && primaryRootRef.current === root && root.header === header
+      && historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation
+      && useUIStore.getState().historyScrollRequestGeneration === request && primaryInputsCurrent();
+    void readHistoryPrimaryPanelAddress(root, 'identity', historyScrollToUuid,
+      { tool: historyScrollToolTarget, signal: controller.signal, owns }).then(result => {
+      if (owns()) setPrimaryJumpResolution({ ...result, owner, generation, request,
+        identity: historyScrollToUuid, tool: historyScrollToolTarget });
+    }).catch(error => {
+      if (owns() && error?.code !== 'HISTORY_READ_CANCELLED') {
+        setHistoryLoadError(String(error?.code || error));
+        historyDiag('PRIMARY_ADDRESS_FAILED kind=jump code=' + String(error?.code || error));
+      }
+    });
+    return () => controller.abort();
+  }, [primaryPhysicalCandidate, primaryRoot, primaryHeader, historyScrollToUuid, historyScrollToolTarget,
+    requestedHistoryScrollGeneration, historyOwnerKey, primaryPresentation, primaryInputsCurrent]);
+  useEffect(() => {
+    if (!primaryPhysicalCandidate || !primaryRoot?.header || historyScrollToUuid
+      || !initialReadingAnchor || initialReadingAnchor.followBottom
+      || primaryInitialMountedRef.current === primaryInitialMountKey || !primaryInputsCurrent()) return;
+    const root = primaryRoot, header = root.header, owner = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current, mount = primaryInitialMountKey;
+    const controller = new AbortController();
+    const owns = () => !controller.signal.aborted && primaryRootRef.current === root && root.header === header
+      && historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation
+      && primaryInitialMountKeyRef.current === mount && primaryInputsCurrent();
+    void readHistoryPrimaryPanelAddress(root, 'entry', initialReadingAnchor.uuid,
+      { signal: controller.signal, owns }).then(result => {
+      if (owns()) setPrimaryAnchorResolution({ ...result, mount, uuid: initialReadingAnchor.uuid });
+    }).catch(error => {
+      if (owns() && error?.code !== 'HISTORY_READ_CANCELLED') {
+        setHistoryLoadError(String(error?.code || error));
+        historyDiag('PRIMARY_ADDRESS_FAILED kind=anchor code=' + String(error?.code || error));
+      }
+    });
+    return () => controller.abort();
+  }, [primaryPhysicalCandidate, primaryRoot, primaryHeader, historyScrollToUuid, initialReadingAnchor,
+    primaryInitialMountKey, historyOwnerKey, primaryPresentation, primaryInputsCurrent]);
+  const primaryJumpReady = primaryJumpResolution?.root === primaryRoot
+    && primaryJumpResolution?.header === primaryHeader && primaryJumpResolution?.identity === historyScrollToUuid
+    && primaryJumpResolution?.request === requestedHistoryScrollGeneration
+    && primaryJumpResolution?.tool === historyScrollToolTarget;
+  const primaryAnchorReady = primaryAnchorResolution?.root === primaryRoot
+    && primaryAnchorResolution?.header === primaryHeader && primaryAnchorResolution?.mount === primaryInitialMountKey
+    && primaryAnchorResolution?.uuid === initialReadingAnchor?.uuid;
+  // Pending is not empty/missing. Only the first physical mount waits; a
+  // metadata refresh keeps the already mounted list and its semantic keys.
+  const primaryInitialPositionPending = primaryPhysicalCandidate && !!primaryHeader
+    && primaryRoot!.totalCount > 0 && primaryInitialMountedRef.current !== primaryInitialMountKey
+    && (historyScrollToUuid ? !primaryJumpReady
+      : !!initialReadingAnchor && !initialReadingAnchor.followBottom && !primaryAnchorReady);
   const pendingInitialHistoryIndex = useMemo(() => {
+    if (primaryPhysicalCandidate) return primaryJumpReady ? primaryJumpResolution.address?.index ?? -1 : -1;
     if (!historyScrollToUuid || displayEntries.length === 0) return -1;
-    return displayEntryIndexByUuid.get(historyScrollToUuid) ?? -1;
-  }, [displayEntryIndexByUuid, displayEntries.length, historyScrollToUuid]);
+    return displayEntryIndexByUuid!.get(historyScrollToUuid) ?? -1;
+  }, [primaryPhysicalCandidate, primaryJumpReady, primaryJumpResolution, displayEntryIndexByUuid,
+    displayEntries.length, historyScrollToUuid]);
   // Reading-anchor restore target. An explicit Timeline jump wins; otherwise
   // a saved non-follow-bottom anchor puts the exact row the user last read
   // at the exact in-row offset; follow-bottom (or no anchor) starts at the
   // tail. Row identity + offset survives remounts, re-measures and app
   // restarts, unlike a raw pixel scrollTop.
   const initialAnchorLocation = useMemo(() => {
+    if (primaryPhysicalCandidate) {
+      const address = primaryAnchorReady ? primaryAnchorResolution.address : null;
+      return address && initialReadingAnchor ? { index: address.index, align: 'start' as const,
+        behavior: 'auto' as const, offset: initialReadingAnchor.offsetPx } : null;
+    }
     if (displayEntries.length === 0) return null;
     const anchor = getHistoryReadingAnchor(scrollPositionKey);
     if (!anchor || anchor.followBottom) return null;
-    const index = displayEntryIndexByUuid.get(anchor.uuid);
+    const index = displayEntryIndexByUuid!.get(anchor.uuid);
     if (index === undefined) return null;
     return {
       index,
@@ -14712,11 +15952,13 @@ function HistoryPanel({
       behavior: 'auto' as const,
       offset: anchor.offsetPx,
     };
-  }, [displayEntryIndexByUuid, displayEntries.length, scrollPositionKey]);
+  }, [primaryPhysicalCandidate, primaryAnchorReady, primaryAnchorResolution, initialReadingAnchor,
+    displayEntryIndexByUuid, displayEntries.length, scrollPositionKey]);
   const initialTopMostItemIndex = pendingInitialHistoryIndex >= 0
     ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
     : initialAnchorLocation
-      ?? (displayUnits.length > 0 ? displayUnits.length - 1 : 0);
+      ?? (primaryPhysicalCandidate ? Math.max(0, (primaryHeader?.totalEntries ?? 1) - 1)
+        : displayUnits.length > 0 ? displayUnits.length - 1 : 0);
   // Measured geometry of THIS owner, resolved once per physical list mount. An
   // explicit Timeline jump owns the position and must not be overridden by a
   // stored scroll offset.
@@ -15328,12 +16570,19 @@ function HistoryPanel({
       }
       const scrollerRect = scroller.getBoundingClientRect();
       const headerRect = header?.getBoundingClientRect() || null;
-      const groupUnitIndex = displayUnitsRef.current.findIndex(
-        (unit: any) => unit?.kind === 'group' && unit.key === groupKey,
-      );
-      const groupUnit = groupUnitIndex >= 0
-        ? displayUnitsRef.current[groupUnitIndex] as any
-        : null;
+      const root = primaryRootRef.current;
+      // This diagnostic samples only the current root window. An off-window
+      // group is unavailable here, never a reason for a whole-index lookup.
+      const mountedGroup = root?.renderSnapshot()?.window.entries();
+      let groupUnitIndex = -1, groupUnit: any = null;
+      if (root) {
+        for (const [index, unit] of mountedGroup || []) if (unit?.kind === 'group' && unit.key === groupKey) {
+          groupUnitIndex = index; groupUnit = unit; break;
+        }
+      } else {
+        groupUnitIndex = displayUnitsRef.current.findIndex((unit: any) => unit?.kind === 'group' && unit.key === groupKey);
+        groupUnit = groupUnitIndex >= 0 ? displayUnitsRef.current[groupUnitIndex] : null;
+      }
       const groupEntries = Array.isArray(groupUnit?.entries) ? groupUnit.entries : [];
       const state = useWorkspaceStore.getState();
       let activeTab = false;
@@ -15350,7 +16599,7 @@ function HistoryPanel({
         + ' elapsedMs=' + Math.round(performance.now() - startedAt)
         + ' active=' + (activeTab ? 1 : 0)
         + ' unitIdx=' + groupUnitIndex
-        + ' units=' + displayUnitsRef.current.length
+        + ' units=' + (root ? root.totalCount : displayUnitsRef.current.length)
         + ' members=' + groupEntries.length
         + ' memberStubs=' + groupEntries.filter((entry: any) => entry?.rowStub).length
         + ' expanded=' + (groupUnit?.expanded === true ? 1 : 0)
@@ -15494,27 +16743,23 @@ function HistoryPanel({
       pendingHistoryGroupExpandRef.current = null;
       return;
     }
-    if (expandedGroupKeys.has(pending.groupKey)) return;
+    if (isHistoryDisplayGroupExpanded(expandedGroupKeys, pending.groupKey)) return;
     historyDiag('GROUP_EXPAND_COMMIT tab=' + tabId.slice(-12)
       + ' key=' + pending.groupKey.slice(0, 24)
       + ' reason=' + pending.reason
       + ' barrier=follow-prop-effect');
-    setExpandedGroupKeys((previous) => {
-      if (previous.has(pending.groupKey)) return previous;
-      const next = new Set(previous);
-      next.add(pending.groupKey);
-      return next;
-    });
+    setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, pending.groupKey, true));
   }, [expandedGroupKeys, historyFollowOutputEnabled, historyGroupExpandStage, tabId]);
 
   useLayoutEffect(() => {
     const pending = pendingHistoryGroupExpandRef.current;
-    if (!pending || !expandedGroupKeys.has(pending.groupKey)) return;
+    if (!pending || !isHistoryDisplayGroupExpanded(expandedGroupKeys, pending.groupKey)) return;
     pendingHistoryGroupExpandRef.current = null;
     stabilizePendingHistoryGroupExpand(pending);
   }, [expandedGroupKeys, stabilizePendingHistoryGroupExpand]);
 
   const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
+    compositeRevealSequenceRef.current += 1;
     const scroller = virtuosoScrollerRef.current;
     let clickedHeader: HTMLElement | null = null;
     if (scroller) {
@@ -15571,6 +16816,7 @@ function HistoryPanel({
     setHistoryGroupExpandStage((stage) => stage + 1);
   }, [historyRevealOps, tabId, traceHistoryGroupToggleGeometry]);
   const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
+    compositeRevealSequenceRef.current += 1;
     // Same order as the card path: following off BEFORE the resize, or a
     // stale tail pin rides the shrink to the new bottom (+246px measured).
     traceHistoryGroupToggleGeometry(groupKey, 'collapse', 'header');
@@ -15578,12 +16824,7 @@ function HistoryPanel({
     historyGroupRevealExtentRef.current = null;
     historyRevealOps.unpinTail();
     flushSync(() => {
-      setExpandedGroupKeys((previous) => {
-        if (!previous.has(groupKey)) return previous;
-        const next = new Set(previous);
-        next.delete(groupKey);
-        return next;
-      });
+      setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, groupKey, false));
     });
   }, [historyRevealOps, traceHistoryGroupToggleGeometry]);
   /**
@@ -15603,10 +16844,12 @@ function HistoryPanel({
    * Near the physical bottom the browser may clamp the requested top position;
    * visibility of the header is the contract, not an impossible empty tail.
    */
+  const pendingPrimaryGroupCollapseRef = useRef<any>(null);
   const collapseGroupFromFoot = useCallback((
     groupKey: string,
     source: 'foot' | 'rail' = 'foot',
   ) => {
+    compositeRevealSequenceRef.current += 1;
     const scroller = virtuosoScrollerRef.current;
     if (!scroller) {
       collapseGroupPreservingViewport(groupKey);
@@ -15622,9 +16865,15 @@ function HistoryPanel({
     const headerOffset = header
       ? header.getBoundingClientRect().top - scroller.getBoundingClientRect().top
       : null;
-    const headerIndex = displayUnits.findIndex(
+    const root = primaryRootRef.current;
+    const headerIndex = root ? -1 : displayUnits.findIndex(
       (unit: any) => unit?.kind === 'group' && unit.key === groupKey,
     );
+    if (root && (headerOffset === null || headerOffset < 0)) {
+      pendingPrimaryGroupCollapseRef.current = { root, groupKey, scroller,
+        owner: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+        visit: historyPresentationProofRef.current.visit, gesture: historyUserGestureGenerationRef.current };
+    }
     historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
       + ' key=' + groupKey.slice(0, 24)
       + ' reason=' + source
@@ -15634,14 +16883,10 @@ function HistoryPanel({
     historyGroupRevealExtentRef.current = null;
     historyRevealOps.unpinTail();
     flushSync(() => {
-      setExpandedGroupKeys((previous) => {
-        if (!previous.has(groupKey)) return previous;
-        const next = new Set(previous);
-        next.delete(groupKey);
-        return next;
-      });
+      setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, groupKey, false));
     });
     if (headerOffset === null || headerOffset < 0) {
+      if (root) return; // the new collapsed view resolves its own header below
       // The data list has just changed shape. A pre-collapse pixel target is
       // not authoritative for Virtuoso: its remeasurement may move the same
       // logical item hundreds of pixels. Ask for the header by index on the
@@ -15669,6 +16914,62 @@ function HistoryPanel({
       return;
     }
   }, [collapseGroupPreservingViewport, displayUnits, historyRevealOps, tabId, traceHistoryGroupToggleGeometry]);
+  const revealCompositeWorkActions = useCallback<HistoryCompositeReveal>((anchor, opening, commit, source = 'header') => {
+    const revealSequence = ++compositeRevealSequenceRef.current;
+    const scroller = findHistoryScrollParent(anchor);
+    const landOnHeader = !opening && source !== 'header' && !!anchor && !!scroller
+      && anchor.getBoundingClientRect().top < scroller.getBoundingClientRect().top;
+    const owner = historyOwnerKeyRef.current, generation = historyOwnerGenerationRef.current;
+    const gesture = historyUserGestureGenerationRef.current, visit = historyPresentationProofRef.current.visit;
+    historyDiag('COMPOSITE_GROUP_TOGGLE tab=' + tabId.slice(-12) + ' source=' + source
+      + ' opening=' + (opening ? '1' : '0') + ' land=' + (landOnHeader ? '1' : '0'));
+    applyHistoryRevealUpdate(anchor, opening, commit);
+    if (!landOnHeader || !anchor || !scroller) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!anchor.isConnected || !scroller.isConnected || findHistoryScrollParent(anchor) !== scroller
+        || historyOwnerKeyRef.current !== owner || historyOwnerGenerationRef.current !== generation
+        || compositeRevealSequenceRef.current !== revealSequence
+        || historyUserGestureGenerationRef.current !== gesture
+        || !historyPresentationOwnsWrite(historyPresentationProofRef.current, visit)) return;
+      const offset = anchor.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+      if (offset < 0) scroller.scrollTop = Math.max(0, scroller.scrollTop + offset - 8);
+      historyDiag('COMPOSITE_GROUP_LAND tab=' + tabId.slice(-12) + ' source=' + source
+        + ' offset=' + Math.round(offset));
+    }));
+  }, [tabId]);
+  useEffect(() => {
+    const pending = pendingPrimaryGroupCollapseRef.current;
+    if (!pending || isHistoryDisplayGroupExpanded(expandedGroupKeys, pending.groupKey) || !primaryInputsCurrent()) return;
+    const root = pending.root, header = root.header, controller = new AbortController();
+    const owns = () => !controller.signal.aborted && pendingPrimaryGroupCollapseRef.current === pending
+      && primaryRootRef.current === root && root.header === header && primaryInputsCurrent()
+      && pending.scroller.isConnected && historyOwnerKeyRef.current === pending.owner
+      && historyOwnerGenerationRef.current === pending.generation
+      && historyUserGestureGenerationRef.current === pending.gesture
+      && historyPresentationOwnsWrite(historyPresentationProofRef.current, pending.visit);
+    if (!owns()) { pendingPrimaryGroupCollapseRef.current = null; return; }
+    void readHistoryPrimaryPanelAddress(root, 'group', pending.groupKey, { signal: controller.signal, owns }).then(result => {
+      if (!owns()) return;
+      const address = result.address;
+      if (!address) { pendingPrimaryGroupCollapseRef.current = null; return; }
+      virtuosoRef.current?.scrollToIndex({ index: address.index, align: 'start' });
+      requestAnimationFrame(() => {
+        if (!owns()) return;
+        const landed = Array.from(pending.scroller.querySelectorAll('[data-history-group]') as NodeListOf<HTMLElement>)
+          .find(node => node.getAttribute('data-history-group') === pending.groupKey);
+        if (!landed) virtuosoRef.current?.scrollToIndex({ index: address.index, align: 'start' });
+        else pending.scroller.scrollTop = Math.max(0, pending.scroller.scrollTop
+          + landed.getBoundingClientRect().top - pending.scroller.getBoundingClientRect().top - 8);
+        pendingPrimaryGroupCollapseRef.current = null;
+      });
+    }).catch(error => {
+      if (owns() && error?.code !== 'HISTORY_READ_CANCELLED') {
+        setHistoryLoadError(String(error?.code || error));
+        pendingPrimaryGroupCollapseRef.current = null;
+      }
+    });
+    return () => controller.abort();
+  }, [primaryHeader, primaryPresentation, expandedGroupKeys, primaryInputsCurrent]);
   // Visible index range from Virtuoso. Drives the visible-uuid set without
   // an IntersectionObserver (cheaper, exact: no threshold guessing).
   const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
@@ -15681,8 +16982,11 @@ function HistoryPanel({
   // `rowStub` flags — main's ground truth — stayed correct. Every decision
   // now reads the rows themselves.
   const hydrationCenterUuidRef = useRef<string | null>(null);
+  const hydrationRadiusRef = useRef(HISTORY_HYDRATION_RADIUS_ROWS);
   const hydrationRequestInFlightRef = useRef(false);
   const hydrationRangeIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hydrationRangeCheckRef = useRef<(() => void) | null>(null);
+  const hydrationRangePendingRef = useRef<{ ownerKey: string; generation: number; visit: number } | null>(null);
   // Orphans a stale request's completion callback after an owner switch: the
   // old `.finally` must not clear the in-flight flag (or fire the pending
   // follow-up) of the NEXT owner's request.
@@ -15694,6 +16998,7 @@ function HistoryPanel({
     centerUuid: string;
     reason: string;
     extra: string;
+    radius: number;
   } | null>(null);
   // Retry stopper: when main answers "that centre row does not exist in my
   // projection" (centerMissing), re-asking for the same uuid is a request
@@ -15730,24 +17035,55 @@ function HistoryPanel({
     centerUuid: string | null,
     reason: string,
     extra?: string,
+    radius?: number,
   ) => boolean>(() => false);
   requestHistoryHydrationAtRef.current = (
     centerUuid: string | null,
     reason: string,
     extra = '',
+    radius = HISTORY_HYDRATION_RADIUS_ROWS,
   ) => {
     if (!centerUuid) return false;
+    const root = primaryRootRef.current;
+    if (root) {
+      if (root.hasEntry(centerUuid)) return true;
+      if (hydrationRequestInFlightRef.current) return false;
+      hydrationRequestInFlightRef.current = true;
+      const owner = historyOwnerKeyRef.current;
+      const generation = historyOwnerGenerationRef.current;
+      const owns = () => historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation;
+      void root.resolveUuid(centerUuid, { owns }).then(target => {
+        if (!owns()) return;
+        if (!target) {
+          hydrationLastResultRef.current = { centerUuid, centerMissing: true };
+          return;
+        }
+        return root.readWindow(target.index, target.index, {
+          owns, captionSelections: Array.from(groupCaptionSelectionsRef.current.entries()),
+        });
+      }).catch(error => {
+        if (error?.code !== 'HISTORY_READ_CANCELLED') setHistoryLoadError(String(error?.code || error));
+      }).finally(() => {
+        if (historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation) {
+          hydrationRequestInFlightRef.current = false;
+        }
+      });
+      return true;
+    }
+
     const last = hydrationLastResultRef.current;
     if (last && last.centerMissing && last.centerUuid === centerUuid) return false;
     const issuedMap = hydrationLastIssuedRef.current;
-    const issuedAt = issuedMap.get(centerUuid);
-    if (issuedAt !== undefined && performance.now() - issuedAt < HYDRATION_REISSUE_COOLDOWN_MS) {
+    const issueKey = centerUuid + ":" + radius;
+    const issuedAt = issuedMap.get(issueKey);
+    if (hydrationCenterUuidRef.current === centerUuid && hydrationRadiusRef.current === radius
+      && issuedAt !== undefined && performance.now() - issuedAt < HYDRATION_REISSUE_COOLDOWN_MS) {
       return false;
     }
     if (hydrationRequestInFlightRef.current) {
-      if (hydrationCenterUuidRef.current !== centerUuid) {
-        const firstQueue = hydrationPendingRef.current?.centerUuid !== centerUuid;
-        hydrationPendingRef.current = { centerUuid, reason, extra };
+      if (hydrationCenterUuidRef.current !== centerUuid || hydrationRadiusRef.current !== radius) {
+        const firstQueue = hydrationPendingRef.current?.centerUuid !== centerUuid || hydrationPendingRef.current?.radius !== radius;
+        hydrationPendingRef.current = { centerUuid, reason, extra, radius };
         if (firstQueue) {
           historyDiag('HYDRATION_QUEUED tab=' + tabId.slice(-12) +
             ' reason=' + reason + extra +
@@ -15760,8 +17096,9 @@ function HistoryPanel({
     if (!load) return false;
     const seq = ++hydrationRequestSeqRef.current;
     hydrationCenterUuidRef.current = centerUuid;
+    hydrationRadiusRef.current = radius;
     hydrationRequestInFlightRef.current = true;
-    issuedMap.set(centerUuid, performance.now());
+    issuedMap.set(issueKey, performance.now());
     // Bounded: drop expired marks, keep the map at a handful of live ones.
     if (issuedMap.size > 8) {
       const cutoff = performance.now() - HYDRATION_REISSUE_COOLDOWN_MS;
@@ -15777,10 +17114,18 @@ function HistoryPanel({
       hydrationRequestInFlightRef.current = false;
       const pending = hydrationPendingRef.current;
       hydrationPendingRef.current = null;
-      if (pending && pending.centerUuid !== centerUuid) {
+      if (pending && (pending.centerUuid !== centerUuid || pending.radius !== radius)) {
         requestHistoryHydrationAtRef.current(
-          pending.centerUuid, pending.reason, pending.extra,
+          pending.centerUuid, pending.reason, pending.extra, pending.radius,
         );
+      } else {
+        const range = hydrationRangePendingRef.current;
+        hydrationRangePendingRef.current = null;
+        if (range && range.ownerKey === historyOwnerKeyRef.current
+          && range.generation === historyOwnerGenerationRef.current
+          && historyPresentationOwnsWrite(historyPresentationProofRef.current, range.visit)) {
+          hydrationRangeCheckRef.current?.();
+        }
       }
     });
     return true;
@@ -15789,7 +17134,8 @@ function HistoryPanel({
     centerUuid: string | null,
     reason: string,
     extra = '',
-  ) => requestHistoryHydrationAtRef.current(centerUuid, reason, extra), []);
+    radius = HISTORY_HYDRATION_RADIUS_ROWS,
+  ) => requestHistoryHydrationAtRef.current(centerUuid, reason, extra, radius), []);
   const cycleHistoryGroupCaption = useCallback((
     groupKey: string, next: any, previous: any, anchor: HTMLElement | null, commit: () => void,
   ) => {
@@ -15802,7 +17148,12 @@ function HistoryPanel({
     historyDiag('GROUP_CAPTION_CYCLE tab=' + tabId.slice(-12) + ' key=' + groupKey.slice(0,24)
       + ' from=' + String(previous?.uuid || '').slice(-16) + ' to=' + String(next?.uuid || '').slice(-16)
       + ' stub=' + (next?.rowStub ? '1' : '0'));
-    if (next?.rowStub) requestHistoryHydrationAt(next.uuid, 'group-caption');
+    if (primaryRootRef.current) {
+      // Even an already readable caption changes the current view input.
+      // Publish that selection through the held view before admitting it.
+      setPrimaryCaptionRevision(value => value + 1);
+    }
+    else if (next?.rowStub) requestHistoryHydrationAt(next.uuid, 'group-caption');
   }, [historyOwnerKey, requestHistoryHydrationAt, tabId]);
   // Latest entries length — let stable callbacks (scrollToBottom) read it
   // without depending on `entries` (which would invalidate downstream effects
@@ -15878,31 +17229,89 @@ function HistoryPanel({
   const searchPage = Math.floor(currentMatchIdx / HISTORY_SEARCH_PAGE_SIZE);
   const searchScope = JSON.stringify([historyOwnerKey, searchQuery, searchType]);
   const searchKey = JSON.stringify([searchScope, searchPage]);
-  const searchResult = searchOpen && serverMatches?.key === searchKey ? serverMatches.result : null;
   const searchActive = searchOpen && (!!searchQuery || searchType !== 'all');
-  const searchLoading = searchActive && !searchResult && !searchError;
   const searchLastEntry = displayEntries[displayEntries.length - 1];
-  const searchRevision = [displayEntries.length, searchLastEntry?.uuid, searchLastEntry?.content?.length, searchLastEntry?.contentRevision].join(':');
+  // Semantic identity changes for an earlier same-ID/same-size rewrite. A
+  // pure view or body-window publication must not reopen the Source search.
+  const searchSemanticIdentity = primaryPhysicalCandidate
+    ? primaryRootRef.current?.header?.semanticIdentity || primaryRootRef.current?.header?.semanticRevisionToken || '' : '';
+  const searchRevision = JSON.stringify([displayEntries.length, searchLastEntry?.uuid,
+    searchLastEntry?.content?.length, searchLastEntry?.contentRevision, searchSemanticIdentity]);
+  const searchRequest = useMemo(() => ({}), [cwd, searchActive, searchKey, searchRevision,
+    sessionId, tabId, toolType, primaryPhysicalCandidate, historyOwnerVisitState, fileRewriteEpoch]);
+  const searchResult = searchOpen && serverMatches?.request === searchRequest ? serverMatches.result : null;
+  const searchLoading = searchActive && !searchResult && !searchError;
+  const [mountedSearchRows, setMountedSearchRows] = useState<{
+    request: object; client: HistoryPagedSearchClient; matches: ReadonlySet<string>;
+  } | null>(null);
+  const mountedSearchDemandRef = useRef<(() => void) | null>(null);
+  const searchHighlightDemandRef = useRef<(() => void) | null>(null);
   const searchEntriesRef = useRef(displayEntries);
   searchEntriesRef.current = displayEntries;
   const searchMarkerLease = useMemo(() => ({}), [historyOwnerKey]);
-  const matchPositions = useMemo(() => (searchResult?.matches || []).map((match:any) => {
+  const [primarySearchPositions, setPrimarySearchPositions] = useState<any>(null);
+  useEffect(() => {
+    if (!primaryPhysicalCandidate || !searchResult || !primaryRoot?.header || !primaryInputsCurrent()) return;
+    const root = primaryRoot, header = root.header, owner = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current, controller = new AbortController();
+    const owns = () => !controller.signal.aborted && primaryRootRef.current === root && root.header === header
+      && historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation && primaryInputsCurrent();
+    void (async () => {
+      const positions = [];
+      // The requested search page is finite. Resolve its selected subjects
+      // serially under the existing root credits; retain no historical map.
+      for (const match of searchResult.matches || []) {
+        const ref = match.entryRef || {};
+        const tool = { readSessionId: sessionId, messageReference: { provider: toolType, sessionId,
+          physicalSessionId: ref.physicalSessionId || match.physicalSessionId || undefined,
+          transcriptSegmentId: ref.segmentId || undefined, rawUuid: ref.rawUuid || undefined } };
+        const result = await readHistoryPrimaryPanelAddress(root, 'identity', match.sourceIdentity || match.entryUuid,
+          { tool, signal: controller.signal, owns });
+        if (result.address) positions.push({ ...match, entryUuid: result.address.entryUuid,
+          entryIdx: result.address.index, primaryTool: tool });
+      }
+      if (owns()) setPrimarySearchPositions({ root, header, searchResult, positions });
+    })().catch(error => {
+      if (owns() && error?.code !== 'HISTORY_READ_CANCELLED') {
+        setSearchError('Попробуйте ещё раз.');
+        historyDiag('SEARCH_ADDRESS_FAILED code=' + String(error?.code || error));
+      }
+    });
+    return () => controller.abort();
+  }, [primaryPhysicalCandidate, primaryRoot, primaryHeader, searchResult, primaryPresentation,
+    primaryInputsCurrent, historyOwnerKey, sessionId, toolType]);
+  const matchPositions = useMemo(() => primaryPhysicalCandidate
+    ? primarySearchPositions?.root === primaryRoot && primarySearchPositions?.header === primaryHeader
+      && primarySearchPositions?.searchResult === searchResult ? primarySearchPositions.positions : []
+    : (searchResult?.matches || []).map((match:any) => {
     let entryUuid = match.entryUuid;
-    let entryIdx = displayEntryIndexByUuid.get(entryUuid);
+    let entryIdx = displayEntryIndexByUuid!.get(entryUuid);
     if (entryIdx === undefined && match.sourceIdentity) {
       const entry = displayEntries.find(item => historySearchEntryKeys(item).includes(match.sourceIdentity));
-      if (entry) { entryUuid = entry.uuid; entryIdx = displayEntryIndexByUuid.get(entryUuid); }
+      if (entry) { entryUuid = entry.uuid; entryIdx = displayEntryIndexByUuid!.get(entryUuid); }
     }
     return {...match, entryUuid, entryIdx};
-  }).filter((match:any) => match.entryIdx !== undefined), [displayEntries, displayEntryIndexByUuid, searchResult]);
+  }).filter((match:any) => match.entryIdx !== undefined), [primaryPhysicalCandidate, primarySearchPositions,
+    primaryRoot, primaryHeader, displayEntries, displayEntryIndexByUuid, searchResult]);
   const matchingEntryUuids = useMemo(() => new Set<string>([
-    ...(searchResult?.entryUuids || []), ...matchPositions.map((match:any)=>match.entryUuid),
-  ]), [matchPositions, searchResult]);
+    // Only the legacy response carries a complete marker array. Root keeps
+    // the requested page plus currently mounted matching row addresses.
+    ...(!searchResult?.searchClient ? searchResult?.entryUuids || [] : []),
+    ...matchPositions.map((match:any)=>match.entryUuid),
+    ...(searchResult?.searchClient && mountedSearchRows?.client === searchResult.searchClient
+      && mountedSearchRows.request === searchRequest ? mountedSearchRows.matches : []),
+  ]), [matchPositions, searchResult, mountedSearchRows, searchRequest]);
 
   useEffect(() => {
-    setServerMatches((previous:any)=>previous?.key===searchKey?previous:null); setSearchError('');
+    setServerMatches(null); setMountedSearchRows(null); setSearchError('');
     if (!searchActive) return;
     let disposed = false;
+    const searchAbort=new AbortController();
+    let ownedSearchClient: HistoryPagedSearchClient | undefined;
+    const closeOwnedSearch = () => {
+      const client = ownedSearchClient; ownedSearchClient = undefined;
+      void client?.close().catch(error => historyDiag('SEARCH_RELEASE_FAILED error=' + String(error)));
+    };
     const timer = window.setTimeout(async () => {
       const payload = {toolType, sessionId, tabId, cwd, query:searchQuery, type:searchType,
         diagnosticActionId:currentUIActionId(),
@@ -15911,29 +17320,186 @@ function HistoryPanel({
       uiPerformancePhase('search-request', { tab:tabId, rows:searchEntriesRef.current.length });
       try {
         const result = toolType === 'codex' && sessionId
-          ? await ipcRenderer.invoke('agent-transcript:search-history', payload)
+          ? primaryPhysicalCandidate ? await openHistoryPagedSearch(ipcRenderer.invoke.bind(ipcRenderer),{...payload,sessionId},{signal:searchAbort.signal})
+            : await ipcRenderer.invoke('agent-transcript:search-history', payload)
           : {success:true,...searchHistoryEntries(searchEntriesRef.current, payload)};
-        if (disposed) return;
+        if (disposed) {await (result as any)?.searchClient?.close();return;}
         if (!result?.success) throw new Error(result?.error || 'history-search-failed');
         uiPerformancePhase('search-result', { tab:tabId, ms:performance.now()-searchStartedAt, matches:result.total });
-        setServerMatches({key:searchKey,result});
-        if (currentMatchIdx >= result.total && currentMatchIdx !== 0) setCurrentMatchIdx(0);
+        ownedSearchClient = (result as any).searchClient;
+        setServerMatches({request:searchRequest,result});
+        setCurrentMatchIdx(index => index >= result.total && index !== 0 ? 0 : index);
       } catch (error) {
         if (disposed) return;
         setSearchError('Попробуйте ещё раз.');
         historyDiag('SEARCH_FAILED tab=' + tabId.slice(-12) + ' error=' + String(error));
       }
     }, 180);
-    return () => { disposed = true; window.clearTimeout(timer); };
-  }, [cwd, searchActive, searchKey, searchRevision, sessionId, tabId, toolType]);
+    return () => { disposed = true; searchAbort.abort(); window.clearTimeout(timer); closeOwnedSearch(); };
+  }, [searchRequest]);
 
   useEffect(() => {
     if (!searchResult || !searchActive) { clearHistorySearchMarkers(tabId, searchMarkerLease); return; }
     const match = searchResult.matches.find((item:any) => item.matchIndex === currentMatchIdx);
-    publishHistorySearchMarkers(tabId, {lease:searchMarkerLease,sessionId:sessionId || '',
-      keys:new Set<string>(searchResult.turnKeys),currentKeys:new Set<string>(match?.turnKeys || [])});
+    publishHistorySearchMarkers(tabId, searchResult.searchClient
+      ? {lease:searchMarkerLease,sessionId:sessionId||'',rootClient:searchResult.searchClient,
+          currentMatchIndex:searchResult.total > 0 ? currentMatchIdx : undefined}
+      : {lease:searchMarkerLease,sessionId:sessionId || '',keys:new Set<string>(searchResult.turnKeys),currentKeys:new Set<string>(match?.turnKeys || [])});
     return () => clearHistorySearchMarkers(tabId, searchMarkerLease);
   }, [currentMatchIdx, searchActive, searchMarkerLease, searchResult, sessionId, tabId]);
+
+  // Root membership is queried for actual mounted subjects only. This lane
+  // owns one read and a latest-demand bit; DOM/metadata wakes never replay
+  // covered keys, and scrolling away evicts their coverage (no visited store).
+  useEffect(() => {
+    const client: HistoryPagedSearchClient | undefined = searchResult?.searchClient;
+    if (!client || !searchActive) return;
+    const owner = historyOwnerKey, generation = historyOwnerGenerationRef.current;
+    const stage = panelRef.current?.querySelector('[data-history-content-stage]');
+    if (!stage) return;
+    let disposed = false, failed = false, running = false, scheduled = false, pending = false;
+    let releaseRead: (() => Promise<void>) | undefined;
+    const flags = new Map<string, boolean>();
+    const owns = () => !disposed && historyOwnerKeyRef.current === owner
+      && historyOwnerGenerationRef.current === generation
+      && primaryPositionModeRef.current === primaryPhysicalCandidate;
+    const releaseOwnedRead = () => {
+      const release = releaseRead; releaseRead = undefined;
+      void release?.().catch(error => historyDiag('SEARCH_READ_RELEASE_FAILED error=' + String(error)));
+    };
+    const capture = async () => {
+      const subjects = new Map<string, string[]>(), keys = new Set<string>();
+      const scroller = virtuosoScrollerRef.current, root = primaryRootRef.current;
+      const header = root?.header, frame = primaryPositionFrameRef.current;
+      // capture is asynchronous for retained coordinates. Keep the original
+      // ready-Root/frame witness across that new microtask boundary too.
+      let ownsSnapshot = () => owns() && virtuosoScrollerRef.current === scroller
+        && primaryRootRef.current === root && root?.header === header
+        && primaryPositionFrameRef.current === frame && (!scroller || stage.contains(scroller));
+      if (owns() && scroller && stage.contains(scroller)) {
+        if (root?.header && !root.closed && primaryInputsCurrent()) {
+          const mounted = collectHistoryPrimaryMountedSearchSubjects(scroller, historyOwnerDomId, root, historySearchEntryKeys);
+          for (const [uuid, aliases] of mounted.subjects) subjects.set(uuid, aliases);
+          for (const key of mounted.keys) keys.add(key);
+        } else {
+          const publication = primaryPhysicalCandidate ? primaryPositionOwner.capture() : null;
+          const visit = historyPresentationProofRef.current.visit;
+          const gesture = historyUserGestureGenerationRef.current;
+          const ownsPosition = () => owns()
+            && primaryPositionFrameRef.current === frame
+            && virtuosoScrollerRef.current === scroller && stage.contains(scroller)
+            && historyPresentationProofRef.current.visit === visit
+            && historyUserGestureGenerationRef.current === gesture
+            && (!primaryPhysicalCandidate || primaryPositionOwner.owns(publication));
+          // Only mounted DOM subjects are retained across the coordinate
+          // awaits. Full History IDs are never copied into a renderer index.
+          const rows = Array.from(scroller.querySelectorAll<HTMLElement>('[data-uuid]'))
+            .map(row => ({ row, uuid: row.dataset.uuid, owner: row.dataset.historyRowOwner }));
+          for (const { row, uuid, owner: rowOwner } of rows) {
+            if (!uuid || rowOwner !== historyOwnerDomId || subjects.has(uuid)) continue;
+            let entry: FullHistoryEntry | null | undefined;
+            if (primaryPhysicalCandidate) {
+              const selected = await primaryMountedPosition.resolve(publication, uuid, { owns: ownsPosition });
+              if (!ownsPosition()) return null;
+              if (selected.status === 'failed') throw selected.error;
+              if (selected.status === 'superseded') return null;
+              entry = selected.address ? primaryPositionOwner.entryAt(selected.address) as FullHistoryEntry | null : null;
+            } else {
+              const index = displayEntryIndexByUuidRef.current!.get(uuid);
+              if (index === undefined) continue;
+              const unit = displayUnitsRef.current[index];
+              entry = unit?.kind === 'entry' ? unit.entry
+                : unit?.entries?.find((item: any) => item.uuid === uuid);
+            }
+            if (!entry || entry.uuid !== uuid || row.dataset.uuid !== uuid
+              || row.dataset.historyRowOwner !== rowOwner || !scroller.contains(row)) continue;
+            const aliases = historySearchEntryKeys(entry);
+            subjects.set(uuid, aliases);
+            for (const key of aliases) keys.add(key);
+          }
+          // Do not publish an empty/mixed snapshot after a projection/DOM
+          // replacement. The real external demand bit owns the next read.
+          ownsSnapshot = () => ownsPosition() && !rows.some(({ row, uuid, owner: rowOwner }) =>
+            !scroller.contains(row) || row.dataset.uuid !== uuid || row.dataset.historyRowOwner !== rowOwner);
+          if (!ownsSnapshot()) return null;
+        }
+      }
+      return { subjects, keys, owns: ownsSnapshot };
+    };
+    const nextBatch = (subjects: Map<string, string[]>) => {
+      const batch = new Set<string>();
+      for (const aliases of subjects.values()) {
+        if (aliases.some(key => flags.get(key) === true)) continue;
+        for (const key of aliases) if (!flags.has(key)) {
+          batch.add(key); if (batch.size === 3) return Array.from(batch);
+        }
+      }
+      return Array.from(batch);
+    };
+    const publish = (subjects: Map<string, string[]>) => {
+      const matches = new Set<string>();
+      for (const [uuid, aliases] of subjects) if (aliases.some(key => flags.get(key) === true)) matches.add(uuid);
+      setMountedSearchRows(previous => previous?.request === searchRequest && previous.client === client
+        && previous.matches.size === matches.size && [...matches].every(uuid => previous.matches.has(uuid))
+        ? previous : { request: searchRequest, client, matches });
+      searchHighlightDemandRef.current?.();
+    };
+    const settle = async () => {
+      if (!owns() || failed) return;
+      running = true; pending = false;
+      try {
+        releaseRead = client.retain();
+        for (;;) {
+          if (!owns()) return;
+          const snapshot = await capture();
+          if (!snapshot || !snapshot.owns()) return;
+          for (const key of flags.keys()) if (!snapshot.keys.has(key)) flags.delete(key);
+          const batch = nextBatch(snapshot.subjects);
+          publish(snapshot.subjects);
+          if (!batch.length) { pending = false; break; }
+          const items = await client.entryFlags(batch);
+          if (!owns()) return;
+          // The current DOM/metadata wins even if it changed during the RPC.
+          // Keep only membership proofs for this frozen root's mounted keys.
+          const current = await capture();
+          if (!current || !current.owns()) return;
+          for (const key of flags.keys()) if (!current.keys.has(key)) flags.delete(key);
+          for (const item of items) if (current.keys.has(item.entryUuid)) flags.set(item.entryUuid, item.match);
+        }
+      } catch (error) {
+        if (owns()) {
+          failed = true; flags.clear(); setMountedSearchRows(null);
+          setSearchError('Попробуйте ещё раз.');
+          historyDiag('SEARCH_FLAGS_FAILED tab=' + tabId.slice(-12) + ' error=' + String(error));
+        }
+      } finally {
+        releaseOwnedRead(); running = false;
+        if (pending && owns() && !failed) demand();
+      }
+    };
+    const demand = () => {
+      if (!owns() || failed) return;
+      pending = true;
+      if (running || scheduled) return;
+      scheduled = true;
+      queueMicrotask(() => { scheduled = false; if (owns() && !failed) void settle(); });
+    };
+    mountedSearchDemandRef.current = demand;
+    const observer = new MutationObserver(demand);
+    observer.observe(stage, { subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ['data-uuid', 'data-history-row-owner'] });
+    demand();
+    return () => {
+      disposed = true; observer.disconnect(); flags.clear(); releaseOwnedRead();
+      if (mountedSearchDemandRef.current === demand) mountedSearchDemandRef.current = null;
+    };
+  }, [searchResult?.searchClient, searchRequest, searchActive, historyOwnerKey, historyOwnerDomId, primaryInputsCurrent,
+    primaryPhysicalCandidate, primaryPositionOwner, primaryMountedPosition]);
+
+  // A new metadata alias or hydrated body is a real demand, but not a new
+  // lane/cache. Unchanged view/body-window renders reuse the covered keys.
+  useEffect(() => { mountedSearchDemandRef.current?.(); }, [displayEntries, displayEntryIndexByUuid, primaryPositionFrame,
+    primaryRootRevision, mountWaveRenderState, historySeekPresentationEpoch]);
 
   // Navigate to current match entry. A match found by main can live outside
   // the hydrated span (that is the whole reason the search moved to main), so
@@ -15947,7 +17513,8 @@ function HistoryPanel({
     // Use the existing Timeline seek owner: it suspends the old reading
     // anchor, hydrates far stubs and waits for a stable real row. A direct
     // smooth scroll fought hydration's anchor-preservation and snapped back.
-    setHistoryScrollToUuid(match.sourceIdentity || match.entryUuid, tabId);
+    setHistoryScrollToUuid(match.sourceIdentity || match.entryUuid, tabId, match.primaryTool
+      ? { ...match.primaryTool, requestId: window.require('node:crypto').randomUUID() } : null);
   }, [historyTailPinScheduler, matchPositions, setHistoryScrollToUuid, setHistoryTailFollowIntent, tabId]);
 
   const goNextMatch = useCallback(() => {
@@ -15982,13 +17549,15 @@ function HistoryPanel({
       clearHistorySearchHighlights(searchMarkerLease);
       return;
     }
-    if (!searchActive || !searchQuery || matchPositions.length === 0) {
+    if (!searchActive || !searchQuery || matchingEntryUuids.size === 0) {
       clearHistorySearchHighlights(searchMarkerLease);
       return;
     }
 
-    // Debounce DOM traversal slightly
-    const timer = setTimeout(() => {
+    // CSS Highlight publication does not mutate DOM. A real DOM demand can
+    // repaint new text nodes without a React state/observer feedback loop.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const paint = () => {
       const q = searchQuery.toLowerCase();
       const qLen = searchQuery.length;
       const allRanges: Range[] = [];
@@ -16038,9 +17607,16 @@ function HistoryPanel({
       }
 
       setHistorySearchHighlights(searchMarkerLease, allRanges, currentRanges);
-    }, 50);
+    };
+    const requestPaint = () => {
+      clearTimeout(timer);
+      timer = setTimeout(paint, 50);
+    };
+    searchHighlightDemandRef.current = requestPaint;
+    requestPaint();
 
     return () => {
+      if (searchHighlightDemandRef.current === requestPaint) searchHighlightDemandRef.current = null;
       clearTimeout(timer);
       clearHistorySearchHighlights(searchMarkerLease);
     };
@@ -16217,12 +17793,152 @@ function HistoryPanel({
     }
   }, [historyTailPinScheduler, mainSurface, onControlsHeightChange, staleOwnerCurtain, tabId]);
 
+  // Local metadata status clones share one owner; a new append/begin gets
+  // a new token even when H/O/A are reused. Weak keys retain no ID inventory.
+  const localPromptMetaOwnersRef = useRef(new WeakMap<PromptHandoffMeta, object>());
+  const getLocalPromptMetaOwner = useCallback((meta: PromptHandoffMeta | undefined) => {
+    if (!meta) return null;
+    let owner = localPromptMetaOwnersRef.current.get(meta);
+    if (!owner) { owner = Object.freeze({}); localPromptMetaOwnersRef.current.set(meta, owner); }
+    return owner;
+  }, []);
+
+  // CURRENT publication fields are read afresh in addition to their full
+  // graph descriptors. A getter's closed-over value can change while the
+  // function/prototype graph stays identical; it is not a reusable witness.
+  const primaryPromptPublicationFingerprint = useCallback((value: any) => {
+    const project = (record: any, keys: string[]) => record && typeof record === 'object'
+      ? keys.map(key => [key, record[key]]) : record;
+    const chips = (values: any) => Array.isArray(values) ? Array.from(values, chip => project(chip,
+      ['id', 'kind', 'text', 'label', 'sourceKey', 'inheritanceDepth', 'inheritanceParentLabel', 'messageReference'])) : values;
+    const images = (values: any) => Array.isArray(values) ? Array.from(values, image => project(image,
+      ['id', 'path', 'assetId', 'mediaType', 'size', 'availability', 'error'])) : values;
+    const proof = (record: any) => project(record,
+      ['entryUuid', 'sourceIdentity', 'sessionId', 'auditTimestamp', 'actualHash', 'recordByteOffset']);
+    const author = value?.authoringSnapshot;
+    return historyPrimaryPromptAdoptionFingerprint({ graph: value,
+      fields: project(value, ['uuid', 'role', 'content', 'text', 'timestamp', 'optimisticAt', 'handoffId',
+        'submittedAt', 'sessionId', 'sessionIdHint', 'sendOperationKey', 'sendAttemptId', 'queueStatus',
+        'statusReason', 'statusChangedAt', 'requiresAuditIdentity', 'auditTimestamp', 'auditHash', 'auditSessionId',
+        'auditEntryUuid', 'sourceIdentity', 'recordByteOffset', 'source', 'toolType', 'applicationQueueId']),
+      text: value && typeof value === 'object' ? [normalizeHistoryPromptIdentityText(value.content),
+        normalizeHistoryPromptIdentityText(value.text)] : null,
+      audit: proof(value?.auditProof), queue: proof(value?.providerQueueProof),
+      chips: chips(value?.promptChips), images: images(value?.imagePaths),
+      author: project(author, ['editorText']), authorChips: chips(author?.chips), authorImages: images(author?.imagePaths),
+      handoffAuthor: value?.authoringText, handoffChips: chips(value?.authoringChips), handoffImages: images(value?.authoringImagePaths),
+      returning: project(value?.historyReturn, ['token', 'state', 'provider', 'handoffId', 'tabId']),
+    });
+  }, []);
+
+  // One CURRENT local/handoff continuation. The held query only reads history;
+  // it never captures a later composer, replacement handoff or metadata owner.
+  const primaryPromptAdoptionLifeRef = useRef({ active: true, epoch: 0, leases: new Set<() => void>() });
+  useEffect(() => {
+    const life = primaryPromptAdoptionLifeRef.current;
+    life.active = true;
+    return () => { life.active = false; life.epoch++; for (const close of [...life.leases]) close(); };
+  }, [historyOwnerKey, tabId]);
+  const capturePrimaryPromptAdoption = useCallback((handoffId: string, options: {
+    committed?: boolean;
+    expectedHandoff?: ReturnType<typeof getHistoryPromptHandoffsSnapshot>[number] | null;
+    extra?: unknown[];
+  } = {}) => {
+    const root = primaryRootRef.current, header = root?.header;
+    const ownerKey = historyOwnerKeyRef.current, generation = historyOwnerGenerationRef.current;
+    const life = primaryPromptAdoptionLifeRef.current, epoch = life.epoch;
+    const dataSubject = root?.getReceiptDataSubject();
+    const committed = options.committed === true;
+    const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId) || null;
+    if (options.expectedHandoff !== undefined && handoff !== options.expectedHandoff) return null;
+    const meta = promptHandoffMetaRef.current.get(handoffId);
+    const metaOwner = getLocalPromptMetaOwner(meta);
+    const receiptRead = beginHistorySendReceiptRead(tabId, { observePendingHandoffChanges: true });
+    const afterClose = new Set<() => void>();
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true; receiptRead.close(); life.leases.delete(close);
+      for (const finish of afterClose) finish();
+      afterClose.clear();
+    };
+    life.leases.add(close);
+    let recoveryAllowed = false;
+    try {
+      const recoveryOwner = captureHistoryReceiptRecoveryOwner({ tabId, handoffId,
+        operationKey: handoff?.sendOperationKey ?? meta?.sendOperationKey,
+        attemptId: handoff?.sendAttemptId ?? meta?.sendAttemptId,
+        provider: handoff?.toolType || toolType, sessionId: handoff?.sessionIdHint || meta?.sessionId,
+        historyReturn: handoff?.historyReturn,
+      });
+      try { recoveryAllowed = recoveryOwner.recoveryAllowed && recoveryOwner.isCurrent(); }
+      finally { recoveryOwner.dispose(); }
+    } catch (error) { close(); throw error; }
+    if (!recoveryAllowed) { close(); return null; }
+    // The exact handoff object fences lifecycle replacement; a captured
+    // absence keeps the pending-list ABA fence until publication. Every X
+    // still invalidates the adopted lease while a query/ACK/updater waits.
+    if (handoff) receiptRead.adoptList();
+    const currentLocalRows = primarySparsePublicationOwner.localRows({ ownerKey, generation });
+    if (!currentLocalRows) { close(); return null; }
+    const rows = currentLocalRows.filter(row => isLocalPromptEntry(row) && row.handoffId === handoffId);
+    const returnPending = returnPromptInflight.current.has(handoffId);
+    const returned = isHistorySendReturned(tabId, handoffId), restored = isHistorySendReturnRestored(tabId, handoffId);
+    const scopeCurrent = () => life.active && life.epoch === epoch && receiptRead.isCurrent()
+      && historyTabIdRef.current === tabId && historyOwnerKeyRef.current === ownerKey
+      && historyOwnerGenerationRef.current === generation && primaryRootRef.current === root
+      && !!root && !root.closed && !!header && root.header === header && root.getReceiptDataSubject() === dataSubject
+      && (!committed || primaryReceiptCommitRef.current?.root === root
+        && primaryReceiptCommitRef.current.dataSubject === dataSubject
+        && primaryReceiptCommitRef.current.ownerKey === ownerKey
+        && primaryReceiptCommitRef.current.generation === generation);
+    const publicationCurrent = (expected = handoff) => scopeCurrent()
+      && getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId) === (expected || undefined)
+      && returnPromptInflight.current.has(handoffId) === returnPending
+      && isHistorySendReturned(tabId, handoffId) === returned && isHistorySendReturnRestored(tabId, handoffId) === restored
+      && scopeCurrent();
+    const owns = (expected = handoff) => publicationCurrent(expected)
+      && promptHandoffMetaRef.current.get(handoffId) === meta
+      && getLocalPromptMetaOwner(meta) === metaOwner;
+    if (!owns()) { close(); return null; }
+    const subjects = [handoff, meta, ...rows, ...(options.extra || [])];
+    let fingerprints: string[];
+    try { fingerprints = subjects.map(primaryPromptPublicationFingerprint); }
+    catch (error) { close(); throw error; }
+    if (!owns()) { close(); return null; }
+    const valid = (expected = handoff) => {
+      if (!owns(expected)) return false;
+      const currentLocalRows = primarySparsePublicationOwner.localRows({ ownerKey, generation });
+      if (!currentLocalRows) return false;
+      const currentRows = currentLocalRows.filter(row => isLocalPromptEntry(row) && row.handoffId === handoffId);
+      if (currentRows.length !== rows.length || currentRows.some((row, index) => row !== rows[index])) return false;
+      const unchanged = subjects.every((value, index) => primaryPromptPublicationFingerprint(value) === fingerprints[index]);
+      // Native getters/coercion/fingerprint and handoff snapshot pruning can
+      // notify reentrantly. Their result cannot outrun this final owner check.
+      return unchanged && owns(expected);
+    };
+    return { root: root!, owns, scopeCurrent, publicationCurrent, valid, handoff, metaOwner,
+      adopt: () => receiptRead.adoptList() && valid(), close,
+      onClose: (finish: () => void) => { if (closed) finish(); else afterClose.add(finish); } };
+  }, [primarySparsePublicationOwner, getLocalPromptMetaOwner, primaryPromptPublicationFingerprint, tabId, toolType]);
+
+  const primaryPromptAppendPendingRef = useRef(new Map<string, {
+    meta: PromptHandoffMeta;
+    revision: number;
+    localIdentity?: FullHistoryEntry;
+    apply?: (durable: boolean, current: () => boolean, finish: () => void) => void;
+  }>());
+
   const appendLocalPromptEntry = useCallback((
     text: string,
     queueStatus: Extract<HistoryPromptHandoffStatus,
       'application-queued' | 'preparing' | 'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
+      applicationQueueId?: number | null;
+      sendOperationKey?: string | null;
+      sendAttemptId?: string | null;
+      authoringSnapshot?: FullHistoryEntry['authoringSnapshot'];
       statusAtSend: AgentPtyStatus;
       submittedAt: number;
       promptChips?: HistoryPromptDraftChip[];
@@ -16263,6 +17979,10 @@ function HistoryPanel({
       queueStatus,
       statusAtSend: meta.statusAtSend,
       handoffId,
+      applicationQueueId: meta.applicationQueueId,
+      sendOperationKey: meta.sendOperationKey,
+      sendAttemptId: meta.sendAttemptId,
+      authoringSnapshot: meta.authoringSnapshot,
       applicationQueueMerge: meta.applicationQueueMerge,
       applicationQueuePosition: meta.applicationQueuePosition,
       statusReason: queueStatus === 'preparing'
@@ -16290,17 +18010,14 @@ function HistoryPanel({
       recordByteOffset: meta.recordByteOffset,
       semanticTags: meta.semanticTags,
     };
-    // An audit update/replay of a card already replaced by its committed
-    // canonical row is not another submission and must not re-arm tail follow.
-    const committed = committedHistoryEntriesRef.current;
-    const committedMatch = committed.ownerKey === historyOwnerKeyRef.current
-      && (meta.auditEntryUuid || meta.sourceIdentity)
-      ? findServerPromptEntry(committed.entries, entry)
-      : null;
-    if (committedMatch) {
-      // A delayed receipt can still bring composer chips/images that are not
-      // in the transcript body. Enrich the same canonical card, not a new row.
+    // An audit update/replay of an already committed card is enrichment,
+    // not a new submission. Primary lookup is an independently leased read;
+    // the first Send callback without exact IDs remains synchronous below.
+    const enrichCommitted = (committedMatch: FullHistoryEntry, valid = () => true, finish = () => {}) => {
+      if (!valid()) { finish(); return; }
       setEntries(previous => {
+        try {
+        if (!valid()) return previous;
         let changed = false;
         const next = previous.map(candidate => {
           if (candidate.uuid !== committedMatch.uuid) return candidate;
@@ -16308,24 +18025,19 @@ function HistoryPanel({
           const images = entry.imagePaths?.length && !candidate.imagePaths?.length;
           if (!chips && !images) return candidate;
           changed = true;
-          return { ...candidate, ...(chips ? { promptChips: entry.promptChips } : {}),
-            ...(images ? { imagePaths: entry.imagePaths } : {}) };
+          return copyHistoryPrimaryMetadataOrigin(candidate, { ...candidate,
+            ...(chips ? { promptChips: entry.promptChips } : {}),
+            ...(images ? { imagePaths: entry.imagePaths } : {}) });
         });
-        if (!changed) return previous;
-        presentationEntriesRef.current = next;
+        if (!changed || !valid()) return previous;
+        if (!publishHistoryRows(next, valid)) return previous;
         persistVolatileOverlay(historySnapshotOwner, next);
         return next;
+        } finally { finish(); }
       });
-      return;
-    }
-    const isNewPromptPresentation = !presentationEntriesRef.current.some((candidate) =>
-      isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
-    );
-    if (isNewPromptPresentation) {
-      if (meta.preserveReadingPosition) keepHistoryTailPinnedAfterMutation('queued-message-merge', false);
-      else keepHistoryTailPinnedAfterMutation('prompt-submitted', true);
-    }
-    promptHandoffMetaRef.current.set(handoffId, {
+    };
+    const localMeta: PromptHandoffMeta = {
+      sendOperationKey: meta.sendOperationKey, sendAttemptId: meta.sendAttemptId,
       text: cleanContent,
       submittedAt,
       sessionId: resolvedSessionId,
@@ -16335,7 +18047,23 @@ function HistoryPanel({
       auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
       recordByteOffset: meta.recordByteOffset,
-    });
+    };
+    const appendOwnedLocal = (publicationCurrent = () => true, finish = () => {}) => {
+      if (!publicationCurrent()) { finish(); return; }
+      const authoring = primaryPhysicalCandidate
+        ? [primaryPromptPublicationFingerprint(entry), primaryPromptPublicationFingerprint(localMeta)] : null;
+      const authoringCurrent = () => !authoring || (primaryPromptPublicationFingerprint(entry) === authoring[0]
+        && primaryPromptPublicationFingerprint(localMeta) === authoring[1]);
+      if (!publicationCurrent()) { finish(); return; }
+    const isNewPromptPresentation = !presentationEntriesRef.current.some((candidate) =>
+      isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
+    );
+    if (isNewPromptPresentation) {
+      if (meta.preserveReadingPosition) keepHistoryTailPinnedAfterMutation('queued-message-merge', false);
+      else keepHistoryTailPinnedAfterMutation('prompt-submitted', true);
+    }
+    const localOwner = getLocalPromptMetaOwner(localMeta);
+    promptHandoffMetaRef.current.set(handoffId, localMeta);
     historyDiag('LOCAL_APPEND tab=' + tabId.slice(-12) +
       ' handoff=' + handoffId +
       ' queueStatus=' + queueStatus +
@@ -16344,6 +18072,9 @@ function HistoryPanel({
       ' submittedLagMs=' + (now - submittedAt) +
       ' preview="' + promptPreview(cleanContent) + '"');
     setEntries(prev => {
+      try {
+      if (!publicationCurrent() || !authoringCurrent() || !publicationCurrent()
+        || getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) !== localOwner) return prev;
       const existingIndex = prev.findIndex((candidate) =>
         isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
       );
@@ -16353,6 +18084,10 @@ function HistoryPanel({
           ? {
               ...candidate,
               content: entry.content,
+              applicationQueueId: entry.applicationQueueId ?? candidate.applicationQueueId,
+              sendOperationKey: entry.sendOperationKey ?? candidate.sendOperationKey,
+              sendAttemptId: entry.sendAttemptId ?? candidate.sendAttemptId,
+              authoringSnapshot: entry.authoringSnapshot ?? candidate.authoringSnapshot,
               queueStatus,
               applicationQueueMerge: entry.applicationQueueMerge,
               applicationQueuePosition: entry.applicationQueuePosition,
@@ -16383,11 +18118,83 @@ function HistoryPanel({
           nextEntries = [...nextEntries]; nextEntries.splice(mine, 1); nextEntries.splice(ahead, 0, entry);
         }
       }
-      presentationEntriesRef.current = nextEntries;
+      if (!publicationCurrent() || !authoringCurrent() || !publicationCurrent()
+        || getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) !== localOwner) return prev;
+      if (!publishHistoryRows(nextEntries, () => publicationCurrent() && authoringCurrent() && publicationCurrent()
+        && getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) === localOwner)) return prev;
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
+      } finally { finish(); }
     });
-  }, [historySnapshotOwner, keepHistoryTailPinnedAfterMutation, persistVolatileOverlay, sessionId, tabId]);
+    };
+    // Before the first canonical cut, the shared/current author owns this
+    // card immediately. This is authoring admission, never an absence proof.
+    if (primaryPhysicalCandidate && !primaryRootRef.current?.header) { appendOwnedLocal(); return; }
+    if (primaryPhysicalCandidate && (meta.auditEntryUuid || meta.sourceIdentity)) {
+      try {
+        const claim = capturePrimaryPromptAdoption(handoffId, { committed: true, extra: [entry, meta] });
+        if (!claim) return; // no current committed proof: retain existing authoring/UNKNOWN
+        const pending = { meta: localMeta, revision: 0 } as {
+          meta: PromptHandoffMeta; revision: number; localIdentity?: FullHistoryEntry;
+          apply?: (durable: boolean, current: () => boolean, finish: () => void) => void;
+        };
+        primaryPromptAppendPendingRef.current.set(handoffId, pending);
+        claim.onClose(() => {
+          if (primaryPromptAppendPendingRef.current.get(handoffId) === pending)
+            primaryPromptAppendPendingRef.current.delete(handoffId);
+        });
+        const closePending = claim.close;
+        let transferred = false, appendProofCurrent = () => false;
+        const owns = () => primaryPromptAppendPendingRef.current.get(handoffId) === pending && claim.owns();
+        void (async () => {
+          const result = await claim.root.readPromptAdoption(entry, { scope: 'canonical', committed: true, owns,
+            onProof: current => { appendProofCurrent = current; } });
+          if (!owns() || !appendProofCurrent() || !claim.valid()) return;
+          if (result) {
+            if (!claim.adopt()) return;
+            transferred = true;
+            enrichCommitted(result.entry as FullHistoryEntry, () => owns() && appendProofCurrent() && claim.valid(), closePending);
+            return;
+          }
+          // Synchronous failed replay calls append then status before this read
+          // returns. Keep that status on THIS original continuation. Raw status
+          // and committed append are different domains, so prove each once.
+          const statusRevision = pending.revision, status = pending.localIdentity;
+          const statusCurrent = () => owns() && pending.revision === statusRevision;
+          let statusProofCurrent = () => true;
+          const durableStatus = status ? !!await claim.root.readPromptAdoption(status,
+            { scope: 'canonical', owns: statusCurrent, onProof: current => { statusProofCurrent = current; } }) : false;
+          if (!statusCurrent() || !appendProofCurrent() || !statusProofCurrent() || !claim.valid()) return;
+          const publicationCurrent = () => primaryPromptAppendPendingRef.current.get(handoffId) === pending
+            && pending.revision === statusRevision && claim.publicationCurrent()
+            && appendProofCurrent() && statusProofCurrent() && claim.publicationCurrent();
+          if (!claim.adopt()) return;
+          transferred = true;
+          appendOwnedLocal(publicationCurrent, pending.apply ? () => {} : closePending);
+          pending.apply?.(durableStatus, () => publicationCurrent()
+            && getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) === getLocalPromptMetaOwner(localMeta), closePending);
+        })().catch((error: any) => {
+          closePending();
+          historyDiag('PRIMARY_PROMPT_APPEND_UNKNOWN tab=' + tabId.slice(-12)
+            + ' code=' + String(error?.code || error?.message || error));
+        }).finally(() => {
+          if (!transferred) closePending();
+        });
+      } catch (error: any) {
+        historyDiag('PRIMARY_PROMPT_APPEND_UNKNOWN tab=' + tabId.slice(-12)
+          + ' code=' + String(error?.code || error?.message || error));
+      }
+      return;
+    }
+    if (primaryPhysicalCandidate) { appendOwnedLocal(); return; }
+    const committed = committedHistoryEntriesRef.current;
+    const committedMatch = committed.ownerKey === historyOwnerKeyRef.current
+      && (meta.auditEntryUuid || meta.sourceIdentity)
+      ? findServerPromptEntry(committed.entries, entry) : null;
+    if (committedMatch) enrichCommitted(committedMatch);
+    else appendOwnedLocal();
+  }, [publishHistoryRows, capturePrimaryPromptAdoption, getLocalPromptMetaOwner, historySnapshotOwner,
+    keepHistoryTailPinnedAfterMutation, persistVolatileOverlay, primaryPhysicalCandidate, primaryPromptPublicationFingerprint, sessionId, tabId]);
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
@@ -16408,7 +18215,9 @@ function HistoryPanel({
     const changedAt = Number.isFinite(changedAtOverride)
       ? Number(changedAtOverride)
       : Date.now();
-    const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || null;
+    const pendingAppend = primaryPhysicalCandidate && !promptHandoffMetaRef.current.has(handoffId)
+      ? primaryPromptAppendPendingRef.current.get(handoffId) : undefined;
+    const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || pendingAppend?.meta || null;
     const currentHandoff = getHistoryPromptHandoffsSnapshot(tabId)
       .find((record) => record.handoffId === handoffId) || null;
     if (
@@ -16423,8 +18232,9 @@ function HistoryPanel({
         + ' terminal=' + currentHandoff.queueStatus);
       return;
     }
+    const enrichMetadata = () => {
     if (handoffMeta && identity) {
-      promptHandoffMetaRef.current.set(handoffId, {
+      const updatedMeta = {
         ...handoffMeta,
         requiresAuditIdentity: identity.requiresAuditIdentity,
         auditTimestamp: identity.auditTimestamp,
@@ -16433,11 +18243,15 @@ function HistoryPanel({
         sourceIdentity: identity.sourceIdentity,
         recordByteOffset: identity.recordByteOffset,
         sessionId: identity.auditSessionId || handoffMeta.sessionId,
-      });
+      };
+      if (promptHandoffMetaRef.current.get(handoffId) !== handoffMeta) return false;
+      localPromptMetaOwnersRef.current.set(updatedMeta, getLocalPromptMetaOwner(handoffMeta)!);
+      promptHandoffMetaRef.current.set(handoffId, updatedMeta);
     }
-    const durableAlreadyExists = !!handoffMeta && serverHasPromptEntry(
-      rawServerEntriesRef.current,
-      {
+    return true;
+    };
+    if (!pendingAppend && !enrichMetadata()) return;
+    const localIdentity = handoffMeta ? {
         uuid: LOCAL_PROMPT_PREFIX + handoffId,
         role: 'queued',
         content: handoffMeta.text,
@@ -16452,15 +18266,17 @@ function HistoryPanel({
         sourceIdentity: identity?.sourceIdentity || handoffMeta.sourceIdentity,
         recordByteOffset: identity?.recordByteOffset ?? handoffMeta.recordByteOffset,
         sessionId: identity?.auditSessionId || handoffMeta.sessionId || sessionId,
-      } as FullHistoryEntry,
-    );
+      } as FullHistoryEntry : null;
+    const applyStatus = (durableAlreadyExists: boolean, valid = () => true, finish = () => {}) => {
+    if (!valid()) { finish(); return; }
+
     if ((queueStatus === 'cancelled' || queueStatus === 'failed') && durableAlreadyExists) {
       historyDiag('LOCAL_STATUS_IGNORED tab=' + tabId.slice(-12) +
         ' handoff=' + handoffId +
         ' queueStatus=' + queueStatus +
         ' reason=' + reason +
         ' durable=1');
-      return;
+      finish(); return;
     }
     let suppression: SuppressedPrompt | null = null;
     const suppressionRequiresAudit = identity?.requiresAuditIdentity === true
@@ -16483,7 +18299,9 @@ function HistoryPanel({
         expiresAt: changedAt + 5 * 60 * 1000,
         reason,
       };
+      if (!valid()) { finish(); return; }
       suppressedPromptsRef.current.set(handoffId, suppression);
+      setPrimarySuppressionRevision(value => value + 1);
       historyDiag('SUPPRESS_ARMED tab=' + tabId.slice(-12) +
         ' handoff=' + handoffId +
         ' reason=' + reason +
@@ -16493,6 +18311,8 @@ function HistoryPanel({
         ' preview="' + promptPreview(handoffMeta.text) + '"');
     }
     setEntries(prev => {
+      try {
+      if (!valid()) return prev;
       const nextEntries = prev.map(entry => {
         if (!isLocalPromptEntry(entry) || entry.handoffId !== handoffId) return entry;
         historyDiag('LOCAL_STATUS tab=' + tabId.slice(-12) +
@@ -16520,29 +18340,160 @@ function HistoryPanel({
             : {}),
         };
       }).filter(entry => !suppression || !entryMatchesSuppressedPrompt(entry, suppression));
-      presentationEntriesRef.current = nextEntries;
+      if (!valid()) return prev;
+      if (!publishHistoryRows(nextEntries, valid)) return prev;
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
+      } finally { finish(); }
     });
-  }, [historySnapshotOwner, persistVolatileOverlay, sessionId, tabId]);
+    };
+    if (pendingAppend && localIdentity) {
+      // The append still owns the original absence/meta/handoff witnesses.
+      // Register only this synchronous paired status; no later owner capture.
+      pendingAppend.revision++;
+      pendingAppend.localIdentity = localIdentity;
+      const identityFingerprint = primaryPromptPublicationFingerprint(identity);
+      pendingAppend.apply = (durable, valid, finish) => {
+        const current = () => valid() && primaryPromptPublicationFingerprint(identity) === identityFingerprint && valid();
+        if (!current() || !enrichMetadata()) { finish(); return; }
+        applyStatus(durable, current, finish);
+      };
+      return;
+    }
+    if (primaryPhysicalCandidate && !primaryRootRef.current?.header) { applyStatus(false); return; }
+    if (primaryPhysicalCandidate && localIdentity) {
+      try {
+        const claim = capturePrimaryPromptAdoption(handoffId, { extra: [localIdentity, identity, handoffMeta] });
+        if (!claim) return;
+        let transferred = false, proofCurrent = () => false;
+        const valid = () => claim.owns() && proofCurrent() && claim.valid() && claim.owns();
+        void claim.root.readPromptAdoption(localIdentity, { scope: 'canonical', owns: claim.owns,
+          onProof: current => { proofCurrent = current; } })
+          .then(result => {
+            if (!valid() || !claim.adopt()) return;
+            transferred = true; applyStatus(!!result, valid, claim.close);
+          })
+          .catch((error: any) => {
+            claim.close();
+            historyDiag('PRIMARY_PROMPT_STATUS_UNKNOWN tab=' + tabId.slice(-12)
+              + ' code=' + String(error?.code || error?.message || error));
+          }).finally(() => { if (!transferred) claim.close(); });
+      } catch (error: any) {
+        historyDiag('PRIMARY_PROMPT_STATUS_UNKNOWN tab=' + tabId.slice(-12)
+          + ' code=' + String(error?.code || error?.message || error));
+      }
+      return;
+    }
+    applyStatus(!!localIdentity && serverHasPromptEntry(rawServerEntriesRef.current, localIdentity));
+  }, [publishHistoryRows, capturePrimaryPromptAdoption, getLocalPromptMetaOwner, historySnapshotOwner,
+    persistVolatileOverlay, primaryPhysicalCandidate, primaryPromptPublicationFingerprint, sessionId, tabId]);
 
-  const removeLocalPromptEntry = useCallback((handoffId: string, reason: string) => {
-    if (!handoffId) return;
-    promptHandoffMetaRef.current.delete(handoffId);
-    suppressedPromptsRef.current.delete(handoffId);
+  const captureLocalPromptRemoval = useCallback((handoffId: string,
+    removedOwner?: ReturnType<typeof getHistoryPromptHandoffsSnapshot>[number] | null,
+    expected?: { operationKey?: string | null; attemptId?: string | null }) => {
+    if (!handoffId) return null;
+    const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId) || null;
+    const owner = removedOwner === undefined ? current : removedOwner;
+    if (current && current !== owner) return null;
+    const operationKey = owner?.sendOperationKey ?? expected?.operationKey ?? null;
+    const attemptId = owner?.sendAttemptId ?? expected?.attemptId ?? null;
+    // Missing legacy bind fields remain compatible; omitted expected keys
+    // request no comparison. Only known conflicts reject the captured owner.
+    if (owner && expected && !historyPromptHandoffAcceptsAuditIdentity(owner, {
+      sendOperationKey: expected.operationKey === undefined ? owner.sendOperationKey : expected.operationKey,
+      sendAttemptId: expected.attemptId === undefined ? owner.sendAttemptId : expected.attemptId,
+    })) return null;
+    const meta = promptHandoffMetaRef.current.get(handoffId);
+    const compareOperationKey = !!owner?.sendOperationKey || expected?.operationKey !== undefined;
+    const compareAttemptId = !!owner?.sendAttemptId || expected?.attemptId !== undefined;
+    const sameKnownOwner = (value: {sendOperationKey?:string|null;sendAttemptId?:string|null}) =>
+      historyPromptHandoffAcceptsAuditIdentity({
+        sendOperationKey: value.sendOperationKey ?? null, sendAttemptId: value.sendAttemptId ?? null,
+      }, {
+        sendOperationKey: compareOperationKey ? operationKey : value.sendOperationKey,
+        sendAttemptId: compareAttemptId ? attemptId : value.sendAttemptId,
+      });
+    if (meta && !sameKnownOwner(meta)) return null;
+    const rows = presentationEntriesRef.current.filter(row => isLocalPromptEntry(row)
+      && row.handoffId === handoffId && sameKnownOwner(row)).map(row => Object.freeze({ row,
+        operationKey: row.sendOperationKey ?? null, attemptId: row.sendAttemptId ?? null }));
+    // The ownerless merged-source event still carries its exact retired
+    // unattempted operation. It cannot authorize another attempt's row.
+    if (removedOwner === null && expected && !rows.some(item => item.operationKey === operationKey
+      && item.attemptId === attemptId)) return null;
+    return Object.freeze({ handoffId, owner, operationKey, attemptId, rows,
+      meta, metaOwner: getLocalPromptMetaOwner(meta),
+      metaOperationKey: meta?.sendOperationKey ?? null, metaAttemptId: meta?.sendAttemptId ?? null,
+      suppression: suppressedPromptsRef.current.get(handoffId),
+      ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current });
+  }, [getLocalPromptMetaOwner, tabId]);
+
+  const removeLocalPromptEntry = useCallback((handoffId: string, reason: string,
+    removal = captureLocalPromptRemoval(handoffId)) => {
+    if (!removal || removal.handoffId !== handoffId) return;
     setEntries((prev) => {
-      const nextEntries = prev.filter((entry) =>
-        !isLocalPromptEntry(entry) || entry.handoffId !== handoffId
-      );
-      if (nextEntries.length === prev.length) return prev;
-      historyDiag('LOCAL_REMOVE tab=' + tabId.slice(-12) +
-        ' handoff=' + handoffId +
-        ' reason=' + reason);
-      presentationEntriesRef.current = nextEntries;
+      if (historyOwnerKeyRef.current !== removal.ownerKey || historyOwnerGenerationRef.current !== removal.generation) return prev;
+      const active = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+      if (active && active !== removal.owner) return prev;
+      const meta = promptHandoffMetaRef.current.get(handoffId);
+      if (meta && (getLocalPromptMetaOwner(meta) !== removal.metaOwner || (meta.sendOperationKey ?? null) !== removal.metaOperationKey
+        || (meta.sendAttemptId ?? null) !== removal.metaAttemptId)) return prev;
+      // Recheck object AND H/O/A inside the React updater: a delayed cleanup
+      // cannot filter a new row or delete a newly projected metadata owner.
+      const sameMetaOwner = !!meta && getLocalPromptMetaOwner(meta) === removal.metaOwner;
+      const removedRows: Array<{ row: FullHistoryEntry; operationKey: string | null; attemptId: string | null }> = [];
+      // An older queued projection carries its captured metadata tuple, which
+      // may still be partial after a later handoff binding/enrichment.
+      const nextEntries = prev.filter(entry => {
+        const original = removal.rows.find(item => item.row === entry
+          && entry.handoffId === handoffId && (entry.sendOperationKey ?? null) === item.operationKey
+          && (entry.sendAttemptId ?? null) === item.attemptId);
+        const remove = !!original || sameMetaOwner && isLocalPromptEntry(entry) && entry.handoffId === handoffId
+          && (entry.sendOperationKey ?? null) === removal.metaOperationKey && (entry.sendAttemptId ?? null) === removal.metaAttemptId;
+        if (remove) removedRows.push({ row: entry,
+          operationKey: original ? original.operationKey : removal.metaOperationKey,
+          attemptId: original ? original.attemptId : removal.metaAttemptId });
+        return !remove;
+      });
+      const removalCurrent = () => {
+        const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+        const currentMeta = promptHandoffMetaRef.current.get(handoffId);
+        return (!current || current === removal.owner
+          && (current.sendOperationKey ?? null) === removal.operationKey && (current.sendAttemptId ?? null) === removal.attemptId)
+          && currentMeta === meta && (!meta || getLocalPromptMetaOwner(meta) === removal.metaOwner
+            && (meta.sendOperationKey ?? null) === removal.metaOperationKey && (meta.sendAttemptId ?? null) === removal.metaAttemptId)
+          && removedRows.every(item => item.row.handoffId === handoffId
+            && (item.row.sendOperationKey ?? null) === item.operationKey && (item.row.sendAttemptId ?? null) === item.attemptId)
+          && getHistoryPromptHandoffsSnapshot(tabId).every(value => value.handoffId !== handoffId || value === removal.owner)
+          && promptHandoffMetaRef.current.get(handoffId) === meta
+          && historyOwnerKeyRef.current === removal.ownerKey && historyOwnerGenerationRef.current === removal.generation;
+      };
+      const retireRemovedMetadata = () => {
+        if (sameMetaOwner && promptHandoffMetaRef.current.get(handoffId) === meta) promptHandoffMetaRef.current.delete(handoffId);
+        if (suppressedPromptsRef.current.get(handoffId) === removal.suppression
+          && suppressedPromptsRef.current.delete(handoffId)) setPrimarySuppressionRevision(value => value + 1);
+      };
+      if (nextEntries.length === prev.length) {
+        if (removalCurrent()) retireRemovedMetadata();
+        return prev;
+      }
+      historyDiag('LOCAL_REMOVE tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' reason=' + reason);
+      if (!publishHistoryRows(nextEntries, removalCurrent)) return prev;
+      retireRemovedMetadata();
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
     });
-  }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
+  }, [publishHistoryRows, captureLocalPromptRemoval, getLocalPromptMetaOwner, historySnapshotOwner, persistVolatileOverlay, tabId]);
+
+  const consumeLocalPromptEntry = useCallback((handoffId: string, reason: string,
+    expected?: { operationKey?: string | null; attemptId?: string | null;
+      owner?: ReturnType<typeof getHistoryPromptHandoffsSnapshot>[number] | null }, owns = () => true) => {
+    const removal = captureLocalPromptRemoval(handoffId, expected?.owner, expected);
+    if (!removal || !owns()) return false;
+    if (!consumeHistoryPromptHandoffIfCurrent(tabId, handoffId, removal.owner)) return false;
+    removeLocalPromptEntry(handoffId, reason, removal);
+    return true;
+  }, [captureLocalPromptRemoval, removeLocalPromptEntry, tabId]);
 
   const queueMergeIntents = useRef(new Map<string, any>());
   const queueMergeInflight = useRef(new Set<string>());
@@ -16576,6 +18527,43 @@ function HistoryPanel({
   }, [tabId]);
 
   const returnPromptInflight = useRef(new Set<string>());
+  const releaseSendQueue = useCallback(async (entry: FullHistoryEntry) => {
+    const owner = historyOwnerKey, generation = historyOwnerGenerationRef.current;
+    const isCurrent = () => historyOwnerKeyRef.current === owner && historyOwnerGenerationRef.current === generation;
+    if (!isCurrent()) return false;
+    const { handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId } = entry;
+    if (!handoffId || !operationKey || !attemptId) return false;
+    const sameReceipt = () => {
+      const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId);
+      const row = presentationEntriesRef.current.find(item => isLocalPromptEntry(item) && item.handoffId === handoffId);
+      return [handoff, row].every(value => !value || value.queueStatus !== 'sent'
+        && (!value.sendOperationKey || value.sendOperationKey === operationKey)
+        && (!value.sendAttemptId || value.sendAttemptId === attemptId));
+    };
+    const current = getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId);
+    if (current && (current.sendOperationKey !== operationKey || current.sendAttemptId !== attemptId)) return false;
+    const requestId = 'history-release-' + historyServicePromptFingerprint(JSON.stringify([tabId, handoffId, operationKey, attemptId]));
+    try {
+      const result = await ipcRenderer.invoke('agent:release-send-queue-head', { tabId, handoffId, operationKey, attemptId, requestId });
+      if (result?.cancelled) return false;
+      if (!result?.success || !result.released && !result.confirmed) throw new Error(result?.code || 'send_queue_release_unconfirmed');
+      if (!isCurrent() || !sameReceipt()) return true; // durable old action may settle; never project it into a new owner/attempt
+      if (result.released) {
+        settleHistoryPromptHandoff(tabId, handoffId, { queueStatus: 'delivery-unknown', reason: 'durable-input-slot-retired' });
+        updateLocalPromptEntry(handoffId, 'delivery-unknown', 'durable-input-slot-retired');
+      }
+      return true;
+    } catch (error: any) {
+      if (!isCurrent() || !sameReceipt()) return false;
+      useUIStore.getState().showToast('Очередь не освобождена: ' + String(error?.message || error)
+        + '. Повторный клик проверит ту же операцию, не отправит сообщение заново.', 'error');
+      return false;
+    }
+  }, [historyOwnerKey, tabId, updateLocalPromptEntry]);
+  const [receiptPresentationRevision, setReceiptPresentationRevision] = useState(0);
+  const [composerReturnPreparations, setComposerReturnPreparations] = useState<Array<{
+    tabId: string; sourceSessionId: string | null; handoffId: string; token: string;
+  }>>([]);
   const dismissPromptPresentation = useCallback(async (entry: FullHistoryEntry) => {
     const handoffId = entry.handoffId || '';
     const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
@@ -16609,11 +18597,15 @@ function HistoryPanel({
             return;
           }
           if (!result?.success || !result.dismissed) throw new Error(result?.reason || 'dismiss-unconfirmed');
+          const control = result.presentationControl;
+          if (!control || control.tabId !== tabId || control.handoffId !== handoffId
+            || current.sendOperationKey && control.operationKey !== current.sendOperationKey
+            || (control.attemptId ?? null) !== (current.sendAttemptId ?? null)
+            || !recordHistorySendPresentationDismissal(control)) throw new Error('dismiss-control-unconfirmed');
         }
         const latest = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
         if (latest && (latest.sendOperationKey !== current.sendOperationKey || latest.sendAttemptId !== current.sendAttemptId)) return;
-        consumeHistoryPromptHandoff(tabId, handoffId);
-        removeLocalPromptEntry(handoffId, unknown ? 'unknown-presentation-dismissed' : 'failed-presentation-dismissed');
+        consumeLocalPromptEntry(handoffId, unknown ? 'unknown-presentation-dismissed' : 'failed-presentation-dismissed');
       } catch (error: any) {
         showHistoryIncidentToast(tabId, error, { headline: 'Не удалось скрыть карточку',
           toolType, action: unknown ? 'dismiss-unknown-prompt' : 'dismiss-failed-prompt', handoffId, code: 'history-send-dismiss-unconfirmed' });
@@ -16624,6 +18616,11 @@ function HistoryPanel({
       || returnPromptInflight.current.has(handoffId)) return;
     const identity = { tabId, handoffId, token: handoff.historyReturn.token, provider: handoff.toolType };
     returnPromptInflight.current.add(handoffId);
+    // Only presentation of this real pre-input return request. The Main
+    // receipt still owns adoption/cancellation; this status never sends,
+    // clears a draft or pretends an unknown return has been completed.
+    const preparation = { ...identity, sourceSessionId: sessionId || null };
+    setComposerReturnPreparations(current => beginComposerReturnPreparation(current, preparation));
     try {
       // Registration may still be crossing IPC when this very early click
       // arrives. Same identity joins registration; it never submits a prompt.
@@ -16648,8 +18645,7 @@ function HistoryPanel({
       recordHistorySendReturnControl(acknowledged.control);
       useUIStore.getState().acknowledgeHistorySendDraftReturn(tabId, identity.token);
       removeHistorySendRecovery(tabId, handoffId);
-      consumeHistoryPromptHandoff(tabId, handoffId);
-      removeLocalPromptEntry(handoffId, 'returned-to-composer');
+      consumeLocalPromptEntry(handoffId, 'returned-to-composer');
     } catch (error: any) {
       // Unknown return ACK cannot justify restoring a potentially sent message.
       // A failed draft save/ACK keeps the card and its original asset owner.
@@ -16660,8 +18656,11 @@ function HistoryPanel({
       }
       showHistoryIncidentToast(tabId, error, { headline: 'Не удалось завершить возврат сообщения',
         toolType, action: 'return-prompt-before-input', handoffId, code: 'history-send-return-unconfirmed' });
-    } finally { returnPromptInflight.current.delete(handoffId); }
-  }, [removeLocalPromptEntry, tabId, toolType]);
+    } finally {
+      setComposerReturnPreparations(current => finishComposerReturnPreparation(current, preparation));
+      returnPromptInflight.current.delete(handoffId);
+    }
+  }, [consumeLocalPromptEntry, removeLocalPromptEntry, sessionId, tabId, toolType]);
 
   const acknowledgeMaterializedHistoryReceipt = useCallback(async (input: {
     operationKey?: string | null;
@@ -16730,170 +18729,362 @@ function HistoryPanel({
   }, [tabId]);
 
   useEffect(() => {
-    let disposed = false;
-    void ipcRenderer.invoke('agent:list-send-receipts', {
-      tabId,
-    }).then(async (result: any) => {
-      if (disposed || result?.success !== true || !Array.isArray(result.records)) return;
-      let restorableDraft: string | null = null;
-      let restorableRecord: any = null;
-      let restorableAt = -1;
-      let hydrated = 0;
-      const dismissRecoveredReceipt = async (record: any, reason: string) => {
-        const handoffId = typeof record?.handoffId === 'string' ? record.handoffId : '';
-        if (!handoffId) return false;
-        try {
-          const dismissed = await ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', {
-            tabId,
-            handoffId,
-          });
-          historyDiag('DURABLE_DRAFT_RECEIPT_CONSUMED tab=' + tabId.slice(-12)
-            + ' handoff=' + handoffId
-            + ' success=' + (dismissed?.success === true ? '1' : '0')
-            + ' dismissed=' + (dismissed?.dismissed === true ? '1' : '0')
-            + ' reason=' + reason
-            + ' result=' + (dismissed?.reason || '-'));
-          return dismissed?.success === true && dismissed?.dismissed === true;
-        } catch (error: any) {
-          console.warn('[HistoryPanel] durable draft receipt consume failed tab=' + tabId.slice(-12)
-            + ' handoff=' + handoffId + ': ' + String(error?.message || error));
-          return false;
-        }
+    let stopped = false;
+    let disposeRead = () => {};
+    const effectRoot = primaryPhysicalCandidate ? primaryRootRef.current : null;
+    const effectOwner = historyOwnerKey, effectGeneration = historyOwnerGenerationRef.current;
+    const readCurrentReceiptCut = () => {
+      disposeRead();
+      if (stopped || historyOwnerKeyRef.current !== effectOwner
+        || historyOwnerGenerationRef.current !== effectGeneration
+        || primaryPhysicalCandidate && primaryRootRef.current !== effectRoot) return;
+      let disposed = false;
+      const ownerKey = historyOwnerKey, ownerGeneration = historyOwnerGenerationRef.current;
+      const receiptRead = beginHistorySendReceiptRead(tabId, {
+        observePendingHandoffChanges: true,
+        onInvalidated: () => {
+          if (!disposed && historyOwnerKeyRef.current === ownerKey
+            && historyOwnerGenerationRef.current === ownerGeneration) {
+            setReceiptPresentationRevision(value => value + 1);
+          }
+        },
+      });
+      const root = primaryPhysicalCandidate ? primaryRootRef.current : null;
+      const header = root?.header || null;
+      const receiptCommit = primaryPhysicalCandidate ? primaryReceiptCommitRef.current : null;
+      const confirmedCommitCurrent = () => !!receiptCommit && primaryReceiptCommitRef.current === receiptCommit
+        && receiptCommit.root === root && receiptCommit.dataSubject === root?.getReceiptDataSubject()
+        && receiptCommit.ownerKey === ownerKey && receiptCommit.generation === ownerGeneration
+        && primaryRootRef.current === root && root?.header === header && !root?.closed
+        && historyOwnerKeyRef.current === ownerKey && historyOwnerGenerationRef.current === ownerGeneration;
+      const draftOwner = captureHistoryComposerDraftOwner({ store: useUIStore, tabId });
+      let activeProbe: AbortController | null = null;
+      let activeReceiptOwner: ReturnType<typeof captureHistoryReceiptRecoveryOwner> | null = null;
+      let restorableOwner: ReturnType<typeof captureHistoryReceiptRecoveryOwner> | null = null;
+      const sourceScopeCurrent = () => !disposed && historyOwnerKeyRef.current === ownerKey
+        && historyOwnerGenerationRef.current === ownerGeneration
+        && (!primaryPhysicalCandidate || (primaryRootRef.current === root
+          && (root?.header || null) === header && !root?.closed));
+      const scopeCurrent = () => sourceScopeCurrent() && receiptRead.isCurrent();
+      const releaseActiveProbe = () => {
+        activeProbe?.abort(); activeProbe = null;
+        if (activeReceiptOwner !== restorableOwner) activeReceiptOwner?.dispose();
+        activeReceiptOwner = null;
       };
-      for (const record of result.records) {
-        hydrateHistoryPromptHandoffImages(record);
-        if (record?.provider !== toolType) continue;
-        const canonicalProjectionReady = presentedOwnerKey === historyOwnerKey
-          && (rawServerEntriesRef.current.length > 0
-            || chipsFreshOwnerKey === historyOwnerKey);
-        // On a cold owner, the durable transcript has not been read yet. A
-        // confirmed receipt means its canonical row exists, so wait for that
-        // first read instead of briefly appending a duplicate SENT at the end.
-        if ((record?.state === 'confirmed' || record?.state === 'not-submitted')
-          && !record?.presentation
-          && !canonicalProjectionReady) {
-          continue;
+      const releaseRecoveryReaders = () => {
+        releaseActiveProbe(); restorableOwner?.dispose(); restorableOwner = null;
+        draftOwner.dispose(); receiptRead.close();
+      };
+      disposeRead = () => { disposed = true; releaseRecoveryReaders(); };
+      void ipcRenderer.invoke('agent:list-send-receipts', {
+        tabId,
+      }).then(async (result: any) => {
+        if (!scopeCurrent() || result?.success !== true || !Array.isArray(result.records)
+          || !receiptRead.adoptList()) return;
+        let restorableDraft: string | null = null;
+        let restorableRecord: any = null;
+        let restorableAt = -1;
+        let hydrated = 0;
+        const dismissRecoveredReceipt = async (record: any, reason: string,
+          receiptOwner: ReturnType<typeof captureHistoryReceiptRecoveryOwner>) => {
+          const handoffId = typeof record?.handoffId === 'string' ? record.handoffId : '';
+          if (!handoffId || !scopeCurrent() || !receiptOwner.isCurrent()) return null;
+          try {
+            const dismissed = await ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', {
+              tabId,
+              handoffId,
+              failedOnly: true,
+              operationKey: record.operationKey,
+              attemptId: record.attemptId ?? null,
+            });
+            if (!scopeCurrent() || !receiptOwner.isCurrent()) return null;
+            if (dismissed?.success === true && dismissed.dismissed === true && dismissed.presentationControl) {
+              if (!receiptOwner.acceptPresentationDismissal(dismissed.presentationControl)) return null;
+            }
+            historyDiag('DURABLE_DRAFT_RECEIPT_CONSUMED tab=' + tabId.slice(-12)
+              + ' handoff=' + handoffId
+              + ' success=' + (dismissed?.success === true ? '1' : '0')
+              + ' dismissed=' + (dismissed?.dismissed === true ? '1' : '0')
+              + ' reason=' + reason
+              + ' result=' + (dismissed?.reason || '-'));
+            if (dismissed?.success !== true || dismissed?.dismissed !== true) return null;
+            // Recording our own exact successful dismissal intentionally retires
+            // the old list lease. The original object/absence witness must still
+            // own this cleanup; a reentrant same-attempt begin cannot be adopted.
+            return { isCurrent: () => sourceScopeCurrent() && receiptOwner.isCurrent(), dispose: receiptOwner.dispose };
+          } catch (error: any) {
+            console.warn('[HistoryPanel] durable draft receipt consume failed tab=' + tabId.slice(-12)
+              + ' handoff=' + handoffId + ': ' + String(error?.message || error));
+            return null;
+          }
+        };
+        for (const record of result.records) {
+          releaseActiveProbe();
+          if (!scopeCurrent()) return;
+          if (hydrateHistoryPromptHandoffImages(record)) {
+            // Image enrichment publishes synchronously. A subscriber may
+            // replace even the same H/O/A, so this old list cannot acquire
+            // that replacement as its delivery or canonical-ACK owner.
+            setReceiptPresentationRevision(value => value + 1);
+            return;
+          }
+          if (record?.provider !== toolType || record?.tabId !== tabId) continue;
+          // An exact delivery receipt may already have completed while this
+          // read-only History cut is cold/unavailable. Stop the existing
+          // card's queue loader without manufacturing a canonical row or ACK.
+          const deliveryUpdate = settleExistingHistoryPromptHandoffFromDurableReceipt(record);
+          if (deliveryUpdate.ownerChanged) continue;
+          if (deliveryUpdate.changed) {
+            // A new list/owner claim must precede any canonical ACK. A
+            // synchronous subscriber can replace even the same H/O/A here.
+            setReceiptPresentationRevision(value => value + 1);
+            return;
+          }
+          if (!scopeCurrent()) return; // publication can invalidate this list lease
+          const controller = new AbortController();
+          const receiptOwner = captureHistoryReceiptRecoveryOwner(record, { onInvalidated: () => controller.abort() });
+          activeProbe = controller; activeReceiptOwner = receiptOwner;
+          const ownsRecord = () => scopeCurrent() && !controller.signal.aborted && receiptOwner.isCurrent();
+          if (!ownsRecord()) continue;
+          if (!receiptOwner.recoveryAllowed) {
+            // An already observed hide/return owns recovery. Preserve the existing
+            // exact hidden-card cleanup, without starting a stale draft query.
+            if (receiptOwner.presentationDismissed && record?.surface === 'desktop-history') {
+              const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
+              if (outcome.reason === 'durable-history-presentation-dismissed') {
+                consumeLocalPromptEntry(record.handoffId, outcome.reason);
+              }
+            }
+            continue;
+          }
+          const canonicalProjectionReady = primaryPhysicalCandidate
+            ? !!root && !!header && scopeCurrent()
+            : presentedOwnerKey === historyOwnerKey
+              && (rawServerEntriesRef.current.length > 0 || chipsFreshOwnerKey === historyOwnerKey);
+          // On a cold owner, the durable transcript has not been read yet. A
+          // confirmed receipt means its canonical row exists, so wait for that
+          // first read instead of briefly appending a duplicate SENT at the end.
+          if (historyReceiptNeedsCanonicalProjection(record) && !canonicalProjectionReady) {
+            continue;
+          }
+          let laterCanonicalEntry: FullHistoryEntry | null = null;
+          let laterCanonicalMatch = false;
+          if (record?.state === 'not-submitted') {
+            if (primaryPhysicalCandidate) {
+              if (root && header) try {
+                laterCanonicalMatch = await root!.hasLaterCanonicalReceipt(record, { signal: controller.signal, owns: ownsRecord });
+                if (!ownsRecord()) continue;
+                if (typeof laterCanonicalMatch !== 'boolean') throw new Error('canonical-receipt-proof-invalid');
+              } catch (error: any) {
+                if (ownsRecord()) historyDiag('DURABLE_DRAFT_CANONICAL_UNKNOWN tab=' + tabId.slice(-12)
+                  + ' handoff=' + String(record.handoffId || '-')
+                  + ' code=' + String(error?.code || error?.message || error));
+                // UNKNOWN is not an absence proof and cannot restore a draft.
+                continue;
+              }
+            } else {
+              laterCanonicalEntry = rawServerEntriesRef.current.find((entry) =>
+                durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(record, entry)) || null;
+              laterCanonicalMatch = !!laterCanonicalEntry;
+            }
+          }
+          if (laterCanonicalMatch === true) {
+            // The automatic attempt genuinely stopped before Enter, but the same
+            // draft was subsequently submitted manually after its exact transcript
+            // boundary. Keep that delivery attributed to the manual action while
+            // retiring this receipt as a draft source. A legacy build may already
+            // have copied the stale recovery into persistent composer state; clear
+            // only the byte-equivalent text with no newer structured attachments.
+            const ui = useUIStore.getState();
+            const currentDraft = ui.historyPromptDrafts[tabId] || '';
+            const expectedDraft = String(record?.receipt?.promptText || '');
+            const sameDraft = currentDraft.replace(/\r\n/g, '\n').trim()
+              === expectedDraft.replace(/\r\n/g, '\n').trim();
+            const currentImages = ui.historyPromptDraftImages[tabId] || [];
+            const currentChips = ui.historyPromptDraftChips[tabId] || [];
+            const pendingImages = ui.historyPromptDraftPendingImages[tabId] || [];
+            const clearedLegacyRecovery = !!currentDraft
+              && sameDraft && draftOwner.isCurrent() && ownsRecord()
+              && currentImages.length === 0 && currentChips.length === 0 && pendingImages.length === 0;
+            if (clearedLegacyRecovery) {
+              setHistoryPromptDraft(tabId, '', { images: [], chips: [] });
+              flushHistoryComposerDrafts();
+            }
+            const dismissed = await dismissRecoveredReceipt(record, 'later-canonical-user-entry', receiptOwner);
+            if (!dismissed) continue;
+            try {
+              if (!dismissed.isCurrent()) continue;
+              consumeLocalPromptEntry(record.handoffId, 'not-submitted-draft-later-sent');
+            } finally { dismissed.dispose(); }
+            if (!scopeCurrent()) return;
+            historyDiag('DURABLE_DRAFT_SUPERSEDED tab=' + tabId.slice(-12)
+              + ' handoff=' + String(record.handoffId || '-')
+              + ' entry=' + (laterCanonicalEntry ? laterCanonicalEntry.uuid.slice(0, 8) : 'canonical-read-proof')
+              + ' boundary=' + Number(record?.transcriptBoundary?.fileSize || -1)
+              + ' offset=' + (laterCanonicalEntry ? Number(laterCanonicalEntry.recordByteOffset ?? -1) : 'producer-checked')
+              + ' clearedLegacy=' + (clearedLegacyRecovery ? '1' : '0'));
+            continue;
+          }
+          if (primaryPhysicalCandidate && record?.state === 'confirmed') {
+            // A fetched cut cannot acknowledge a replacement before its data
+            // commit. Hidden/background panels use the same commit, without a
+            // mount/paint/viewport requirement. The immutable token rejects ABA.
+            if (!root || !header || !confirmedCommitCurrent()) continue;
+            const ownsConfirmed = () => ownsRecord() && confirmedCommitCurrent();
+            try {
+              const proof = await root.readConfirmedCanonicalReceipt(record, {
+                signal: controller.signal, owns: ownsConfirmed,
+              });
+              if (!ownsConfirmed()) continue;
+              if (!proof || proof.header !== header || typeof proof.found !== 'boolean'
+                || (proof.found ? !Number.isSafeInteger(proof.ordinal) || proof.ordinal! < 0
+                  || proof.ordinal! >= header.canonicalEntryCount : proof.ordinal !== null || proof.acknowledgement !== null)) {
+                throw new Error('confirmed-canonical-receipt-proof-invalid');
+              }
+              if (proof.found) {
+                const acknowledgement = proof.acknowledgement;
+                // A selected row with an ineligible ACK is still a match; it
+                // must not fall through and fabricate a replacement SENT card.
+                if (!acknowledgement) continue;
+                if (acknowledgement.operationKey !== String(record.operationKey || '').trim()
+                  || acknowledgement.attemptId !== String(record.attemptId || '').trim()
+                  || acknowledgement.handoffId !== String(record.handoffId || '').trim()
+                  || acknowledgement.provider !== record.provider) throw new Error('confirmed-receipt-ack-owner-invalid');
+                if (!ownsConfirmed()) continue;
+                const acknowledged = await ipcRenderer.invoke('agent:acknowledge-send-receipt-presentation', {
+                  ...acknowledgement, tabId,
+                });
+                historyDiag('DURABLE_PRESENTATION_ACK tab=' + tabId.slice(-12)
+                  + ' handoff=' + record.handoffId
+                  + ' success=' + (acknowledged?.success === true ? '1' : '0')
+                  + ' applied=' + (acknowledged?.applied === true ? '1' : '0')
+                  + ' reason=' + (acknowledged?.reason || '-'));
+                if (!ownsConfirmed() || acknowledged?.success !== true) continue;
+                consumeLocalPromptEntry(record.handoffId, 'durable-presentation-already-materialized',
+                  { operationKey: record.operationKey, attemptId: record.attemptId }, ownsConfirmed);
+                continue;
+              }
+            } catch (error: any) {
+              if (ownsRecord()) historyDiag('DURABLE_CONFIRMED_CANONICAL_UNKNOWN tab=' + tabId.slice(-12)
+                + ' handoff=' + String(record.handoffId || '-')
+                + ' code=' + String(error?.code || error?.message || error));
+              // UNKNOWN/cancel/refusal is not absence or automatic retry authority.
+              continue;
+            }
+          } else {
+            const materialized = record?.state === 'confirmed'
+              && committedHistoryEntriesRef.current.ownerKey === historyOwnerKey
+              ? committedHistoryEntriesRef.current.entries.find((entry) =>
+                  durableHistorySendReceiptMatchesCanonicalEntry(record, entry)
+                )
+              : null;
+            if (materialized) {
+              const acknowledged = await acknowledgeMaterializedHistoryReceipt({
+                operationKey: record.operationKey,
+                attemptId: record.attemptId,
+                handoffId: record.handoffId,
+                provider: record.provider,
+                sessionId: record.receipt?.sessionId || record.sessionId,
+                auditEntryUuid: record.receipt?.entryUuid || record.auditIdentity?.entryUuid,
+                auditSourceIdentity: record.receipt?.sourceIdentity
+                  || record.auditIdentity?.sourceIdentity,
+              }, materialized);
+              if (!acknowledged || !ownsRecord()) continue;
+              consumeLocalPromptEntry(record.handoffId, 'durable-presentation-already-materialized',
+                { operationKey: record.operationKey, attemptId: record.attemptId }, ownsRecord);
+              continue;
+            }
+          }
+          // Project API/iOS/Terminal MCP own their external composer and retry
+          // projection, so History must not recreate their optimistic cards
+          // after restart. It still lists their confirmed receipts above so an
+          // exact canonical transcript row can retire a local card that was
+          // already projected while the renderer was alive.
+          if (record?.surface !== 'desktop-history') continue;
+          const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
+          if (outcome.hydrated) hydrated += 1;
+          if (!outcome.hydrated && (
+            outcome.reason === 'durable-history-presentation-already-materialized'
+            || outcome.reason === 'durable-history-presentation-dismissed'
+            || outcome.reason === 'durable-history-confirmed-identity-missing'
+            || outcome.reason === 'durable-history-confirmed-proof-incomplete'
+          )) {
+            consumeLocalPromptEntry(record.handoffId, outcome.reason);
+          }
+          if (outcome.restorableDraft && receiptOwner.isCurrent() && Number(record?.updatedAt || 0) >= restorableAt) {
+            if (restorableOwner !== receiptOwner) restorableOwner?.dispose();
+            restorableOwner = receiptOwner;
+            restorableDraft = outcome.restorableDraft;
+            restorableRecord = record;
+            restorableAt = Number(record?.updatedAt || 0);
+          }
         }
-        const laterCanonicalEntry = record?.state === 'not-submitted'
-          ? rawServerEntriesRef.current.find((entry) =>
-              durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(record, entry)
-            )
-          : null;
-        if (laterCanonicalEntry) {
-          // The automatic attempt genuinely stopped before Enter, but the same
-          // draft was subsequently submitted manually after its exact transcript
-          // boundary. Keep that delivery attributed to the manual action while
-          // retiring this receipt as a draft source. A legacy build may already
-          // have copied the stale recovery into persistent composer state; clear
-          // only the byte-equivalent text with no newer structured attachments.
+        releaseActiveProbe();
+        if (restorableDraft && scopeCurrent() && restorableOwner?.isCurrent() && draftOwner.isCurrent()) {
           const ui = useUIStore.getState();
           const currentDraft = ui.historyPromptDrafts[tabId] || '';
-          const expectedDraft = String(record?.receipt?.promptText || '');
-          const sameDraft = currentDraft.replace(/\r\n/g, '\n').trim()
-            === expectedDraft.replace(/\r\n/g, '\n').trim();
-          const currentImages = ui.historyPromptDraftImages[tabId] || [];
-          const currentChips = ui.historyPromptDraftChips[tabId] || [];
-          const clearedLegacyRecovery = !!currentDraft
-            && sameDraft
-            && currentImages.length === 0
-            && currentChips.length === 0;
-          if (clearedLegacyRecovery) {
-            setHistoryPromptDraft(tabId, '', { images: [], chips: [] });
+          if (!currentDraft && !(ui.historyPromptDraftImages[tabId]?.length)
+            && !(ui.historyPromptDraftChips[tabId]?.length) && !(ui.historyPromptDraftPendingImages[tabId]?.length)) {
+            setHistoryPromptDraft(tabId, restorableDraft);
+            // Once the receipt has been copied into the normal persistent draft
+            // store, that store owns future restarts. Leaving the receipt active
+            // would resurrect the same text after every deliberate clear.
             flushHistoryComposerDrafts();
+            const dismissed = await dismissRecoveredReceipt(restorableRecord, 'restored-to-persistent-composer', restorableOwner);
+            dismissed?.dispose();
+            if (!scopeCurrent()) return;
+            historyDiag('DURABLE_DRAFT_RESTORED tab=' + tabId.slice(-12)
+              + ' chars=' + restorableDraft.length);
           }
-          await dismissRecoveredReceipt(record, 'later-canonical-user-entry');
-          consumeHistoryPromptHandoff(tabId, record.handoffId);
-          removeLocalPromptEntry(record.handoffId, 'not-submitted-draft-later-sent');
-          historyDiag('DURABLE_DRAFT_SUPERSEDED tab=' + tabId.slice(-12)
-            + ' handoff=' + String(record.handoffId || '-')
-            + ' entry=' + laterCanonicalEntry.uuid.slice(0, 8)
-            + ' boundary=' + Number(record?.transcriptBoundary?.fileSize || -1)
-            + ' offset=' + Number(laterCanonicalEntry.recordByteOffset ?? -1)
-            + ' clearedLegacy=' + (clearedLegacyRecovery ? '1' : '0'));
-          continue;
         }
-        const materialized = record?.state === 'confirmed'
-          && committedHistoryEntriesRef.current.ownerKey === historyOwnerKey
-          ? committedHistoryEntriesRef.current.entries.find((entry) =>
-              durableHistorySendReceiptMatchesCanonicalEntry(record, entry)
-            )
-          : null;
-        if (materialized) {
-          const acknowledged = await acknowledgeMaterializedHistoryReceipt({
-            operationKey: record.operationKey,
-            attemptId: record.attemptId,
-            handoffId: record.handoffId,
-            provider: record.provider,
-            sessionId: record.receipt?.sessionId || record.sessionId,
-            auditEntryUuid: record.receipt?.entryUuid || record.auditIdentity?.entryUuid,
-            auditSourceIdentity: record.receipt?.sourceIdentity
-              || record.auditIdentity?.sourceIdentity,
-          }, materialized);
-          if (!acknowledged || disposed) continue;
-          consumeHistoryPromptHandoff(tabId, record.handoffId);
-          removeLocalPromptEntry(record.handoffId, 'durable-presentation-already-materialized');
-          continue;
+        if (hydrated > 0) {
+          historyDiag('DURABLE_HANDOFFS_HYDRATED tab=' + tabId.slice(-12)
+            + ' count=' + hydrated);
         }
-        // Project API/iOS/Terminal MCP own their external composer and retry
-        // projection, so History must not recreate their optimistic cards
-        // after restart. It still lists their confirmed receipts above so an
-        // exact canonical transcript row can retire a local card that was
-        // already projected while the renderer was alive.
-        if (record?.surface !== 'desktop-history') continue;
-        const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
-        if (outcome.hydrated) hydrated += 1;
-        if (!outcome.hydrated && (
-          outcome.reason === 'durable-history-presentation-already-materialized'
-          || outcome.reason === 'durable-history-presentation-dismissed'
-          || outcome.reason === 'durable-history-confirmed-identity-missing'
-          || outcome.reason === 'durable-history-confirmed-proof-incomplete'
-        )) {
-          consumeHistoryPromptHandoff(tabId, record.handoffId);
-          removeLocalPromptEntry(record.handoffId, outcome.reason);
-        }
-        if (outcome.restorableDraft && Number(record?.updatedAt || 0) >= restorableAt) {
-          restorableDraft = outcome.restorableDraft;
-          restorableRecord = record;
-          restorableAt = Number(record?.updatedAt || 0);
-        }
-      }
-      if (restorableDraft) {
-        const currentDraft = useUIStore.getState().historyPromptDrafts[tabId] || '';
-        if (!currentDraft) {
-          setHistoryPromptDraft(tabId, restorableDraft);
-          // Once the receipt has been copied into the normal persistent draft
-          // store, that store owns future restarts. Leaving the receipt active
-          // would resurrect the same text after every deliberate clear.
-          flushHistoryComposerDrafts();
-          await dismissRecoveredReceipt(restorableRecord, 'restored-to-persistent-composer');
-          historyDiag('DURABLE_DRAFT_RESTORED tab=' + tabId.slice(-12)
-            + ' chars=' + restorableDraft.length);
-        }
-      }
-      if (hydrated > 0) {
-        historyDiag('DURABLE_HANDOFFS_HYDRATED tab=' + tabId.slice(-12)
-          + ' count=' + hydrated);
-      }
-    }).catch((error: any) => {
-      console.warn('[HistoryPanel] durable receipt hydration failed tab=' + tabId.slice(-12)
-        + ': ' + String(error?.message || error));
+      }).catch((error: any) => {
+        console.warn('[HistoryPanel] durable receipt hydration failed tab=' + tabId.slice(-12)
+          + ': ' + String(error?.message || error));
+      }).finally(releaseRecoveryReaders);
+    };
+    const unsubscribe = effectRoot?.onReceiptReadWake(event => {
+      if (effectRoot.header !== event.header || effectRoot.getReceiptDataSubject() !== event.dataSubject) return;
+      readCurrentReceiptCut();
     });
-    return () => { disposed = true; };
+    readCurrentReceiptCut();
+    return () => { stopped = true; unsubscribe?.(); disposeRead(); };
   }, [
+    primaryPhysicalCandidate,
+    primaryRoot,
+    primaryHeader,
+    entries,
     acknowledgeMaterializedHistoryReceipt,
     chipsFreshOwnerKey,
     flushHistoryComposerDrafts,
     historyOwnerKey,
     presentedOwnerKey,
+    receiptPresentationRevision,
+    fileRewriteEpoch,
     removeLocalPromptEntry,
+    consumeLocalPromptEntry,
     setHistoryPromptDraft,
     tabId,
     toolType,
   ]);
 
   useEffect(() => subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
+    if (change.type === 'presentation-control') {
+      setReceiptPresentationRevision(value => value + 1);
+      return;
+    }
     if (change.type === 'consume' || change.type === 'retract') {
-      removeLocalPromptEntry(change.handoffId, 'handoff-' + change.type);
+      // The notification's removed owner precedes all reentrant listeners.
+      // Never recapture a replacement H as the target of an older consume.
+      if (change.removedOwner !== undefined) {
+        const expected = change.type === 'consume' && change.removedOwner === null
+          ? { operationKey: change.operationKey, attemptId: change.attemptId } : undefined;
+        const removal = captureLocalPromptRemoval(change.handoffId, change.removedOwner, expected);
+        removeLocalPromptEntry(change.handoffId, 'handoff-' + change.type, removal);
+      }
       return;
     }
     const records = change.type === 'replay'
@@ -16940,6 +19131,7 @@ function HistoryPanel({
         }) as FullHistoryEntry[];
         if (retainedLive !== currentLive) {
           liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: retainedLive };
+          primaryLiveCoverageOwner.wake('subject');
           setLiveEntries(retainedLive);
           historyDiag('LIVE_PROMPT_RETIRED tab=' + tabId.slice(-12)
             + ' handoff=' + record.handoffId
@@ -16957,6 +19149,7 @@ function HistoryPanel({
       ) {
         appendLocalPromptEntry(record.text, record.queueStatus, {
           handoffId: record.handoffId,
+          ...historyPromptHandoffRecoveryFields(record),
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
@@ -16979,6 +19172,7 @@ function HistoryPanel({
         // path remains the single presentation owner.
         appendLocalPromptEntry(record.text, 'sending', {
           handoffId: record.handoffId,
+          ...historyPromptHandoffRecoveryFields(record),
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
@@ -17002,8 +19196,11 @@ function HistoryPanel({
     }
   }), [
     appendLocalPromptEntry,
+    captureLocalPromptRemoval,
     historyOwnerKey,
+    primaryLiveCoverageOwner,
     removeLocalPromptEntry,
+    consumeLocalPromptEntry,
     sessionId,
     tabId,
     toolType,
@@ -17039,11 +19236,12 @@ function HistoryPanel({
     setEntries((previous) => {
       const withoutDuplicate = previous.filter((candidate) => candidate.uuid !== uuid);
       const nextEntries = mergeServerAndLocalEntries(withoutDuplicate, [entry]);
-      presentationEntriesRef.current = nextEntries;
+      if (!publishHistoryRows(nextEntries)) return previous;
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
     });
   }, [
+    publishHistoryRows,
     historySnapshotOwner,
     keepHistoryTailPinnedAfterMutation,
     persistVolatileOverlay,
@@ -17106,14 +19304,34 @@ function HistoryPanel({
     };
   }, [appendCompactErrorEntry, removeLocalPromptEntry, tabId, toolType]);
 
+  const durablePromptOwnerRef = useCanonicalPromptRecoveryOwner(historyOwnerKey);
   const hasDurablePrompt = useCallback((
     text: string,
     submittedAt: number,
     identity: DurablePromptIdentity = {},
-  ) => (
-    serverHasPromptEntry(
-      rawServerEntriesRef.current,
-      {
+    options: { signal?: AbortSignal } = {},
+  ): boolean | Promise<boolean> => {
+    const identities = canonicalPromptRecoveryIdentities(identity);
+    const root = primaryRootRef.current;
+    if (identities.length && (root || primaryRootReadEnabled && toolType === 'codex'
+      && primaryCompositeOwnerRef.current !== historyOwnerKey)) {
+      try {
+        const owner = captureCanonicalPromptRecoveryOwner(durablePromptOwnerRef, historyOwnerKey);
+        const header = root?.header;
+        const generation = historyOwnerGenerationRef.current;
+        const owns = () => owner.isCurrent()
+            && historyTabIdRef.current === tabId && historyOwnerKeyRef.current === historyOwnerKey
+            && historyOwnerGenerationRef.current === generation && primaryRootRef.current === root
+            && root?.header === header;
+        return readCanonicalPromptRecoveryProof({ root, header, identities, signal: options.signal,
+          ownerSignal: owner.signal, owns,
+        }).then(found => {
+          if (!owns()) throw Object.assign(new Error('Canonical prompt recovery owner changed'), { code: 'HISTORY_READ_CANCELLED' });
+          return found;
+        }).catch(cause => { throw canonicalPromptRecoveryReadError(cause); });
+      } catch (cause) { throw canonicalPromptRecoveryReadError(cause); }
+    }
+    const localIdentity = {
         uuid: LOCAL_PROMPT_PREFIX + 'durable-check',
         role: 'queued',
         content: text,
@@ -17127,9 +19345,30 @@ function HistoryPanel({
         sourceIdentity: identity.sourceIdentity,
         recordByteOffset: identity.recordByteOffset,
         sessionId: identity.auditSessionId || identity.sessionId,
-      } as FullHistoryEntry,
-    )
-  ), []);
+      } as FullHistoryEntry;
+    if (root || primaryRootReadEnabled && toolType === 'codex'
+      && primaryCompositeOwnerRef.current !== historyOwnerKey) {
+      try {
+        const owner = captureCanonicalPromptRecoveryOwner(durablePromptOwnerRef, historyOwnerKey);
+        const header = root?.header, generation = historyOwnerGenerationRef.current;
+        const owns = () => owner.isCurrent() && historyTabIdRef.current === tabId
+          && historyOwnerKeyRef.current === historyOwnerKey && historyOwnerGenerationRef.current === generation
+          && primaryRootRef.current === root && root?.header === header;
+        if (!root || !header || root.closed || !owns()) throw Object.assign(
+          new Error('Canonical prompt adoption unavailable'), { code: 'HISTORY_READ_CANCELLED' });
+        const identityFingerprint = primaryPromptPublicationFingerprint(identity);
+        let proofCurrent = () => false;
+        return root.readPromptAdoption(localIdentity, { scope: 'canonical', signal: options.signal, owns,
+          onProof: current => { proofCurrent = current; } })
+          .then(result => {
+            if (!owns() || !proofCurrent() || primaryPromptPublicationFingerprint(identity) !== identityFingerprint || !owns()) throw Object.assign(new Error('Canonical prompt recovery owner changed'), { code: 'HISTORY_READ_CANCELLED' });
+            return !!result;
+          }).catch(cause => { throw canonicalPromptRecoveryReadError(cause); });
+      } catch (cause) { throw canonicalPromptRecoveryReadError(cause); }
+    }
+    // Only explicit legacy/composite uses arrays; UNKNOWN never falls through.
+    return serverHasPromptEntry(rawServerEntriesRef.current, localIdentity);
+  }, [durablePromptOwnerRef, historyOwnerKey, primaryRootReadEnabled, primaryPromptPublicationFingerprint, tabId, toolType]);
 
   const upsertLocalRewindEntry = useCallback((detail: {
     tabId?: string;
@@ -17226,7 +19465,7 @@ function HistoryPanel({
       rewindDraftPresentationRef.current.delete(opId);
       setEntries(prev => {
         const nextEntries = prev.filter(entry => entry.uuid !== uuid);
-        presentationEntriesRef.current = nextEntries;
+        if (!publishHistoryRows(nextEntries)) return prev;
         persistVolatileOverlay(historySnapshotOwner, nextEntries);
         return nextEntries;
       });
@@ -17248,7 +19487,7 @@ function HistoryPanel({
     const removeLocalRewindEntry = () => {
       setEntries(prev => {
         const nextEntries = prev.filter(entry => entry.uuid !== uuid);
-        presentationEntriesRef.current = nextEntries;
+        if (!publishHistoryRows(nextEntries)) return prev;
         persistVolatileOverlay(historySnapshotOwner, nextEntries);
         return nextEntries;
       });
@@ -17315,22 +19554,22 @@ function HistoryPanel({
       };
       const next = idx < 0 ? [...prev, nextEntry] : [...prev];
       if (idx >= 0) next[idx] = { ...next[idx], ...nextEntry };
-      presentationEntriesRef.current = next;
+      if (!publishHistoryRows(next)) return prev;
       persistVolatileOverlay(historySnapshotOwner, next);
       return next;
     });
-  }, [historySnapshotOwner, persistVolatileOverlay, sessionId, setHistoryPromptDraft, setHistoryRewindPreview, tabId, toolType]);
+  }, [publishHistoryRows, historySnapshotOwner, persistVolatileOverlay, sessionId, setHistoryPromptDraft, setHistoryRewindPreview, tabId, toolType]);
 
   const dismissLocalRewindPresentation = useCallback((entry: FullHistoryEntry) => {
     if (entry.role !== 'rewind' || !entry.uuid.startsWith(LOCAL_REWIND_PREFIX)) return;
     setEntries((previous) => {
       const next = previous.filter((candidate) => candidate.uuid !== entry.uuid);
       if (next.length === previous.length) return previous;
-      presentationEntriesRef.current = next;
+      if (!publishHistoryRows(next)) return previous;
       persistVolatileOverlay(historySnapshotOwner, next);
       return next;
     });
-  }, [historySnapshotOwner, persistVolatileOverlay]);
+  }, [publishHistoryRows, historySnapshotOwner, persistVolatileOverlay]);
 
   useEffect(() => {
     const previousOwner = rewindPreviewOwnerRef.current;
@@ -17353,7 +19592,99 @@ function HistoryPanel({
     };
   }, [tabId, setHistoryRewindPreview]);
 
+  const primaryPromptConsumptionEpochRef = useRef(0);
+  const consumePrimaryMaterializedPromptHandoffs = useCallback(() => {
+    const epoch = ++primaryPromptConsumptionEpochRef.current;
+    const root = primaryRootRef.current, header = root?.header;
+    const ownerKey = historyOwnerKeyRef.current, generation = historyOwnerGenerationRef.current;
+    const dataSubject = root?.getReceiptDataSubject();
+    const currentPass = () => primaryPromptConsumptionEpochRef.current === epoch
+      && historyOwnerKeyRef.current === ownerKey && historyOwnerGenerationRef.current === generation
+      && primaryRootRef.current === root && !!root && !root.closed && root.header === header
+      && root.getReceiptDataSubject() === dataSubject && primaryReceiptCommitRef.current?.root === root
+      && primaryReceiptCommitRef.current.dataSubject === dataSubject
+      && primaryReceiptCommitRef.current.ownerKey === ownerKey && primaryReceiptCommitRef.current.generation === generation;
+    if (!currentPass()) return;
+    const handoffs = [...getHistoryPromptHandoffsSnapshot(tabId)]
+      .sort((left, right) => left.submittedAt - right.submittedAt);
+    const consumedServerUuids = new Set<string>();
+    void (async () => {
+      for (const handoff of handoffs) {
+        if (!currentPass()) return;
+        if (handoff.toolType !== toolType) continue;
+      const carrierProof = handoff.auditProof || handoff.providerQueueProof;
+      const localIdentity: FullHistoryEntry = {
+        uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoff.handoffId,
+        role: 'queued',
+        timestamp: new Date(handoff.submittedAt).toISOString(),
+        content: normalizeHistoryPromptText(handoff.text),
+        sessionId: carrierProof?.sessionId || handoff.sessionIdHint || sessionId,
+        optimisticAt: handoff.submittedAt,
+        queueStatus: handoff.queueStatus,
+        statusReason: handoff.statusReason,
+        requiresAuditIdentity: handoff.requiresAuditIdentity,
+        auditTimestamp: handoff.auditProof?.auditTimestamp,
+        auditHash: handoff.auditProof?.actualHash,
+        auditSessionId: handoff.auditProof?.sessionId || undefined,
+        auditEntryUuid: handoff.auditProof?.entryUuid,
+        sourceIdentity: carrierProof?.sourceIdentity,
+        recordByteOffset: carrierProof?.recordByteOffset,
+      };
+        const claim = capturePrimaryPromptAdoption(handoff.handoffId,
+          { committed: true, expectedHandoff: handoff, extra: [localIdentity, carrierProof] });
+        if (!claim) continue;
+        let ackOwnsLease = false, proofCurrent = () => false;
+        const valid = (expected = handoff) => currentPass() && proofCurrent() && claim.valid(expected)
+          && currentPass() && claim.owns(expected);
+        try {
+        const owns = () => currentPass() && claim.owns();
+        const result = await root!.readPromptAdoption(localIdentity, { scope: 'canonical', committed: true,
+          excludedUuids: consumedServerUuids, legacyHandoff: handoff, owns,
+          onProof: current => { proofCurrent = current; } });
+        if (!currentPass()) return;
+        if (!valid() || !result) continue;
+        const matched = result.entry as FullHistoryEntry;
+        // Reservation belongs to the WHOLE ordered pass, before any enrichment
+        // or ACK. A failed CAS/ACK cannot donate this UUID to a later handoff.
+        consumedServerUuids.add(matched.uuid);
+        if (result.legacy) {
+          if (!claim.adopt()) continue;
+          consumeLocalPromptEntry(handoff.handoffId, 'legacy-orchestration-materialized',
+            { owner: handoff, operationKey: handoff.sendOperationKey, attemptId: handoff.sendAttemptId },
+            () => valid());
+          continue;
+        }
+        const ackInput = {
+          operationKey: handoff.sendOperationKey, attemptId: handoff.sendAttemptId,
+          handoffId: handoff.handoffId, provider: handoff.toolType,
+          sessionId: carrierProof?.sessionId || handoff.sessionIdHint,
+          auditEntryUuid: handoff.auditProof?.entryUuid, auditSourceIdentity: carrierProof?.sourceIdentity,
+        };
+        if (!claim.adopt() || !valid()) continue;
+        const materializedOwner = adoptHistoryPromptHandoffCanonicalEntryIfCurrent(tabId, handoff.handoffId, handoff, {
+          entryUuid: matched.uuid, sessionId: matched.sessionId,
+          sourceIdentity: matched.sourceIdentity, sourceIdentityAliases: matched.sourceIdentityAliases,
+        });
+        if (!materializedOwner || !valid(materializedOwner)) continue;
+        // ACK keeps the original audited carrier pair. Only the immutable
+        // successor returned by OUR promotion may own the eventual consume.
+        ackOwnsLease = true;
+        void acknowledgeMaterializedHistoryReceipt(ackInput, matched).then(acknowledged => {
+          if (!acknowledged || !valid(materializedOwner)) return;
+          if (!consumeHistoryPromptHandoffIfCurrent(tabId, handoff.handoffId, materializedOwner)) return;
+          historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) + ' handoff=' + handoff.handoffId
+            + ' proof=' + (handoff.auditProof ? 'audit' : handoff.providerQueueProof ? 'provider-queue' : 'fallback'));
+        }).catch((error: any) => historyDiag('PRIMARY_PROMPT_ACK_UNKNOWN tab=' + tabId.slice(-12)
+          + ' code=' + String(error?.code || error?.message || error))).finally(claim.close);
+        } finally { if (!ackOwnsLease) claim.close(); }
+      }
+    })().catch((error: any) => historyDiag('PRIMARY_PROMPT_HANDOFF_UNKNOWN tab=' + tabId.slice(-12)
+      + ' code=' + String(error?.code || error?.message || error)));
+  }, [acknowledgeMaterializedHistoryReceipt, capturePrimaryPromptAdoption,
+    consumeLocalPromptEntry, sessionId, tabId, toolType]);
+
   const consumeMaterializedPromptHandoffs = useCallback((serverEntries: FullHistoryEntry[]) => {
+    if (primaryPhysicalCandidate) { consumePrimaryMaterializedPromptHandoffs(); return; }
     const consumedServerUuids = new Set<string>();
     const handoffs = [...getHistoryPromptHandoffsSnapshot(tabId)]
       .sort((left, right) => left.submittedAt - right.submittedAt);
@@ -17389,19 +19720,20 @@ function HistoryPanel({
       if (!matched) continue;
       consumedServerUuids.add(matched.uuid);
       if (legacyOrchestrationMatch) {
-        consumeHistoryPromptHandoff(tabId, handoff.handoffId);
-        removeLocalPromptEntry(handoff.handoffId, 'legacy-orchestration-materialized');
+        consumeLocalPromptEntry(handoff.handoffId, 'legacy-orchestration-materialized',
+          { owner: handoff, operationKey: handoff.sendOperationKey, attemptId: handoff.sendAttemptId });
         historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
           ' handoff=' + handoff.handoffId +
           ' proof=orchestration-run-tag');
         continue;
       }
-      adoptHistoryPromptHandoffCanonicalEntry(tabId, handoff.handoffId, {
+      const materializedOwner = adoptHistoryPromptHandoffCanonicalEntryIfCurrent(tabId, handoff.handoffId, handoff, {
         entryUuid: matched.uuid,
         sessionId: matched.sessionId,
         sourceIdentity: matched.sourceIdentity,
         sourceIdentityAliases: matched.sourceIdentityAliases,
       });
+      if (!materializedOwner) continue;
       void acknowledgeMaterializedHistoryReceipt({
         operationKey: handoff.sendOperationKey,
         attemptId: handoff.sendAttemptId,
@@ -17412,7 +19744,7 @@ function HistoryPanel({
         auditSourceIdentity: carrierProof?.sourceIdentity,
       }, matched).then((acknowledged) => {
         if (!acknowledged) return;
-        consumeHistoryPromptHandoff(tabId, handoff.handoffId);
+        if (!consumeHistoryPromptHandoffIfCurrent(tabId, handoff.handoffId, materializedOwner)) return;
         historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
           ' handoff=' + handoff.handoffId +
           ' proof=' + (handoff.auditProof
@@ -17422,12 +19754,25 @@ function HistoryPanel({
               : 'fallback'));
       });
     }
-  }, [acknowledgeMaterializedHistoryReceipt, removeLocalPromptEntry, sessionId, tabId, toolType]);
+  }, [acknowledgeMaterializedHistoryReceipt, consumeLocalPromptEntry, consumePrimaryMaterializedPromptHandoffs,
+    primaryPhysicalCandidate, removeLocalPromptEntry, sessionId, tabId, toolType]);
 
   // Load full history
-  const runHistoryLoad = useCallback(async (isRefresh = false, signal?: AbortSignal) => {
+  const runHistoryLoad = useCallback(async (isRefresh = false, signal?: AbortSignal, requestedClass: HistoryPrimaryRequestClass = 'source') => {
     const ownerKeyAtStart = historyOwnerKey;
     const generationAtStart = historyOwnerGenerationRef.current;
+    const ordinaryHydrationAtStart = hydrationRequestInFlightRef.current && !primaryRootRef.current
+      ? { sequence: hydrationRequestSeqRef.current, visit: historyPresentationProofRef.current.visit }
+      : null;
+    // Capture before the first await. Transport's real read ID is observed on
+    // its existing invoke; neither a later input nor a result creates this ID.
+    const historyDiagnosticAttempt = historyCommitDiagnosticsRef.current?.begin({
+      ownerKey: ownerKeyAtStart, sessionId, generation: generationAtStart,
+      presentationVisit: historyPresentationProofRef.current.visit,
+    }, currentUIActionId(), 'read');
+    const historyInvoke = ipcRenderer.invoke.bind(ipcRenderer);
+    const historyDiagnosticInvoke = historyCommitDiagnosticsRef.current?.observeRead(historyDiagnosticAttempt, historyInvoke)
+      || historyInvoke;
     const loadSequence = ++historyLoadSequenceRef.current;
     const loadStartedAt = Date.now();
     const isCurrentOwner = () => (
@@ -17436,20 +19781,29 @@ function HistoryPanel({
     );
     const waitForHistoryApplySlot = async (phase: string, priority: {
       lightweightServiceDelta?: boolean;
+      visibleHydrationDelta?: () => boolean;
       changedCount?: number;
       changedBytes?: number;
     } = {}) => {
-      // Initial foreground paint is the only apply that may stay on the
-      // current lane. Every refresh and every hidden cold load first enters a
-      // browser background task; queued wheel input therefore gets to mark
-      // the global hold before React reconciliation is even scheduled.
+      // Missing bodies of the current visible viewport are foreground work,
+      // too. Only an exact bounded hydration delta gets this promotion;
+      // ordinary refreshes and hidden loads retain the background input lane.
       const shouldBypass = () => shouldBypassHistoryApplyPriority({
         phase,
         presented: historyPresentationProofRef.current.presented,
         ownerCurrent: isCurrentOwner(),
         lightweightServiceDelta: priority.lightweightServiceDelta === true,
+        visibleHydrationDelta: priority.visibleHydrationDelta?.() === true,
       });
       if (shouldBypass()) {
+        if (priority.visibleHydrationDelta?.() === true && isCurrentOwner()
+          && historyPresentationProofRef.current.presented) {
+          historyDiag('LOAD_APPLY_PRIORITY tab=' + tabId.slice(-12)
+            + ' seq=' + loadSequence + ' phase=' + phase
+            + ' outcome=visible-viewport-body waitedMs=0'
+            + ' changed=' + (priority.changedCount ?? -1)
+            + ' estimatedMemoryBytes=' + (priority.changedBytes ?? -1));
+        }
         if (priority.lightweightServiceDelta
           && isCurrentOwner()
           && historyPresentationProofRef.current.presented) {
@@ -17487,7 +19841,7 @@ function HistoryPanel({
       historyRevisionRef.current = null;
       // A fresh tab can own PREPARING before its first SID exists.
       const localEntries = presentationEntriesRef.current.filter(isLocalPromptEntry);
-      presentationEntriesRef.current = localEntries;
+      if (!publishHistoryRows(localEntries, isCurrentOwner)) return false;
       setEntries((current) => current.length === localEntries.length && current.every((row, index) => row === localEntries[index])
         ? current : localEntries);
       historyLoaderReasonRef.current = 'no-session';
@@ -17562,12 +19916,189 @@ function HistoryPanel({
         hydrate: toolType === 'codex'
           ? {
               centerUuid: hydrationCenterUuidRef.current,
-              radius: HISTORY_HYDRATION_RADIUS_ROWS,
+              radius: hydrationRadiusRef.current,
               alwaysHydrateTail: HISTORY_HYDRATION_TAIL_ROWS,
             }
           : null,
       };
-      let result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, requestPayload, { signal });
+      if (primaryRootReadEnabled && toolType === 'codex' && primaryCompositeOwnerRef.current !== ownerKeyAtStart) {
+        let model = primaryRootRef.current;
+        if (!model || model.closed) {
+          model = new HistoryPrimaryRootReadModel(historyDiagnosticInvoke, historyPrimaryTransport);
+          primaryRootRef.current = model;
+        }
+        const composition = primaryPresentationRef.current;
+        const compositionFingerprint = historyPrimaryPanelInputFingerprint(composition,
+          suppressedPromptsRef.current, groupCaptionSelectionsRef.current, historyPrimaryToolClaimFingerprint);
+        // Recheck at execution, not when the change was queued. A source or
+        // semantic request may have superseded an expansion while we awaited.
+        const requestClass = requestedClass === 'view'
+          ? historyPrimaryCompositionRequestClass(primaryCompositionAppliedRef.current, composition,
+            suppressedPromptsRef.current, model.header, primarySuppressionCountAppliedRef.current) : normalizeHistoryPrimaryRequestClass(requestedClass);
+        const capturedSuppressionCount = suppressedPromptsRef.current.size;
+        const requestVersion = primaryRequestVersionRef.current;
+        const viewWitness = { entries: presentationEntriesRef.current, live: liveProjectionRef.current,
+          results: liveToolResultsRef.current, rewind: useUIStore.getState().historyRewindPreviews[tabId] };
+        // Only this request's proved publication may advance the entries witness.
+        // Keep the original viewWitness and every non-row subject unchanged.
+        const viewPublicationEntries = { current: viewWitness.entries };
+        const viewCurrent = () => requestClass !== 'view' || (
+          primaryRequestVersionRef.current === requestVersion
+          && primaryRootRef.current === model
+          && presentationEntriesRef.current === viewPublicationEntries.current
+          && liveProjectionRef.current === viewWitness.live
+          && liveToolResultsRef.current === viewWitness.results
+          && useUIStore.getState().historyRewindPreviews[tabId] === viewWitness.rewind
+          && historyPrimaryCompositionRequestClass(composition, primaryPresentationRef.current,
+            suppressedPromptsRef.current, model.header, capturedSuppressionCount) === 'view'
+        );
+        if (!model.header) {
+          primaryColdReadFailureRef.current = null;
+          setHistoryLoadError(null);
+          setLoading(true);
+        }
+        let outcome;
+        try {
+          outcome = await model.open(historyPrimaryRequestPayload({ toolType, sessionId, cwd, tabId },
+            requestClass, composition, suppressedPromptsRef.current, model.header), {
+          signal, owns: () => isCurrentOwner() && viewCurrent(),
+          presentationScope: {ownerKey:ownerKeyAtStart,generation:generationAtStart,
+            visit:historyPresentationProofRef.current.visit,presented:historyPresentationProofRef.current.presented},
+          beforeAdopt: () => waitForHistoryApplySlot(isRefresh ? 'root-refresh' : 'root-cold'),
+          prepareAdopt: async (candidate) => {
+            const currentRows = new WeakRef(presentationEntriesRef.current);
+            const localPublication = primarySparsePublicationOwner.publishCompatibility(presentationEntriesRef.current, {
+              ownerKey: ownerKeyAtStart, generation: generationAtStart,
+            });
+            const currentLocals = () => isCurrentOwner() && !signal?.aborted && viewCurrent()
+              && presentationEntriesRef.current === currentRows.deref()
+              && primarySparsePublicationOwner.current() === localPublication;
+            const proof = await candidate.preparePromptAdoptionSparse(localPublication.rows.slice(), composition.localEntries, {
+              isLocal: entry => isLocalPromptEntry(entry) || isLocalRewindEntry(entry) || isLocalCompactErrorEntry(entry),
+              suppressions: Array.from(suppressedPromptsRef.current.values()), signal, owns: currentLocals,
+            });
+            // Np is still required by the named grouping/geometry adapters.
+            // Its exact original graph is used ONLY in this explicit adapter.
+            const next = proof.materializeCompatibility(candidate.metadata.entries as FullHistoryEntry[]);
+            return Object.freeze({ ...proof, entries: next });
+          },
+          adopt: (adopted, promptAdoption) => {
+            if (!isCurrentOwner() || signal?.aborted || !viewCurrent() || !promptAdoption?.isCurrent()) return;
+            // Prepared Np compatibility remains real and OPEN. Canonical Nc
+            // validation is a checked owner fact, never a raw/committed array.
+            const adoptedMetadata = adopted.metadata;
+            const canonicalMetadataFact = adoptedMetadata?.canonicalMetadataFact;
+            const canonicalHeader = adopted.header;
+            const canonicalDataSubject = adopted.getReceiptDataSubject();
+            if (!adoptedMetadata || !canonicalMetadataFact || !canonicalHeader || !canonicalDataSubject)
+              throw new Error('HISTORY_PRIMARY_CANONICAL_METADATA_REQUIRED');
+            lastServerEntryUuidsRef.current = new Set();
+            // Primary tool-result retirement is a held semantic-cut query
+            // after React commit below. These thin stubs contain no actions.
+            reconcileCodexEffectiveSettings(tabId, sessionId, [], { effective: adoptedMetadata.effectiveSettings });
+            // The prepared cut proved genuinely late CURRENT locals before
+            // publication. No thin metadata row enters the native matcher.
+            const next = promptAdoption.entries as FullHistoryEntry[];
+            historyPresentationApplyGuardRef.current('primary-root');
+            if (!isCurrentOwner() || signal?.aborted || !viewCurrent() || !promptAdoption.isCurrent()
+              || adopted.header !== canonicalHeader || adopted.getReceiptDataSubject() !== canonicalDataSubject) return;
+            primarySparsePublicationOwner.adopt(promptAdoption, next, { ownerKey: ownerKeyAtStart, generation: generationAtStart });
+            primaryPreparedCompatibilityRef.current = { origin: promptAdoption.prepared.capability, entries: adoptedMetadata.entries };
+            if (!publishHistoryRows(next)) return;
+            setEntries(next);
+            // The original full proof above owned currentRows. Publishing next
+            // deliberately changes that ref; retain its owner/cut fence here.
+            const viewRewindAfterApply = requestClass === 'view'
+              ? useUIStore.getState().historyRewindPreviews[tabId] : viewWitness.rewind;
+            if (!isCurrentOwner() || signal?.aborted || primaryRootRef.current !== adopted || presentationEntriesRef.current !== next
+              || requestClass === 'view' && (primaryRequestVersionRef.current !== requestVersion
+                || liveProjectionRef.current !== viewWitness.live
+                || liveToolResultsRef.current !== viewWitness.results || viewRewindAfterApply !== viewWitness.rewind)
+              || adopted.header !== canonicalHeader || adopted.getReceiptDataSubject() !== canonicalDataSubject) return;
+            if (requestClass === 'view') viewPublicationEntries.current = next;
+            primarySurfaceWitnessRef.current = captureHistoryPrimaryPanelWitness({
+              root: adopted, header: canonicalHeader, ownerKey: ownerKeyAtStart, entries: next,
+              rewind: viewWitness.rewind,
+              presentation: composition, fingerprint: compositionFingerprint,
+            });
+            primaryCanonicalDiagnosticRef.current = Object.freeze({ root: adopted,
+              header: canonicalHeader, dataSubject: canonicalDataSubject, ownerKey: ownerKeyAtStart,
+              generation: generationAtStart, fact: canonicalMetadataFact });
+            persistVolatileOverlay(historySnapshotOwner, next);
+            payloadGenerationRef.current = { ownerKey: ownerKeyAtStart, value: canonicalHeader.generation };
+            physicalFileIdentityRef.current = { ownerKey: ownerKeyAtStart, value: canonicalHeader.sourceSnapshot.fileIdentity };
+            setPayloadGeneration(canonicalHeader.generation);
+            historyRevisionRef.current = canonicalHeader.semanticRevisionToken || canonicalHeader.revision;
+            historyCommitDiagnosticsRef.current?.adopt(historyDiagnosticAttempt, {
+              revisionToken: canonicalHeader.semanticRevisionToken || canonicalHeader.revision,
+              payloadGeneration: canonicalHeader.generation,
+              row: canonicalMetadataFact.diagnosticTail.kind === 'row' ? canonicalMetadataFact.diagnosticTail.row : undefined,
+            });
+            // A stale semantic request may merge CURRENT local authoring, but
+            // cannot claim to have composed that newer semantic input. The
+            // existing effect/flight will reconcile it next.
+            primaryCompositionAppliedRef.current = composition;
+            primarySuppressionCountAppliedRef.current = capturedSuppressionCount;
+            setPrimaryRoot(adopted);
+            setPrimaryRootRevision(value => value + 1);
+            setChipsFreshOwnerKey(ownerKeyAtStart);
+            rewindPrefixOnScreenRef.current = null;
+            historyLoaderReasonRef.current = 'primary-root-' + canonicalHeader.mode;
+            setHistoryLoadError(null);
+            setLoading(false);
+            historyDiag('PRIMARY_ROOT_ADOPT tab=' + tabId.slice(-12) + ' seq=' + loadSequence
+              + ' units=' + adopted.totalCount + ' canonicalRows=' + canonicalHeader.canonicalEntryCount
+              + ' preparedStubs=' + adoptedMetadata.entries.length
+              + ' canonicalInventory=0 preparedMetadataOwner=OPEN fullBodyArrays=0 richFull=OPEN geometry=OPEN');
+          },
+          });
+        } catch (error) {
+          // Only cancellation caused by this view's lost local witness is an
+          // optimization miss. Protocol/lease/source errors retain their path.
+          if (requestClass === 'view' && (error as any)?.code === 'HISTORY_READ_CANCELLED'
+            && isCurrentOwner() && !signal?.aborted && !viewCurrent()) {
+            return { kind: 'recompose-required' as const, requiredClass: 'semantic' as const, reason: 'panel-semantic-input-moved' };
+          }
+          throw error;
+        }
+        if (outcome.kind === 'superseded-dependency') return outcome;
+        if (outcome.kind === 'recompose-required') {
+          if (requestClass !== 'view' || (outcome.requiredClass !== 'semantic' && outcome.requiredClass !== 'source')) {
+            throw new Error('HISTORY_PRIMARY_RECOMPOSE_PROTOCOL');
+          }
+          return outcome;
+        }
+        if (outcome.kind === 'root') {
+          if (isRefresh) keepHistoryTailPinnedAfterMutation('primary-root-refresh');
+          // The worker admission is already released. Hold only THIS panel
+          // flight until the actual committed range of the new root is served;
+          // trailing live/source work stays coalesced instead of overtaking it.
+          const window = await model.waitForPresentation({signal,owns:isCurrentOwner,scope:()=>({
+            ownerKey:historyOwnerKeyRef.current,generation:historyOwnerGenerationRef.current,
+            visit:historyPresentationProofRef.current.visit,presented:historyPresentationProofRef.current.presented,
+          })});
+          historyDiag('PRIMARY_ROOT_WINDOW_SETTLED tab=' + tabId.slice(-12) + ' status=' + window.status
+            + ' adoption=' + window.adoptionId + ' lease=' + window.leaseId);
+          if (window.status === 'failed') throw window.error;
+          if (window.status === 'superseded') return {kind:'window-superseded' as const,
+            requiredClass:window.requiredClass === 'semantic' || window.requiredClass === 'source' ? window.requiredClass
+              : historyPrimaryCompositionRequestClass(composition,primaryPresentationRef.current,
+                suppressedPromptsRef.current,model.header,capturedSuppressionCount),reason:window.reason || 'window-moved'};
+          if (window.status === 'cancelled') return false;
+          return true;
+        }
+        if (requestClass === 'view' || outcome.kind !== 'legacy' || outcome.result?.capability !== 'legacy-composite'
+          || outcome.result?.error !== 'HISTORY_ROOT_COMPOSITE_NOT_MIGRATED') {
+          throw new Error('HISTORY_PRIMARY_PROFILE_CONTRACT_REQUIRED');
+        }
+        // This marker can only come from explicit unsupported composite.
+        primaryCompositeOwnerRef.current = ownerKeyAtStart;
+        if (primaryCanonicalDiagnosticRef.current?.root === model) primaryCanonicalDiagnosticRef.current = null;
+        void model.close();
+        primaryRootRef.current = null;
+        setPrimaryRoot(null);
+      }
+      let result = await readHistoryThroughIpc(historyDiagnosticInvoke, ipcChannel, requestPayload, { signal });
       if (result?.success && result.delta === true && isCurrentOwner()) {
         // Reassembly needs the exact baseline the digest described. The raw
         // ref is owner-scoped and set together with the revision ref, so a
@@ -17597,7 +20128,7 @@ function HistoryPanel({
             ' reason=' + (!baselineValid
               ? (baseline.length === 0 ? 'no-baseline' : 'revision-moved')
               : 'missing-row'));
-          result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, { ...requestPayload, ifRevision: null }, { signal });
+          result = await readHistoryThroughIpc(historyDiagnosticInvoke, ipcChannel, { ...requestPayload, ifRevision: null }, { signal });
         }
       }
       if (!isCurrentOwner()) {
@@ -17683,7 +20214,7 @@ function HistoryPanel({
             presentationEntriesRef.current,
           );
           historyPresentationApplyGuardRef.current('unchanged-cache');
-          presentationEntriesRef.current = nextEntries;
+          if (!publishHistoryRows(nextEntries, isCurrentOwner)) return false;
           setEntries(nextEntries);
           persistVolatileOverlay(historySnapshotOwner, nextEntries);
         }
@@ -17716,7 +20247,7 @@ function HistoryPanel({
         const priorityChangedBytes = priorityChangedEntries.length > 0
           ? estimateHistoryValueBytes(
               priorityChangedEntries,
-              HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES + 1,
+              Math.max(HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES, HISTORY_VIEWPORT_HYDRATION_DELTA_MAX_BYTES) + 1,
             )
           : 0;
         const lightweightServiceDelta = isRefresh && isHistoryLightweightServiceDelta({
@@ -17725,8 +20256,23 @@ function HistoryPanel({
           existingUuids: lastServerEntryUuidsRef.current,
           estimatedBytes: priorityChangedBytes,
         });
+        const boundedHydrationDelta = isRefresh && isHistoryViewportHydrationDelta({
+          delta: result.delta === true, rowWindowApplied: result.rowWindowApplied === true,
+          changedEntries: priorityChangedEntries, estimatedBytes: priorityChangedBytes,
+          totalRows: result.entries?.length,
+        });
         await waitForHistoryApplySlot(isRefresh ? 'refresh' : 'cold', {
           lightweightServiceDelta,
+          visibleHydrationDelta: () => boundedHydrationDelta && ordinaryHydrationAtStart !== null
+            && !signal?.aborted && isCurrentOwner() && !primaryRootRef.current
+            && historyPresentationProofRef.current.presented
+            && historyPresentationProofRef.current.visit === ordinaryHydrationAtStart.visit
+            && hydrationRequestSeqRef.current === ordinaryHydrationAtStart.sequence
+            && hydrationRequestInFlightRef.current && historyForegroundPriority.interactionCount() === 0
+            && historyForegroundPriority.hasPendingInput() === false
+            && (!historyForegroundPriority.active() || historyForegroundPriority.owner() === tabId)
+            && ordinaryHistoryDeltaFillsViewport(displayUnitsRef.current, visibleRangeRef.current,
+              groupCaptionSelectionsRef.current, priorityChangedEntries),
           changedCount: priorityChangedEntries.length,
           changedBytes: priorityChangedBytes,
         });
@@ -17799,6 +20345,10 @@ function HistoryPanel({
         const nextRevision = result.revision || null;
         setClaudeMemoryBoundaryUuid(nextBoundaryUuid);
         historyRevisionRef.current = nextRevision;
+        historyCommitDiagnosticsRef.current?.adopt(historyDiagnosticAttempt, {
+          revisionToken: nextRevision?.token, payloadGeneration: nextPayloadGeneration,
+          row: rawServerEntries[rawServerEntries.length - 1],
+        });
         const cacheAccountingStartedAt = performance.now();
         const entriesApproxBytesHint = estimateHistoryEntriesBytesFast(rawServerEntries);
         const cacheResult = historySnapshotCache.set(historySnapshotOwner, {
@@ -17859,7 +20409,7 @@ function HistoryPanel({
             presentationEntriesRef.current,
           );
           console.warn(`[HP] initial load: ${newEntries.length} entries`);
-          presentationEntriesRef.current = newEntries;
+          if (!publishHistoryRows(newEntries, isCurrentOwner)) return false;
           persistVolatileOverlay(historySnapshotOwner, newEntries);
           historyLoaderReasonRef.current = 'load-success';
           // The durable projection replaced any display-only rewind prefix
@@ -17921,7 +20471,7 @@ function HistoryPanel({
                 newEntries.every((entry, idx) => entry === prev[idx]);
               if (sameEntries) return prev;
               console.warn(`[HP] refresh: ${prev.length} → ${newEntries.length}`);
-              presentationEntriesRef.current = newEntries;
+              if (!publishHistoryRows(newEntries, isCurrentOwner)) return prev;
               persistVolatileOverlay(historySnapshotOwner, newEntries);
               return newEntries;
             });
@@ -17978,7 +20528,16 @@ function HistoryPanel({
         return false;
       }
       console.warn('[HistoryPanel] Load error:', e);
-      if (!isRefresh) {
+      if (primaryRootReadEnabled && toolType === 'codex'
+        && primaryCompositeOwnerRef.current !== ownerKeyAtStart && !primaryRootRef.current?.header) {
+        const error = e as any;
+        const message = String(error?.message || '');
+        const sourceChanged = error?.code === 'CODEX_SOURCE_READ_INVALIDATED'
+          || message === 'CODEX_SOURCE_READ_INVALIDATED'
+          || message.endsWith(': CODEX_SOURCE_READ_INVALIDATED');
+        primaryColdReadFailureRef.current = { ownerKey: ownerKeyAtStart, kind: sourceChanged ? 'source-changed' : 'fatal' };
+      }
+      if (!isRefresh || (primaryRootReadEnabled && toolType === 'codex' && primaryCompositeOwnerRef.current !== ownerKeyAtStart)) {
         historyLoaderReasonRef.current = 'load-exception';
         setHistoryLoadError(String((e as any)?.message || e || 'history-load-exception'));
         setLoading(false);
@@ -18003,18 +20562,25 @@ function HistoryPanel({
       // reported as "(open)" forever and blame this load for later freezes.
       endLoadMark();
     }
-  }, [sessionId, cwd, historyOwnerKey, historySnapshotOwner, keepHistoryTailPinnedAfterMutation, materializeHistoryWindowForPresentation, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
+  }, [publishHistoryRows, primarySparsePublicationOwner, sessionId, cwd, historyOwnerKey, historySnapshotOwner, keepHistoryTailPinnedAfterMutation, materializeHistoryWindowForPresentation, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
 
   // One heavyweight History IPC may be active per owner. Events that arrive
   // while it is running collapse into one trailing reconciliation instead of
   // cloning the same large snapshot through Electron in parallel.
-  const loadHistory = useCallback((isRefresh = false): Promise<boolean> => {
+  const loadHistory = useCallback((isRefresh = false, requestedCause?: HistoryPrimaryRequestClass): Promise<boolean> => {
     if (!sessionId) return Promise.resolve(runHistoryLoad(false));
     const ownerKey = historyOwnerKey;
     const generation = historyOwnerGenerationRef.current;
+    // Ordinary boolean callers are source refreshes. Missing/unknown causes
+    // must never opt into borrowing an older physical or semantic snapshot.
+    const requestedClass = normalizeHistoryPrimaryRequestClass(requestedCause);
+    if (requestedClass !== 'view') ++primaryRequestVersionRef.current;
     const active = historyLoadFlightRef.current;
     if (active?.ownerKey === ownerKey && active.generation === generation) {
-      if (isRefresh) active.trailingRefresh = true;
+      if (isRefresh || requestedClass !== active.activeRequestClass) {
+        active.trailingRequestClass = mergeHistoryPrimaryRequestClass(active.trailingRequestClass, requestedClass);
+        active.trailingRefresh = true;
+      }
       historyDiag('LOAD_JOIN tab=' + tabId.slice(-12) +
         ' session=' + sessionId.slice(0, 8) +
         ' refresh=' + (isRefresh ? '1' : '0') +
@@ -18026,22 +20592,61 @@ function HistoryPanel({
       ownerKey: string;
       generation: number;
       trailingRefresh: boolean;
+      trailingRequestClass: HistoryPrimaryRequestClass | null;
+      activeRequestClass: HistoryPrimaryRequestClass;
+      lastDependencyWitness?: string;
       promise: Promise<boolean>;
       controller: AbortController;
     } = {
       ownerKey,
       generation,
       trailingRefresh: false,
+      trailingRequestClass: null,
+      activeRequestClass: requestedClass,
       promise: Promise.resolve(false),
       controller: new AbortController(),
     };
+    historyLoadFlightRef.current = flight;
     flight.promise = (async () => {
       let nextIsRefresh = isRefresh;
+      let nextRequestClass = requestedClass;
       let ok = false;
       do {
         flight.trailingRefresh = false;
-        ok = await runHistoryLoad(nextIsRefresh, flight.controller.signal);
+        flight.trailingRequestClass = null;
+        flight.activeRequestClass = nextRequestClass;
+        const result = await runHistoryLoad(nextIsRefresh, flight.controller.signal, nextRequestClass);
+        ok = result === true;
+        if (result && typeof result === 'object' && result.kind === 'recompose-required') {
+          // Upgrade in THIS flight with the latest refs. A queued source
+          // dominates both a semantic miss and every later view request.
+          flight.trailingRequestClass = mergeHistoryPrimaryRequestClass(flight.trailingRequestClass, result.requiredClass);
+          flight.trailingRefresh = true;
+          historyDiag('PRIMARY_ROOT_RECOMPOSE tab=' + tabId.slice(-12)
+            + ' required=' + result.requiredClass + ' reason=' + result.reason);
+        }
+        if (result && typeof result === 'object' && result.kind === 'window-superseded') {
+          flight.trailingRequestClass = mergeHistoryPrimaryRequestClass(flight.trailingRequestClass,result.requiredClass);
+          flight.trailingRefresh = true;
+        }
+        if (result && typeof result === 'object' && result.kind === 'superseded-dependency') {
+          const key = result.ownerKey + ':' + result.generation + ':' + result.domain + ':' + result.witness.after;
+          if (flight.lastDependencyWitness !== key) {
+            flight.lastDependencyWitness = key;
+            flight.trailingRequestClass = mergeHistoryPrimaryRequestClass(flight.trailingRequestClass,result.requiredClass);
+            flight.trailingRefresh = true;
+          }
+          historyDiag('PRIMARY_ROOT_DEPENDENCY_SUPERSEDED tab=' + tabId.slice(-12) + ' domain=' + result.domain
+            + ' required=' + result.requiredClass + ' witness=' + result.witness.after);
+        }
+        // A real live record may have queued a trailing cold reconciliation.
+        // Only a changed source can consume that wake after refusal. Quota,
+        // corruption/protocol and cancellation never become automatic retries.
+        if (!ok && primaryRootReadEnabled && toolType === 'codex' && !primaryRootRef.current?.header
+          && primaryColdReadFailureRef.current?.ownerKey === ownerKey
+          && primaryColdReadFailureRef.current.kind === 'fatal') flight.trailingRefresh = false;
         nextIsRefresh = true;
+        nextRequestClass = flight.trailingRequestClass || 'source';
       } while (
         flight.trailingRefresh &&
         !flight.controller.signal.aborted &&
@@ -18052,12 +20657,64 @@ function HistoryPanel({
     })().finally(() => {
       if (historyLoadFlightRef.current === flight) historyLoadFlightRef.current = null;
     });
-    historyLoadFlightRef.current = flight;
     return flight.promise;
-  }, [historyOwnerKey, runHistoryLoad, sessionId, tabId]);
+  }, [historyOwnerKey, runHistoryLoad, sessionId, tabId, primaryRootReadEnabled, toolType]);
   // Callers defined ABOVE this declaration (search-match navigation, the
   // Timeline-jump effect) reach the loader through this ref.
   loadHistoryRef.current = loadHistory;
+  const reportPrimaryRootError = useCallback((error: unknown) => {
+    const message = String((error as any)?.code || (error as any)?.message || error);
+    setHistoryLoadError(message);
+    historyDiag('PRIMARY_ROOT_WINDOW_FAILED tab=' + tabId.slice(-12) + ' error=' + message);
+  }, [tabId]);
+  const primaryWindowCommitWakeRef = useRef('');
+  const handlePrimaryWindowCommit = useCallback((outcome: any) => {
+    if (outcome?.status !== 'covered' || outcome.ownerKey !== historyOwnerKeyRef.current
+      || outcome.generation !== historyOwnerGenerationRef.current || outcome.visit !== historyPresentationProofRef.current.visit
+      || !historyPresentationProofRef.current.presented || outcome.leaseId !== primaryRootRef.current?.header?.leaseId) return;
+    const pending = terminalPreviewClearHandoffRef.current;
+    const wakeKey = JSON.stringify([outcome.leaseId,outcome.adoptionId,outcome.surfaceId,
+      outcome.ownerKey,outcome.generation,outcome.visit,outcome.rangeRevision,outcome.from,outcome.to,
+      pending?.previewId,pending?.canonicalIdentity,pending?.phase]);
+    // A list may recommit the same coverage after the handoff's own state
+    // wake. Consume that signal BEFORE setting state; it is not another DOM
+    // transition. A new range/visit/preview phase still gets its own wake.
+    if (primaryWindowCommitWakeRef.current === wakeKey) return;
+    primaryWindowCommitWakeRef.current = wakeKey;
+    if (mountWaveActiveRef.current && mountWaveLaneRef.current) requestHistoryMountWaveStep(mountWaveLaneRef.current);
+    onHistoryHandoffRowMounted();
+  }, [onHistoryHandoffRowMounted]);
+  useLayoutEffect(() => {
+    // Empty History uses its existing explicit empty DOM, so no Virtuoso
+    // Surface exists to acknowledge its zero-length window.
+    if (!primaryRoot || primaryRoot.closed || primaryRoot.totalCount !== 0 || !presented || !primaryInputsCurrent()
+      || !panelRef.current?.querySelector('[data-history-empty-state="empty-transcript"]')) return;
+    const outcome = primaryRoot.commitEmptyPresentation({ownerKey:historyOwnerKey,
+      generation:historyOwnerGenerationRef.current,visit:historyPresentationVisit,presented});
+    if (outcome) handlePrimaryWindowCommit(outcome);
+  }, [primaryRoot,primaryRootRevision,presented,historyOwnerKey,historyPresentationVisit,handlePrimaryWindowCommit,primaryInputsCurrent]);
+  useEffect(() => {
+    if (!primaryRoot || primaryRoot.closed || primaryCompositionAppliedRef.current === primaryPresentation) return;
+    const previous = primaryCompositionAppliedRef.current;
+    historyDiag('PRIMARY_ROOT_COMPOSITION_REQUEST tab=' + tabId.slice(-12)
+      + ' locals=' + (previous?.localEntries !== primaryPresentation.localEntries ? '1' : '0')
+      + ' live=' + (previous?.liveEntries !== primaryPresentation.liveEntries ? '1' : '0')
+      + ' results=' + (previous?.liveToolResults !== primaryPresentation.liveToolResults ? '1' : '0')
+      + ' rewind=' + (previous?.rewindPreview !== primaryPresentation.rewindPreview ? '1' : '0')
+      + ' settingsKeysRef=' + (previous?.settingsPresentationKeys !== primaryPresentation.settingsPresentationKeys ? '1' : '0')
+      + ' settingsKeysBefore=' + (previous?.settingsPresentationKeys?.length ?? -1)
+      + ' settingsKeysAfter=' + primaryPresentation.settingsPresentationKeys.length
+      + ' groupingRef=' + (previous?.grouping !== primaryPresentation.grouping ? '1' : '0')
+      + ' captionRef=' + (previous?.captionSelections !== primaryPresentation.captionSelections ? '1' : '0')
+      + ' suppressionsBefore=' + primarySuppressionCountAppliedRef.current
+      + ' suppressionsAfter=' + suppressedPromptsRef.current.size
+      + ' localCount=' + primaryPresentation.localEntries.length
+      + ' liveCount=' + primaryPresentation.liveEntries.length);
+    // This is an existing-state change, not polling or a second executor.
+    void loadHistory(true, historyPrimaryCompositionRequestClass(previous, primaryPresentation,
+      suppressedPromptsRef.current, primaryRoot.header, primarySuppressionCountAppliedRef.current));
+  }, [primaryPresentation, primaryRoot, loadHistory, tabId]);
+
 
   // Row-window hydration watcher.
   //
@@ -18069,17 +20726,52 @@ function HistoryPanel({
   // tab's span). The rows main shipped cannot drift from themselves.
   //
   // Deliberately NOT event-throttled by a timer: one request in flight at a
-  // time, and a request is only issued when a stub sits within the margin. A
-  // fully hydrated neighbourhood issues nothing at all, so scrolling inside
-  // the span is free; the scan itself is O(margin) property reads.
+  // time, and a request is issued only for a visible missing body. A covered
+  // viewport issues nothing; the raw UUID map translates grouped coordinates.
   const maybeRequestHistoryHydration = useCallback((reason: string) => {
     if (toolType !== 'codex') return;
+    // Primary bodies belong to the independently leased viewport window.
+    // Its all-ID/action metadata deliberately remains stubs: the legacy
+    // hydrator must not treat them as a reason to reopen the complete root.
+    if (primaryRootRef.current?.header) return;
     // This watcher follows a reader's viewport. A retained hidden list may
     // publish a transient range, but that is not a new reading position.
     // Explicit search/jump hydration and the initial cold load use their own
     // admission paths and remain available in the background.
     if (!historyPresentationProofRef.current.presented) return;
-    if (hydrationRequestInFlightRef.current) return;
+    if (hydrationRequestInFlightRef.current) {
+      // A new visible range may arrive while the preceding window loads.
+      // Retain only a wake for this visit, never its stale row/centre values.
+      hydrationRangePendingRef.current = { ownerKey: historyOwnerKeyRef.current,
+        generation: historyOwnerGenerationRef.current, visit: historyPresentationProofRef.current.visit };
+      return;
+    }
+    // A converging Timeline jump owns the centre; ranges published while it
+    // hunts are transit, not reading positions.
+    if (historyJumpHydrationActiveRef.current) return;
+    // A position restore is transit too — and this is the one that cost a
+    // whole tab.
+    //
+    // Switching to a tab remounts the list, and the list publishes its first
+    // range (rows 0-9, the top) BEFORE the restore has moved it to where the
+    // person was reading. The watcher believed that range: it saw stubs at
+    // row 0, asked main to hydrate around row 0 — and main's answer evicted
+    // the span the reader was actually in. Live 18.08 01:50:31: `range=0-9
+    // stubAt=0` immediately after the switch, the readable span moved from
+    // 645-1394 to 0-750, and the tab went grey until it was clicked again.
+    //
+    // A jump restore already knew this; the position restore is the same fact
+    // — the viewport is being MOVED, not read — and it already has a signal.
+    // Ranges during the hunt are a machine scrolling, not a person reading,
+    // and only a person's position deserves the hydrated span.
+    if (reason === 'range-idle' && historyRestoreInFlightRef.current !== 0) return;
+    // Demand only bodies that actually appear in this viewport. Compute the
+    // centre in raw-row coordinates, including gaps hidden by grouping.
+    const range = visibleRangeRef.current;
+    const demand = ordinaryHistoryHydrationDemand(
+      rawServerEntriesRef.current, displayUnitsRef.current, range, groupCaptionSelectionsRef.current,
+    );
+    if (!demand) return;
     // Oscillation breaker (see HYDRATION_BURST_*): viewport-driven hydration
     // must converge. A burst that does not is a loop, and a loop makes the
     // whole app stutter — stop asking until the user scrolls again.
@@ -18101,52 +20793,12 @@ function HistoryPanel({
         return;
       }
     }
-    // A converging Timeline jump owns the centre; ranges published while it
-    // hunts are transit, not reading positions.
-    if (historyJumpHydrationActiveRef.current) return;
-    // A position restore is transit too — and this is the one that cost a
-    // whole tab.
-    //
-    // Switching to a tab remounts the list, and the list publishes its first
-    // range (rows 0-9, the top) BEFORE the restore has moved it to where the
-    // person was reading. The watcher believed that range: it saw stubs at
-    // row 0, asked main to hydrate around row 0 — and main's answer evicted
-    // the span the reader was actually in. Live 18.08 01:50:31: `range=0-9
-    // stubAt=0` immediately after the switch, the readable span moved from
-    // 645-1394 to 0-750, and the tab went grey until it was clicked again.
-    //
-    // A jump restore already knew this; the position restore is the same fact
-    // — the viewport is being MOVED, not read — and it already has a signal.
-    // Ranges during the hunt are a machine scrolling, not a person reading,
-    // and only a person's position deserves the hydrated span.
-    if (reason === 'range-idle' && historyRestoreInFlightRef.current !== 0) return;
-    // Anchor on the STUB, never on the viewport midpoint (the midpoint anchor
-    // looped in production 16.08 ~01:08 — grouping moved it to a different
-    // entry after every response, and that entry often could not anchor a
-    // span at all). The stub search itself is bounded in ENTRIES and skips
-    // collapsed groups — see findHistoryHydrationStub for the second loop
-    // this closed (16.08 ~02:04: two stub flanks wider than one window,
-    // every response evicting the other flank, ~7 reloads/s standing still).
-    const range = visibleRangeRef.current;
-    const found = findHistoryHydrationStub(
-      displayUnitsRef.current,
-      range,
-      HISTORY_HYDRATION_REFETCH_MARGIN_ROWS,
-      groupCaptionSelectionsRef.current,
-    );
-    if (!found) return;
-    const stubEntry = found.entry as FullHistoryEntry;
-    const centerUuid = found.caption === true ? stubEntry.uuid : historyHydrationCenterForRange(
-      displayUnitsRef.current,
-      range,
-      stubEntry.uuid || null,
-    );
+
     requestHistoryHydrationAt(
-      centerUuid,
+      demand.centerUuid,
       reason,
-      ' range=' + range.start + '-' + range.end
-        + ' stubAt=' + found.index
-        + ' stub=' + String(stubEntry.uuid || '').slice(0, 8),
+      ' range=' + range.start + '-' + range.end + ' stub=' + demand.stubUuid.slice(0, 8),
+      demand.radius,
     );
   }, [requestHistoryHydrationAt, toolType]);
 
@@ -18173,6 +20825,7 @@ function HistoryPanel({
       maybeRequestHistoryHydration('range-idle');
     }, HISTORY_HYDRATION_RANGE_IDLE_MS);
   }, [historyScrollSeekController, maybeRequestHistoryHydration]);
+  hydrationRangeCheckRef.current = scheduleHistoryHydrationRangeCheck;
 
   // A stable show can reuse every DOM row without another rangeChanged.
   // Recheck that current range once its exact owner/visit is painted, so a
@@ -18202,15 +20855,20 @@ function HistoryPanel({
     ownerKey = historyOwnerKey,
   ) => {
     const generation = historyOwnerGenerationRef.current;
+    let observedUnmatched: boolean | null = null;
     const result = await flushHistoryDurableWithRetry({
       load: () => loadHistory(true),
       isCurrent: () => (
         historyOwnerKeyRef.current === ownerKey
         && historyOwnerGenerationRef.current === generation
       ),
-      hasUnmatchedLive: () => hasUnmatchedLiveForOwner(ownerKey),
+      hasUnmatchedLive: async () => {
+        observedUnmatched = await hasUnmatchedLiveForOwner(ownerKey);
+        return observedUnmatched;
+      },
     });
-    if (result.stale) return false;
+    if (result.stale || historyOwnerKeyRef.current !== ownerKey
+      || historyOwnerGenerationRef.current !== generation) return false;
     deferredTranscriptRefreshRef.current = !result.settled;
     historyDiag((result.settled ? 'TRANSCRIPT_FLUSH_SETTLED' : 'TRANSCRIPT_FLUSH_PENDING')
       + ' tab=' + tabId.slice(-12)
@@ -18219,7 +20877,7 @@ function HistoryPanel({
       + ' reason=' + reason
       + ' attempts=' + result.attempts
       + ' loadSuccess=' + (result.success ? '1' : '0')
-      + ' unmatched=' + (hasUnmatchedLiveForOwner(ownerKey) ? '1' : '0'));
+      + ' unmatched=' + (observedUnmatched === null ? 'unknown' : observedUnmatched ? '1' : '0'));
     return result.settled;
   }, [
     hasUnmatchedLiveForOwner,
@@ -18255,6 +20913,7 @@ function HistoryPanel({
         changed = true;
       }
       if (!changed) return;
+      setPrimarySuppressionRevision(value => value + 1);
       const rawSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
       if (!rawSnapshot) {
         void loadHistory(false);
@@ -18269,32 +20928,46 @@ function HistoryPanel({
         ).entries,
         presentationEntriesRef.current,
       );
-      presentationEntriesRef.current = nextEntries;
+      if (!publishHistoryRows(nextEntries)) return;
       setEntries(nextEntries);
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
     }, Math.max(0, nextExpiry - Date.now()) + 10);
     return () => clearTimeout(timer);
-  }, [entries, historyOwnerKey, historySnapshotOwner, loadHistory, persistVolatileOverlay, reconcileLiveToolResultsAgainstDurable]);
+  }, [entries, historyOwnerKey, historySnapshotOwner, loadHistory, persistVolatileOverlay, publishHistoryRows, reconcileLiveToolResultsAgainstDurable]);
 
   const waitForDurableRewindHistory = useCallback(async (detail: {
     targetUuid?: string;
     opId?: string;
     toolType?: string;
   }) => {
+    const ownerKey = historyOwnerKeyRef.current;
+    const ownerGeneration = historyOwnerGenerationRef.current;
+    const ownsPanel = () => historyOwnerKeyRef.current === ownerKey
+      && historyOwnerGenerationRef.current === ownerGeneration;
+    const assertCurrent = (owns = ownsPanel) => {
+      if (!owns()) throw Object.assign(new Error('HISTORY_READ_CANCELLED'), { code: 'HISTORY_READ_CANCELLED' });
+    };
     const targetUuid = detail.targetUuid || '';
     for (let attempt = 0; attempt < 6; attempt++) {
+      assertCurrent();
       const ok = await loadHistory(true);
+      assertCurrent();
+      const root = primaryRootRef.current;
+      const ownsRoot = () => ownsPanel() && primaryRootRef.current === root;
       const serverEntryUuids = lastServerEntryUuidsRef.current;
-      const targetStillVisible = !!targetUuid && serverEntryUuids.has(targetUuid);
+      const targetStillVisible = root?.header
+        ? await root.hasCanonicalUuid(targetUuid, { owns: ownsRoot }) : !!targetUuid && serverEntryUuids.has(targetUuid);
+      assertCurrent(ownsRoot);
       historyDiag('REWIND_REFRESH tab=' + tabId.slice(-12) +
         ' op=' + (detail.opId || '-') +
         ' attempt=' + (attempt + 1) +
         ' ok=' + ok +
         ' targetStillVisible=' + targetStillVisible +
-        ' server=' + serverEntryUuids.size);
+        ' server=' + (root?.header ? root.header.canonicalEntryCount : serverEntryUuids.size));
       if (!targetStillVisible) return true;
       await new Promise((resolve) => setTimeout(resolve, attempt < 2 ? 140 : 320));
     }
+    assertCurrent();
     return false;
   }, [loadHistory, tabId]);
 
@@ -18418,7 +21091,8 @@ function HistoryPanel({
         return !!emptyState && emptyState.getBoundingClientRect().height > 0;
       },
       () => {
-        if (!ownsEmptyPaint() || surfacePresentedOwnerRef.current === presentedProofKey) return;
+        if (!ownsEmptyPaint()) return false;
+        if (surfacePresentedOwnerRef.current === presentedProofKey) return true;
         const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
           ? 'hit'
           : 'miss';
@@ -18430,7 +21104,7 @@ function HistoryPanel({
           domRows: 0,
           foreignDomRows: 0,
           cache: cacheAtPaint,
-        })) return;
+        })) return false;
         // `loader=` must report the ACTUAL loader state, not a constant. This
         // branch hard-coded `hidden`, so an empty-state frame — a legitimately
         // painted "no history" placeholder — was indistinguishable in the log
@@ -18446,6 +21120,7 @@ function HistoryPanel({
           + ' domRows=0 foreignDomRows=0'
           + ' loader=' + (visibleSurfaceLoadingRef.current ? 'visible' : 'hidden')
           + ' proof=painted-empty-state');
+        return true;
       },
     );
     return () => emptyPaintProbe.cancel();
@@ -18462,6 +21137,11 @@ function HistoryPanel({
     historyPresentationVisit,
   ]);
 
+  // Only the automatic initial demand waits for presentation. Explicit and live
+  // refreshes continue to use loadHistory directly.
+  const pendingInitialHistoryRef = useRef<{ ownerKey: string; generation: number; cached: boolean; scheduled: boolean } | null>(null);
+  const wakeInitialHistoryRef = useRef<(() => void) | null>(null);
+
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
   const appliedHistoryPresentationRef = useRef({
@@ -18477,6 +21157,7 @@ function HistoryPanel({
       presented: proof.presented,
       visit: proof.visit,
     };
+    if (proof.presented) wakeInitialHistoryRef.current?.();
 
     // The old dormant representation changed every pane to full-screen and
     // changed stacked composers to regular height. A restore was therefore
@@ -18559,6 +21240,7 @@ function HistoryPanel({
         panelRef.current?.setAttribute('data-history-presented', proof.presented ? '1' : '0');
         panelRef.current?.setAttribute('data-history-presentation-visit', String(proof.visit));
 
+        if (proof.presented) wakeInitialHistoryRef.current?.();
         if (!geometryStable) remountForChangedGeometry();
         scrollRestoreGenRef.current += 1;
         if (scrollSaveTimerRef.current) {
@@ -18583,6 +21265,7 @@ function HistoryPanel({
           + ' follow=' + (isAtBottomRef.current ? '1' : '0')
           + ' external=1 geometry=' + (geometryStable ? 'stable' : 'changed'));
       } else {
+        if (proof.presented) wakeInitialHistoryRef.current?.();
         // First visible visit of a background-prewarmed pane crosses two
         // ownership mechanisms in one commit: the ordinary `presented` prop
         // sets the visit, then PersistentPaneHistory hands the same `true`
@@ -18686,10 +21369,10 @@ function HistoryPanel({
           return true;
         },
         () => {
-          if (!ownsPaint() || !paintedContent) return;
+          if (!ownsPaint() || !paintedContent) return false;
           const { realRows, allRealRows } = paintedContent;
           const proofKey = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
-          if (surfacePresentedOwnerRef.current === proofKey) return;
+          if (surfacePresentedOwnerRef.current === proofKey) return true;
           const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
             ? 'hit'
             : 'miss';
@@ -18701,7 +21384,7 @@ function HistoryPanel({
             domRows: realRows,
             foreignDomRows: Math.max(0, allRealRows - realRows),
             cache: cacheAtPaint,
-          })) return;
+          })) return false;
           historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
             + ' owner=' + historyOwnerDigest(ownerAtSchedule)
             + ' generation=' + generationAtSchedule
@@ -18711,6 +21394,7 @@ function HistoryPanel({
             + ' foreignDomRows=' + Math.max(0, allRealRows - realRows)
             + ' loader=' + (visibleSurfaceLoadingRef.current ? 'visible' : 'hidden')
             + ' proof=stable-space-layer');
+          return true;
         },
       );
     };
@@ -18747,27 +21431,13 @@ function HistoryPanel({
   // Cancels a warm-return verify pass that has not fired yet (owner left
   // before its two-frame delay elapsed).
   const deferredWarmRefreshCancelRef = useRef<(() => void) | null>(null);
-  useLayoutEffect(() => {
-    // Names the owner-takeover commit in freeze attribution. The 04.08 19:38
-    // log showed 693/937ms long tasks whose first ~600-800ms preceded
-    // LOAD_START — i.e. the takeover render+seeding itself, not the IPC load.
-    // This mark closes on the next frame, covering exactly that commit.
-    const endOwnerMountMark = markRendererActivity(
-      'history-owner-mount:' + tabId.slice(-8)
-    );
-    requestAnimationFrame(() => endOwnerMountMark());
-    const generation = historyOwnerGenerationRef.current + 1;
-    const viewportPaintOwner: HistoryViewportPaintOwner = {
-      key: historyOwnerKey,
-      generation,
-    };
-    const ownerStartedAt = Date.now();
-    historyOwnerStartedAtRef.current = ownerStartedAt;
-    historyOwnerGenerationRef.current = generation;
-    // Publish the generation so the list's key changes and it truly remounts;
-    // that mount is the only moment restored geometry is applied.
-    setHistoryOwnerVisitState(generation);
-    historyOwnerKeyRef.current = historyOwnerKey;
+  wakeInitialHistoryRef.current = () => {
+    const intent = pendingInitialHistoryRef.current;
+    if (!intent || intent.scheduled || !historyPresentationProofRef.current.presented
+      || intent.ownerKey !== historyOwnerKey
+      || intent.ownerKey !== historyOwnerKeyRef.current
+      || intent.generation !== historyOwnerGenerationRef.current) return;
+    const generation = intent.generation;
     const reportInitialLoadSettled = (status: HistoryInitialSourceSignal['status']) => {
       queueMicrotask(() => {
         if (
@@ -18784,6 +21454,114 @@ function HistoryPanel({
         });
       });
     };
+    if (intent.cached) {
+      intent.scheduled = true;
+      // Warm return: the cached rows are ALREADY on screen — the verify-
+      // freshness pass is invisible to the user unless the file changed, so it
+      // has no claim on the switch window. Waiting two frames keeps the whole
+      // takeover (highlight, cached rows, restored position) clean of IPC and
+      // heavy merges; a live session's tail events still arrive through the
+      // transcript-changed subscription regardless of this initial check.
+      //
+      // Probe-first: "did anything change?" is a stats-only question, but the
+      // old path asked it through the FULL get-full-history pipeline — main
+      // resolved the whole 59MB chain to answer "unchanged" (821-1292ms wall
+      // per switch under the switch-window IPC storm, live 05.08 15:29, felt
+      // as a train of 150-250ms input stalls while moving the cursor). The
+      // cheap probe answers from file stats; only a real change or a missing
+      // revision escalates to the heavy load. Claude-only: codex's own
+      // unchanged path already answers in ~50ms.
+      let refreshRaf2 = 0;
+      const refreshRaf1 = requestAnimationFrame(() => {
+        refreshRaf2 = requestAnimationFrame(() => {
+          if (pendingInitialHistoryRef.current !== intent || historyOwnerKeyRef.current !== historyOwnerKey
+            || historyOwnerGenerationRef.current !== generation) return;
+          intent.scheduled = false;
+          // Hiding a retained owner does not run owner cleanup. Keep this
+          // primitive intent for its next presentation instead of starting
+          // a background read from an already scheduled warm frame.
+          if (!historyPresentationProofRef.current.presented) return;
+          pendingInitialHistoryRef.current = null;
+          const revisionForProbe = toolType === 'claude' ? historyRevisionRef.current : null;
+          if (!revisionForProbe) {
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
+            return;
+          }
+          const probeStartedAt = Date.now();
+          void ipcRenderer.invoke('claude:validate-full-history-revision', {
+            sessionId,
+            cwd,
+            tabId,
+            revision: revisionForProbe,
+          }).then((probe: any) => {
+            if (historyOwnerKeyRef.current !== historyOwnerKey
+              || historyOwnerGenerationRef.current !== generation) return;
+            if (probe?.success && probe.unchanged === true
+              // A newer revision means a full load landed while the probe ran
+              // — its answer describes a stale question.
+              && historyRevisionRef.current === revisionForProbe) {
+              historyDiag('LOAD_FRESH_PROBE tab=' + tabId.slice(-12)
+                + ' session=' + sessionId.slice(0, 8)
+                + ' unchanged=1 elapsedMs=' + (Date.now() - probeStartedAt));
+              reportInitialLoadSettled('cached');
+              return;
+            }
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
+          }).catch(() => {
+            if (historyOwnerKeyRef.current !== historyOwnerKey
+              || historyOwnerGenerationRef.current !== generation) return;
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
+          });
+        });
+      });
+      // Cancellation lives in the shared cleanup below via the owner guard —
+      // an owner change before the frames fire makes the callback a no-op, and
+      // the rAFs themselves are cancelled explicitly.
+      const cancelDeferredRefresh = () => {
+        cancelAnimationFrame(refreshRaf1);
+        if (refreshRaf2) cancelAnimationFrame(refreshRaf2);
+      };
+      deferredWarmRefreshCancelRef.current = cancelDeferredRefresh;
+    } else {
+      pendingInitialHistoryRef.current = null;
+      deferredWarmRefreshCancelRef.current = null;
+      void loadHistory(false).then((ok) => {
+        reportInitialLoadSettled(ok ? 'success' : 'failure');
+      }).catch(() => reportInitialLoadSettled('failure'));
+    }
+  };
+  useLayoutEffect(() => {
+    // Names the owner-takeover commit in freeze attribution. The 04.08 19:38
+    // log showed 693/937ms long tasks whose first ~600-800ms preceded
+    // LOAD_START — i.e. the takeover render+seeding itself, not the IPC load.
+    // This mark closes on the next frame, covering exactly that commit.
+    const endOwnerMountMark = markRendererActivity(
+      'history-owner-mount:' + tabId.slice(-8)
+    );
+    requestAnimationFrame(() => endOwnerMountMark());
+    void primaryRootRef.current?.close();
+    primaryRootRef.current = null;
+    setPrimaryRoot(null);
+    primaryCompositionAppliedRef.current = null;
+    primarySuppressionCountAppliedRef.current = null;
+    const generation = historyOwnerGenerationRef.current + 1;
+    const viewportPaintOwner: HistoryViewportPaintOwner = {
+      key: historyOwnerKey,
+      generation,
+    };
+    const ownerStartedAt = Date.now();
+    historyOwnerStartedAtRef.current = ownerStartedAt;
+    historyOwnerGenerationRef.current = generation;
+    // Publish the generation so the list's key changes and it truly remounts;
+    // that mount is the only moment restored geometry is applied.
+    setHistoryOwnerVisitState(generation);
+    historyOwnerKeyRef.current = historyOwnerKey;
     deferredTranscriptRefreshRef.current = false;
     // Hydration machinery is owner-local. The seq bump orphans a previous
     // owner's in-flight completion callback so it can neither clear the new
@@ -18791,9 +21569,11 @@ function HistoryPanel({
     // 14.08 07:02: tab-2482's watcher read a span that tab-2546's load wrote.
     hydrationRequestSeqRef.current += 1;
     hydrationRequestInFlightRef.current = false;
+    hydrationRangePendingRef.current = null;
     hydrationPendingRef.current = null;
     hydrationLastResultRef.current = null;
     hydrationLastIssuedRef.current = new Map();
+    hydrationRadiusRef.current = HISTORY_HYDRATION_RADIUS_ROWS;
     historyJumpHydrationActiveRef.current = false;
     // Seed the FIRST request's hydration centre from where this owner will
     // actually land: a pending Timeline jump wins, then the saved reading
@@ -18808,10 +21588,15 @@ function HistoryPanel({
       hydrationCenterUuidRef.current = pendingJumpUuid
         || (savedAnchor && !savedAnchor.followBottom ? savedAnchor.uuid : null);
     }
+    primaryCanonicalDiagnosticRef.current = null;
     liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: [] };
     liveToolResultsRef.current = { ownerKey: historyOwnerKey, results: new Map() };
-    durableSourceIdentitiesRef.current = new Set();
+    durableSourceIdentitiesRef.current = primaryPhysicalCandidate ? null : new Set();
+    primaryLiveCoverageOwner.invalidate();
+    primaryLiveCommitRef.current = null;
     committedHistoryEntriesRef.current = { ownerKey: '', entries: [] };
+    primaryReceiptCommitRef.current = null;
+    primaryPresentationDataCommitRef.current = null;
     setLiveEntries([]);
     setLiveToolResults(new Map());
     viewportPaintProbeRef.current?.cancel();
@@ -18868,11 +21653,13 @@ function HistoryPanel({
               && !isLocalCompactErrorEntry(entry)
             ));
           if (prefix.length > 0) {
+            rewindPrefixHandoffRef.current?.catalogSource?.close();
             rewindPrefixHandoffRef.current = {
               sourceSessionId: activeOp.sourceSessionId,
               expectedChildSessionId: sessionId,
               entries: prefix,
               capturedAt: Date.now(),
+              catalogSource: primaryAgentCatalogModeRef.current ? primaryAgentSourceOwner.capture(prefix) : null,
             };
             historyDiag('REWIND_PREFIX_CAPTURE tab=' + tabId.slice(-12)
               + ' op=' + activeOp.opId
@@ -18951,6 +21738,7 @@ function HistoryPanel({
           enterAttemptAt: handoff.enterAttemptAt,
           sendInputTiming: handoff.sendInputTiming,
           historyReturn: handoff.historyReturn,
+          ...historyPromptHandoffRecoveryFields(handoff),
           promptChips: normalizeComposerChips(handoff.promptChips)
             .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
           imagePaths: retainHistoryDraftImages(cleanContent, handoff.imagePaths),
@@ -18968,7 +21756,7 @@ function HistoryPanel({
       [],
       reconciledOverlay.rows as FullHistoryEntry[],
     );
-    const cachedSnapshot = sessionId
+    const cachedSnapshot = sessionId && !primaryPhysicalCandidate
       ? historySnapshotCache.get<FullHistoryEntry>(historySnapshotOwner)
       : undefined;
     const cacheStats = historySnapshotCache.stats();
@@ -18999,6 +21787,7 @@ function HistoryPanel({
     if (cachedSnapshot) {
       // A cached child projection wins over the display-only prefix; drop the
       // handoff so a LATER unrelated owner change cannot consume stale rows.
+      rewindPrefixHandoffRef.current?.catalogSource?.close();
       rewindPrefixHandoffRef.current = null;
       const rawCachedEntries = cachedSnapshot.entries as unknown as FullHistoryEntry[];
       reconcileLiveToolResultsAgainstDurable(rawCachedEntries, historyOwnerKey);
@@ -19014,10 +21803,17 @@ function HistoryPanel({
       viewportReadyOwnerKeyRef.current = needsViewportProof ? '' : historyOwnerKey;
       setViewportReadyOwnerKey(needsViewportProof ? '' : historyOwnerKey);
       setViewportProofRequired(needsViewportProof);
-      presentationEntriesRef.current = cachedEntries;
+      if (!publishHistoryRows(cachedEntries)) return;
       setEntries(cachedEntries);
       setClaudeMemoryBoundaryUuid(cachedSnapshot.claudeMemoryBoundaryUuid);
       historyRevisionRef.current = cachedSnapshot.revision;
+      historyCommitDiagnosticsRef.current?.adopt(historyCommitDiagnosticsRef.current?.begin({
+        ownerKey: historyOwnerKey, sessionId, generation,
+        presentationVisit: historyPresentationProofRef.current.visit,
+      }, currentUIActionId(), 'snapshot-restore'), {
+        revisionToken: cachedSnapshot.revision?.token, payloadGeneration: cachedPayloadGeneration,
+        row: rawCachedEntries[rawCachedEntries.length - 1],
+      });
       lastServerEntryUuidsRef.current = new Set(rawCachedEntries.map((entry) => entry.uuid));
       rawServerEntriesRef.current = rawCachedEntries;
       rewindPrefixOnScreenRef.current = null;
@@ -19064,7 +21860,9 @@ function HistoryPanel({
         setViewportProofRequired(true);
         setLoading(!!sessionId);
       }
-      presentationEntriesRef.current = initialRows;
+      const catalogPrefixSource = prefixRows.length > 0 ? prefixHandoff?.catalogSource || null : null;
+      try { if (!publishHistoryRows(initialRows, () => true, catalogPrefixSource)) return; }
+      finally { prefixHandoff?.catalogSource?.close(); }
       setEntries(initialRows);
       setClaudeMemoryBoundaryUuid(null);
       historyRevisionRef.current = null;
@@ -19076,80 +21874,22 @@ function HistoryPanel({
     if (currentPreview?.sessionId && currentPreview.sessionId !== sessionId) {
       setHistoryRewindPreview(tabId, null);
     }
-    if (cachedSnapshot) {
-      // Warm return: the cached rows are ALREADY on screen — the verify-
-      // freshness pass is invisible to the user unless the file changed, so it
-      // has no claim on the switch window. Waiting two frames keeps the whole
-      // takeover (highlight, cached rows, restored position) clean of IPC and
-      // heavy merges; a live session's tail events still arrive through the
-      // transcript-changed subscription regardless of this initial check.
-      //
-      // Probe-first: "did anything change?" is a stats-only question, but the
-      // old path asked it through the FULL get-full-history pipeline — main
-      // resolved the whole 59MB chain to answer "unchanged" (821-1292ms wall
-      // per switch under the switch-window IPC storm, live 05.08 15:29, felt
-      // as a train of 150-250ms input stalls while moving the cursor). The
-      // cheap probe answers from file stats; only a real change or a missing
-      // revision escalates to the heavy load. Claude-only: codex's own
-      // unchanged path already answers in ~50ms.
-      let refreshRaf2 = 0;
-      const refreshRaf1 = requestAnimationFrame(() => {
-        refreshRaf2 = requestAnimationFrame(() => {
-          if (historyOwnerKeyRef.current !== historyOwnerKey
-            || historyOwnerGenerationRef.current !== generation) return;
-          const revisionForProbe = toolType === 'claude' ? historyRevisionRef.current : null;
-          if (!revisionForProbe) {
-            void loadHistory(true).then((ok) => {
-              reportInitialLoadSettled(ok ? 'success' : 'failure');
-            }).catch(() => reportInitialLoadSettled('failure'));
-            return;
-          }
-          const probeStartedAt = Date.now();
-          void ipcRenderer.invoke('claude:validate-full-history-revision', {
-            sessionId,
-            cwd,
-            tabId,
-            revision: revisionForProbe,
-          }).then((probe: any) => {
-            if (historyOwnerKeyRef.current !== historyOwnerKey
-              || historyOwnerGenerationRef.current !== generation) return;
-            if (probe?.success && probe.unchanged === true
-              // A newer revision means a full load landed while the probe ran
-              // — its answer describes a stale question.
-              && historyRevisionRef.current === revisionForProbe) {
-              historyDiag('LOAD_FRESH_PROBE tab=' + tabId.slice(-12)
-                + ' session=' + sessionId.slice(0, 8)
-                + ' unchanged=1 elapsedMs=' + (Date.now() - probeStartedAt));
-              reportInitialLoadSettled('cached');
-              return;
-            }
-            void loadHistory(true).then((ok) => {
-              reportInitialLoadSettled(ok ? 'success' : 'failure');
-            }).catch(() => reportInitialLoadSettled('failure'));
-          }).catch(() => {
-            if (historyOwnerKeyRef.current !== historyOwnerKey
-              || historyOwnerGenerationRef.current !== generation) return;
-            void loadHistory(true).then((ok) => {
-              reportInitialLoadSettled(ok ? 'success' : 'failure');
-            }).catch(() => reportInitialLoadSettled('failure'));
-          });
-        });
-      });
-      // Cancellation lives in the shared cleanup below via the owner guard —
-      // an owner change before the frames fire makes the callback a no-op, and
-      // the rAFs themselves are cancelled explicitly.
-      const cancelDeferredRefresh = () => {
-        cancelAnimationFrame(refreshRaf1);
-        if (refreshRaf2) cancelAnimationFrame(refreshRaf2);
-      };
-      deferredWarmRefreshCancelRef.current = cancelDeferredRefresh;
-    } else {
-      deferredWarmRefreshCancelRef.current = null;
-      void loadHistory(false).then((ok) => {
-        reportInitialLoadSettled(ok ? 'success' : 'failure');
-      }).catch(() => reportInitialLoadSettled('failure'));
-    }
+    pendingInitialHistoryRef.current = { ownerKey: historyOwnerKey, generation, cached: !!cachedSnapshot, scheduled: false };
+    const deferredInitialIntent = pendingInitialHistoryRef.current;
+    if (!historyPresentationProofRef.current.presented) queueMicrotask(() => {
+      if (pendingInitialHistoryRef.current !== deferredInitialIntent || historyPresentationProofRef.current.presented
+        || historyOwnerKeyRef.current !== historyOwnerKey || historyOwnerGenerationRef.current !== generation) return;
+      // Release the parent's background admission, without claiming data
+      // readiness or admitting its deferred Timeline. Foreground wake remains.
+      onInitialSourceSignalRef.current?.({ tabId, sessionId, ownerKey: historyOwnerKey,
+        generation, phase: 'load', status: 'deferred' });
+    });
+    wakeInitialHistoryRef.current?.();
     return () => {
+      if (pendingInitialHistoryRef.current?.generation === generation
+        && pendingInitialHistoryRef.current.ownerKey === historyOwnerKey) {
+        pendingInitialHistoryRef.current = null;
+      }
       deferredWarmRefreshCancelRef.current?.();
       deferredWarmRefreshCancelRef.current = null;
       // Release this read consumer before the former owner's continuation can
@@ -19160,6 +21900,11 @@ function HistoryPanel({
         flight.trailingRefresh = false;
         flight.controller.abort();
       }
+      void primaryRootRef.current?.close();
+      primaryRootRef.current = null;
+      const diagnosticAtCleanup = primaryCanonicalDiagnosticRef.current;
+      if (diagnosticAtCleanup?.ownerKey === historyOwnerKey && diagnosticAtCleanup.generation === generation)
+        primaryCanonicalDiagnosticRef.current = null;
       viewportPaintProbeRef.current?.cancel(viewportPaintOwner);
       surfacePresentedProbeRef.current?.cancel(viewportPaintOwner);
       // Geometry is captured continuously while the owner is alive (see the
@@ -19187,7 +21932,7 @@ function HistoryPanel({
         ' generation=' + generation +
         ' lifetimeMs=' + Math.max(0, Date.now() - ownerStartedAt));
     };
-  }, [historyOwnerKey, historySnapshotOwner, fileRewriteEpoch, loadHistory, persistVolatileOverlay, reconcileLiveToolResultsAgainstDurable, sessionId, setHistoryRewindPreview, tabId, toolType]);
+  }, [historyOwnerKey, historySnapshotOwner, fileRewriteEpoch, loadHistory, persistVolatileOverlay, primaryLiveCoverageOwner, publishHistoryRows, reconcileLiveToolResultsAgainstDurable, sessionId, setHistoryRewindPreview, tabId, toolType]);
 
   // A retained list may not emit rangeChanged or mount callbacks at all.
   // Rebinding its DATA owner must still publish pixel proof for History and
@@ -19210,21 +21955,112 @@ function HistoryPanel({
       const row = virtuosoScrollerRef.current?.querySelector(selector) as HTMLElement | null;
       return !!row && row.getBoundingClientRect().height > 0;
     }, () => {
-      if (!owns() || surfacePresentedOwnerRef.current === proofKey) return;
+      if (!owns()) return false;
+      if (surfacePresentedOwnerRef.current === proofKey) return true;
       const domRows = virtuosoScrollerRef.current?.querySelectorAll(selector).length || 0;
-      if (publishHistorySurfacePresented({ ...owner, ownerKey: owner.key,
+      if (!publishHistorySurfacePresented({ ...owner, ownerKey: owner.key,
         presentationVisit: presentation.visit, proof: 'mounted-painted-row',
-        domRows, foreignDomRows: 0, cache: 'hit' })) {
-        historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
-          + ' owner=' + historyOwnerDigest(owner.key) + ' generation=' + owner.generation
-          + ' presentationVisit=' + presentation.visit + ' domRows=' + domRows
-          + ' source=rewrite-commit proof=mounted-painted-row');
-      }
+        domRows, foreignDomRows: 0, cache: 'hit' })) return false;
+      historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
+        + ' owner=' + historyOwnerDigest(owner.key) + ' generation=' + owner.generation
+        + ' presentationVisit=' + presentation.visit + ' domRows=' + domRows
+        + ' source=rewrite-commit proof=mounted-painted-row');
+      return true;
     });
     return () => probe.cancel(owner);
   }, [historyOwnerKey, historyOwnerDomId, historyOwnerVisit, retainedRewriteMount,
     ownerChangedBeforeLayoutHandoff, surfaceLoading, publishHistorySurfacePresented, tabId]);
 
+  // This render's candidate and O(1) sample are committed data, not a DOM-ready
+  // predicate. The tail need not be mounted/visible; that boundary stays unknown.
+  const historyCommitCandidateAtRender = historyCommitDiagnosticsRef.current?.candidate();
+  const primaryCanonicalDiagnosticAtRender = primaryPhysicalCandidate ? primaryCanonicalDiagnosticRef.current : null;
+  useLayoutEffect(() => {
+    if (!historyCommitDiagnosticsRef.current) return;
+    if (presentedOwnerKey !== historyOwnerKey || historyOwnerKeyRef.current !== historyOwnerKey
+      || !historyPresentationProofRef.current.presented || surfaceLoading) return;
+    let diagnosticRow;
+    if (primaryPhysicalCandidate) {
+      const selected = primaryCanonicalDiagnosticAtRender;
+      const adopted = primarySurfaceWitnessRef.current;
+      if (!selected || selected !== primaryCanonicalDiagnosticRef.current
+        || selected.ownerKey !== historyOwnerKey || selected.generation !== historyOwnerGenerationRef.current
+        || selected.root !== primaryRootRef.current || selected.root.closed
+        || selected.root.header !== selected.header || selected.root.getReceiptDataSubject() !== selected.dataSubject
+        || adopted?.root !== selected.root || adopted.header !== selected.header
+        || adopted.entries.deref() !== entries || presentationEntriesRef.current !== entries) return;
+      // A checked empty domain preserves the old undefined tail. Missing or
+      // stale evidence never takes that branch and never becomes empty proof.
+      diagnosticRow = selected.fact.diagnosticTail.kind === 'row' ? selected.fact.diagnosticTail.row : undefined;
+    } else {
+      diagnosticRow = transcriptEntries[transcriptEntries.length - 1];
+    }
+    historyCommitDiagnosticsRef.current?.commit(historyCommitCandidateAtRender, {
+      ownerKey: historyOwnerKey, sessionId, generation: historyOwnerGenerationRef.current,
+      presentationVisit: historyPresentationProofRef.current.visit,
+    }, diagnosticRow);
+  }, [historyCommitCandidateAtRender, primaryCanonicalDiagnosticAtRender, primaryPhysicalCandidate,
+    historyOwnerKey, presentedOwnerKey, sessionId, entries, transcriptEntries, surfaceLoading, historyPresentationVisit]);
+
+  // Capture the actual render's cut before the layout effect, just as the
+  // tool-coverage reader below does. Never certify a later mutable header.
+  const primaryReceiptRootAtRender = primaryPhysicalCandidate ? primaryRoot : null;
+  const primaryReceiptHeaderAtRender = primaryReceiptRootAtRender?.header || null;
+  const primaryReceiptGenerationAtRender = historyOwnerGenerationRef.current;
+  const primaryShownPublicationAtRender = primaryLocalPublicationAtRender;
+  useLayoutEffect(() => {
+    primaryPresentationDataCommitRef.current = null;
+    if (!primaryPhysicalCandidate || presentedOwnerKey !== historyOwnerKey
+      || historyOwnerKeyRef.current !== historyOwnerKey
+      || historyOwnerGenerationRef.current !== primaryReceiptGenerationAtRender
+      || presentationEntriesRef.current !== entries
+      || !primarySparsePublicationOwner.matches(primaryShownPublicationAtRender, entries,
+        { ownerKey: historyOwnerKey, generation: primaryReceiptGenerationAtRender })) return;
+    // A genuine CURRENT-local-only state can commit before a Root exists.
+    // A retained prepared cut can commit after its original model closes.
+    // Neither event claims canonical freshness, paint, Input or Main ACK.
+    primaryPresentationDataCommitRef.current = Object.freeze({ publication: primaryShownPublicationAtRender,
+      ownerKey: historyOwnerKey, generation: primaryReceiptGenerationAtRender });
+  }, [primaryPhysicalCandidate, presentedOwnerKey, historyOwnerKey, primaryReceiptGenerationAtRender,
+    entries, primaryShownPublicationAtRender, primarySparsePublicationOwner]);
+  useLayoutEffect(() => {
+    if (!primaryPhysicalCandidate) return;
+    const input = primaryAgentCatalogInputs;
+    // DATA commit owns this catalog source. A Root header, measured geometry,
+    // canonical receipt or a subsequent open is deliberately not its owner.
+    const owns = () => primaryAgentCatalogModeRef.current
+      && primaryAgentCatalogInputsRef.current === input
+      && historyOwnerKeyRef.current === input.ownerKey
+      && historyOwnerGenerationRef.current === input.generation
+      && liveProjectionRef.current === input.rawLiveOwner
+      && primaryPresentationDataCommitRef.current?.publication === input.publication
+      && primarySparsePublicationOwner.current() === input.publication
+      && input.publication.entries.deref() === presentationEntriesRef.current
+      && primaryAgentSourceOwner.current() === input.source
+      && !input.source?.prepared?.closed;
+    if (!owns()) return;
+    const nativeInput = Object.freeze({ rows: input.rows, live: input.live, context: input.context });
+    let current: ReturnType<typeof createHistoryAgentCatalogCurrent> | null = null;
+    let fingerprint: string | null = null, sourceError: unknown = input.source?.error || null;
+    try {
+      current = createHistoryAgentCatalogCurrent({
+        recipe: { segments: input.source?.segments || [], live: input.live }, context: input.context,
+        isLocalPromptEntry, isTaskAction, historyAgentKey, owns, fingerprint: historyPrimaryPromptAdoptionFingerprint,
+      });
+      fingerprint = historyPrimaryPromptAdoptionFingerprint(nativeInput);
+    }
+    catch (error) { sourceError = error; }
+    if (!owns()) return;
+    primaryAgentCatalogOwner.update({ publication: input.publication, subject: input,
+      prepared: input.settled ? input.source?.prepared || null : null,
+      current, sourceError, owns, ownerFence: owns,
+      // Native predicate replay is inside the owner BEFORE this ORIGINAL
+      // complete CURRENT witness, and the cheap original fence follows both.
+      fullWitness: () => fingerprint !== null
+        && historyPrimaryPromptAdoptionFingerprint(nativeInput) === fingerprint,
+    });
+  }, [primaryPhysicalCandidate, primaryAgentCatalogInputs, primaryAgentCatalogOwner,
+    primaryAgentSourceOwner, primarySparsePublicationOwner]);
   // `transcriptEntries` already committed the durable version into the same
   // virtualized slot before this layout effect runs. Now it is safe to retire
   // the redundant live state; the next render keeps the same row and key.
@@ -19232,20 +22068,176 @@ function HistoryPanel({
     if (
       presentedOwnerKey !== historyOwnerKey
       || historyOwnerKeyRef.current !== historyOwnerKey
+      || primaryPhysicalCandidate && (historyOwnerGenerationRef.current !== primaryReceiptGenerationAtRender
+        || primaryRootRef.current !== primaryReceiptRootAtRender
+        || primaryReceiptRootAtRender && (primaryReceiptRootAtRender.closed
+          || primaryReceiptRootAtRender.header !== primaryReceiptHeaderAtRender))
     ) return;
-    // Reconciliation computes and publishes the same exact identity set
-    // synchronously, including when there are no live rows to retire.
-    reconcileLiveProjectionAgainstDurable(entries, historyOwnerKey);
-    const committed = entries.filter(entry => !isLocalPromptEntry(entry) && !entry.liveProjection);
-    committedHistoryEntriesRef.current = { ownerKey: historyOwnerKey, entries: committed };
-    consumeMaterializedPromptHandoffs(committed);
+    const previousReceiptCommit = primaryReceiptCommitRef.current;
+    primaryReceiptCommitRef.current = null;
+    primaryLiveCommitRef.current = null;
+    // Legacy reconciliation stays synchronous. Primary retirement uses the
+    // same data-commit boundary through bounded current-claim coverage below.
+    let committed: FullHistoryEntry[] | null = null;
+    if (!primaryPhysicalCandidate) {
+      const durableEntries = primaryRootRef.current?.header ? rawServerEntriesRef.current : entries;
+      reconcileLiveProjectionAgainstDurable(durableEntries, historyOwnerKey);
+      committed = durableEntries.filter(entry => !isLocalPromptEntry(entry) && !entry.liveProjection);
+      committedHistoryEntriesRef.current = { ownerKey: historyOwnerKey, entries: committed };
+    }
+    if (primaryReceiptRootAtRender && primaryReceiptHeaderAtRender
+      && primaryRootRef.current === primaryReceiptRootAtRender
+      && primaryReceiptRootAtRender.header === primaryReceiptHeaderAtRender
+      && !primaryReceiptRootAtRender.closed && presentationEntriesRef.current === entries) {
+      const dataSubject = primaryReceiptRootAtRender.getReceiptDataSubject();
+      const presentationCommit = primaryPresentationDataCommitRef.current;
+      const committedPresentation = presentationCommit?.publication === primaryShownPublicationAtRender
+        && presentationCommit.ownerKey === historyOwnerKey && presentationCommit.generation === primaryReceiptGenerationAtRender
+        && primarySparsePublicationOwner.matches(primaryShownPublicationAtRender, entries,
+          { ownerKey: historyOwnerKey, generation: primaryReceiptGenerationAtRender })
+        && primaryShownPublicationAtRender.prepared?.receiptDataSubject === dataSubject;
+      const adopted = primarySurfaceWitnessRef.current;
+      const currentAdoption = adopted?.root === primaryReceiptRootAtRender
+        && adopted.header === primaryReceiptHeaderAtRender && adopted.entries.deref() === entries;
+      const committedSubject = previousReceiptCommit?.root === primaryReceiptRootAtRender
+        && previousReceiptCommit.dataSubject === dataSubject && previousReceiptCommit.ownerKey === historyOwnerKey
+        && previousReceiptCommit.generation === historyOwnerGenerationRef.current;
+      // A changed data subject needs the actual adopter's current entries.
+      // Equal counts/aliases or a naked new header cannot certify old rows.
+      if (dataSubject && committedPresentation && (currentAdoption || committedSubject)) {
+        primaryReceiptCommitRef.current = Object.freeze({ root: primaryReceiptRootAtRender,
+          dataSubject, presentationDataSubject: primaryShownPublicationAtRender.dataSubject,
+          ownerKey: historyOwnerKey, generation: historyOwnerGenerationRef.current });
+      }
+    }
+    const liveCommit = primaryReceiptCommitRef.current, live = liveProjectionRef.current;
+    if (liveCommit && live.ownerKey === historyOwnerKey) {
+      let fingerprints: readonly string[] | null = null;
+      try {
+        fingerprints = Object.freeze(live.entries.map(historyPrimaryLiveClaimFingerprint));
+      } catch (error: any) {
+        console.warn('[HistoryPrimary] LIVE_COMMIT_UNKNOWN tab=' + tabId.slice(-12)
+          + ' code=' + String(error?.code || 'UNKNOWN'));
+      }
+      // The receipt owns canonical data independently of the current live
+      // wrapper. UNKNOWN live work cannot revoke a valid canonical commit;
+      // a moved original owner/cut must still clear only this stale receipt.
+      const currentCommit = primaryReceiptCommitRef.current === liveCommit
+        && historyOwnerKeyRef.current === liveCommit.ownerKey
+        && historyOwnerGenerationRef.current === liveCommit.generation
+        && primaryRootRef.current === liveCommit.root && !liveCommit.root.closed
+        && liveCommit.root.header === primaryReceiptHeaderAtRender
+        && liveCommit.root.getReceiptDataSubject() === liveCommit.dataSubject
+        && primaryPresentationDataCommitRef.current?.publication.dataSubject === liveCommit.presentationDataSubject;
+      if (fingerprints && currentCommit && liveProjectionRef.current === live)
+        primaryLiveCommitRef.current = Object.freeze({ ...liveCommit, live, entries: live.entries, fingerprints });
+      else if (!currentCommit && primaryReceiptCommitRef.current === liveCommit) primaryReceiptCommitRef.current = null;
+    }
+    primaryLiveCoverageOwner.wake('commit');
+    if (primaryPhysicalCandidate) consumePrimaryMaterializedPromptHandoffs();
+    else consumeMaterializedPromptHandoffs(committed!);
   }, [
+    primaryLiveCoverageOwner,
     entries,
     historyOwnerKey,
     presentedOwnerKey,
     reconcileLiveProjectionAgainstDurable,
     consumeMaterializedPromptHandoffs,
+    consumePrimaryMaterializedPromptHandoffs,
+    primaryPhysicalCandidate,
+    primaryReceiptRootAtRender,
+    primaryReceiptHeaderAtRender,
+    primaryReceiptGenerationAtRender,
+    primaryShownPublicationAtRender,
+    primarySparsePublicationOwner,
   ]);
+
+  // Bind coverage to THIS render's committed canonical cut, not whichever
+  // mutable model.header happens to be current when an async reply arrives.
+  const primaryToolCoverageSettledRef = useRef<{
+    root: HistoryPrimaryRootReadModel;
+    header: NonNullable<HistoryPrimaryRootReadModel['header']>;
+    owner: string;
+    generation: number;
+    current: typeof liveToolResultsRef.current;
+    map: typeof liveToolResultsRef.current.results;
+  } | null>(null);
+  const primaryToolCoverageCutAtRender = primaryRoot?.header || null;
+  useLayoutEffect(() => {
+    const root = primaryRootRef.current;
+    const header = primaryToolCoverageCutAtRender;
+    const owner = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current;
+    const requestVersion = primaryRequestVersionRef.current;
+    const inputOwner = liveToolResultsRef.current;
+    const inputMap = inputOwner.results;
+    const scopeCurrent = () => historyOwnerKeyRef.current === owner && presentedOwnerKey === owner
+      && historyOwnerGenerationRef.current === generation;
+    const settled = primaryToolCoverageSettledRef.current;
+    const ownPublication = settled?.root === root && settled.header === header && settled.owner === owner
+      && settled.generation === generation && settled.current === inputOwner && settled.map === inputMap;
+    // Never retain a previous owner's Map/root after a clear or handoff.
+    if (!ownPublication) primaryToolCoverageSettledRef.current = null;
+    if (!root || !header || root.header !== header || !scopeCurrent()
+      || inputOwner.ownerKey !== owner || inputMap.size === 0 || liveToolResults !== inputMap) return;
+    // A terminal publication is not another input or retry of this frozen cut.
+    // External owners/Maps and newly adopted headers still create fresh work.
+    if (ownPublication) return;
+
+    // Keep the state-owned input Map untouched. This one CURRENT working copy
+    // also lets each proof reject a record replaced in place during the await.
+    let currentMap = new Map(inputMap);
+    let currentOwner = {ownerKey:owner,results:currentMap};
+    liveToolResultsRef.current = currentOwner;
+    const sameLineage = () => liveToolResultsRef.current === currentOwner
+      && currentOwner.results === currentMap && currentOwner.ownerKey === owner;
+    const valid = () => sameLineage() && scopeCurrent() && root === primaryRootRef.current
+      && root.header === header && primaryRequestVersionRef.current === requestVersion;
+    const demand = new AbortController();
+    let retired = false;
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      // An external writer already publishes its newer CURRENT owner. Never
+      // send our pending Map over it, or over another tab/generation.
+      if (!sameLineage() || !scopeCurrent()) return;
+      let unchanged = !retired && inputOwner.ownerKey === owner && inputOwner.results === inputMap
+        && currentMap.size === inputMap.size;
+      if (unchanged) for (const [key, record] of currentMap) {
+        if (!inputMap.has(key) || inputMap.get(key) !== record) { unchanged = false; break; }
+      }
+      if (unchanged) {
+        currentMap = inputMap;
+        currentOwner = inputOwner;
+        liveToolResultsRef.current = inputOwner;
+      }
+      primaryToolCoverageSettledRef.current = {root,header,owner,generation,current:currentOwner,map:currentMap};
+      if (!unchanged) setLiveToolResults(currentMap);
+    };
+    void root.reconcileCommittedToolResults({signal:demand.signal,owns:valid,
+      commitPage: (proofs, cut) => {
+        if (!valid() || cut !== header || demand.signal.aborted) return;
+        const owned = proofs.filter(proof => inputMap.has(proof.key)
+          && currentMap.get(proof.key) === inputMap.get(proof.key));
+        const remaining = applyHistoryPrimaryToolCoverage(currentMap, owned);
+        if (remaining === currentMap) return;
+        retired = true;
+        currentMap = remaining;
+        currentOwner = {ownerKey:owner,results:remaining};
+        liveToolResultsRef.current = currentOwner;
+        // Only advance this pass's lineage; publishing here would restart it.
+      },
+    }).catch(error => {
+      if (error?.code !== 'HISTORY_READ_CANCELLED') console.warn('[HistoryPrimary] TOOL_COVERAGE_FAILED tab='
+        + tabId.slice(-12) + ' code=' + String(error?.code || 'UNKNOWN'));
+      // Unknown is not absence or retry permission. CURRENT owners remain.
+    }).finally(finish);
+    return () => {
+      demand.abort(); // Demand only; retained readers/documents stay independent.
+      finish(); // Publish any valid partial retirement once on supersession.
+    };
+  }, [primaryToolCoverageCutAtRender, liveToolResults, historyOwnerKey, presentedOwnerKey, tabId]);
 
   // Restore the reading position once per owner, after the surface is ready.
   // Anchor first (row identity + in-row offset — stable across remeasures,
@@ -19256,7 +22248,7 @@ function HistoryPanel({
     if (historyResizeRef.current?.active()) return;
     const presentationAtRestore = historyPresentationProofRef.current;
     if (!presentationAtRestore.presented) return;
-    if (surfaceLoading || initialLoadDoneRef.current) return;
+    if (surfaceLoading || primaryInitialPositionPending || initialLoadDoneRef.current) return;
     // Same mountability gates as the render stub: passive effects of the
     // TRANSITIONAL commit (owner prop changed, takeover not yet re-rendered)
     // flush before the commit that actually mounts the list. Running the
@@ -19264,7 +22256,7 @@ function HistoryPanel({
     // — the convergence loop would spin over nothing while blocking the real
     // restore of the mounted list one commit later.
     if (ownerChangedBeforeLayoutHandoff || historyOwnerVisit === 0) return;
-    if (displayEntries.length === 0) return;
+    if (primaryPhysicalCandidate ? !primaryHeader || primaryRoot!.totalCount === 0 : displayEntries.length === 0) return;
     const pendingJump = useUIStore.getState();
     if (
       pendingJump.historyScrollTargetTabId === tabId
@@ -19472,8 +22464,17 @@ function HistoryPanel({
     };
     const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
     if (anchor && !anchor.followBottom) {
-      const index = displayEntryIndexByUuidRef.current.get(anchor.uuid);
-      if (index !== undefined) {
+      const anchorRoot = primaryRootRef.current?.header ? primaryRootRef.current : null;
+      let anchorHeader = anchorRoot?.header;
+      let anchorAddress = anchorRoot && primaryAnchorReady ? primaryAnchorResolution.address : null;
+      const retainedPosition = primaryPhysicalCandidate && !anchorRoot;
+      let anchorPosition: Awaited<ReturnType<typeof primaryAnchorPosition.resolve>> | null = null;
+      const index = anchorRoot ? anchorAddress?.index : retainedPosition ? undefined
+        : displayEntryIndexByUuidRef.current!.get(anchor.uuid);
+      if (index !== undefined || retainedPosition) {
+        // Start the EXISTING convergence immediately, including its original
+        // attempts/lifetime. Registration of this projection is awaited by
+        // its jump, never by waiting for some future canonical Root.
         // The restored position is mid-list: Virtuoso followOutput must not
         // treat a live append as "user is at the tail" and yank away.
         setHistoryTailFollowIntent(false);
@@ -19483,7 +22484,7 @@ function HistoryPanel({
         const uuidTag = anchor.uuid.slice(0, 8);
         historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
           + ' mode=anchor uuid=' + uuidTag
-          + ' idx=' + index + ' offset=' + anchor.offsetPx);
+          + ' idx=' + (index ?? 'pending') + ' offset=' + anchor.offsetPx);
         const restoreToken = ++historyRestoreTokenRef.current;
         historyRestoreInFlightRef.current = restoreToken;
         runHistoryScrollConvergence({
@@ -19492,23 +22493,54 @@ function HistoryPanel({
           ),
           measureDrift: () => {
             const scroller = virtuosoScrollerRef.current;
-            if (!scroller) return null;
+            if (!scroller || anchorRoot && (anchorRoot.header !== anchorHeader || !primaryInputsCurrent())) return null;
+            if (!anchorRoot && primaryPositionModeRef.current && (anchorPosition?.status !== 'ready'
+              || !primaryPositionOwner.owns(anchorPosition.publication))) return null;
+            const domUuid = anchorRoot && anchorAddress?.kind === 'group' ? anchorAddress.firstUuid : anchor.uuid;
             const node = scroller.querySelector(
-              `[data-uuid="${CSS.escape(anchor.uuid)}"]`,
+              `[data-uuid="${CSS.escape(domUuid)}"]`,
             ) as HTMLElement | null;
             if (!node) return null;
             const desiredTop = scroller.getBoundingClientRect().top - anchor.offsetPx;
             return node.getBoundingClientRect().top - desiredTop;
           },
-          jump: () => {
-            const currentIndex = displayEntryIndexByUuidRef.current.get(anchor.uuid);
-            if (currentIndex === undefined) return false; // row vanished mid-restore
-            virtuosoRef.current?.scrollToIndex({
-              index: currentIndex,
-              align: 'start',
-              behavior: 'auto',
-              offset: anchor.offsetPx,
-            });
+          jump: async () => {
+            let currentIndex: number | undefined;
+            if (anchorRoot) {
+              const owns = () => !cancelReasonForRestore(ownerAtRestore, generationAtRestore, restoreGenAtStart)
+                && primaryRootRef.current === anchorRoot && primaryInputsCurrent();
+              if (!primaryInputsCurrent()) return true; // pending composition, no position write
+              if (anchorRoot.header !== anchorHeader) {
+                const requestedHeader = anchorRoot.header;
+                try {
+                  const result = await readHistoryPrimaryPanelAddress(anchorRoot, 'entry', anchor.uuid, { owns });
+                  if (!owns()) return false;
+                  anchorHeader = result.header; anchorAddress = result.address;
+                } catch (error) {
+                  if ((error as any)?.code === 'HISTORY_READ_CANCELLED' && owns()
+                    && anchorRoot.header !== requestedHeader) return true;
+                  throw error;
+                }
+              }
+              currentIndex = anchorAddress?.index;
+              if (!owns()) return false;
+            } else if (retainedPosition || primaryPositionModeRef.current) {
+              const publication = primaryPositionOwner.capture();
+              const scroller = virtuosoScrollerRef.current, gesture = historyUserGestureGenerationRef.current;
+              const owns = () => !cancelReasonForRestore(ownerAtRestore, generationAtRestore, restoreGenAtStart)
+                && historyRestoreInFlightRef.current === restoreToken
+                && virtuosoScrollerRef.current === scroller && !!scroller?.isConnected
+                && historyUserGestureGenerationRef.current === gesture && primaryPositionOwner.owns(publication);
+              const result = await primaryAnchorPosition.resolve(publication, anchor.uuid, { owns });
+              if (!owns()) return true;
+              if (result.status === 'failed') throw result.error;
+              if (result.status === 'superseded') return true;
+              anchorPosition = result;
+              currentIndex = result.address?.index;
+            } else currentIndex = displayEntryIndexByUuidRef.current!.get(anchor.uuid);
+            if (currentIndex === undefined) return false; // proved disappeared
+            virtuosoRef.current?.scrollToIndex({ index: currentIndex, align: 'start',
+              behavior: 'auto', offset: anchor.offsetPx });
             return true;
           },
           onSettled: (o) => {
@@ -19652,17 +22684,40 @@ function HistoryPanel({
     // on the render where `entries` landed, and without this dep nothing
     // re-triggers the restore for a cache-hit switch (entries don't change
     // again).
-  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout, presented, historyPresentationVisit, presentationRestoreTick]);
+  }, [surfaceLoading, primaryInitialPositionPending, primaryPhysicalCandidate, primaryHeader,
+    primaryAnchorReady, primaryAnchorResolution, primaryInputsCurrent, primaryPositionOwner, primaryAnchorPosition,
+    tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout, presented, historyPresentationVisit, presentationRestoreTick]);
 
-  const resolveTerminalPreviewCanonicalTarget = useCallback((canonicalIdentity: string) => (
-    resolveHistoryTerminalPreviewCanonicalTarget({
+  const resolveTerminalPreviewCanonicalTarget = useCallback((canonicalIdentity: string) => {
+    if (primaryPhysicalCandidate) return readCurrentPrimaryTerminalPreviewMembership(canonicalIdentity)?.target || null;
+    return resolveHistoryTerminalPreviewCanonicalTarget({
       canonicalIdentity,
       displayEntries: displayEntriesRef.current,
       displayUnits: displayUnitsRef.current,
-      unitIndexByUuid: unitIndexByUuidRef.current,
+      unitIndexByUuid: unitIndexByUuidRef.current!,
       identitiesForEntry: historyLivePresentationIdentities,
-    })
-  ), []);
+    });
+  }, [primaryPhysicalCandidate, readCurrentPrimaryTerminalPreviewMembership]);
+
+  const readTerminalPreviewCanonicalNode = useCallback((scroller: HTMLElement, target: {
+    domUuid: string; unitIndex: number; physicalKey?: string;
+  } | null) => {
+    if (!target) return null;
+    const node = scroller.querySelector<HTMLElement>(
+      (primaryPhysicalCandidate ? `[data-item-index="${target.unitIndex}"] ` : '')
+        + `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`
+        + `[data-uuid="${CSS.escape(target.domUuid)}"]`,
+    );
+    if (!node || !primaryPhysicalCandidate) return node;
+    const root = primaryRootRef.current, presentation = historyPresentationProofRef.current;
+    if (!root || primaryInputsCurrent() !== true || !root.hasCurrentPresentationCoverage({
+      ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+      visit: presentation.visit, presented: presentation.presented,
+    }) || !target.physicalKey || root.addressAt(target.unitIndex)?.physicalKey !== target.physicalKey
+      || node.getAttribute('data-history-unit-key') !== target.physicalKey
+      || node.closest('[data-item-index]')?.getAttribute('data-item-index') !== String(target.unitIndex)) return null;
+    return node;
+  }, [historyOwnerDomId, primaryPhysicalCandidate, primaryInputsCurrent]);
 
   // A canonical entry can exist in the projection before Virtuoso mounts its
   // exact presentation unit. Probe only for a few frames after each concrete
@@ -19950,16 +23005,24 @@ function HistoryPanel({
       let current = terminalPreviewClearHandoffRef.current;
       if (!current || current.previewId !== requested.previewId) return;
       const presentation = historyPresentationProofRef.current;
-      const canonicalEntry = displayEntries.find(entry => historyTerminalPreviewHasCanonicalIdentity(
-        entry, current.canonicalIdentity, historyLivePresentationIdentities));
-      const canonicalHash = canonicalEntry && current.canonicalTextHash
-        ? historyServicePromptFingerprint(String(canonicalEntry.content || '').trim())
-          .slice(0, current.canonicalTextHash.length) : null;
+      const membership = primaryPhysicalCandidate
+        ? readCurrentPrimaryTerminalPreviewMembership(current.canonicalIdentity) : null;
+      if (primaryPhysicalCandidate && !membership) return;
+      const canonicalEntry = primaryPhysicalCandidate ? null : displayEntries.find(entry => historyTerminalPreviewHasCanonicalIdentity(
+        entry, current!.canonicalIdentity, historyLivePresentationIdentities));
+      const canonicalInPresentation = primaryPhysicalCandidate
+        ? membership?.preparedPresent === true : !!canonicalEntry;
+      const canonicalHash = current.canonicalTextHash
+        ? primaryPhysicalCandidate
+          ? membership?.preparedTextHash?.slice(0, current.canonicalTextHash.length) || null
+          : canonicalEntry ? historyServicePromptFingerprint(String(canonicalEntry.content || '').trim())
+            .slice(0, current.canonicalTextHash.length) : null
+        : null;
       const rebase = historyTerminalPreviewHandoffRebaseVerdict(current, {
         previewId: terminalPreviewRef.current?.previewId || '',
         ownerKey: historyOwnerKeyRef.current, ownerGeneration: historyOwnerGenerationRef.current,
         presentationVisit: presentation.visit, presented: presentation.presented,
-        canonicalInPresentation: !!canonicalEntry, canonicalTextHash: canonicalHash,
+        canonicalInPresentation, canonicalTextHash: canonicalHash,
       });
       if (rebase === 'rebase') {
         const scroller = virtuosoScrollerRef.current;
@@ -20003,7 +23066,7 @@ function HistoryPanel({
             + ' preview=' + current.previewId.slice(-18) + ' identity=' + current.canonicalIdentity.slice(-32)
             + ' reason=' + rebase + ' generation=' + current.ownerGeneration + '->' + historyOwnerGenerationRef.current
             + ' visit=' + current.presentationVisit + '->' + presentation.visit
-            + ' canonicalInPresentation=' + (canonicalEntry ? '1' : '0'));
+            + ' canonicalInPresentation=' + (canonicalInPresentation ? '1' : '0'));
         }
         return;
       }
@@ -20016,15 +23079,9 @@ function HistoryPanel({
       const canonicalTarget = resolveTerminalPreviewCanonicalTarget(
         current.canonicalIdentity,
       );
-      const canonicalInPresentation = !!canonicalEntry;
       const scroller = virtuosoScrollerRef.current;
       if (!scroller) return;
-      const targetNode = canonicalTarget
-        ? scroller.querySelector(
-          `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`
-            + `[data-uuid="${CSS.escape(canonicalTarget.domUuid)}"]`,
-        ) as HTMLElement | null
-        : null;
+      const targetNode = readTerminalPreviewCanonicalNode(scroller, canonicalTarget);
       const previewNode = panelRef.current?.querySelector(
         `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
       ) as HTMLElement | null;
@@ -20093,6 +23150,11 @@ function HistoryPanel({
           presentationVisit: latestPresentation.visit,
           presented: latestPresentation.presented,
         })) return false;
+        if (primaryPhysicalCandidate && (!readCurrentPrimaryTerminalPreviewMembership(current.canonicalIdentity)
+          || !primaryRootRef.current?.hasCurrentPresentationCoverage({
+            ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+            visit: latestPresentation.visit, presented: latestPresentation.presented,
+          }))) return false;
         if (current.scrollCancelledByGesture) return true;
         const targetOffsetPx = current.anchorKind === 'reading-row'
           ? readHistoryTerminalPreviewReadingTop(scroller, current.readingUnitKey)
@@ -20146,7 +23208,8 @@ function HistoryPanel({
         // last row from mounting. Keep bottom ownership until that row commits;
         // its ref wakes us before paint, without waiting for another rAF pin.
         const lastSlot = scroller.querySelector<HTMLElement>(
-          `[data-item-index="${displayUnitsRef.current.length - 1}"]`,
+          `[data-item-index="${(primaryPhysicalCandidate ? primaryRootRef.current?.totalCount || 0
+            : displayUnitsRef.current.length) - 1}"]`,
         );
         if (!lastSlot?.querySelector('[data-history-row-real]')
           || lastSlot.getBoundingClientRect().height <= 0) return;
@@ -20213,6 +23276,7 @@ function HistoryPanel({
       const settleOwnerGeneration = settling.ownerGeneration;
       const settlePresentationVisit = settling.presentationVisit;
       const settleScroller = scroller;
+      const settlePrimaryHeader = primaryPhysicalCandidate ? primaryRootRef.current?.header : null;
       const readCanonicalTop = () => {
         if (settling.anchorKind === 'reading-row') {
           return readHistoryTerminalPreviewReadingTop(settleScroller, settling.readingUnitKey);
@@ -20221,10 +23285,7 @@ function HistoryPanel({
           settling.canonicalIdentity,
         );
         if (!latestTarget) return null;
-        const latestNode = settleScroller.querySelector(
-          `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`
-            + `[data-uuid="${CSS.escape(latestTarget.domUuid)}"]`,
-        ) as HTMLElement | null;
+        const latestNode = readTerminalPreviewCanonicalNode(settleScroller, latestTarget);
         return latestNode
           ? latestNode.getBoundingClientRect().top
             - settleScroller.getBoundingClientRect().top
@@ -20257,6 +23318,12 @@ function HistoryPanel({
         isCurrent: () => {
           const latestPresentation = historyPresentationProofRef.current;
           return settleScroller.isConnected
+            && (!primaryPhysicalCandidate || (primaryRootRef.current?.header === settlePrimaryHeader
+              && !!readCurrentPrimaryTerminalPreviewMembership(settling.canonicalIdentity)
+              && primaryRootRef.current?.hasCurrentPresentationCoverage({
+                ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
+                visit: latestPresentation.visit, presented: latestPresentation.presented,
+              }) === true))
             && terminalPreviewClearHandoffRef.current === settling
             && historyOwnerKeyRef.current === settleOwnerKey
             && historyOwnerGenerationRef.current === settleOwnerGeneration
@@ -20283,6 +23350,11 @@ function HistoryPanel({
       if (raf) cancelAnimationFrame(raf);
     };
   }, [
+    primaryPhysicalCandidate,
+    primaryHeader,
+    primaryTerminalPreviewMembership,
+    readCurrentPrimaryTerminalPreviewMembership,
+    readTerminalPreviewCanonicalNode,
     displayEntries,
     displayUnits,
     historyOwnerVisit,
@@ -20379,6 +23451,7 @@ function HistoryPanel({
     const clearLiveProjection = () => {
       if (liveProjectionRef.current.ownerKey !== ownerKey) return;
       liveProjectionRef.current = { ownerKey, entries: [] };
+      primaryLiveCoverageOwner.wake('subject');
       liveToolResultsRef.current = { ownerKey, results: new Map() };
       setLiveEntries([]);
       setLiveToolResults(new Map());
@@ -20472,8 +23545,11 @@ function HistoryPanel({
           ))
           .filter((entry: FullHistoryEntry) => {
             const identities = historyLivePresentationIdentities(entry);
+            if (primaryLiveCoverageEnabledRef.current) {
+              return primaryLiveCoverageOwner.admits(entry, identities, alreadyPresentedLiveIdentities);
+            }
             return identities.length === 0
-              || !identities.some((identity) => durableSourceIdentitiesRef.current.has(identity))
+              || !identities.some((identity) => durableSourceIdentitiesRef.current?.has(identity))
               || identities.some((identity) => alreadyPresentedLiveIdentities.has(identity))
               // A same-record settings contradiction must still reach the
               // shared merge when the canonical read arrived before the event.
@@ -20481,6 +23557,7 @@ function HistoryPanel({
           });
         projectionChanged = projected !== current;
         liveProjectionRef.current = { ownerKey, entries: projected };
+        primaryLiveCoverageOwner.wake('subject');
         setLiveEntries(projected);
       }
       const resultValues = extractHistoryLiveToolResults(detail) as HistoryLiveToolResult[];
@@ -20507,7 +23584,15 @@ function HistoryPanel({
       if (!projectionChanged && !toolResultsChanged) return;
       keepHistoryTailPinnedAfterMutation('live-message');
       deferredTranscriptRefreshRef.current = true;
-      if (!isTurnBusyRef.current) {
+      const coldFailure = primaryColdReadFailureRef.current;
+      if (historyPrimaryColdReadWakeAllowed({ enabled: primaryRootReadEnabled, toolType,
+        supported: primaryCompositeOwnerRef.current !== ownerKey, hasRoot: !!primaryRootRef.current?.header,
+        failure: coldFailure, ownerKey, record: detail })) {
+        // A cold root has no frozen baseline to compose yet. An actual new
+        // source record wakes the existing single-flight reader, even during
+        // a running turn. No timers, DTO fallback or post-failure polling.
+        void loadHistoryRef.current?.(true);
+      } else if (!isTurnBusyRef.current) {
         void flushLiveHistoryToDurable('live-message-after-turn', ownerKey);
       }
     };
@@ -20520,6 +23605,7 @@ function HistoryPanel({
     flushLiveHistoryToDurable,
     historyOwnerKey,
     keepHistoryTailPinnedAfterMutation,
+    primaryLiveCoverageOwner,
     sessionId,
     setHistoryRewindPreview,
     tabId,
@@ -20657,23 +23743,35 @@ function HistoryPanel({
       }) as FullHistoryEntry[];
       if (settledEntries !== live.entries) {
         liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: settledEntries };
+        primaryLiveCoverageOwner.wake('subject');
         setLiveEntries(settledEntries);
       }
     }
-    const hasLiveProjection = hasUnmatchedLiveForOwner(historyOwnerKey);
-    if (!deferredTranscriptRefreshRef.current && !hasLiveProjection) return;
-    historyDiag('TRANSCRIPT_FLUSH tab=' + tabId.slice(-12) +
-      ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
-      ' tool=' + toolType +
-      ' reason=turn-settled' +
-      ' live=' + (hasLiveProjection ? '1' : '0'));
-    const ownerKey = historyOwnerKey;
-    void flushLiveHistoryToDurable('turn-settled', ownerKey);
+    const ownerKey = historyOwnerKey, generation = historyOwnerGenerationRef.current;
+    let disposed = false;
+    void (async () => {
+      const hasLiveProjection = await hasUnmatchedLiveForOwner(ownerKey);
+      if (disposed || historyOwnerKeyRef.current !== ownerKey
+        || historyOwnerGenerationRef.current !== generation || isTurnBusyRef.current
+        || typeof hasLiveProjection !== 'boolean') return;
+      if (!deferredTranscriptRefreshRef.current && !hasLiveProjection) return;
+      historyDiag('TRANSCRIPT_FLUSH tab=' + tabId.slice(-12) +
+        ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+        ' tool=' + toolType +
+        ' reason=turn-settled' +
+        ' live=' + (hasLiveProjection ? '1' : '0'));
+      await flushLiveHistoryToDurable('turn-settled', ownerKey);
+    })().catch((error: any) => {
+      if (error?.code !== 'HISTORY_READ_CANCELLED') console.warn('[HistoryPrimary] LIVE_SETTLE_UNKNOWN tab='
+        + tabId.slice(-12) + ' code=' + String(error?.code || 'UNKNOWN'));
+    });
+    return () => { disposed = true; };
   }, [
     flushLiveHistoryToDurable,
     hasUnmatchedLiveForOwner,
     historyOwnerKey,
     isTurnBusy,
+    primaryLiveCoverageOwner,
     sessionId,
     tabId,
     toolType,
@@ -21300,11 +24398,41 @@ function HistoryPanel({
     state.seekExitAnchor = null;
   }, []);
 
+  // Each position owner retains one selected address, independent of the
+  // bounded body window. Header replacement requires a fresh point proof.
+  const primaryWheelAddress = useMemo(() => createHistoryPrimarySelectedAddress({
+    onError: reportPrimaryRootError,
+  }), [reportPrimaryRootError]);
+  const primaryResizeAddress = useMemo(() => createHistoryPrimarySelectedAddress({
+    onError: reportPrimaryRootError,
+  }), [reportPrimaryRootError]);
+  useEffect(() => () => {
+    primaryWheelAddress.dispose();
+    primaryResizeAddress.dispose();
+  }, [primaryWheelAddress, primaryResizeAddress]);
+  const historyPhysicalItemKeyAt = useCallback((index: number) => {
+    const root = primaryRootRef.current;
+    if (root?.header) return primaryInputsCurrent() ? root.addressAt(index)?.physicalKey || '' : '';
+    return displayUnitItemKeysRef.current[index] || '';
+  }, [primaryInputsCurrent]);
+  const readHistoryWheelAddress = useCallback((identity: string) => {
+    const root = primaryRootRef.current;
+    if (!root?.header) {
+      const index = findHistoryUnitIndexByKey(displayUnitItemKeysRef.current, identity);
+      return { status: index >= 0 ? 'ready' : 'absent', address: { index } };
+    }
+    if (!primaryInputsCurrent()) return { status: 'pending', address: null };
+    return primaryWheelAddress.read(root, 'key', identity, {
+      owns: () => primaryRootRef.current === root && primaryInputsCurrent(),
+    });
+  }, [primaryWheelAddress, primaryInputsCurrent]);
+
   const captureHistoryWheelGeometryAnchor = useCallback((
     scroller: HTMLElement,
     source: 'real' | 'seek',
-  ) => {
+  ) => primaryInputTransaction.run(() => {
     const scrollerRect = scroller.getBoundingClientRect();
+    const root = primaryRootRef.current;
     const nodes = source === 'seek'
       ? Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-seek-key]'))
       : Array.from(scroller.querySelectorAll<HTMLElement>('[data-item-index]'));
@@ -21314,15 +24442,26 @@ function HistoryPanel({
         : node.getAttribute('data-item-index'));
       const identity = source === 'seek'
         ? node.getAttribute('data-history-seek-key') || ''
-        : displayUnitItemKeysRef.current[index] || '';
+        : historyPhysicalItemKeyAt(index);
+      const mountedKey = source === 'seek' ? identity
+        : node.querySelector('[data-history-unit-key]')?.getAttribute('data-history-unit-key');
+      const current = !root?.header || primaryInputsCurrent()
+        && root.addressAt(index)?.physicalKey === identity && mountedKey === identity;
       const rect = node.getBoundingClientRect();
-      return { identity, top: rect.top, bottom: rect.bottom };
+      return { index, identity: current ? identity : '', top: rect.top, bottom: rect.bottom };
     });
     const anchor = pickHistoryGestureAnchorCandidate(
       candidates,
       scrollerRect.top,
       scrollerRect.bottom,
     );
+    if (anchor && root?.header) {
+      const address = root.addressAt(anchor.index);
+      if (!primaryInputsCurrent() || address?.physicalKey !== anchor.identity) return null;
+      primaryWheelAddress.seed(root, 'key', anchor.identity, address, {
+        owns: () => primaryRootRef.current === root && primaryInputsCurrent(),
+      });
+    }
     return anchor
       ? {
         identity: anchor.identity,
@@ -21333,10 +24472,11 @@ function HistoryPanel({
         ),
       }
       : null;
-  }, []);
+  }), [historyPhysicalItemKeyAt, primaryInputsCurrent, primaryWheelAddress, primaryInputTransaction]);
 
-  const measureHistoryWheelGeometryRelease = useCallback((identity: string) => {
-    const anchorIndex = findHistoryUnitIndexByKey(displayUnitItemKeysRef.current, identity);
+  const measureHistoryWheelGeometryRelease = useCallback((identity: string) => primaryInputTransaction.run(() => {
+    const selected = readHistoryWheelAddress(identity);
+    const anchorIndex = selected.status === 'ready' ? selected.address?.index ?? -1 : -1;
     if (anchorIndex < 0) return { trailingHeightDelta: 0, measuredRows: 0 };
     const state = historyWheelGeometryFreezeRef.current;
     let trailingHeightDelta = 0;
@@ -21346,13 +24486,15 @@ function HistoryPanel({
       const index = Number(row.getAttribute('data-item-index'));
       if (!Number.isFinite(index) || index < anchorIndex) continue;
       const realRow = row.querySelector<HTMLElement>('[data-history-row-real]');
+      if (primaryRootRef.current?.header
+        && realRow?.getAttribute('data-history-unit-key') !== historyPhysicalItemKeyAt(index)) continue;
       const currentHeight = realRow?.getBoundingClientRect().height;
       if (!Number.isFinite(currentHeight) || Number(currentHeight) <= 0) continue;
       trailingHeightDelta += Number(currentHeight) - previous.frozenHeight;
       measuredRows += 1;
     }
     return { trailingHeightDelta, measuredRows };
-  }, []);
+  }), [readHistoryWheelAddress, historyPhysicalItemKeyAt, primaryInputTransaction]);
 
   const readHistoryWheelGeometryAnchorTop = useCallback((
     scroller: HTMLElement,
@@ -21360,14 +24502,17 @@ function HistoryPanel({
     requireReal: boolean,
   ) => {
     if (!scroller.isConnected) return null;
-    const index = findHistoryUnitIndexByKey(displayUnitItemKeysRef.current, identity);
+    const selected = readHistoryWheelAddress(identity);
+    const index = selected.status === 'ready' ? selected.address?.index ?? -1 : -1;
     if (index < 0) return null;
     const wrapper = scroller.querySelector<HTMLElement>(
       `[data-item-index="${CSS.escape(String(index))}"]`,
     );
     if (!wrapper || (requireReal && !wrapper.querySelector('[data-history-row-real]'))) return null;
+    if (primaryRootRef.current?.header
+      && wrapper.querySelector('[data-history-unit-key]')?.getAttribute('data-history-unit-key') !== identity) return null;
     return wrapper.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-  }, []);
+  }, [readHistoryWheelAddress]);
 
   const settleHistoryWheelGeometryRelease = useCallback(({
     scroller,
@@ -21396,14 +24541,24 @@ function HistoryPanel({
       trailingHeightDeltaPx: releaseMeasurement.trailingHeightDelta,
       measuredRows: releaseMeasurement.measuredRows,
     });
+    // A hydration commit may replace the seek's pending real-row waiter.
+    // Carry its existing mask into the successor, otherwise that cancelled
+    // waiter never reaches the only old mask-release branch.
+    const ownsSeekMask = source === 'seek-exit'
+      || (source === 'hydration-apply' && scroller.hasAttribute('data-history-seek-geometry-settling'));
     if (source === 'seek-exit') setHistorySeekGeometryMask(scroller, true);
     restoreHistoryWheelGeometryRows();
     setHistorySeekPresentationEpoch((value) => value + 1);
+    const addressReady = () => readHistoryWheelAddress(identity).status === 'ready';
+    const addressStillPossible = () => {
+      const status = readHistoryWheelAddress(identity).status;
+      return status === 'ready' || status === 'pending';
+    };
     const ownsRelease = () => (
       scroller.isConnected
       && historyOwnerKeyRef.current === ownerKey
       && historyOwnerGenerationRef.current === ownerGeneration
-      && findHistoryUnitIndexByKey(displayUnitItemKeysRef.current, identity) >= 0
+      && addressStillPossible()
       && historyPresentationOwnsWrite(
         historyPresentationProofRef.current,
         presentationVisit,
@@ -21446,7 +24601,7 @@ function HistoryPanel({
         // same JS task, therefore no unbridged intermediate frame can paint.
         scroller.removeAttribute('data-history-geometry-bridge');
         scroller.style.removeProperty('--hp-history-geometry-bridge-y');
-        if (ownsRelease() && reason !== 'stale-owner') {
+        if (ownsRelease() && addressReady() && reason !== 'stale-owner') {
           if (anchorMode === 'tail-gap') {
             const desiredTop = Math.max(
               0,
@@ -21494,7 +24649,8 @@ function HistoryPanel({
       },
       isCurrent: ownsRelease,
       isPaused: () => (
-        historyRestoreInFlightRef.current !== 0
+        !addressReady()
+        || historyRestoreInFlightRef.current !== 0
         || historyScrollInFlightRef.current !== null
         || (source !== 'hydration-apply' && hydrationRequestInFlightRef.current)
         || historyScrollSeekController.isActive()
@@ -21506,12 +24662,12 @@ function HistoryPanel({
         if (historyWheelGeometryReleaseSettleCancelRef.current === cancel) {
           historyWheelGeometryReleaseSettleCancelRef.current = null;
         }
-        const transferredToNewGesture = source === 'seek-exit'
+        const transferredToNewGesture = ownsSeekMask
           && (
             outcome.reason === 'user-gesture'
             || (outcome.reason === 'cancelled' && historyScrollSeekController.isActive())
           );
-        if (source === 'seek-exit' && !transferredToNewGesture) {
+        if (ownsSeekMask && !transferredToNewGesture) {
           setHistorySeekGeometryMask(scroller, false);
         }
         historyDiag('WHEEL_GEOMETRY_RELEASE_DONE tab=' + historyTabIdRef.current.slice(-12)
@@ -21533,6 +24689,7 @@ function HistoryPanel({
     historyScrollSeekController,
     measureHistoryWheelGeometryRelease,
     readHistoryWheelGeometryAnchorTop,
+    readHistoryWheelAddress,
     restoreHistoryWheelGeometryRows,
     setHistorySeekGeometryMask,
   ]);
@@ -21866,6 +25023,10 @@ function HistoryPanel({
     if (!scroller?.isConnected) return;
     if (event.reason !== 'scroller-change' && event.reason !== 'scroller-gone') {
       scheduleHistorySeekRealRowsReady(scroller);
+      // rangeChanged may have settled while seek placeholders were active.
+      // That deferred hydration check cannot wake itself after seek exits;
+      // re-arm it from this existing transition, with the same owner guards.
+      scheduleHistoryHydrationRangeCheck();
     }
     if (event.reason !== 'velocity-settled') {
       releaseHistoryWheelGeometryFreeze(false);
@@ -22240,7 +25401,11 @@ function HistoryPanel({
 
   useEffect(() => {
     if (!historyScrollToUuid) return;
-    if (surfaceLoading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
+    if (surfaceLoading || (primaryPhysicalCandidate ? !primaryHeader || primaryRoot!.totalCount === 0 : displayEntries.length === 0)) return;
+    // Before the held view resolves the point address, the request remains
+    // pending in its existing owner. No missing/empty or legacy fallback.
+    if (primaryPhysicalCandidate && (!primaryJumpReady || !primaryInputsCurrent())) return;
+    const navigationRoot = primaryPhysicalCandidate ? primaryRootRef.current : null;
     const requestedTargetIdentity = historyScrollToUuid;
     const toolTarget = historyScrollToolTarget;
     const requestGeneration = useUIStore.getState().historyScrollRequestGeneration;
@@ -22253,17 +25418,28 @@ function HistoryPanel({
       } }));
       return;
     }
-    const resolvedNavigationTarget = resolveHistoryToolNavigationTarget(
-      displayEntries,
-      requestedTargetIdentity,
-      toolTarget,
+    const resolvedNavigationTarget = navigationRoot ? primaryJumpResolution.address : resolveHistoryToolNavigationTarget(
+      displayEntries, requestedTargetIdentity, toolTarget,
     );
     let targetUuid = resolvedNavigationTarget?.uuid || requestedTargetIdentity;
     // Target hidden inside a collapsed series: expand SYNCHRONOUSLY first.
     // The state update re-runs this effect on the next commit against the
     // unrolled unit list; the store key is intentionally NOT consumed yet.
-    if (expandGroupForUuid(targetUuid, 'timeline-jump')) return;
-    const idx = toolTarget && !resolvedNavigationTarget ? -1 : displayEntryIndexByUuid.get(targetUuid) ?? -1;
+    if (navigationRoot) {
+      if (resolvedNavigationTarget?.kind === 'group' && !resolvedNavigationTarget.expanded && resolvedNavigationTarget.groupKey) {
+        setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, resolvedNavigationTarget.groupKey, true));
+        return; // new view publication re-resolves the still-owned request
+      }
+    } else if (expandGroupForUuid(targetUuid, 'timeline-jump')) return;
+    const idx = navigationRoot ? resolvedNavigationTarget?.index ?? -1
+      : toolTarget && !resolvedNavigationTarget ? -1 : displayEntryIndexByUuid!.get(targetUuid) ?? -1;
+    let compositeRevealKey = idx >= 0 && toolTarget?.toolUseId
+      ? JSON.stringify([targetUuid, toolTarget.toolUseId]) : null;
+    if (idx >= 0 && toolTarget?.toolUseId) {
+      // If text and calls share this source row, reveal the exact call before
+      // the existing Timeline convergence/flash looks for its DOM node.
+      compositeGroupState.revealOnce(compositeRevealKey!);
+    }
     // Consume the store key immediately. The convergence loop is driven by the
     // ref-generation guard, NOT by this effect's cleanup, so clearing the key
     // (which re-runs the effect → early-return above) does not abort the loop.
@@ -22272,7 +25448,7 @@ function HistoryPanel({
       historyDiag('SCROLL_TO_MISS tab=' + tabId.slice(-12) +
         ' uuid=' + targetUuid.slice(-12) +
         panelDiagContextRef.current +
-        ' entries=' + displayEntries.length +
+        ' entries=' + (navigationRoot ? navigationRoot.totalCount : displayEntries.length) +
         ' reason=uuid-not-in-display');
       // entry doesn't exist in this session — acknowledge so the dot spinner clears
       window.dispatchEvent(
@@ -22313,7 +25489,7 @@ function HistoryPanel({
       ' uuid=' + targetUuid.slice(-12) +
       panelDiagContextRef.current +
       ' idx=' + idx +
-      ' entries=' + displayEntries.length +
+      ' entries=' + (navigationRoot ? navigationRoot.totalCount : displayEntries.length) +
       ' initialIdx=' + pendingInitialHistoryIndex +
       ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
       ' scrollTop=' + Math.round(startScroller?.scrollTop || 0) +
@@ -22324,6 +25500,7 @@ function HistoryPanel({
     const finish = (found: boolean, reason: string) => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return;
       const scroller = virtuosoScrollerRef.current;
+      if (compositeRevealKey) compositeGroupState.clearReveal(compositeRevealKey);
       historyScrollInFlightRef.current = null;
       historyJumpHydrationActiveRef.current = false;
       // Same echo hazard as position restores: the jump's own velocity
@@ -22378,9 +25555,52 @@ function HistoryPanel({
     let lastTargetWasStub = false;
     let stubWaitStartedAt: number | null = null;
     let stubWaitTotalMs = 0;
-    let navigationEntries = displayEntries;
-    const step = () => {
+    let navigationEntries = navigationRoot ? null : displayEntries;
+    let navigationHeader = navigationRoot?.header;
+    let navigationAddress = navigationRoot ? resolvedNavigationTarget : null;
+    const ownsNavigation = () => scrollMountedRef.current && scrollGenRef.current === myGen
+      && historyOwnerKeyRef.current === ownerAtStart
+      && historyUserGestureGenerationRef.current === userGeneration
+      && (!navigationRoot || primaryRootRef.current === navigationRoot && !navigationRoot.closed
+        && useUIStore.getState().historyScrollRequestGeneration === requestGeneration);
+    const step = async () => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
+      if (navigationRoot) {
+        if (!ownsNavigation()) { finish(false, 'source-jump-cancelled'); return; }
+        if (!primaryInputsCurrent()) {
+          if (performance.now() - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) { finish(false, 'target-address-timeout'); return; }
+          requestAnimationFrame(step); return;
+        }
+        if (navigationRoot.header !== navigationHeader) {
+          const requestedHeader = navigationRoot.header;
+          try {
+            const result = await readHistoryPrimaryPanelAddress(navigationRoot, 'identity', requestedTargetIdentity,
+              { tool: toolTarget, owns: () => ownsNavigation() && primaryInputsCurrent() });
+            if (!ownsNavigation()) { finish(false, 'source-jump-cancelled'); return; }
+            navigationHeader = result.header; navigationAddress = result.address;
+            if (!navigationAddress) { finish(false, 'identity-not-in-display'); return; }
+            if (navigationAddress.kind === 'group' && !navigationAddress.expanded && navigationAddress.groupKey) {
+              setExpandedGroupKeys(previous => setHistoryDisplayGroupExpanded(previous, navigationAddress.groupKey, true));
+              navigationHeader = null; requestAnimationFrame(step); return;
+            }
+            if (navigationAddress.uuid !== targetUuid) {
+              targetUuid = navigationAddress.uuid; stable = 0; lastTop = null;
+              if (toolTarget?.toolUseId) {
+                if (compositeRevealKey) compositeGroupState.clearReveal(compositeRevealKey);
+                compositeRevealKey = JSON.stringify([targetUuid, toolTarget.toolUseId]);
+                compositeGroupState.revealOnce(compositeRevealKey);
+              }
+              if (historyScrollInFlightRef.current?.gen === myGen) historyScrollInFlightRef.current.uuid = targetUuid;
+            }
+          } catch (error) {
+            if (!ownsNavigation()) { finish(false, 'source-jump-cancelled'); return; }
+            if ((error as any)?.code === 'HISTORY_READ_CANCELLED'
+              && (navigationRoot.header !== requestedHeader || !primaryInputsCurrent())) { requestAnimationFrame(step); return; }
+            setHistoryLoadError(String((error as any)?.code || error));
+            finish(false, 'source-address-read-failed'); return;
+          }
+        }
+      }
       if (toolTarget) {
         if (useUIStore.getState().historyScrollRequestGeneration !== requestGeneration
           || historyOwnerKeyRef.current !== ownerAtStart
@@ -22399,12 +25619,17 @@ function HistoryPanel({
       // A live/local row can acquire its canonical UUID while this jump is
       // settling. Follow the requested exact identity in the current final
       // presentation, never the old UUID or a text match.
-      if (entriesRef.current !== navigationEntries) {
+      if (!navigationRoot && entriesRef.current !== navigationEntries) {
         navigationEntries = entriesRef.current;
         const currentTarget = resolveHistoryToolNavigationTarget(navigationEntries, requestedTargetIdentity, toolTarget);
         if (toolTarget && !currentTarget) { finish(false, 'source-tool-disappeared'); return; }
         if (currentTarget && currentTarget.uuid !== targetUuid) {
           targetUuid = currentTarget.uuid;
+          if (toolTarget?.toolUseId) {
+            if (compositeRevealKey) compositeGroupState.clearReveal(compositeRevealKey);
+            compositeRevealKey = JSON.stringify([targetUuid, toolTarget.toolUseId]);
+            compositeGroupState.revealOnce(compositeRevealKey);
+          }
           stable = 0;
           lastTop = null;
           if (historyScrollInFlightRef.current?.gen === myGen) {
@@ -22412,22 +25637,82 @@ function HistoryPanel({
           }
         }
       }
-      const currentIdx = displayEntryIndexByUuidRef.current.get(targetUuid) ?? -1;
+      let currentIdx: number;
+      if (navigationRoot) currentIdx = navigationAddress?.index ?? -1;
+      else if (primaryPositionModeRef.current) {
+        // A legacy-started navigation loop is not effect-cleanup owned. If
+        // the actual current projection has become primary, its continuing
+        // position intent uses the SAME coordinate owner as pending resize.
+        // Keep its original request/gesture/startedAt; never restore a Map or
+        // capture a newer writer after the selected read has awaited.
+        const publication = primaryPositionOwner.capture();
+        const generationAtRead = historyOwnerGenerationRef.current;
+        const visitAtRead = historyPresentationProofRef.current.visit;
+        const scrollerAtRead = virtuosoScrollerRef.current;
+        const ownsPosition = () => ownsNavigation() && primaryPositionModeRef.current
+          && performance.now() - startedAt <= JUMP_STUB_HYDRATION_WAIT_MS
+          && useUIStore.getState().historyScrollRequestGeneration === requestGeneration
+          && historyOwnerGenerationRef.current === generationAtRead
+          && historyPresentationProofRef.current.visit === visitAtRead
+          && virtuosoScrollerRef.current === scrollerAtRead && !!scrollerAtRead?.isConnected
+          && primaryPositionOwner.owns(publication);
+        // Observe this ORIGINAL absolute deadline even if a data RPC never
+        // replies. It is not a new lease lifetime or a resize/anchor policy.
+        // The strictly-after check preserves the inclusive 20,000ms boundary.
+        const positionDeadline = new AbortController();
+        const positionDeadlineTimer = setTimeout(() => {
+          if (performance.now() - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) positionDeadline.abort();
+        }, Math.max(1, Math.ceil(startedAt + JUMP_STUB_HYDRATION_WAIT_MS - performance.now()) + 1));
+        try {
+          const selected = await primaryTimelinePosition.resolve(publication, targetUuid,
+            { owns: ownsPosition, signal: positionDeadline.signal });
+          if (!ownsNavigation() || useUIStore.getState().historyScrollRequestGeneration !== requestGeneration) {
+            finish(false, 'source-jump-cancelled'); return;
+          }
+          // The new await spends the ORIGINAL address-wait lifetime even
+          // when it eventually succeeds. A late success cannot write once
+          // that lifetime ended, and never receives a fresh startedAt.
+          if (performance.now() - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) {
+            finish(false, 'target-address-timeout'); return;
+          }
+          if (!ownsPosition() || selected.status === 'superseded') {
+            requestAnimationFrame(step); return;
+          }
+          if (selected.status === 'failed') throw selected.error;
+          currentIdx = selected.address?.index ?? -1;
+        } catch (error) {
+          if (!ownsNavigation()) { finish(false, 'source-jump-cancelled'); return; }
+          if (performance.now() - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) {
+            finish(false, 'target-address-timeout'); return;
+          }
+          setHistoryLoadError(String((error as any)?.code || error));
+          finish(false, 'source-address-read-failed'); return;
+        } finally {
+          clearTimeout(positionDeadlineTimer);
+        }
+      } else currentIdx = displayEntryIndexByUuidRef.current!.get(targetUuid) ?? -1;
       if (currentIdx < 0) {
         finish(false, 'target-disappeared');
         return;
       }
       const now = performance.now();
       const targetIsStub = toolType === 'codex'
-        && isHistoryHydrationTargetStub(entriesRef.current, targetUuid);
+        && (primaryRootRef.current ? !primaryRootRef.current.hasEntry(targetUuid)
+          : isHistoryHydrationTargetStub(entriesRef.current, targetUuid));
       if (targetIsStub) {
+        // Root mode moves the existing virtual viewport to the target before
+        // fetching its body. The mounted range, not a second full index/body
+        // cache, then owns this offscreen row's lifetime.
+        if (primaryRootRef.current) virtuosoRef.current?.scrollToIndex({ index: currentIdx, align: 'center', behavior: 'auto' });
         if (stubWaitStartedAt === null) stubWaitStartedAt = now;
         historyJumpHydrationActiveRef.current = true;
-        requestHistoryHydrationAt(targetUuid, 'timeline-jump', ' idx=' + currentIdx);
+        // The primary Surface's admitted list range owns its single current
+        // body demand. A second point-window flight would evict that range.
+        if (!navigationRoot) requestHistoryHydrationAt(targetUuid, 'timeline-jump', ' idx=' + currentIdx);
         // Main just answered that this row does not exist in its projection
         // (file rewritten under us): waiting will not materialize it.
         const lastResult = hydrationLastResultRef.current;
-        if (lastResult?.centerMissing && lastResult.centerUuid === targetUuid) {
+        if (!navigationRoot && lastResult?.centerMissing && lastResult.centerUuid === targetUuid) {
           finish(false, 'target-not-in-projection');
           return;
         }
@@ -22480,7 +25765,7 @@ function HistoryPanel({
             ' uuid=' + targetUuid.slice(-12) +
             panelDiagContextRef.current +
             ' idx=' + currentIdx +
-            ' entries=' + entriesRef.current.length +
+            ' entries=' + (navigationRoot ? navigationRoot.totalCount : entriesRef.current.length) +
             ' attempts=' + attempts +
             ' range=' + range.start + '-' + range.end +
             ' scrollTop=' + Math.round(scroller.scrollTop) +
@@ -22522,7 +25807,9 @@ function HistoryPanel({
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, [displayEntryIndexByUuid, displayEntries, entries, expandGroupForUuid, historyScrollToUuid, historyScrollToolTarget, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType, sessionId]);
+  }, [primaryPhysicalCandidate, primaryHeader, primaryJumpReady, primaryJumpResolution, primaryInputsCurrent,
+    primaryPositionOwner, primaryTimelinePosition, displayEntryIndexByUuid, displayEntries, entries, expandGroupForUuid, historyScrollToUuid, historyScrollToolTarget,
+    pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType, sessionId, compositeGroupState]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
@@ -22842,23 +26129,77 @@ function HistoryPanel({
       getFollowBottom: () => isAtBottomRef.current,
       isPositionBusy: () => !initialLoadDoneRef.current || historyRestoreInFlightRef.current !== 0
         || historyScrollSeekController.isActive(),
+      canWritePosition: () => !primaryRootRef.current?.header || primaryInputsCurrent(),
       isContentReady: (anchor: any) => {
         if (mountWaveActiveRef.current) return false;
         const s = virtuosoScrollerRef.current;
         if (!s) return false;
-        if (anchor.kind !== 'tail') return true;
-        const slot = s.querySelector<HTMLElement>(`[data-item-index="${displayUnitItemKeysRef.current.length - 1}"]`);
-        return !!slot?.querySelector('[data-history-row-real]')
-          && Math.abs(Math.round(slot.getBoundingClientRect().height) - Number(slot.getAttribute('data-known-size'))) <= 1;
+        const root = primaryRootRef.current;
+        if (root?.header && !primaryInputsCurrent()) return false;
+        if (anchor.kind !== 'tail') {
+          if (!root?.header) return true;
+          const row = Array.from(s.querySelectorAll<HTMLElement>('[data-history-row-real]'))
+            .find((node) => node.getAttribute('data-history-unit-key') === anchor.key
+              || !!anchor.uuid && node.getAttribute('data-uuid') === anchor.uuid);
+          const slot = row?.closest<HTMLElement>('[data-item-index]');
+          const index = Number(slot?.getAttribute('data-item-index'));
+          const address = slot && root.addressAt(index);
+          return !!address && row?.getAttribute('data-history-unit-key') === address.physicalKey;
+        }
+        const index = (root?.header ? root.totalCount : displayUnitItemKeysRef.current.length) - 1;
+        const slot = s.querySelector<HTMLElement>(`[data-item-index="${index}"]`);
+        const row = slot?.querySelector<HTMLElement>('[data-history-row-real]');
+        const tailAddress = root?.header ? root.addressAt(index) : undefined;
+        if (root?.header && (!tailAddress
+          || row?.getAttribute('data-history-unit-key') !== tailAddress.physicalKey)) return false;
+        return !!row
+          && Math.abs(Math.round(slot!.getBoundingClientRect().height) - Number(slot!.getAttribute('data-known-size'))) <= 1;
       },
       converge: runHistoryScrollConvergence,
-      jumpToKey: (key: string, uuid: string, tail = false) => {
+      jumpToKey: async (key: string, uuid: string, tail = false) => {
+        const root = primaryRootRef.current;
+        if (root?.header) {
+          if (!primaryInputsCurrent()) return true; // pending composition, no physical write
+          const header = root.header, ownerAtRead = owner(), gesture = historyUserGestureGenerationRef.current;
+          const restoreToken = resizeToken;
+          const owns = () => primaryRootRef.current === root && root.header === header
+            && owner() === ownerAtRead && historyUserGestureGenerationRef.current === gesture
+            && resizeToken === restoreToken && historyRestoreInFlightRef.current === restoreToken
+            && historyPresentationProofRef.current.presented && primaryInputsCurrent();
+          if (tail) {
+            if (!owns() || root.totalCount <= 0) return false;
+            virtuosoRef.current?.scrollToIndex({ index: root.totalCount - 1, align: 'end', behavior: 'auto' });
+            return true;
+          }
+          const selected = await primaryResizeAddress.resolveKeyOrTarget(root, key, uuid, { owns });
+          if (!owns()) return true; // same controller may resume after the new cut adopts
+          if (selected?.status === 'failed') throw selected.error;
+          if (selected?.status !== 'ready' || !selected.address) return false;
+          virtuosoRef.current?.scrollToIndex({ index: selected.address.index, align: 'start', behavior: 'auto' });
+          return true;
+        }
         if (tail) {
           virtuosoRef.current?.scrollToIndex({ index: displayUnitItemKeysRef.current.length - 1, align: 'end', behavior: 'auto' });
           return true;
         }
         const index = findHistoryUnitIndexByKey(displayUnitItemKeysRef.current, key);
-        const resolved = index >= 0 ? index : displayEntryIndexByUuidRef.current.get(uuid);
+        let resolved: number | undefined = index >= 0 ? index : undefined;
+        if (index < 0 && primaryPositionModeRef.current) {
+          const publication = primaryPositionOwner.capture();
+          const ownerAtRead = owner(), gesture = historyUserGestureGenerationRef.current;
+          const restoreToken = resizeToken, scroller = virtuosoScrollerRef.current;
+          const owns = () => owner() === ownerAtRead && historyUserGestureGenerationRef.current === gesture
+            && resizeToken === restoreToken && historyRestoreInFlightRef.current === restoreToken
+            && historyPresentationProofRef.current.presented
+            && virtuosoScrollerRef.current === scroller && !!scroller?.isConnected
+            && primaryPositionOwner.owns(publication);
+          const selected = await primaryResizePosition.resolve(publication, uuid, { owns });
+          if (!owns()) return true; // Original convergence keeps its lifetime; no stale write.
+          if (selected.status === 'failed') throw selected.error;
+          if (selected.status === 'superseded') return true;
+          if (selected.status !== 'ready' || !selected.address) return false;
+          resolved = selected.address.index;
+        } else if (index < 0) resolved = displayEntryIndexByUuidRef.current!.get(uuid);
         if (resolved === undefined || resolved < 0) return false;
         virtuosoRef.current?.scrollToIndex({ index: resolved, align: 'start', behavior: 'auto' });
         return true;
@@ -22895,8 +26236,16 @@ function HistoryPanel({
         if (!scroller?.isConnected) return;
         const captured = captureHistoryAnchorFromDom(scroller, anchor.kind === 'tail');
         if (captured && reason === 'restored') setHistoryReadingAnchor(scrollPositionKeyRef.current, { ...captured, savedAt: Date.now() });
+        const primary = primaryRootRef.current;
+        if (primary?.header && !primaryInputsCurrent()) return;
         const rows = Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-row-real]'))
-          .filter((row) => row.getAttribute('data-history-row-owner') === historyOwnerDomId && row.getBoundingClientRect().height > 0);
+          .filter((row) => {
+            if (row.getAttribute('data-history-row-owner') !== historyOwnerDomId || row.getBoundingClientRect().height <= 0) return false;
+            if (!primary?.header) return true;
+            const slot = row.closest<HTMLElement>('[data-item-index]');
+            const address = slot && primary.addressAt(Number(slot.getAttribute('data-item-index')));
+            return !!address && row.getAttribute('data-history-unit-key') === address.physicalKey;
+          });
         if (rows.length > 0) publishHistorySurfacePresented({
           ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
           presentationVisit: historyPresentationProofRef.current.visit,
@@ -22939,6 +26288,7 @@ function HistoryPanel({
     };
   }, [historyOwnerKey, historyOwnerDomId, historySnapshotOwner, fileRewriteEpoch, armHistoryViewportPaintProof,
     historyScrollSeekController, historyTailPinScheduler, publishHistorySurfacePresented,
+    primaryInputsCurrent, primaryResizeAddress, primaryPhysicalCandidate, primaryPositionOwner, primaryResizePosition,
     setHistoryTailFollowIntent, tabId]);
 
   useEffect(() => { historyResizeRef.current?.refresh(); }, [viewportReadyOwnerKey, historyOwnerVisit]);
@@ -22973,6 +26323,7 @@ function HistoryPanel({
   // identical text frames (production 20.08 03:20 UTC, 19/23 jumps).
   const handleHistoryVirtuosoScrollerRef = useCallback((rawScroller: HTMLElement | Window | null) => {
     const nextScroller = rawScroller instanceof HTMLElement ? rawScroller : null;
+    if (nextScroller && primaryRootRef.current?.header) primaryInitialMountedRef.current = primaryInitialMountKeyRef.current;
     const prev = virtuosoScrollerRef.current;
     if (prev === nextScroller) {
       historyScrollSeekController.setScroller(nextScroller, historyScrollerOwnerToken());
@@ -23052,6 +26403,339 @@ function HistoryPanel({
     requestHistoryMountWaveStep,
   ]);
 
+  // Shared verbatim by the legacy and rooted acquisition paths.
+  const renderHistoryUnit = (_idx: number, unit: any, wrapResponseWork = true): React.ReactNode => {
+              const responseWork = unit?.responseWork;
+              if (wrapResponseWork && responseWork?.key) return (
+                <HistoryResponseWorkMember groupKey={responseWork.key} onCollapse={collapseGroupFromFoot}>
+                  {renderHistoryUnit(_idx, unit, false)}
+                </HistoryResponseWorkMember>
+              );
+              // ---- Group header unit (collapsed OR expanded) ----
+              if ((unit as any).kind === 'group') {
+                const group = unit as any;
+                const groupExpanded = group.expanded === true;
+                const workClock = group.familyKey === 'response-work'
+                  ? historyResponseWorkClock(group, responseWorkTailTiming) : null;
+                const groupAnchorUuid = group.entries[0]?.uuid || '';
+                const groupChainBreak =
+                  claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
+                const parentGroup = group.parentGroup as
+                  | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
+                  | undefined;
+                const headerNode = (
+                  <div
+                    // When expanded, the first MEMBER row carries the anchor
+                    // uuid as data-uuid; the header must not duplicate it or
+                    // uuid-driven DOM lookups (restore, search highlight)
+                    // would find two nodes.
+                    data-uuid={groupExpanded ? undefined : groupAnchorUuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-row-real="1"
+                    ref={onHistoryHandoffRowMounted}
+                    data-history-unit-key={historyPhysicalItemKeyAt(_idx)}
+                    data-history-group={group.key}
+                    style={{
+                      paddingTop: 2,
+                      paddingBottom: 2,
+                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    {group.familyKey === 'response-work' ? (<>
+                      <HistoryResponseWorkHeader
+                        expanded={groupExpanded}
+                        recordTimeAttributes={group.recordTimeAttributes}
+                        onToggle={() => groupExpanded
+                          ? collapseGroupPreservingViewport(group.key)
+                          : expandGroupPreservingViewport(group.key, 'click')}>
+                        {workClock
+                          ? <HistoryResponseTailTimer timing={workClock} placement="work" />
+                          : <span>Работа</span>}
+                      </HistoryResponseWorkHeader>
+                      {!groupExpanded && <HistoryResponseWorkPreview group={group} />}
+                    </>
+                    ) : <HistoryCollapsedGroupRow
+                      group={group}
+                      captionOwnerKey={historyOwnerKey}
+                      captionIdentity={groupCaptionSelectionsRef.current.get(group.key) || null}
+                      onCaptionChange={cycleHistoryGroupCaption}
+                      onCaptionContextMenu={(event, captionEntry) => openHistoryEntryContextMenu(event, captionEntry, toolType, tabId,
+                        copiedHistoryMessageIteration(entries, captionEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
+                      expanded={groupExpanded}
+                      liveBackgroundUuids={liveBackgroundUuids}
+                      isTurnBusy={isTurnBusy}
+                      isLastUnit={_idx === (primaryRootRef.current?.header ? primaryRootRef.current.totalCount : displayUnits.length) - 1}
+                      onToggle={() => {
+                        if (groupExpanded) {
+                          historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
+                            + ' key=' + group.key.slice(0, 24)
+                            + ' reason=click');
+                          collapseGroupPreservingViewport(group.key);
+                        } else {
+                          expandGroupPreservingViewport(group.key, 'click');
+                        }
+                      }}
+                    />}
+                  </div>
+                );
+                if (!parentGroup) return headerNode;
+                return (
+                  <div
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-row-real="1"
+                    ref={onHistoryHandoffRowMounted}
+                    data-history-unit-key={historyPhysicalItemKeyAt(_idx)}
+                    className="hp-history-group-member"
+                    data-history-group-member={parentGroup.key}
+                    data-history-group-uniform={parentGroup.uniform ? '1' : undefined}
+                    data-history-group-last={parentGroup.last ? '1' : undefined}
+                    style={{
+                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryGroupRail
+                      groupKey={parentGroup.key}
+                      onCollapse={collapseGroupFromFoot}
+                      nested={!!responseWork}
+                    />
+                    {headerNode}
+                    {parentGroup.last && (
+                      <HistoryGroupFoot
+                        groupKey={parentGroup.key}
+                        onCollapse={collapseGroupFromFoot}
+                      />
+                    )}
+                  </div>
+                );
+              }
+              const entryUnit = unit as any;
+              const entry = entryUnit.entry as FullHistoryEntry;
+              const expandedGroup = entryUnit.expandedGroup as
+                | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
+                | undefined;
+              const expandedSubgroup = entryUnit.expandedSubgroup as
+                | { key: string; familyKey: string; docsKind?: string; first: boolean; last: boolean }
+                | undefined;
+              const presentedEntry = applyHistoryLiveToolResultsToEntry(
+                entry,
+                visibleLiveToolResultValues,
+              ) as FullHistoryEntry;
+              const compositeWorkState = entryUnit.responseWork && historyGroupActionsEnabled
+                && !!presentedEntry.content && (presentedEntry.actions?.length || 0) >= 2
+                ? compositeGroupState : undefined;
+              // Red tint for the chain-break zone: every entry at or before
+              // the boundary uuid is unreachable by Claude's own backtrace
+              // (live Claude would truncate to entries AFTER the boundary on
+              // next resume). Independent of compact — orphans appear with
+              // or without compact (rebuild / Stop / Esc / SSE crash).
+              const isChainBreakZone =
+                claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
+              // Mount wave: rows that existed at visit mount render an
+              // exact-height shell until their upgrade step commits. Rows
+              // NOT in the shell set (streamed in during the wave) render
+              // real immediately. The wrapper stays the real one either way
+              // — context menu, uuid identity and tint are never deferred.
+              // Row-window stub: main shipped this row's identity only (see
+              // applyHistoryRowWindow). It renders exactly like a mount-wave
+              // shell — same wrapper, same stored height — because it is the
+              // same promise to Virtuoso: this row occupies these pixels, its
+              // content arrives later. The difference is who fills it: the
+              // wave upgrades locally, a stub needs main to hydrate it, which
+              // the viewport watcher below requests.
+              if ((presentedEntry as any).rowStub) {
+                const stubHeight = mountWaveMetaRef.current?.heightLookup?.(_idx)
+                  ?? historyRowHeightLookup(_idx);
+                return (
+                  <div
+                    data-uuid={presentedEntry.uuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-mount-shell="1"
+                    data-history-row-stub="1"
+                    data-history-unit-key={historyPhysicalItemKeyAt(_idx)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
+                    style={{
+                      paddingTop: 4,
+                      paddingBottom: 4,
+                      height: stubHeight,
+                      boxSizing: 'border-box',
+                      overflow: 'hidden',
+                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryMountShellBody index={_idx} />
+                  </div>
+                );
+              }
+              const waveMeta = mountWaveMetaRef.current;
+              const asShell =
+                mountWaveActive
+                && waveMeta?.visitKey === restoredLayoutVisitKey
+                && waveMeta.shellUuids.has(presentedEntry.uuid)
+                && !mountWaveRenderState.realUuids.has(presentedEntry.uuid);
+              if (asShell && waveMeta) {
+                return (
+                  <div
+                    data-uuid={presentedEntry.uuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-mount-shell="1"
+                    data-history-unit-key={historyPhysicalItemKeyAt(_idx)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
+                    style={{
+                      paddingTop: 4,
+                      paddingBottom: 4,
+                      // The wrapper adds 8px vertical padding around the
+                      // card; the stored size is the WRAPPER's measured
+                      // height, so the inner body gets size minus padding —
+                      // giving the wrapper exactly the stored pixels.
+                      height: waveMeta.heightLookup(_idx),
+                      boxSizing: 'border-box',
+                      overflow: 'hidden',
+                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryMountShellBody index={_idx} />
+                  </div>
+                );
+              }
+              const entryBody = (
+                <>
+                  <HistoryEntry
+                    entry={presentedEntry}
+                    suppressResponseTiming={entryUnit.suppressResponseTiming === true}
+                    compositeGroupState={compositeWorkState}
+                    onCompositeReveal={compositeWorkState ? revealCompositeWorkActions : undefined}
+                    isTurnBusy={compositeWorkState ? isTurnBusy : undefined}
+                    tabId={tabId}
+                    toolType={toolType}
+                    allowRewind={!previewMode && toolType !== 'gemini'}
+                    rewindLocked={historyRewindLocked}
+                    rewindUnavailableReason={historyRewindUnavailableReason}
+                    allowHistoryRewriteRewind={
+                      !previewMode
+                      && (toolType === 'claude' || toolType === 'codex')
+                      && !!sessionId
+                    }
+                    historyRewriteRewindLocked={historyRewriteRewindLocked}
+                    historyRewriteRewindUnavailableReason={historyRewriteRewindUnavailableReason}
+                    onHistoryRewriteRewind={executeHistoryRewriteRewind}
+                    allowDeleteIteration={
+                      !previewMode
+                      && (toolType === 'claude' || toolType === 'codex')
+                      && !!sessionId
+                    }
+                    deleteIterationLocked={historyRewriteRewindLocked}
+                    deleteIterationUnavailableReason={historyRewriteRewindUnavailableReason}
+                    onDeleteIteration={executeHistoryDeleteIteration}
+                    onDismissPromptPresentation={dismissPromptPresentation}
+                    onMergeQueuedPrompt={!previewMode ? mergeQueuedPrompt : undefined}
+                    onReleaseSendQueue={!previewMode ? releaseSendQueue : undefined}
+                    onDismissRewindPresentation={dismissLocalRewindPresentation}
+                    forceExpanded={
+                      searchActive && matchingEntryUuids.has(entry.uuid)
+                    }
+                  />
+                </>
+              );
+              return (
+                <div
+                  data-uuid={presentedEntry.uuid}
+                  data-history-row-owner={historyOwnerDomId}
+                  data-history-row-real="1"
+                  ref={onHistoryHandoffRowMounted}
+                  data-history-unit-key={historyPhysicalItemKeyAt(_idx)}
+                  data-history-live-entry={presentedEntry.liveProjection ? '1' : undefined}
+                  data-history-durable-source={
+                    !presentedEntry.liveProjection
+                      ? presentedEntry.sourceIdentity || undefined
+                      : undefined
+                  }
+                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
+                  style={{
+                    // Member rows tile FLUSH: any wrapper padding would cut
+                    // the group rail into segments (the member's border-left
+                    // cannot reach across it).
+                    paddingTop: expandedGroup || expandedSubgroup ? 0 : 4,
+                    paddingBottom: expandedGroup || expandedSubgroup ? 0 : 4,
+                    backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    ...(flashUuid === presentedEntry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
+                  }}
+                >
+                  {expandedGroup ? (
+                    // Member of an expanded group: indented under the rail.
+                    // Collapsing happens on the group HEADER above or anywhere
+                    // along this member's rail (the foot is its final glyph),
+                    // so a long block never requires scrolling back to its top.
+                    <div
+                      className={`hp-history-group-member${expandedGroup.familyKey === 'research' ? ' hp-history-group-member--research' : ''}`}
+                      data-history-group-member={expandedGroup.key}
+                      data-history-group-uniform={expandedGroup.uniform ? '1' : undefined}
+                      data-history-group-last={expandedGroup.last ? '1' : undefined}
+                    >
+                      <HistoryGroupRail
+                        groupKey={expandedGroup.key}
+                        onCollapse={collapseGroupFromFoot}
+                        nested={!!responseWork}
+                      />
+                      {expandedSubgroup ? (
+                        <div
+                          className="hp-history-subgroup-member"
+                          data-history-subgroup-member={expandedSubgroup.key}
+                          data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
+                          data-history-docs-kind={expandedSubgroup.docsKind || undefined}
+                        >
+                          <HistoryGroupRail
+                            groupKey={expandedSubgroup.key}
+                            onCollapse={collapseGroupFromFoot}
+                            title="Свернуть серию"
+                            nested
+                          />
+                          {entryBody}
+                          {expandedSubgroup.last && (
+                            <HistoryGroupFoot
+                              groupKey={expandedSubgroup.key}
+                              onCollapse={collapseGroupFromFoot}
+                              title="Свернуть серию"
+                            />
+                          )}
+                        </div>
+                      ) : entryBody}
+                      {expandedGroup.last && (
+                        <HistoryGroupFoot
+                          groupKey={expandedGroup.key}
+                          onCollapse={collapseGroupFromFoot}
+                        />
+                      )}
+                    </div>
+                  ) : expandedSubgroup ? (
+                    <div
+                      className="hp-history-subgroup-member hp-history-subgroup-member--root"
+                      data-history-subgroup-member={expandedSubgroup.key}
+                      data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
+                      data-history-docs-kind={expandedSubgroup.docsKind || undefined}
+                    >
+                      <HistoryGroupRail
+                        groupKey={expandedSubgroup.key}
+                        onCollapse={collapseGroupFromFoot}
+                        title="Свернуть серию"
+                        nested
+                      />
+                      {entryBody}
+                      {expandedSubgroup.last && (
+                        <HistoryGroupFoot
+                          groupKey={expandedSubgroup.key}
+                          onCollapse={collapseGroupFromFoot}
+                          title="Свернуть серию"
+                        />
+                      )}
+                    </div>
+                  ) : entryBody}
+                </div>
+              );
+  };
+
   // Single composer for the tab, rendered either inside the panel (History
   // primary) or into the docked host below the terminal (terminal primary).
   // Built once as a node so both placements share identical props — two
@@ -23089,6 +26773,7 @@ function HistoryPanel({
       onSwapPrimarySurface={onSwapPrimarySurface}
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={lifecycleStatus}
+      returnPreparation={composerReturnPreparationView(composerReturnPreparations, tabId, sessionId)}
       operationalPhase={compactOperationalPhase}
       onRuntimeSnapshotChange={handleRuntimeSnapshotChange}
       onInputBusyChange={setControlsPasteBusy}
@@ -23143,6 +26828,13 @@ function HistoryPanel({
       data-history-tab-id={tabId}
       data-history-session={sessionId || undefined}
       data-history-presented={presented ? '1' : '0'}
+      data-history-primary-lease={primaryRoot?.header?.leaseId}
+      // Diagnostic eligibility only; the worker still authenticates the
+      // capability, dependencies and time boundary before a view can fork.
+      data-history-primary-view-inputs={primaryRootReadEnabled && primaryRoot?.header
+        ? historyPrimaryCompositionRequestClass(primaryCompositionAppliedRef.current, primaryPresentation,
+          suppressedPromptsRef.current, primaryRoot.header, primarySuppressionCountAppliedRef.current) === 'view' ? '1' : '0'
+        : undefined}
       data-history-presentation-visit={historyPresentationVisit}
       data-history-viewport-ready={
         viewportReadyOwnerKey === historyOwnerKey ? '1' : '0'
@@ -23327,6 +27019,7 @@ function HistoryPanel({
         <HistoryResearchModelsProvider tabId={tabId} sessionId={sessionId} entries={transcriptEntries}
           enabled={isOpen} presented={presented} presentationRef={historyPresentationProofRef}
           presentationChannel={presentationExternallyManaged ? presentationChannel : undefined}>
+        <HistoryAgentCatalogLivenessContext.Provider value={primaryAgentLiveness}>
         <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
         <HistoryBackgroundTaskCallContext.Provider value={liveBackgroundTaskCalls}>
         <HistoryAgentInspectorContext.Provider value={agentInspectorController}>
@@ -23340,13 +27033,18 @@ function HistoryPanel({
             very next synchronous render discarded — every warm switch paid
             the list mount TWICE inside one frame. The stub is never visible:
             no paint happens between these commits. */}
-        {surfaceLoading || (ownerChangedBeforeLayoutHandoff && !retainedRewriteMount) || historyOwnerVisit === 0 ? (
+        {surfaceLoading || primaryHeaderPending || primaryInitialPositionPending || (ownerChangedBeforeLayoutHandoff && !retainedRewriteMount) || historyOwnerVisit === 0 ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
-            <HistoryLoadingStatus toolType={toolType} sessionId={sessionId} cwd={cwd}>
+            {(primaryHeaderPending || primaryInitialPositionPending) && historyLoadError ? (
+              <div data-history-address-state="read-error" style={{ color: '#fb7185', textAlign: 'center', padding: '0 24px' }}>
+                <div>{primaryHeaderPending ? 'История не загружена' : 'Не удалось определить позицию в истории'}</div>
+                <div style={{ fontSize: 10, overflowWrap: 'anywhere' }}>{historyLoadError}</div>
+              </div>
+            ) : <HistoryLoadingStatus toolType={toolType} sessionId={sessionId} cwd={cwd}>
               <HistorySpinner size={16} />
-            </HistoryLoadingStatus>
+            </HistoryLoadingStatus>}
           </div>
-        ) : transcriptEntries.length === 0 && !visibleTerminalPreview ? (
+        ) : (primaryPhysicalCandidate ? !!primaryHeader && primaryRoot!.totalCount === 0 : transcriptEntries.length === 0) && !visibleTerminalPreview ? (
           historyLoadError ? (
             <div
               data-history-empty-state="load-error"
@@ -23422,7 +27120,7 @@ function HistoryPanel({
           )
         ) : (
           <>
-          <Virtuoso
+          <HistoryPrimaryRootSurface
             // `restoreStateFrom` is consumed once per PHYSICAL mount. A stable
             // persistent-pane visit is opacity/inert only, so its ready
             // Virtuoso must keep the same key and measured DOM. Owner takeover
@@ -23430,7 +27128,21 @@ function HistoryPanel({
             // performs the one legitimate remount/restore transaction.
             key={restoredLayoutVisitKey}
             ref={virtuosoRef}
-            data={displayUnits}
+            primaryRoot={primaryRoot}
+            rootRevision={primaryRootRevision}
+            presentationScope={{ownerKey:historyOwnerKey,generation:historyOwnerGenerationRef.current,
+              visit:historyPresentationVisit,presented}}
+            presentationChannel={presentationExternallyManaged ? presentationChannel : undefined}
+            presentationRef={historyPresentationProofRef}
+            legacyData={displayUnits}
+            captionSelections={() => Array.from(groupCaptionSelectionsRef.current.entries())}
+            onRootError={reportPrimaryRootError}
+            inputsCurrent={primaryInputsCurrent}
+            inputTransaction={primaryInputTransaction.run}
+            unitMatches={(index, unit) => primaryRoot
+              ? primaryInputsCurrent() && primaryRoot.addressAt(index)?.physicalKey === String(historyVirtuosoUnitKey(unit))
+              : historyVirtuosoUnitKey(unit) === historyVirtuosoUnitKey(displayUnitsRef.current[index])}
+            onWindowCommit={handlePrimaryWindowCommit}
             itemSize={measureHistoryVirtuosoItemSize}
             components={HISTORY_VIRTUOSO_COMPONENTS}
             context={historyVirtuosoContext}
@@ -23438,7 +27150,7 @@ function HistoryPanel({
             // completed answer updates in place instead of unmounting between
             // the rollout event and the durable History refresh. A collapsed
             // group keys by its own stable group key (first call id).
-            computeItemKey={(_idx) => displayUnitItemKeys[_idx]}
+            computeItemKey={primaryRoot ? undefined : (_idx) => displayUnitItemKeys[_idx]}
             // Mount the scroller against our handleScroll so the per-scroll
             // FAB toggle / position-save stays identical to pre-virtuoso behavior.
             scrollerRef={handleHistoryVirtuosoScrollerRef}
@@ -23499,8 +27211,8 @@ function HistoryPanel({
                         historyPresentationProofRef.current,
                         presentationAtRange.visit,
                       )
-                    ) return;
-                    consumeHistoryViewportPaintProof({
+                    ) return false;
+                    return consumeHistoryViewportPaintProof({
                       ownerKey: ownerAtRange,
                       generation: generationAtRange,
                       presentationVisit: presentationAtRange.visit,
@@ -23560,7 +27272,7 @@ function HistoryPanel({
                         historyPresentationProofRef.current,
                         presentationAtRange.visit,
                       )
-                    ) return;
+                    ) return false;
                     const allDomRows = virtuosoScrollerRef.current
                       ?.querySelectorAll('[data-uuid]').length || 0;
                     const domRows = virtuosoScrollerRef.current
@@ -23575,7 +27287,7 @@ function HistoryPanel({
                       domRows,
                       foreignDomRows: Math.max(0, allDomRows - domRows),
                       cache: cacheAtRange,
-                    })) return;
+                    })) return false;
                     // paintGapMs is the number the blank-frame class is judged
                     // on: how long the surface stood between "loader gone" and
                     // "rows on screen". Deriving it by pairing two log lines
@@ -23636,20 +27348,20 @@ function HistoryPanel({
                       && displayUnitLayoutKeysRef.current.length === layoutItemKeys.length
                       && layoutItemKeys.every((key, index) => displayUnitLayoutKeysRef.current[index] === key);
                     requestAnimationFrame(() => requestAnimationFrame(() => {
-                    if (!ownsLayoutSnapshot()) return;
+                    if (!ownsLayoutSnapshot()) return false;
                     // A restore hunt still owns the scroller two frames after
                     // presentation on cold tail returns — its jump positions
                     // are not a baseline worth keeping, and the hunt's own
                     // settle banks the real one.
-                    if (historyRestoreInFlightRef.current) return;
+                    if (historyRestoreInFlightRef.current) return false;
                     // Mid-wave the list is mostly shells; their heights are
                     // real only when they came FROM the store. Snapshotting
                     // now would bank avg-estimated shells as measurements —
                     // the wave-done step does the baseline save instead.
-                    if (mountWaveActiveRef.current) return;
+                    if (mountWaveActiveRef.current) return false;
                     try {
                       virtuosoAtPaint?.getState((snapshot) => {
-                        if (!ownsLayoutSnapshot()) return;
+                        if (!ownsLayoutSnapshot()) return false;
                         const saved = saveHistoryMeasuredLayout(
                           ownerAtRange, snapshot as any, layoutItemKeys,
                         );
@@ -23663,6 +27375,7 @@ function HistoryPanel({
                       });
                     } catch { /* geometry is optional */ }
                     }));
+                    return true;
                   },
                 );
               }
@@ -23723,305 +27436,14 @@ function HistoryPanel({
               ['--cb-markdown-code-max-height' as any]:
                 Math.ceil(historyFontSize * 0.92 * 1.5 * historyMarkdownCodeMaxLines + 20) + 'px',
             }}
-            itemContent={(_idx, unit) => {
-              // ---- Group header unit (collapsed OR expanded) ----
-              if ((unit as any).kind === 'group') {
-                const group = unit as any;
-                const groupExpanded = group.expanded === true;
-                const groupAnchorUuid = group.entries[0]?.uuid || '';
-                const groupChainBreak =
-                  claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
-                const parentGroup = group.parentGroup as
-                  | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
-                  | undefined;
-                const headerNode = (
-                  <div
-                    // When expanded, the first MEMBER row carries the anchor
-                    // uuid as data-uuid; the header must not duplicate it or
-                    // uuid-driven DOM lookups (restore, search highlight)
-                    // would find two nodes.
-                    data-uuid={groupExpanded ? undefined : groupAnchorUuid}
-                    data-history-row-owner={historyOwnerDomId}
-                    data-history-row-real="1"
-                    ref={onHistoryHandoffRowMounted}
-                    data-history-unit-key={displayUnitItemKeys[_idx]}
-                    data-history-group={group.key}
-                    style={{
-                      paddingTop: 2,
-                      paddingBottom: 2,
-                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
-                    }}
-                  >
-                    <HistoryCollapsedGroupRow
-                      group={group}
-                      captionOwnerKey={historyOwnerKey}
-                      captionIdentity={groupCaptionSelectionsRef.current.get(group.key) || null}
-                      onCaptionChange={cycleHistoryGroupCaption}
-                      expanded={groupExpanded}
-                      liveBackgroundUuids={liveBackgroundUuids}
-                      isTurnBusy={isTurnBusy}
-                      isLastUnit={_idx === displayUnits.length - 1}
-                      onToggle={() => {
-                        if (groupExpanded) {
-                          historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
-                            + ' key=' + group.key.slice(0, 24)
-                            + ' reason=click');
-                          collapseGroupPreservingViewport(group.key);
-                        } else {
-                          expandGroupPreservingViewport(group.key, 'click');
-                        }
-                      }}
-                    />
-                  </div>
-                );
-                if (!parentGroup) return headerNode;
-                return (
-                  <div
-                    data-history-row-owner={historyOwnerDomId}
-                    data-history-row-real="1"
-                    ref={onHistoryHandoffRowMounted}
-                    data-history-unit-key={displayUnitItemKeys[_idx]}
-                    className="hp-history-group-member"
-                    data-history-group-member={parentGroup.key}
-                    data-history-group-uniform={parentGroup.uniform ? '1' : undefined}
-                    data-history-group-last={parentGroup.last ? '1' : undefined}
-                    style={{
-                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
-                    }}
-                  >
-                    <HistoryGroupRail
-                      groupKey={parentGroup.key}
-                      onCollapse={collapseGroupFromFoot}
-                    />
-                    {headerNode}
-                    {parentGroup.last && (
-                      <HistoryGroupFoot
-                        groupKey={parentGroup.key}
-                        onCollapse={collapseGroupFromFoot}
-                      />
-                    )}
-                  </div>
-                );
-              }
-              const entryUnit = unit as any;
-              const entry = entryUnit.entry as FullHistoryEntry;
-              const expandedGroup = entryUnit.expandedGroup as
-                | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
-                | undefined;
-              const expandedSubgroup = entryUnit.expandedSubgroup as
-                | { key: string; familyKey: string; docsKind?: string; first: boolean; last: boolean }
-                | undefined;
-              const presentedEntry = applyHistoryLiveToolResultsToEntry(
-                entry,
-                visibleLiveToolResultValues,
-              ) as FullHistoryEntry;
-              // Red tint for the chain-break zone: every entry at or before
-              // the boundary uuid is unreachable by Claude's own backtrace
-              // (live Claude would truncate to entries AFTER the boundary on
-              // next resume). Independent of compact — orphans appear with
-              // or without compact (rebuild / Stop / Esc / SSE crash).
-              const isChainBreakZone =
-                claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
-              // Mount wave: rows that existed at visit mount render an
-              // exact-height shell until their upgrade step commits. Rows
-              // NOT in the shell set (streamed in during the wave) render
-              // real immediately. The wrapper stays the real one either way
-              // — context menu, uuid identity and tint are never deferred.
-              // Row-window stub: main shipped this row's identity only (see
-              // applyHistoryRowWindow). It renders exactly like a mount-wave
-              // shell — same wrapper, same stored height — because it is the
-              // same promise to Virtuoso: this row occupies these pixels, its
-              // content arrives later. The difference is who fills it: the
-              // wave upgrades locally, a stub needs main to hydrate it, which
-              // the viewport watcher below requests.
-              if ((presentedEntry as any).rowStub) {
-                const stubHeight = mountWaveMetaRef.current?.heightLookup?.(_idx)
-                  ?? historyRowHeightLookup(_idx);
-                return (
-                  <div
-                    data-uuid={presentedEntry.uuid}
-                    data-history-row-owner={historyOwnerDomId}
-                    data-history-mount-shell="1"
-                    data-history-row-stub="1"
-                    data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
-                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
-                    style={{
-                      paddingTop: 4,
-                      paddingBottom: 4,
-                      height: stubHeight,
-                      boxSizing: 'border-box',
-                      overflow: 'hidden',
-                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
-                    }}
-                  >
-                    <HistoryMountShellBody index={_idx} />
-                  </div>
-                );
-              }
-              const waveMeta = mountWaveMetaRef.current;
-              const asShell =
-                mountWaveActive
-                && waveMeta?.visitKey === restoredLayoutVisitKey
-                && waveMeta.shellUuids.has(presentedEntry.uuid)
-                && !mountWaveRenderState.realUuids.has(presentedEntry.uuid);
-              if (asShell && waveMeta) {
-                return (
-                  <div
-                    data-uuid={presentedEntry.uuid}
-                    data-history-row-owner={historyOwnerDomId}
-                    data-history-mount-shell="1"
-                    data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
-                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
-                    style={{
-                      paddingTop: 4,
-                      paddingBottom: 4,
-                      // The wrapper adds 8px vertical padding around the
-                      // card; the stored size is the WRAPPER's measured
-                      // height, so the inner body gets size minus padding —
-                      // giving the wrapper exactly the stored pixels.
-                      height: waveMeta.heightLookup(_idx),
-                      boxSizing: 'border-box',
-                      overflow: 'hidden',
-                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
-                    }}
-                  >
-                    <HistoryMountShellBody index={_idx} />
-                  </div>
-                );
-              }
-              const entryBody = (
-                <>
-                  <HistoryEntry
-                    entry={presentedEntry}
-                    tabId={tabId}
-                    toolType={toolType}
-                    allowRewind={!previewMode && toolType !== 'gemini'}
-                    rewindLocked={historyRewindLocked}
-                    rewindUnavailableReason={historyRewindUnavailableReason}
-                    allowHistoryRewriteRewind={
-                      !previewMode
-                      && (toolType === 'claude' || toolType === 'codex')
-                      && !!sessionId
-                    }
-                    historyRewriteRewindLocked={historyRewriteRewindLocked}
-                    historyRewriteRewindUnavailableReason={historyRewriteRewindUnavailableReason}
-                    onHistoryRewriteRewind={executeHistoryRewriteRewind}
-                    allowDeleteIteration={
-                      !previewMode
-                      && (toolType === 'claude' || toolType === 'codex')
-                      && !!sessionId
-                    }
-                    deleteIterationLocked={historyRewriteRewindLocked}
-                    deleteIterationUnavailableReason={historyRewriteRewindUnavailableReason}
-                    onDeleteIteration={executeHistoryDeleteIteration}
-                    onDismissPromptPresentation={dismissPromptPresentation}
-                    onMergeQueuedPrompt={!previewMode ? mergeQueuedPrompt : undefined}
-                    onDismissRewindPresentation={dismissLocalRewindPresentation}
-                    forceExpanded={
-                      searchActive && matchingEntryUuids.has(entry.uuid)
-                    }
-                  />
-                </>
-              );
-              return (
-                <div
-                  data-uuid={presentedEntry.uuid}
-                  data-history-row-owner={historyOwnerDomId}
-                  data-history-row-real="1"
-                  ref={onHistoryHandoffRowMounted}
-                  data-history-unit-key={displayUnitItemKeys[_idx]}
-                  data-history-live-entry={presentedEntry.liveProjection ? '1' : undefined}
-                  data-history-durable-source={
-                    !presentedEntry.liveProjection
-                      ? presentedEntry.sourceIdentity || undefined
-                      : undefined
-                  }
-                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
-                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
-                  style={{
-                    // Member rows tile FLUSH: any wrapper padding would cut
-                    // the group rail into segments (the member's border-left
-                    // cannot reach across it).
-                    paddingTop: expandedGroup || expandedSubgroup ? 0 : 4,
-                    paddingBottom: expandedGroup || expandedSubgroup ? 0 : 4,
-                    backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
-                    ...(flashUuid === presentedEntry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
-                  }}
-                >
-                  {expandedGroup ? (
-                    // Member of an expanded group: indented under the rail.
-                    // Collapsing happens on the group HEADER above or anywhere
-                    // along this member's rail (the foot is its final glyph),
-                    // so a long block never requires scrolling back to its top.
-                    <div
-                      className={`hp-history-group-member${expandedGroup.familyKey === 'research' ? ' hp-history-group-member--research' : ''}`}
-                      data-history-group-member={expandedGroup.key}
-                      data-history-group-uniform={expandedGroup.uniform ? '1' : undefined}
-                      data-history-group-last={expandedGroup.last ? '1' : undefined}
-                    >
-                      <HistoryGroupRail
-                        groupKey={expandedGroup.key}
-                        onCollapse={collapseGroupFromFoot}
-                      />
-                      {expandedSubgroup ? (
-                        <div
-                          className="hp-history-subgroup-member"
-                          data-history-subgroup-member={expandedSubgroup.key}
-                          data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
-                          data-history-docs-kind={expandedSubgroup.docsKind || undefined}
-                        >
-                          <HistoryGroupRail
-                            groupKey={expandedSubgroup.key}
-                            onCollapse={collapseGroupFromFoot}
-                            title="Свернуть серию"
-                            nested
-                          />
-                          {entryBody}
-                          {expandedSubgroup.last && (
-                            <HistoryGroupFoot
-                              groupKey={expandedSubgroup.key}
-                              onCollapse={collapseGroupFromFoot}
-                              title="Свернуть серию"
-                            />
-                          )}
-                        </div>
-                      ) : entryBody}
-                      {expandedGroup.last && (
-                        <HistoryGroupFoot
-                          groupKey={expandedGroup.key}
-                          onCollapse={collapseGroupFromFoot}
-                        />
-                      )}
-                    </div>
-                  ) : expandedSubgroup ? (
-                    <div
-                      className="hp-history-subgroup-member hp-history-subgroup-member--root"
-                      data-history-subgroup-member={expandedSubgroup.key}
-                      data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
-                      data-history-docs-kind={expandedSubgroup.docsKind || undefined}
-                    >
-                      <HistoryGroupRail
-                        groupKey={expandedSubgroup.key}
-                        onCollapse={collapseGroupFromFoot}
-                        title="Свернуть серию"
-                        nested
-                      />
-                      {entryBody}
-                      {expandedSubgroup.last && (
-                        <HistoryGroupFoot
-                          groupKey={expandedSubgroup.key}
-                          onCollapse={collapseGroupFromFoot}
-                          title="Свернуть серию"
-                        />
-                      )}
-                    </div>
-                  ) : entryBody}
-                </div>
-              );
-            }}
+            renderUnit={renderHistoryUnit}
           />
+          {primaryRoot && historyLoadError && (
+            <div role="alert" data-history-primary-error="1" style={{ position: 'absolute', top: 0,
+              left: 0, right: 0, zIndex: 6, color: '#fb7185', background: '#151515', padding: '4px 8px', fontSize: 11 }}>
+              {historyLoadError}
+            </div>
+          )}
           {(viewportAwaitingFirstRange || historyResizePhase === 'settling') && (
             <div
               data-history-viewport-loader
@@ -24048,6 +27470,7 @@ function HistoryPanel({
         </HistoryAgentInspectorContext.Provider>
         </HistoryBackgroundTaskCallContext.Provider>
         </HistoryBackgroundLiveContext.Provider>
+        </HistoryAgentCatalogLivenessContext.Provider>
         </HistoryResearchModelsProvider>
         </HistoryPayloadContext.Provider>
         {/* «Выдвинуть вторую поверхность» — вплотную над полем ввода, у правого
@@ -24116,7 +27539,7 @@ function HistoryPanel({
         </ControlHint>
       </div>
 
-      {(backgroundHistoryChips.length > 0 || historyAgentChips.length > 0) && (
+      {(primaryAgentCatalogDock || backgroundHistoryChips.length > 0 || historyAgentChips.length > 0) && (
         // Only the compact chip-row owns normal-flow height. Its Inspector is
         // an absolute popover upward, so opening/loading/switching a child
         // transcript never changes the History viewport or a Virtuoso row.
@@ -24124,6 +27547,7 @@ function HistoryPanel({
           <HistoryBackgroundTasksBar
             chips={backgroundHistoryChips}
             agents={historyAgentChips}
+            catalog={primaryAgentCatalogDock}
             selectedKey={expandedBackgroundChipKey}
             rosterOpen={agentRosterOpen}
             onToggleDetail={toggleHistoryDetail}

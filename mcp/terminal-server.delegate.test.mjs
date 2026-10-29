@@ -1143,6 +1143,30 @@ test('MCP explicit selection and inherited continuation require the new app capa
   assert.equal(harness.requests.length, before);
 });
 
+test('strict observer MCP forwards exact selected turn/baseline to its own source with no files/model/continue', async t => {
+  const harness = await createHarness(t, (_body, _index, req) => ({ status: req.url === '/api/me' ? 200 : 202,
+    body: req.url === '/api/me' ? { capabilities: { externalResearchOrchestration: { version: 1,
+      browserSelection: { version: 1, field: 'browserId', jobOwnerPinned: true, offlinePreflight: true },
+      observeExistingTurn: { version: 1 } } } } : { runId: 'observe-one', jobId: 'noted_observe-one' } }));
+  const target = { version: 1, recoveryOperationId: 'manual-one', generationKind: 'new_user',
+    document: { tabId: 42, timeOrigin: 123 }, account: { userId: 'u', accountId: 'a' },
+    turn: { quality: 'native', conversationId: 'same', userMessageId: 'new-user' },
+    previousUserMessageIds: ['old-user'], previousFinalMessageIds: ['old-final'] };
+  const response = await harness.invoke({ runId: 'observe-one', browserId: 'yandex', url: 'https://chatgpt.com/c/same', target }, 'observe_external_turn');
+  assert.notEqual(response.result.isError, true, JSON.stringify(response));
+  const post = harness.requests.at(-1);
+  assert.equal(post.body.sourceTabId, 'test-source-tab'); assert.equal(post.body.browserId, 'yandex');
+  assert.deepEqual(post.body.options.observeExistingTurn, target); assert.equal(post.body.options.readOnlyImport, true);
+  assert.equal(post.body.options.autoClose, false); assert.equal(post.body.options.importTimeoutMs, 120000);
+  assert.equal(post.body.files, undefined); assert.equal(post.body.options.model, undefined); assert.equal(post.body.continueFromRunId, undefined);
+  assert.equal(response.result.structuredContent.jobId, 'noted_observe-one');
+});
+test('strict observer refuses an older Noted capability instead of falling back to author continue or URL import', async t => {
+  const harness = await createHarness(t, () => ({ status: 200, body: { capabilities: { externalResearchOrchestration: { version: 1 } } } }));
+  const response = await harness.invoke({ runId: 'observe-one', browserId: 'yandex', url: 'https://chatgpt.com/c/same', target: {} }, 'observe_external_turn');
+  assert.equal(response.result.isError, true); assert.match(response.result.content[0].text, /app_update_required/);
+  assert(harness.requests.every(req => req.method === 'GET'));
+});
 test('existing ChatGPT conversation import creates a tracked read-only run without a model prompt', async (t) => {
   const harness = await createHarness(t, (_body, _index, req) => {
     if (req.url === '/api/me') {

@@ -94,6 +94,7 @@ export function createHistoryResizeController(options) {
           cancelled: () => disposed || current !== session ? 'superseded'
             : getOwner() !== owner ? 'owner-change' : !isPresented() ? 'hidden' : null,
           measureDrift: () => {
+            if (options.canWritePosition && options.canWritePosition(anchor) !== true) return null;
             const s = getScroller();
             if (options.isContentReady && !options.isContentReady(anchor)) return null;
             session.measurement = measureHistoryResizeAnchor(s, anchor);
@@ -105,10 +106,13 @@ export function createHistoryResizeController(options) {
             return target - s.scrollTop;
           },
           jump: () => {
+            // A pending primary composition retains the resize intent without
+            // lending its old mounted row authority to write the new cut.
+            if (options.canWritePosition && options.canWritePosition(anchor) !== true) return true;
             const s = getScroller();
             if (!s) return true; // Physical list is between mounts.
-            if (anchor.kind === 'tail' && options.isContentReady && !options.isContentReady(anchor)) {
-              return jumpToKey(null, null, true);
+            if (options.isContentReady && !options.isContentReady(anchor)) {
+              return anchor.kind === 'tail' ? jumpToKey(null, null, true) : jumpToKey(anchor.key, anchor.uuid);
             }
             const measured = measureHistoryResizeAnchor(s, anchor);
             if (!measured) return jumpToKey(anchor.key, anchor.uuid);

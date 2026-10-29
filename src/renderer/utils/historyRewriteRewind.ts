@@ -24,6 +24,9 @@ export type HistoryRewriteRewindTarget = {
   uuid: string;
   text: string;
   endUuid?: string;
+  entryRef?: any;
+  endEntryRef?: any;
+  expectedContentRevision?: string;
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
 };
@@ -256,6 +259,8 @@ export async function executeHistoryRewriteRewindScenario({
         cwd,
         startUuid: target.uuid,
         endUuid: range.endUuid,
+        ...(target.entryRef ? { startEntryRef: target.entryRef, endEntryRef: target.endEntryRef,
+          expectedContentRevision: target.expectedContentRevision } : {}),
         validateOnly: true,
         toPhysicalEnd: rangeMode === 'tail',
         tabId, historyInput,
@@ -312,6 +317,8 @@ export async function executeHistoryRewriteRewindScenario({
           cwd,
           startUuid: target.uuid,
           endUuid: range.endUuid,
+          ...(target.entryRef ? { startEntryRef: target.entryRef, endEntryRef: target.endEntryRef,
+            expectedContentRevision: target.expectedContentRevision } : {}),
           tabId, historyInput,
           ...(toolType === 'codex' ? { toPhysicalEnd: rangeMode === 'tail' } : {}),
           ...(toolType === 'codex' && codexSettingsProof ? { codexSettingsProof } : {}),

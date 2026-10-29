@@ -986,35 +986,7 @@ class DatabaseManager {
     // (forks retain ancestor UUIDs). Do not SELECT/hash every stored chip body
     // on each unchanged probe. Transactional witnesses invalidate the exact
     // same hash on any real write, including another SQLite connection.
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS history_prompt_revision_versions (
-        tool_type TEXT PRIMARY KEY,
-        version INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_insert
-      AFTER INSERT ON history_prompt_presentations BEGIN
-        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (NEW.tool_type, 1)
-        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_delete
-      AFTER DELETE ON history_prompt_presentations BEGIN
-        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (OLD.tool_type, 1)
-        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_update
-      AFTER UPDATE ON history_prompt_presentations
-      WHEN OLD.tool_type IS NOT NEW.tool_type OR OLD.session_id IS NOT NEW.session_id
-        OR OLD.audit_timestamp IS NOT NEW.audit_timestamp OR OLD.transport_hash IS NOT NEW.transport_hash
-        OR OLD.entry_uuid IS NOT NEW.entry_uuid OR OLD.schema_version IS NOT NEW.schema_version
-        OR OLD.chips_json IS NOT NEW.chips_json
-      BEGIN
-        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (NEW.tool_type, 1)
-        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
-        INSERT INTO history_prompt_revision_versions(tool_type, version)
-        SELECT OLD.tool_type, 1 WHERE OLD.tool_type IS NOT NEW.tool_type
-        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
-      END;
-    `);
+    require('./history-prompt-version-schema').installHistoryPromptVersionSchema(this.db);
 
     // Generated semantic projection for the expanded Timeline. The canonical
     // transcript remains JSONL; this row is disposable metadata keyed by the
@@ -1268,6 +1240,8 @@ class DatabaseManager {
     `);
 
     require('./history-freshness-metadata').installHistoryFreshnessMetadata(this.db);
+    require('./timeline-annotation-version-schema').installTimelineAnnotationVersionSchema(this.db);
+    require('./timeline-fork-presentation-version-schema').installTimelineForkPresentationVersionSchema(this.db);
 
     // Runtime state in main is keyed by tab_id alone. Repair legacy collisions
     // before enforcing the same identity contract in SQLite; otherwise a PTY,
@@ -6591,14 +6565,14 @@ class DatabaseManager {
     ).get(toolType)?.version || 0 : null;
     this._historyPromptRevisionCache ||= new Map();
     const cached = this._historyPromptRevisionCache.get(toolType);
-    if (cacheable && cached?.version === version) return cached.token;
+    if (cacheable && cached?.connection === this.db && cached.version === version) return cached.token;
     // Exact UUID decoration intentionally follows preserved entries across
     // resume/fork session boundaries. Until sidecars are copied into every
     // child, the revision must cover all rows for this provider; a token scoped
     // only to the requested session could declare History unchanged while an
     // ancestor row gained presentation metadata.
     const rows = this.db.prepare(`
-      SELECT session_id, audit_timestamp, transport_hash, entry_uuid, schema_version, chips_json
+      SELECT session_id, audit_timestamp, transport_hash, entry_uuid, schema_version, chips_json, updated_at
       FROM history_prompt_presentations
       WHERE tool_type = ?
       ORDER BY session_id ASC, audit_timestamp ASC, transport_hash ASC
@@ -6608,7 +6582,7 @@ class DatabaseManager {
       .update(JSON.stringify(rows))
       .digest('hex')
       .slice(0, 24);
-    if (cacheable) this._historyPromptRevisionCache.set(toolType, { version, token });
+    if (cacheable) this._historyPromptRevisionCache.set(toolType, { connection: this.db, version, token });
     return token;
   }
 

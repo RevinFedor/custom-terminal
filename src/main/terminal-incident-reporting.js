@@ -38,10 +38,26 @@ function terminalSendIncidentNotification(result, record, checkedAt = Date.now()
   };
 }
 
+// Notification grouping never supplies launch/input authority. It joins only
+// the watchdog and waiter that proved the same physical Codex launch; each
+// retains its own independently captured diagnostic artifact.
+function codexStartupDiagnosticGroup(tabId, launchId, lifecycleGeneration) {
+  if (![tabId, launchId, lifecycleGeneration].every(value => typeof value === 'string' && value.trim())) return null;
+  return JSON.stringify(['codex-startup-diagnostic', tabId, launchId, lifecycleGeneration]);
+}
+
+function codexStartupWaitDiagnosticGroup(tabId, toolType, expected, observed) {
+  if (toolType !== 'codex' || !expected?.launchId || !expected?.lifecycleGeneration
+    || expected.launchId !== observed?.launchId
+    || expected.lifecycleGeneration !== observed?.lifecycleGeneration) return null;
+  return codexStartupDiagnosticGroup(tabId, expected.launchId, expected.lifecycleGeneration);
+}
+
 // Diagnostic capture is an observer, never an admission/retry mechanism.
 // Capture starts synchronously at the incident, before disk/renderer awaits.
 function createTerminalIncidentReporter({ capture, notify, limit = 256 }) {
   const incidents = new Map();
+  const notifiedGroups = new Map();
   return function report(key, payload) {
     if (incidents.has(key)) return incidents.get(key);
     let captured;
@@ -50,7 +66,16 @@ function createTerminalIncidentReporter({ capture, notify, limit = 256 }) {
       result => ({ ...payload, ...result, success: true }),
       error => ({ ...payload, success: false, error: String(error?.message || error) }),
     ).then(result => {
-      try { notify(result); } catch (error) { console.warn('[TerminalIncident] notify failed', error?.message); }
+      const group = typeof result.notificationGroup === 'string' && result.notificationGroup ? result.notificationGroup : null;
+      const presented = group && notifiedGroups.has(group)
+        ? { ...result, silent: true, duplicateNotification: true } : result;
+      try {
+        const delivered = notify(presented);
+        if (group && result.success && !presented.silent && delivered !== false) {
+          notifiedGroups.set(group, true);
+          while (notifiedGroups.size > limit) notifiedGroups.delete(notifiedGroups.keys().next().value);
+        }
+      } catch (error) { console.warn('[TerminalIncident] notify failed', error?.message); }
       return result;
     });
     incidents.set(key, pending);
@@ -91,4 +116,5 @@ function terminalSendFailureDiagnosticPayload(input = {}, store) {
       pasteWritten: typeof input.pasteWritten === 'boolean' ? input.pasteWritten : null } };
 }
 module.exports = { createTerminalIncidentReporter, terminalSendIncidentNotification,
+  codexStartupDiagnosticGroup, codexStartupWaitDiagnosticGroup,
   resolveTerminalIncidentSendIdentity, terminalSendFailureDiagnosticPayload };

@@ -98,21 +98,21 @@ test('tool schemas expose only the agreed arguments and describe message/receipt
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   for (const [name, fields] of [
     ['send_message', ['tabId', 'text', 'requestId']],
-    ['reply_to_message', ['messageId', 'text', 'requestId']],
+    ['reply_to_message', ['messageId', 'messageIds', 'text', 'requestId']],
     ['get_message', ['messageId']],
     ['get_send_receipt', ['tabId', 'handoffId']],
   ]) {
     const tool = byName.get(name);
     assert.deepEqual(Object.keys(tool.inputSchema.properties), fields);
-    assert.deepEqual(tool.inputSchema.required, fields.filter((field) => field !== 'requestId'));
+    assert.deepEqual(tool.inputSchema.required, name === 'reply_to_message' ? ['text'] : fields.filter((field) => field !== 'requestId'));
     assert.equal(tool.inputSchema.additionalProperties, false);
     assert.match(tool.description, /poll/i);
   }
   assert.match(byName.get('send_message').description, /busy owner.*continue.*before its final/s);
-  assert.match(byName.get('reply_to_message').description, /server derives the recipient/);
+  assert.match(byName.get('reply_to_message').description, /server derives recipients/);
   assert.match(byName.get('send_prompt').description, /get_send_receipt.*never retry changed or empty text/);
   assert.match(byName.get('send_prompt').inputSchema.properties.handoffId.description, /get_send_receipt/);
-  for (const name of ['delegate_to_session', 'start_external_research', 'continue_external_research', 'import_external_conversation', 'get_delegation_result']) {
+  for (const name of ['delegate_to_session', 'start_external_research', 'continue_external_research', 'import_external_conversation', 'observe_external_turn', 'get_delegation_result']) {
     const description = byName.get(name).description;
     assert.match(description, /orchestrationInlineResults:\{version:1\}/);
     assert.match(description, /Check the actual notification/);
@@ -286,6 +286,28 @@ test('an invalid acceptance response cannot claim successful durable delivery', 
   }
 });
 
+test('one MCP batch call sends the explicit list once and returns mixed per-ID outcomes, including an empty delivery list', async () => {
+  for (const empty of [false, true]) {
+    const results = [{ questionId: 'Q1', status: 'already-answered', replyMessageId: 'old' },
+      { questionId: 'Q2', status: empty ? 'already-answered' : 'reply-created', replyMessageId: empty ? 'old2' : 'new' }];
+    const h = harness({ respond: call => call.endpoint === '/api/me'
+      ? { status: 200, body: { capabilities: { tabMessages: { ...capability, batchReply: { version: 1 } } } } }
+      : { status: 202, body: { ok: true, accepted: !empty, results, messages: empty ? [] : [{ messageId: 'new', deliveryState: 'queued' }] } } });
+    const result = await h.call('reply_to_message', { messageIds: ['Q1', 'Q2'], text: 'one shared text', requestId: 'same-batch-key' });
+    assert.notEqual(result.isError, true);
+    const body = assertStructured(result); assert.deepEqual(body.results, results);
+    const posts = h.calls.filter(c => c.method === 'POST'); assert.equal(posts.length, 1);
+    assert.equal(posts[0].endpoint, '/api/tab-messages/replies');
+    assert.deepEqual(posts[0].body.messageIds, ['Q1', 'Q2']); assert.equal(posts[0].body.text, 'one shared text');
+    assert.equal(posts[0].body.sourceTabId, owner.tabId); assert.equal(posts[0].body.requestId, 'same-batch-key');
+  }
+});
+test('old loaded App refuses batch before mutation; no fanout into separate single Replies', async () => {
+  const h = harness(); const result = await h.call('reply_to_message', { messageIds: ['Q1', 'Q2'], text: 'shared', requestId: 'same' });
+  assert.equal(result.isError, true); assert.equal(h.calls.filter(c => c.method === 'POST').length, 0);
+  assert.equal(assertStructured(result).code, 'app_update_required');
+});
+
 test('get_message preserves the bounded server response using only an encoded GET through the source app', async () => {
   const bounded = { ok: true, message: { messageId: 'question/id', deliveryState: 'sent' }, replies: [{ messageId: 'reply', text: 'answer' }], truncated: true, nextCursor: 'reply-cursor' };
   const h = harness({ respond: () => ({ status: 200, body: bounded }) });
@@ -304,6 +326,15 @@ test('get_send_receipt is a thin read-only exact-key GET, including an empty rec
   const result = await h.call('get_send_receipt', { tabId, handoffId });
   assert.deepEqual(assertStructured(result), receipt);
   assert.deepEqual(h.calls, [{ method: 'GET', endpoint: '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/send-receipts?handoffId=' + encodeURIComponent(handoffId), body: null }]);
+});
+test('actual get_message dispatcher preserves a modern durable wait outcome and a late reply without any POST or model input', async () => {
+  const snapshot = { ok: true, message: { messageId: 'Q', kind: 'question', deliveryState: 'sent',
+    loopWait: { version: 1, revision: 8, state: 'returning', disposition: 'reply_timeout',
+      notice: { operationKey: 'tab-message-outcome:Q', handoffId: 'tab-message-outcome:Q', state: 'sent' } } },
+    reply: { messageId: 'R', kind: 'reply', replyTo: 'Q', deliveryState: 'pending', text: 'Late exact answer' } };
+  const h = harness({ respond: () => ({ status: 200, body: snapshot }) });
+  assert.deepEqual(assertStructured(await h.call('get_message', { messageId: 'Q' })), snapshot);
+  assert.deepEqual(h.calls, [{ method: 'GET', endpoint: '/api/tab-messages/Q', body: null }]);
 });
 
 test('invalid inputs cannot broaden a read or cause a message POST', async () => {

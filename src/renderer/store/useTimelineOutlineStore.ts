@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import { openTimelineView } from '../utils/timelineViewClient.mjs';
+import { heldTimelineView } from '../utils/timelineViewReadModel.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -285,3 +287,33 @@ export const useTimelineOutlineStore = create<TimelineOutlineStore>((set, get) =
     }));
   },
 }));
+
+// Outline generation's provider/body owner is still explicitly OPEN. Its root
+// caller requests only a compact completion receipt, never adopts the generated
+// sourceUuids/member graph into the renderer's persistent outline store.
+export async function generateRootTimelineOutline(target: TimelineOutlineTarget) {
+  const model = heldTimelineView(target), client = model?.current?.client;
+  const key = timelineOutlineKey(target.toolType, target.sessionId);
+  if (useTimelineOutlineStore.getState().generatingKeys.has(key)) return null;
+  useTimelineOutlineStore.setState(state => ({ generatingKeys: new Set(state.generatingKeys).add(key) }));
+  let actionClient: any;
+  try {
+    actionClient = client ? await client.retainSnapshot()
+      : await openTimelineView(ipcRenderer.invoke.bind(ipcRenderer), { ...target, timelineReadClass: 'source',
+        timelineViewOptions: { expandedLayout: false, treeMode: false, width: 32, viewportExtent: 1,
+          fontSize: 12, summaryFontSize: 11, lineClamp: 3, layoutFingerprint: 'outline-job-v1' } });
+    const result = await ipcRenderer.invoke('timeline-outline:generate', { ...target,
+      resultMode: 'root-status-v1', timelineParentLease: actionClient.identity });
+    if (result?.success !== true || result.resultMode !== 'root-status-v1'
+      || !Number.isSafeInteger(result.groupCount) || result.groupCount < 0
+      || Object.hasOwn(result, 'data') || Object.hasOwn(result, 'outline')) {
+      throw new Error(result?.error || 'Timeline outline compact receipt is unavailable');
+    }
+    window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId: target.tabId } }));
+    return result;
+  } finally {
+    await actionClient?.close();
+    useTimelineOutlineStore.setState(state => { const generatingKeys = new Set(state.generatingKeys);
+      generatingKeys.delete(key); return { generatingKeys }; });
+  }
+}

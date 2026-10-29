@@ -3,12 +3,38 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
+const ts = require('typescript');
 
 const {
   CodexImageTransport,
   buildCodexImagePastePlan,
   replaceUnavailableImagePathMarkers,
 } = require('./codex-image-transport');
+
+test('web Markdown title is not a local image in actual Main preflight, paste plan or missing replacement', async () => {
+  const main = fs.readFileSync(require.resolve('./main'), 'utf8');
+  const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+  const fn = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'validatePromptQueueImageMarkers');
+  assert.ok(fn);
+  const stats = [], staged = [];
+  const context = vm.createContext({ path, srcMainDir: __dirname, require,
+    isPortableImagePath: value => value.startsWith('/'),
+    fs: { promises: { stat: async value => { stats.push(value); return { isFile: () => true }; } } } });
+  vm.runInContext(fn.getText(ast), context);
+  const link = '[image](https://example.test/icon "[imagePath: /synthetic/hidden.png]")';
+  const input = link + ' after [imagePath: /synthetic/real.png]';
+  const proof = await context.validatePromptQueueImageMarkers(input);
+  assert.equal(proof.success, true); assert.deepEqual(stats, ['/synthetic/real.png']);
+  const plan = buildCodexImagePastePlan(input, value => {
+    staged.push(value); return { success: true, path: value, inputPath: '/alias/real.png' };
+  });
+  assert.deepEqual(staged, ['/synthetic/real.png']);
+  assert.equal(plan.text, link + ' after /alias/real.png');
+  assert.equal(replaceUnavailableImagePathMarkers(input, [{ path: '/synthetic/hidden.png' }]), input);
+  assert.equal(replaceUnavailableImagePathMarkers(input, [{ path: '/synthetic/real.png' }]),
+    link + ' after [imageError: queue_image_path_unavailable #1]');
+});
 
 test('stages a durable image through a whitespace-free alias without copying bytes', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-image-transport-'));

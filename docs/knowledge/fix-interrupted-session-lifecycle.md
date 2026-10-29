@@ -1,5 +1,67 @@
 # Fix: Гонка при сохранении прерванных сессий (Shutdown Lifecycle)
 
+## AutoResume и RunAfter: запуск без Send-квитанции
+
+26Oct17:14:55UTC после обновления AutoResume и RunAfter обеих вкладок4196/5957
+получили `agent_launch_target_control_unavailable` на `intent-begin`, до запуска
+CLI и создания Send. Условие `app-restart` уже было удовлетворено; старое время
+карточки не объясняло отказ. Main из установленного ASAR точно совпал с CURRENT.
+
+Общая проверка target читала `record.receipt` при отсутствующем record: оба
+необязательных attempt ID равнялись undefined, поэтому сравнение прошло, а
+следующее обращение выбросило TypeError. Внешний launch guard маскировал его
+общим target-control error. В двух местах чтение receipt теперь также optional.
+Обычный Resume не требует квитанции Send; существующий continuation fence
+по-прежнему проверяется, если квитанция и её exact attempt действительно есть.
+
+Регрессия выполняет actual `beginAgentLaunchIntent` вместе с настоящими target
+guards и registry; прежний stub target-check скрывал этот путь. Проверяются
+Resume с/без explicit target, отсутствие квитанции, foreign target и Stop.
+Focused Source:173PASS9files, PRE того же теста17PASS/5FAIL→22PASS. Проверены
+также original/late-input/UNKNOWN/FIFO/first-input и AutoResume controls.
+OS/provider leaves контролируемые; установленный запуск после ремонта не проверен.
+
+## Codex live watcher не должен читать временную History-копию
+
+Инцидент754 (25Oct): сохранённый лог содержит272 ENOENT live watcher на исчезнувшем
+`noted-codex-readviews/...jsonl`, provisional source и отказ пользовательского
+`codex:interrupt-turn` с `codex_turn_identity_pending`. Временный файл реально
+использовался live-наблюдением; точный первоначальный assignment и physical
+writer/child этой исторической попытки не установлены. Для257 такого witness нет.
+
+Source reproduction: общий history locator распаковывал zstd и отдавал копию
+Main watcher. Теперь live-purpose locator возвращает native source без decode;
+plain header проверяется отдельно. Если Resume материализует source позднее,
+прежний process-owned reconciliation подключает provisional watcher с audit-offset
+при pending Send, иначе live-offset, и исходным временем launch. User carrier
+перед task_started не пропускается. Exact user audit, source adoption и held replay затем
+проходят прежними владельцами до natural final. Read view может удалиться;
+чтение архива/полной History и принятие native child не теряются.
+
+Отсутствие подтверждения Send и отсутствие ID хода — разные состояния.
+Прерывание известного текущего хода не требует confirmed Send; при неизвестном
+ID Escape по-прежнему не угадывается. Явный process Stop имеет отдельный Main
+owner/process-scope proof и не требует canonical turn ID. Этот ремонт не меняет
+смысл interrupt-кнопки на kill всего CLI и не повторяет UNKNOWN input.
+Регрессии: `codex-live-source-resolution.actual.test.js`; private Source-цепочка,
+не установленная/GUI приёмка и не восстановление754/257.
+
+## Full Close обычного PTY во время окончания команды
+
+При `forceFresh` ps команда может завершиться между захватом scope и ответом.
+Старый snapshot тогда правильно становится UNKNOWN из-за `commandRunning`.
+Для обычного PTY разрешён один новый force-fresh read только при true→false и
+неизменных terminal/lifecycle/runSeq/cwd/namespace, без Claude/Codex launch.
+Замена владельца, новый command sequence, timeout и повторный UNKNOWN не дают
+этого продолжения и никогда не превращаются в absent. Stop/kill и durable Close
+по-прежнему проверяют своего исходного владельца; новый read не повторяет их.
+Диагностика `[Perf:ProcessTreeLookup] scopeChanged=[...]` пишет лишь имена полей;
+`[AILifecycle:ProcessProof] reobserve-shell-completion` обозначает второе чтение.
+Проверено на owned packaged: тот же natural-completion scope change, новый read
+и обычный archive/finalize Close. Это не разрешение повторять прежнюю неизвестную
+Close-операцию после смены Main или считать её завершённой по одному app exit.
+
+
 ### Симптомы
 - После перезапуска ВСЕ claude-табы (20+) в "синем режиме" (Продолжить сессию), хотя активным был только один.
 - После повторного перезапуска табы, которые были в синем режиме, **не очищаются** — остаются синими навсегда.
@@ -70,6 +132,14 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
    `foreground_command_running` выполняется та же проверка, закрывая гонку между
    чтением и записью. Только совпадение tab + provider + session даёт такой
    результат; чужой writer и неразрешённая identity остаются ошибкой.
+
+   Для pending Resume политика первого запуска `Leave paused` сама по себе
+   не запрещает join без нового override. Проверять AutoResume одновременно
+   с after-restart Run After до writer adoption: одна physical launch-команда,
+   один preparation, ожидание exact ready без false rejected/restore toast.
+   Настоящие ошибки остаются видимыми. Исчезновение прежней rejected-плашки
+   по `codex-tui-ready` означает свежую готовность, а не таймерное доказательство
+   того, что ошибочный второй запуск был принят.
 
 7. Порядок — пользовательский, а не порядок `Map` shutdown-снимка: сначала
    сфокусированное окно активного workflow, затем остальные видимые окна и его

@@ -57,7 +57,13 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
     });
   }
   function maintenance(existing) {
-    const held = hostProtocol.readIngress(ingressFile).fences.some(f => f.state === 'held');
+    let held;
+    try { held = hostProtocol.readIngress(ingressFile).fences.some(f => f.state === 'held'); }
+    catch (error) {
+      // Maintenance authority can be unavailable while the HTTP hub and the
+      // other MCP transports are healthy. Preserve their observed identities.
+      return { version: 1, held: true, code: error.code || 'research_host_ingress_unavailable', replayPermission: false };
+    }
     if (held && existing?.capabilities?.browserMaintenance !== 1) {
       return { version: 1, held: true, code: 'research_legacy_host_bootstrap_required', replayPermission: false };
     }

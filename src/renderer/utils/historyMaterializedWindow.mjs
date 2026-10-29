@@ -1,5 +1,10 @@
 import { resolveHistoryGroupCaption } from './historyGroupCaption.mjs';
 
+// Keep a small neighborhood of already read presentation rows for reversing
+// direction by several screens. This retains captions, not hidden group tools;
+// the existing 512-UUID limit and physical-revision proof still apply.
+export const HISTORY_ORDINARY_REVISIT_BUFFER_UNITS = 48;
+
 const exactRevisionToken = (entry) => {
   if (!entry || typeof entry !== 'object') return '';
   const entryRef = entry.entryRef;
@@ -75,6 +80,9 @@ export function retainHistoryMaterializedWindow(previous, incoming, protectedUui
 const unitPresentationUuids = (unit, captionSelections = null) => {
   if (!unit) return [];
   if (unit.kind !== 'group') return unit.entry?.uuid ? [unit.entry.uuid] : [];
+  if (unit.familyKey === 'response-work') {
+    return unit.expanded !== true && unit.previewEntry?.uuid ? [unit.previewEntry.uuid] : [];
+  }
   // A collapsed group's expensive members are not DOM rows. Its height only
   // depends on stub-safe header facts plus the optional caption text.
   const choice = captionSelections?.get(unit.key);
@@ -124,6 +132,12 @@ export function historyHydrationCenterForRange(units, range, fallbackUuid = null
     if (!unit) continue;
     if (unit.kind !== 'group') {
       if (unit.entry?.uuid) return unit.entry.uuid;
+      continue;
+    }
+    // Only the selected commentary is visible in this header; never warm an
+    // arbitrary hidden middle member of a long work chapter.
+    if (unit.familyKey === 'response-work') {
+      if (unit.expanded !== true && unit.previewEntry?.uuid) return unit.previewEntry.uuid;
       continue;
     }
     if (unit.captionEntry?.uuid) return unit.captionEntry.uuid;

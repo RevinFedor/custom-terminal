@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { causal } = require('./perf-causal-context');
+const { isCodexRolloutFile, rolloutRepresentation, resolveExistingRollout } = require('./codex-rollout-format');
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
 const DEFAULT_CACHE_MS = 15_000;
@@ -110,9 +111,12 @@ async function scanCodexTree(root, wanted, location) {
         stack.push(filePath);
         continue;
       }
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      if (!entry.isFile() || !isCodexRolloutFile(entry.name)) continue;
       for (const sessionId of idsInFilename(entry.name, wanted)) {
-        if (!matches.has(sessionId)) matches.set(sessionId, { filePath, location });
+        const previous = matches.get(sessionId);
+        if (!previous || previous.representation === 'zstd' && rolloutRepresentation(filePath) === 'jsonl') {
+          matches.set(sessionId, { filePath, location, representation: rolloutRepresentation(filePath) });
+        }
       }
     }
   }
@@ -221,22 +225,34 @@ class AgentSessionAvailabilityService {
       .map((descriptor) => [descriptorKey(descriptor), descriptor])).values()];
     if (descriptors.length === 0) return { success: true, results: [] };
     const probe = await this.probeBatch({ sessions: descriptors, force });
-    const results = descriptors.map((descriptor) => {
+    const results = [];
+    for (const descriptor of descriptors) {
       const key = sessionKey(descriptor.provider, descriptor.sessionId);
-      const cached = this.pathCache.get(key) || null;
-      const probed = (probe.results || []).find((entry) => (
+      let cached = this.pathCache.get(key) || null;
+      let probed = (probe.results || []).find((entry) => (
         entry.provider === descriptor.provider && entry.sessionId === descriptor.sessionId
       )) || null;
-      return {
+      if (descriptor.provider === 'codex' && cached) {
+        const physical = await resolveExistingRollout(cached.filePath);
+        if (physical.state === 'present') {
+          cached = { ...cached, filePath: physical.filePath, representation: physical.representation };
+          this.pathCache.set(key, cached);
+        } else {
+          cached = null;
+          probed = { state: physical.state, reason: physical.state === 'unknown' ? 'path-check-failed' : 'session-file-not-found' };
+        }
+      }
+      results.push({
         provider: descriptor.provider,
         sessionId: descriptor.sessionId,
         tabId: descriptor.tabId || null,
         filePath: cached?.filePath || null,
+        ...(cached?.representation ? { representation: cached.representation } : {}),
         location: cached?.location || null,
         state: probed?.state || 'unknown',
         reason: probed?.reason || 'probe-incomplete',
-      };
-    });
+      });
+    }
     return { success: true, checkedAt: probe.checkedAt, results };
   }
 
@@ -283,9 +299,12 @@ class AgentSessionAvailabilityService {
         }
         const cachedPath = this.pathCache.get(key);
         if (cachedPath) {
-          const state = await pathState(cachedPath.filePath);
+          const resolved = provider === 'codex' ? await resolveExistingRollout(cachedPath.filePath) : null;
+          const state = resolved?.state || await pathState(cachedPath.filePath);
           if (state === 'present') {
-            const raw = { state: cachedPath.location === 'archived' ? 'archived' : 'available', checkedAt, ...cachedPath };
+            const hit = resolved ? { ...cachedPath, filePath: resolved.filePath, representation: resolved.representation } : cachedPath;
+            const raw = { state: cachedPath.location === 'archived' ? 'archived' : 'available', checkedAt, ...hit };
+            this.pathCache.set(key, hit);
             rawByKey.set(key, raw);
             this.rawCache.set(key, raw);
             this.wasPresent.add(key);
@@ -367,6 +386,7 @@ class AgentSessionAvailabilityService {
         reason,
         checkedAt,
         archived: raw.state === 'archived',
+        ...(raw.representation ? { representation: raw.representation } : {}),
         missingDependencies,
         deletedAt: deleted?.deletedAt || null,
         deletionSource: deleted?.source || null,
@@ -380,7 +400,8 @@ class AgentSessionAvailabilityService {
     const key = sessionKey(provider, sessionId);
     rawByKey.set(key, raw);
     this.rawCache.set(key, raw);
-    if (raw.filePath) this.pathCache.set(key, { filePath: raw.filePath, location: raw.location || 'active' });
+    if (raw.filePath) this.pathCache.set(key, { filePath: raw.filePath, location: raw.location || 'active',
+      ...(raw.representation ? { representation: raw.representation } : {}) });
     if (raw.state === 'available' || raw.state === 'archived') {
       this.wasPresent.add(key);
       this.deleted.delete(key);

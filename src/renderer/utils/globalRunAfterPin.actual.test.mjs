@@ -11,8 +11,8 @@ function body(pattern) {
   assert.ok(matched, 'actual callback must exist');
   return matched.replaceAll('<HTMLElement>', '');
 }
-const recheck = body(/const recheckPreviewHover = useCallback\(\(point: \{ clientX: number; clientY: number \} \| null\) => \{([\s\S]*?)\n  \}, \[closePanel, editorGestureActive, mode, pickingRewind\]\);/);
-const close = body(/const closePanel = useCallback\(\(reason\?: 'outside'\) => \{([\s\S]*?)\n  \}, \[\]\);/);
+const recheck = body(/const recheckPreviewHover = useCallback\(\(point: \{ clientX: number; clientY: number \} \| null, immediate = false\) => \{([\s\S]*?)\n  \}, \[closePanel, editorGestureActive, mode, pickingRewind\]\);/);
+const close = body(/const closePanel = useCallback\(\(reason\?: 'outside', immediate = false\) => \{([\s\S]*?)\n  \}, \[\]\);/);
 const toggle = body(/const togglePinned = \(\) => \{([\s\S]*?)\n  \};/);
 const resize = body(/const startResize = useCallback\(\(edge: 'right' \| 'bottom' \| 'corner', event: React\.PointerEvent<HTMLElement>\) => \{([\s\S]*?)\n  \}, \[panelSize, position, startResizeGesture\]\);/);
 const relay = body(/const handleEditorGesture = useCallback\(\(active: boolean, point: \{ clientX: number; clientY: number \} \| null\) => \{([\s\S]*?)\n  \}, \[\]\);/);
@@ -51,8 +51,9 @@ function fixture() {
     setEditorGestureActive: (active) => { ctx.editorGestureActive = active; calls.push('gesture:' + active); },
     setEditorState: (state) => { ctx.editorState = state; calls.push('editor'); },
     setMode: (mode) => { ctx.mode = mode; calls.push(mode); },
+    flushSync: fn => { calls.push('flush'); fn(); },
   });
-  vm.runInContext(`function closePanel(reason) {${close}}; function recheckPreviewHover(point) {${recheck}}; function togglePinned() {${toggle}}; function startResize(edge, event) {${resize}}; function handleEditorGesture(active, point) {${relay}};`, ctx);
+  vm.runInContext(`function closePanel(reason, immediate = false) {${close}}; function recheckPreviewHover(point, immediate = false) {${recheck}}; function togglePinned() {${toggle}}; function startResize(edge, event) {${resize}}; function handleEditorGesture(active, point) {${relay}};`, ctx);
   ctx.recheckPreviewHoverRef = { current: (point) => ctx.recheckPreviewHover(point) };
   return { ctx, calls, Element, allowClose: (value) => { allowed = value; } };
 }
@@ -76,6 +77,14 @@ test('internal page/control use remains preview; pointer leave closes through th
   ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
   assert.equal(ctx.mode, 'hidden');
   assert.deepEqual(calls, ['save', 'hidden']);
+});
+test('actual existing immediate leave flushes only after blur/save accepts close', () => {
+  const {ctx,calls,Element,allowClose}=fixture();const field=new Element();field.inside=true;
+  field.blur=()=>calls.push('blur-field');ctx.document.activeElement=field;
+  allowClose(false);ctx.recheckPreviewHover({clientX:900,clientY:700},true);
+  assert.equal(ctx.mode,'preview');assert.deepEqual(calls,['blur-field','save']);
+  calls.length=0;allowClose(true);ctx.recheckPreviewHover({clientX:900,clientY:700},true);
+  assert.deepEqual(calls,['blur-field','save','flush','hidden']);
 });
 
 test('header pages and protruding resize handles are part of preview hover geometry', () => {

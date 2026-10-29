@@ -57,7 +57,9 @@
 .cb-prose ul ul, .cb-prose ol ol,
 .cb-prose ul ol, .cb-prose ol ul { margin: 0; padding-left: 16px; }
 .cb-prose li::marker { color: var(--cb-marker); }
-.cb-prose strong { color: inherit; font-weight: 600; }
+.cb-prose strong { color: var(--cb-prose-strong, inherit); font-weight: 600; }
+/* Headings keep their neutral hierarchy even with redundant **bold** markup. */
+.cb-prose :is(h1, h2, h3, h4, h5, h6) strong { color: inherit; }
 .cb-prose em { font-style: italic; }
 .cb-prose a { color: inherit; text-decoration: underline; }
 .cb-prose blockquote {

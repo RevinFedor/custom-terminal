@@ -22,6 +22,8 @@ const { projectClaudePromptAuditToRequest } = require('./claude-prompt-request-p
 const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { compactSendReceiptPresentation } = require('./compact-send-settlement');
+const { withTerminalMcpPromptSource } = require('./terminal-mcp-prompt-source');
+const { PREPARATION_MS, createSendPreparationScope } = require('./agent-send-preparation');
 const web = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const tree = ts.createSourceFile('web.js', web, ts.ScriptTarget.Latest, true);
@@ -45,10 +47,10 @@ async function fixture(t, provider = 'codex') {
   let ready = false, beforeWrite = null;
   let db, store, queue;
   const ctx = vm.createContext({
-    fs, path, crypto, Buffer, Date, console: { log() {}, warn() {}, error() {} },
+    fs, path, crypto, Buffer, Date, require, srcMainDir: __dirname, console: { log() {}, warn() {}, error() {} },
     ...registry, ...ownership, ...require('./structured-authoring'),
     promptAuditFingerprint, buildCodexImagePastePlan, isLocalSlashCommandPrompt,
-    compactSendReceiptPresentation, classifyAgentSendReceipt,
+    compactSendReceiptPresentation, classifyAgentSendReceipt, PREPARATION_MS, createSendPreparationScope,
     AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     app: { getPath: kind => kind === 'temp' ? temp : path.dirname(assetRoot) },
     mobileAttachmentIndex: new Map(), mobileAttachmentAssetStore: new PromptQueueAssetStore({ rootDir: assetRoot }),
@@ -56,8 +58,10 @@ async function fixture(t, provider = 'codex') {
     cleanOptionalString: (value, fallback = '') => typeof value === 'string' && value.trim() ? value.trim() : fallback,
     decId: decodeURIComponent, shortId: value => value, agentSendBridgeTimeoutMs: 1000,
     agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
-    tabWorkContext: null, withPromptOriginPresentation: value => value,
+    tabWorkContext: null, withPromptOriginPresentation: value => value, withTerminalMcpPromptSource,
     agentSendTargetPreconditionFailure: require('./agent-send-target-precondition').agentSendTargetPreconditionFailure,
+    COMPLETION_ADMISSION: Symbol('external-completion-admission'),
+    buildContinueOperations: null,
     readAgentRuntimeSnapshot: null,
     findOrchestrationTabDescriptor: () => ({ tabId: 'T', projectId: 'P', toolType: provider, sessionId: 'S' }),
     ensureExplicitAgentTabOpen: async () => ({ descriptor: { projectId: 'P', toolType: provider, sessionId: 'S' } }),
@@ -95,7 +99,7 @@ async function fixture(t, provider = 'codex') {
     // not a test-only reconstruction of those two critical boundaries.
     const refused = await vm.runInContext('(async () => {' + mainBlock(
       '  if (destinationRecord?.receipt?.ownedAttachments) {',
-      '  if (requiresImagePathValidation && !presentationSnapshot?.authoringTransport) {') + '})()', physical);
+      '  codexImageSourceAuthoringTransport = ownedAttachmentTransport') + '})()', physical);
     if (refused) return refused;
     const prepared = physical.ownedAttachmentTransport;
     assert.ok(prepared);
@@ -110,6 +114,8 @@ async function fixture(t, provider = 'codex') {
       durablePreSubmitBoundary: null, captureCodexPromptAuditBoundary: () => boundary,
       claudeAuditBoundary: boundary, expectedDestination: null, codexImageRequestProjection: null,
       content: plan.text, codexImagePasteSegments: plan.segments, stagedCodexImageRefs: plan.staged,
+      codexImageSourceAuthoringTransport: prepared.authoringTransport || null,
+      codexImageTransformStages: plan.replaced > 0 ? [plan.transform] : [],
       normalizedPresentationSnapshot: input.presentationSnapshot,
     });
     const stageResult = vm.runInContext('(() => {' + mainBlock(
@@ -130,9 +136,14 @@ async function fixture(t, provider = 'codex') {
   const open = () => {
     db = new Database(databasePath); store = createAgentSendReceiptStore(db);
     ctx.agentSendReceiptStore = store;
-    queue = new AgentSendQueue({ store, ready: () => ready, execute: request => ctx.runPreparedAgentSendScenario({
-      ...request, applicationQueueExecution: true,
-    }) });
+    queue = new AgentSendQueue({ store, ready: () => ready, execute: async request => {
+      const result = await ctx.runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true });
+      if (result?.code === 'agent_send_pre_dispatch_failed') {
+        ready = false;
+        throw Error('Private fixture dispatch dependency failed: ' + result.error);
+      }
+      return result;
+    } });
     ctx.agentSendQueue = queue;
   };
   open();
@@ -153,6 +164,7 @@ async function fixture(t, provider = 'codex') {
   const call = async (route, body, method = 'POST') => {
     const response = await fetch('http://127.0.0.1:' + server.address().port + route, {
       method, headers: { authorization: 'Bearer private-fixture', 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(10000),
       ...(['DELETE', 'GET'].includes(method) ? {} : { body: JSON.stringify(body) }),
     });
     return { status: response.status, data: await response.json() };
@@ -433,10 +445,12 @@ test('authoritative context wrapper refresh rebinds formatter ranges without shi
   const h = await fixture(t), image = await h.upload('context.png', 'image', 'context image');
   const document = await h.upload('context.pdf', 'file', 'context document');
   const wrapper = '<saved_prompt context-update-id="known">old</saved_prompt>';
-  h.ctx.tabWorkContext = { prepare: async (_tab, _handoff, prompt) => ({
-    prefix: 'NEW CONTEXT\n', prompt: 'NEW CONTEXT\n' + prompt.replace(wrapper,
-      '<saved_prompt context-update-id="known">refreshed generated wrapper content</saved_prompt>'),
-  }), activate() {}, settle() {}, assertContinuationScope() {}, release() {} };
+  h.ctx.tabWorkContext = { prepare: async (_tab, _handoff, prompt, plan) => {
+    const replacement = '<saved_prompt context-update-id="known">refreshed generated wrapper content</saved_prompt>';
+    return { prefix: 'NEW CONTEXT\n', ...require('./structured-authoring').editAuthoringTransport(prompt, plan,
+      [{ start: prompt.indexOf(wrapper), end: prompt.indexOf(wrapper) + wrapper.length, text: replacement },
+        { start: 0, end: 0, text: 'NEW CONTEXT\n' }]) };
+  }, activate() {}, settle() {}, assertContinuationScope() {}, release() {} };
   const ack = await h.send(h.request('refresh', [image, document], wrapper + '\n\nLiteral user body'));
   assert.equal(ack.status, 202, JSON.stringify(ack));
   await h.call('/api/mobile-attachments/' + image.id, null, 'DELETE');
@@ -454,7 +468,8 @@ test('default clients keep the existing wait-for-provider response rather than g
   h.queue.publish = record => { if (record.operationKey === 'project:T:default') admitted(); };
   let returned = false;
   const response = h.send({ ...h.request('default', [document]), applicationQueue: false }).then(value => { returned = true; return value; });
-  await waiting; assert.equal(returned, false); assert.equal(h.writes.length, 0);
+  await Promise.race([waiting, response.then(result => { throw Error('default Send returned before admission: ' + JSON.stringify(result)); })]);
+  assert.equal(returned, false); assert.equal(h.writes.length, 0);
   await h.call('/api/mobile-attachments/' + document.id, null, 'DELETE');
   await h.drain();
   const result = await response;
@@ -723,11 +738,13 @@ test('actual Main publisher and History keep original authoring for both provide
       actualText = actualText.replace(imagePath, '[Image #' + (index + 1) + '] ');
     }
     const match = nativeSlots ? require('./codex-prompt-audit').codexCanonicalUserMessageMatch(audit, actualText) : null;
-    if (nativeSlots) assert.equal(match.reason, 'codex_image_placeholder_canonical');
+    if (nativeSlots) assert.equal(match.reason, audit.imageRequestProjection?.version === 2
+      ? 'codex_image_request_transform' : 'codex_image_placeholder_canonical');
     let result = { success: true, actualText, actualHash: promptAuditFingerprint(actualText), actualLen: actualText.length,
       ...(match ? { canonicalized: true, canonicalReason: match.reason } : {}),
       expectedHash: audit.expectedHash, expectedLen: expectedText.length };
     const nativeResult = { ...result, sessionId: 'S', entryUuid: 'exact-private-user', sourceIdentity: 'private-source',
+      actualIdentity: { sessionId: 'S', filePath: '/synthetic/owned.jsonl', byteOffset: 0, timestamp: new Date().toISOString() },
       auditTimestamp: new Date().toISOString() };
     const inner = provider === 'codex' ? projectCodexImageAuditToRequest({ tabId: 'T', record, audit, result })
       : projectClaudePromptAuditToRequest({ tabId: 'T', record, audit, result });

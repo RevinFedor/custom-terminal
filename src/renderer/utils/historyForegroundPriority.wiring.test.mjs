@@ -40,7 +40,7 @@ test('dormant admission and mount waves yield, while exact pane visibility remai
   assert.match(history, /meta\.pendingStepToken !== stepToken/);
   assert.match(pane, /initialPresented=\{historySurfacePresented\}/);
   assert.match(persistentTimeline, /isVisible=\{presented\}/);
-  assert.match(pane, /backgroundPrewarmAdmitted=\{heavyActivationPhase === 'timeline' && !historySurfacePresented\}/);
+  assert.match(pane, /backgroundPrewarmAdmitted=\{renderedHeavyActivationPhase === 'timeline' && !historySurfacePresented\}/);
 });
 
 test('hidden terminal preview coalesces behind continuous drag and never reads hidden geometry', () => {

@@ -266,6 +266,12 @@ setInterval(() => {
 // ── main heartbeat channel ──────────────────────────────────────────────────
 process.on('message', (m) => {
   if (!m || typeof m !== 'object') return;
+  if (m.t === 'perf-manual-request') {
+    const { handleManualWatchdogRequest } = require('./perf-manual-capture');
+    handleManualWatchdogRequest(m, { mainPid: MAIN_PID, flight, stopped: lameDuck,
+      send: reply => process.send?.(reply), log: wdLog });
+    return;
+  }
   if (m.t === 'causal') {
     // Frequent minor-GC records must not consume the evidence allowance for a
     // real Main freeze. Use the existing bounded critical lane, not more IO.

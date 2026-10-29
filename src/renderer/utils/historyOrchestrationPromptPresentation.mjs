@@ -1,8 +1,8 @@
-import { getTabMessageTag, getTerminalMcpTag, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
+import { getTabMessageTag, getTerminalMcpTag, promptOriginTagForSource, systemPromptSource } from '../../shared/prompt-origin.mjs';
 import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
 const ORCHESTRATION_PHASES = new Set(['request', 'completion', 'failure']);
-const PRESENTATION_FIELDS = ['envelopeStart', 'envelopeText', 'bodyStart', 'bodyEnd', 'bodyProjectionHash', 'sourceTabId', 'sourceTabName', 'sourceProjectId', 'targetTabId', 'targetTabName', 'targetProjectId', 'runKind'];
+const PRESENTATION_FIELDS = ['envelopeStart', 'envelopeText', 'bodyStart', 'bodyEnd', 'bodyProjectionHash', 'sourceTabId', 'sourceTabName', 'sourceProjectId', 'targetTabId', 'targetTabName', 'targetProjectId', 'runKind', 'outcome', 'artifactSummary'];
 const presentationFields = tag => Object.fromEntries(PRESENTATION_FIELDS.filter(key => tag[key] !== undefined).map(key => [key, tag[key]]));
 
 /**
@@ -17,6 +17,7 @@ export function resolveHistoryOrchestrationPromptPresentation(entry) {
     kind: 'tab-message',
     messageId: message.messageId,
     replyTo: message.replyTo || null,
+    ...(message.replyToIds ? { replyToIds: message.replyToIds } : {}),
     phase: message.phase,
     sourceTabId: message.sourceTabId,
     sourceTabName: message.sourceTabName,
@@ -26,8 +27,19 @@ export function resolveHistoryOrchestrationPromptPresentation(entry) {
     targetProjectId: message.targetProjectId,
     ...presentationFields(message),
   };
-  if (getTerminalMcpTag(entry)?.source === 'terminal-mcp') {
-    return { kind: 'terminal-mcp', phase: 'prompt' };
+  if (entry.semanticTags.some(tag => tag?.kind === 'prompt-origin' && tag.source === 'system'
+    && systemPromptSource(tag.systemSource) === 'tab-message-outcome')) {
+    return { kind: 'tab-message-outcome', phase: 'prompt' };
+  }
+  const origin = getTerminalMcpTag(entry);
+  if (origin?.source === 'terminal-mcp') {
+    return { kind: 'terminal-mcp', phase: 'prompt',
+      ...(typeof origin.sourceTabId === 'string' && origin.sourceTabId.trim() ? {
+        sourceTabId: origin.sourceTabId,
+        ...(origin.sourceTabName ? { sourceTabName: origin.sourceTabName } : {}),
+        ...(origin.sourceProjectId ? { sourceProjectId: origin.sourceProjectId } : {}),
+      } : {}),
+    };
   }
   const tag = entry.semanticTags.find((candidate) => (
     candidate?.kind === 'orchestration'
@@ -85,6 +97,8 @@ export function projectHistoryServicePromptBody(entry, fingerprint) {
 
 export function resolveHistoryPromptSender(presentation) {
   if (!presentation) return null;
+  if (presentation.kind === 'tab-message-outcome') return { label: 'Noted · статус вопроса',
+    description: 'Служебное уведомление приложения о вашем исходящем вопросе, не сообщение другой вкладки' };
   const completion = presentation.kind !== 'tab-message'
     && (presentation.phase === 'completion' || presentation.phase === 'failure');
   if (completion && presentation.runKind === 'external-research') {
@@ -92,7 +106,8 @@ export function resolveHistoryPromptSender(presentation) {
       ...(presentation.runId ? { researchRunId: presentation.runId } : {}) };
   }
   const sourceTabId = completion ? presentation.targetTabId : presentation.sourceTabId;
-  if (!sourceTabId) return null;
+  if (!sourceTabId) return presentation.kind === 'terminal-mcp'
+    ? { label: 'Terminal MCP', description: 'В этой записи не сохранена вкладка-отправитель' } : null;
   return {
     sourceTabId,
     ...(presentation.kind === 'tab-message' && presentation.messageId ? { messageId: presentation.messageId } : {}),
@@ -109,6 +124,7 @@ export function resolveHistoryPromptHandoffSemanticTags(handoff) {
     return handoff.semanticTags.map(tag => ({ ...tag }));
   }
   const presentation = resolveHistoryOrchestrationHandoffPresentation(handoff);
+  if (presentation?.kind === 'tab-message-outcome') return [promptOriginTagForSource(handoff.source)];
   if (presentation?.kind === 'terminal-mcp') return [{ kind: 'prompt-origin', source: 'terminal-mcp' }];
   return presentation ? [{ kind: 'orchestration', runId: presentation.runId,
     phase: presentation.phase }] : undefined;
@@ -119,6 +135,10 @@ export function resolveHistoryPromptHandoffSemanticTags(handoff) {
 export function resolveHistoryOrchestrationHandoffPresentation(handoff) {
   const handoffId = String(handoff?.handoffId || '');
   const source = normalizeOwnedHandoffSource(handoff?.source);
+  if (source.startsWith('tab-message-outcome:') && handoffId === source
+    && promptOriginTagForSource(source)?.systemSource === 'tab-message-outcome') {
+    return { kind: 'tab-message-outcome', phase: 'prompt' };
+  }
   if (handoffId && promptOriginTagForSource(source)?.source === 'terminal-mcp') {
     const messagePrefix = 'tab-message:';
     if (source.startsWith(messagePrefix) && handoffId !== source) return null;

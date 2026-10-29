@@ -3,6 +3,19 @@ import { buildHistoryComposerPresentationParts } from './composerChips.mjs';
 const plural = new Intl.PluralRules('ru');
 const lineWord = n => ({ one: 'строка', few: 'строки', many: 'строк', other: 'строки' })[plural.select(n)];
 const MAX_JSON_CLASSIFICATION_CHARS = 250000;
+const RESEARCH_ERROR_OUTCOMES = new Set(['failed', 'error', 'startup_failed', 'target_closed',
+  'process_exited', 'process_replaced', 'result_unavailable']);
+const RESEARCH_NON_ERROR_OUTCOMES = new Set(['success', 'interrupted', 'paused', 'detached']);
+
+/** Display only: both source surfaces consume the same saved canonical tag.
+ * Completion is a delivery phase, not proof of success; partial files and
+ * provider prose do not change the run's outcome. No catalog/body reads. */
+export function isFailedResearchPresentation(source) {
+  if (source?.runKind !== 'external-research' || typeof source.runId !== 'string'
+    || !source.runId.trim() || source.phase === 'request') return false;
+  if (RESEARCH_NON_ERROR_OUTCOMES.has(source.outcome)) return false;
+  return RESEARCH_ERROR_OUTCOMES.has(source.outcome) || source.phase === 'failure';
+}
 
 function codeFence(code, language) {
   let size = 3;
@@ -101,6 +114,17 @@ export function researchReplyFromProjection(entry, service, projected) {
   const prefix = entry.content.slice(0, service.envelopeStart);
   const prefixParts = buildHistoryComposerPresentationParts({ text: prefix,
     chips: entry.promptChips, imagePaths: entry.imagePaths }).parts;
-  return { ...researchResultPresentation(body), failed: service.phase === 'failure', prefixParts,
+  const summary = service.phase === 'completion' ? service.artifactSummary : null;
+  const validSummary = Number.isSafeInteger(summary?.missing) && summary.missing > 0
+    && (summary.total === null || Number.isSafeInteger(summary.total) && summary.total >= summary.missing);
+  let fileWarning = null;
+  if (validSummary) {
+    const n = summary.missing, mod100 = n % 100, mod10 = n % 10;
+    const word = summary.total !== null ? (summary.total % 10 === 1 && summary.total % 100 !== 11 ? 'файла' : 'файлов')
+      : mod100 >= 11 && mod100 <= 14 ? 'файлов' : mod10 === 1 ? 'файл' : mod10 >= 2 && mod10 <= 4 ? 'файла' : 'файлов';
+    fileWarning = 'Не скачан' + (n === 1 ? ' ' : 'ы ') + n + (summary.total === null ? ' ' : ' из ' + summary.total + ' ') + word + '.';
+  }
+  const view = researchResultPresentation(body);
+  return { ...view, ...(fileWarning ? { fileWarning, previewText: fileWarning } : {}), failed: isFailedResearchPresentation(service), prefixParts,
     parts: [...prefixParts, { kind: 'text', text: body }] };
 }

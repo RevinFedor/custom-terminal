@@ -5,6 +5,12 @@ import * as presentation from '../../utils/timelineMarkerPresentation.mjs';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import {ChevronDown,ChevronRight} from 'lucide-react';
+import {buildSync} from 'esbuild';
+import {createRequire} from 'node:module';
+import {isFailedResearchPresentation} from '../../utils/researchResultPresentation.mjs';
+const iconBundle=buildSync({entryPoints:[new URL('./ResearchTimelineIcon.tsx',import.meta.url).pathname],bundle:true,write:false,platform:'node',format:'cjs',external:['react','react/*'],loader:{'.png':'dataurl'},logLevel:'silent'});
+const iconModule={exports:{}};new Function('require','module','exports',iconBundle.outputFiles[0].text)(createRequire(import.meta.url),iconModule,iconModule.exports);
+const {ResearchTimelineIcon}=iconModule.exports;
 const source=fs.readFileSync(new URL('./Timeline.tsx',import.meta.url),'utf8'),ast=ts.createSourceFile('Timeline.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
 function handler(name){let expression;const visit=node=>{if(ts.isBinaryExpression(node)&&node.left.getText(ast)==='rowApi.'+name)expression=node.right;ts.forEachChild(node,visit)};visit(ast);assert.ok(expression);return expression.getText(ast);}
 function actualRow(){
@@ -13,7 +19,7 @@ function actualRow(){
  const previews=ast.statements.filter(node=>ts.isFunctionDeclaration(node)&&['expandedPreviewCharLimit','truncateTimelinePreviewText'].includes(node.name?.text)
   ||ts.isVariableStatement(node)&&node.declarationList.declarations.some(d=>d.name.getText(ast).startsWith('EXPANDED_PREVIEW_'))).map(node=>node.getText(ast)).join('\n');
  return vm.runInNewContext(ts.transpileModule(previews+'\nconst Row='+callback.getText(ast)+';\nRow;',{compilerOptions:{jsx:ts.JsxEmit.React,target:ts.ScriptTarget.ES2022}}).outputText,
-  {...presentation,React,ChevronDown,ChevronRight,scDesktopIcon:'sc.png',Tooltip:props=>props.children,isSystemPromptEntry,isServicePromptEntry,getOrchestrationTag:getTerminalMcpTag,
+  {...presentation,React,ChevronDown,ChevronRight,ResearchTimelineIcon,isFailedResearchPresentation,Tooltip:props=>props.children,isSystemPromptEntry,isServicePromptEntry,getOrchestrationTag:getTerminalMcpTag,
    getLoopPromptOriginTag:()=>null,TimelineCornerBadges:()=>React.createElement('div',{'data-test-corner-badges':''})});
 }
 const groupedProps={entry:{uuid:'exact-entry',type:'user',semanticTags:[{kind:'orchestration',runId:'r'}]},index:0,api:{},
@@ -31,6 +37,21 @@ test('actual SC glyph follows the rotated MCP diamond bounds rather than a fixed
   const expected=side*Math.SQRT2;
   assert.ok(Math.abs(Number.parseFloat(style.match(/(?:^|;)width:([^;]+)/)?.[1])-expected)<0.001);
   assert.ok(Math.abs(Number.parseFloat(style.match(/(?:^|;)height:([^;]+)/)?.[1])-expected)<0.001);
+ }
+});
+
+test('failed Research changes only its glyph tint across hover/active/narrow/wide states',()=>{
+ const Row=actualRow();
+ for(const isExpandedLayout of [false,true])for(const isHovered of [false,true])for(const active of [false,true])for(const isInViewport of [false,true]){
+  const props={entry:{uuid:'exact-sc',type:'user',content:'Same saved prose',semanticTags:[{kind:'orchestration',runId:'r',runKind:'external-research',phase:'completion',outcome:'success'}]},
+   index:0,api:{},isExpandedLayout,isHovered,active,isInViewport};
+  const plain=renderToStaticMarkup(React.createElement(Row,props));
+  const failed=renderToStaticMarkup(React.createElement(Row,{...props,entry:{...props.entry,semanticTags:[{...props.entry.semanticTags[0],outcome:'failed'}]}}));
+  assert.match(plain,/<img[^>]*data-timeline-sc-desktop/);assert.match(failed,/<svg[^>]*data-timeline-sc-desktop[^>]*data-research-failed="true"/);
+  const style=html=>html.match(/<(?:img|svg)[^>]*data-timeline-sc-desktop[^>]*style="([^"]+)"/)?.[1];
+  assert.ok(style(plain));assert.equal(style(failed).replace(/;color:var\(--cb-error-text, #f38ba8\)/,''),style(plain));
+  const slot=html=>html.match(/data-timeline-sc-icon-slot[^>]*style="([^"]+)"/)?.[1];assert.equal(slot(plain),slot(failed));
+  assert.match(failed,/data-timeline-entry-uuid="exact-sc"/);assert.doesNotMatch(failed,/data-timeline-group-toggle/);
  }
 });
 
@@ -156,7 +177,7 @@ test('actual collapsed group preserves first-entry note strips and dot-note colo
  const variable=ast.statements.find(node=>ts.isVariableStatement(node)&&node.declarationList.declarations.some(d=>d.name.getText(ast)==='TimelineSegmentRow'));
  const callback=variable.declarationList.declarations[0].initializer.arguments[0];assert.ok(callback);
  const Row=vm.runInNewContext(ts.transpileModule('const Row='+callback.getText(ast)+';\nRow;',{compilerOptions:{jsx:ts.JsxEmit.React,target:ts.ScriptTarget.ES2022}}).outputText,
-  {...presentation,React,ChevronDown,ChevronRight,isSystemPromptEntry,isServicePromptEntry,getOrchestrationTag:getTerminalMcpTag,
+  {...presentation,React,ChevronDown,ChevronRight,ResearchTimelineIcon,isFailedResearchPresentation,isSystemPromptEntry,isServicePromptEntry,getOrchestrationTag:getTerminalMcpTag,
    getLoopPromptOriginTag:()=>null,TimelineCornerBadges:()=>null});
  const props={entry:{uuid:'exact-entry',type:'user',semanticTags:[{kind:'orchestration',runId:'r'}]},index:0,api:{},
   groupInfo:{isGroupHeader:true,isGroupChild:true,groupId:'g',groupSize:3,groupKind:'orchestration',agentName:'MCP'},

@@ -1,0 +1,414 @@
+{
+  "typescript": "5.9.3",
+  "pins": [
+    {
+      "path": "src/main/history-prompt-presentations.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "762f499518eaac726359738628111b494c52f477916562cd84446a376339ee88",
+      "output": "src/main/history-prompt-presentations.js.cjs",
+      "outputSHA256": "4b35ad8298e1329154e4fad3ebbd5dd211154881728363205ba182bf46c79e7a",
+      "dependencies": [
+        "src/main/prompt-audit-fingerprint.js",
+        "src/main/owned-mobile-attachments.js",
+        "src/shared/pasted-content.cjs",
+        "src/main/claude-prompt-audit.js",
+        "src/main/claude-prompt-transport.js",
+        "src/main/claude-prompt-request-projection.js",
+        "src/main/history-authoring-projection.js",
+        "src/shared/fork-operation.cjs",
+        "src/shared/prompt-origin.cjs"
+      ]
+    },
+    {
+      "path": "src/main/prompt-audit-fingerprint.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "6254ecc617bb5bc28618c87e3f563b37ba0cc89d42274eb0f1d5abed385912e3",
+      "output": "src/main/prompt-audit-fingerprint.js.cjs",
+      "outputSHA256": "4c30fc8737ca3f3f02a09fe7e216cfa2f76f6f51f7d7c6b91630f6740e7e6d3c",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/owned-mobile-attachments.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "12248336e326b84c7ce81aaa8ef0278aaa64d3339e41095004c182fb7ced3993",
+      "output": "src/main/owned-mobile-attachments.js.cjs",
+      "outputSHA256": "f6107f176b4418b7a647c7efed0f1ebed10a9c1d63159946dccdf9a4acf74fa3",
+      "dependencies": [
+        "src/main/prompt-queue-assets.js",
+        "src/main/prompt-audit-fingerprint.js",
+        "src/main/codex-image-transport.js"
+      ]
+    },
+    {
+      "path": "src/main/prompt-queue-assets.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "6dcd3ce5bd32ee76bc201e93ece5c1245a1c30b732f63cb5cca0eb0430e84aa1",
+      "output": "src/main/prompt-queue-assets.js.cjs",
+      "outputSHA256": "e42336ae7d1ce3e69d732e0e07f31c89c5a000e95c68c592f362b39c8755aa7a",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/codex-image-transport.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "6b184f5e5e1152e09f61ef3ce66909bf4d4f04151168d9e42c6ee74116df2f9f",
+      "output": "src/main/codex-image-transport.js.cjs",
+      "outputSHA256": "c7df76c3cf54cd6aa6276a45678434ba919d429e83e2c94e5c61f6d81aa8a846",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/pasted-content.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "d8f20ea978b77750c3453fb4d9ad5e9eb9cfad50233777669779677a72c4f881",
+      "output": "src/shared/pasted-content.cjs.cjs",
+      "outputSHA256": "12950ecc6df6843bba885bc695708c2d03a9f38fff4ee69ba3cbdb133ed8ae0b",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/claude-prompt-audit.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "c15e50d6a11bd8bf97458d7a060cab5533cbaa563f44c4c3a4f7450b3b8f005c",
+      "output": "src/main/claude-prompt-audit.js.cjs",
+      "outputSHA256": "1d7c5743c23eee9c441a34e387ce784ccf34e0e74a9d98bb256ed009591f6fa9",
+      "dependencies": [
+        "src/main/prompt-audit-fingerprint.js",
+        "src/main/agent-history-send-receipt.js",
+        "src/shared/pasted-content.cjs",
+        "src/main/claude-prompt-carriers.js",
+        "src/main/agent-prompt-audit-identity.js"
+      ]
+    },
+    {
+      "path": "src/main/agent-history-send-receipt.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "da5bff6da876da15894781254ffcb3589bc744fb4eec277c8eb866f21d18d5aa",
+      "output": "src/main/agent-history-send-receipt.js.cjs",
+      "outputSHA256": "672d1cfac94704df3ac7dd65b38f4facb2e2bb50c05374fbab2725bf307a391b",
+      "dependencies": [
+        "src/shared/agent-local-command.cjs",
+        "src/main/agent-send-receipt-registry.js"
+      ]
+    },
+    {
+      "path": "src/shared/agent-local-command.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "f4e4ce0c4f1400f5f67cd2d73d3015b422ee10b50a4502ac978836e58ba9c7d6",
+      "output": "src/shared/agent-local-command.cjs.cjs",
+      "outputSHA256": "48a137a1c55ace82d3a028c58c94fd961d273229b8dfefdc7c74f3b78d1a417d",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/agent-send-receipt-registry.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "92afc5ea9941bc467bc8d37f6ab110c26901b242a3c301eae1d2dcbc78bd69e6",
+      "output": "src/main/agent-send-receipt-registry.js.cjs",
+      "outputSHA256": "2d3a3978b83517785ce3aa2a6d4a8ca6f87683c2e55e61d87f02b58945a4f123",
+      "dependencies": [
+        "src/main/agent-prompt-audit-identity.js"
+      ]
+    },
+    {
+      "path": "src/main/agent-prompt-audit-identity.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "abaeca2158d7125dce84def480f07679e0ca4fd661617fea9f6ec0c3c688bf92",
+      "output": "src/main/agent-prompt-audit-identity.js.cjs",
+      "outputSHA256": "9745fba72687527f849896508da0b5e8733a05648678ad1fed2119ecdefff85e",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/claude-prompt-carriers.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "4ec4b5ef7a8426ed68d24f3339b7f7af56fbef897f142a95fa877ab51e6688d1",
+      "output": "src/main/claude-prompt-carriers.js.cjs",
+      "outputSHA256": "37ad1bba3af6958077360c9d0c50ff615690bb2c215f28f2f165e8762edb7bbe",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/claude-prompt-transport.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "ef560d733a0d5b30d676ae391906bd657c9e17bcb3a0b38ebc52becd583af3dc",
+      "output": "src/main/claude-prompt-transport.js.cjs",
+      "outputSHA256": "39b6c9d472c8196f5adbd1be3ef5c22c5d62289986a5e1823f360a81422308fd",
+      "dependencies": [
+        "src/main/prompt-audit-fingerprint.js"
+      ]
+    },
+    {
+      "path": "src/main/claude-prompt-request-projection.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "c5f2ad3c972329928ef7381eadf2cfca77a762c29bf122381983680254e760c7",
+      "output": "src/main/claude-prompt-request-projection.js.cjs",
+      "outputSHA256": "955f9d849a3b2ba406b30f2aaa2ef2585bfbab21c40445c2f19326ef43cdb3c2",
+      "dependencies": [
+        "src/main/claude-prompt-transport.js",
+        "src/main/agent-prompt-audit-identity.js",
+        "src/main/owned-mobile-attachments.js"
+      ]
+    },
+    {
+      "path": "src/main/history-authoring-projection.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "c237c8be7f1c5fd1256599df9f14430a26b65d9c8e186d191f98f794d6edcbfc",
+      "output": "src/main/history-authoring-projection.js.cjs",
+      "outputSHA256": "dfbcceeaad01274fc3069122e29b6e4f40d40333c19bed45397ed3377ebdf7a7",
+      "dependencies": [
+        "src/main/prompt-audit-fingerprint.js",
+        "src/main/codex-image-transport.js",
+        "src/main/codex-image-request-projection.js",
+        "src/main/codex-prompt-audit.js",
+        "src/main/owned-mobile-attachments.js",
+        "src/main/prompt-queue-assets.js"
+      ]
+    },
+    {
+      "path": "src/main/codex-image-request-projection.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "d3cde3e1a081fccd9af8ebe708037d5ad58d7206b534fb7c920c6228ab548a2a",
+      "output": "src/main/codex-image-request-projection.js.cjs",
+      "outputSHA256": "768a8d6898462a6c19a694a7f746a2b517347b384157b8aa0069ec5b9fcaf6ef",
+      "dependencies": [
+        "src/main/codex-image-transport.js",
+        "src/main/prompt-audit-fingerprint.js",
+        "src/main/owned-mobile-attachments.js"
+      ]
+    },
+    {
+      "path": "src/main/codex-prompt-audit.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "2f0b6bcd01db80927af7370589442f17e68913ebfef5e604eba26593edfb27f3",
+      "output": "src/main/codex-prompt-audit.js.cjs",
+      "outputSHA256": "63f668b2ae10c7b705b2aa4515da306563705a079786be40eca3dc3c7d54cab4",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/fork-operation.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "c4a6171205250da559a69badd7e2fc3611f98a1b41f16d3de9a319c1a7bbbf8c",
+      "output": "src/shared/fork-operation.cjs.cjs",
+      "outputSHA256": "523f9d337fb2c94b00e217baa900de0b178462ef4027cab7a4fc58baa1e1ef2b",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/prompt-origin.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "9f599c109ec72f8e46dcca6d96b297ad343c26caabb057cc5f5bd45f326bd394",
+      "output": "src/shared/prompt-origin.cjs.cjs",
+      "outputSHA256": "240bc4d13f94556b63cc21fa26d735d1de3583bc817a9c8350ef1486e403aac7",
+      "dependencies": []
+    },
+    {
+      "path": "src/main/history-entry-window.js",
+      "kind": "whole-static-module",
+      "currentSHA256": "e040f0066de1b9f9a217cf0b146dadd75f2ff70a1bdd41e4906d7a20f0c04888",
+      "output": "src/main/history-entry-window.js.cjs",
+      "outputSHA256": "1eb5ae63be67a3440ea2865226981c8e0b1752b72fae7f05cb7bf83822bfcb3e",
+      "dependencies": [
+        "src/shared/history-action-grammar.cjs",
+        "src/shared/history-entry-identity.cjs"
+      ]
+    },
+    {
+      "path": "src/shared/history-action-grammar.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "07881c40cac2e8f2f18b2f448e252ccc7ce31958da43ffcc8ccb5f5ce50f325d",
+      "output": "src/shared/history-action-grammar.cjs.cjs",
+      "outputSHA256": "16eafb2cbef1d4ea4046c4084c02a95e7d0e09418306d36aa5079813522983d8",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/history-entry-identity.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "1ceca6d8b2b3e03009b5f6ca00abbe55e91a7a5241b61179bf6d4b62b3af29c3",
+      "output": "src/shared/history-entry-identity.cjs.cjs",
+      "outputSHA256": "0cea635b9f44f4bd54407f3c8eb65c14a7573f7456c1d027e8bc7141221ee9df",
+      "dependencies": []
+    },
+    {
+      "path": "src/renderer/utils/historyLiveProjection.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "03bbc14e909380b05bd31ec5a895ae0ca9f0247cfc699efc4aa108541a3339c6",
+      "output": "src/renderer/utils/historyLiveProjection.mjs.cjs",
+      "outputSHA256": "d33c583978aa00d04b5e84ece3058f3fe3d36c90f96328f23a716e466a45a885",
+      "dependencies": [
+        "src/renderer/utils/historyClaudePromptCarriers.mjs",
+        "src/shared/history-action-grammar.mjs",
+        "src/shared/claude-slash-display.mjs",
+        "src/shared/claude-provider-failure.cjs",
+        "src/shared/history-record-time.cjs",
+        "src/shared/history-text-phase.cjs"
+      ]
+    },
+    {
+      "path": "src/renderer/utils/historyClaudePromptCarriers.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "63ef1817f93a5889d58c851034c32c4091f48e02e9b279e474f7ac1ad89b4f64",
+      "output": "src/renderer/utils/historyClaudePromptCarriers.mjs.cjs",
+      "outputSHA256": "24d3179f9346d41027d74ce05301ca3d229f21bf72581fcac8c3a443866e7ac1",
+      "dependencies": [
+        "src/shared/history-record-time.cjs"
+      ]
+    },
+    {
+      "path": "src/shared/history-record-time.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "7f98557c75b2ca10e206a99b8a97ab802b858bee3156f5d29c39788fd22a67de",
+      "output": "src/shared/history-record-time.cjs.cjs",
+      "outputSHA256": "379da4314c70ea2bee2b896c3241154ba7ef3f6ab38b5597efb96bd9f05a7d6f",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/history-action-grammar.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "0443f1b9dabaf3f2243be86c3b9a544764ad9f60965b7f487f2f7722acada278",
+      "output": "src/shared/history-action-grammar.mjs.cjs",
+      "outputSHA256": "ec39e96e544af73c767aae543da91f95f49b80e4895f4d6cdfec25e1aa31d16b",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/claude-slash-display.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "85be64401eaa7b345325022b5877172c58a9bb4b427a21f232782f2d73794abe",
+      "output": "src/shared/claude-slash-display.mjs.cjs",
+      "outputSHA256": "103f49ed313c2637af42bb56b1924d1ee66de05eb8baa2cceb0f37e0e9888940",
+      "dependencies": [
+        "src/shared/claude-slash-display.cjs"
+      ]
+    },
+    {
+      "path": "src/shared/claude-slash-display.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "d2ae25c1d381f8dcea80116c86f87f6596ffd65e6fcc3ba251df1d08dc73eec6",
+      "output": "src/shared/claude-slash-display.cjs.cjs",
+      "outputSHA256": "ac2548e9363628afb66f0931a7eecbe7f2bc392c3236635da53157d948327f6d",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/claude-provider-failure.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "d2824e92f97ae9e3b03765a4df7f6776bf0e03fd457598aa012fd4b7563237ee",
+      "output": "src/shared/claude-provider-failure.cjs.cjs",
+      "outputSHA256": "e5d560de0d30182625d73bf06dc700f89df3fef7fcea9c25cf43124e0885c0f1",
+      "dependencies": []
+    },
+    {
+      "path": "src/shared/history-text-phase.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "49d2964618bc28bc1c1abd6abcccbe5f534f29f5b297bd9eb1f34f5cbc0b229b",
+      "output": "src/shared/history-text-phase.cjs.cjs",
+      "outputSHA256": "03c4131b8782f20e513e573496fa84f02bf1363358c3e30ec8d7ccc7909be222",
+      "dependencies": []
+    },
+    {
+      "path": "src/renderer/utils/historyRewindPreviewOwner.ts",
+      "kind": "whole-static-module",
+      "currentSHA256": "f330a652ed8ebaa35f9075496638e34290c650a772fd5d14225ccf39de819bd4",
+      "output": "src/renderer/utils/historyRewindPreviewOwner.ts.cjs",
+      "outputSHA256": "484330eda1c0bbfedcffc009b67b187caa6a90029421ae28acbcb547f0bc2804",
+      "dependencies": []
+    },
+    {
+      "path": "src/renderer/utils/promptImageAttachments.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "8b7966d3a8576ee18aff9e6af27491f687fad97eff44ef5521643de6fdfd2441",
+      "output": "src/renderer/utils/promptImageAttachments.mjs.cjs",
+      "outputSHA256": "87b97da45f086bb421bc7acb29cf9e0af2319c449ef770a8f8f43826bba87005",
+      "dependencies": [
+        "src/shared/prompt-image-attachments.mjs"
+      ]
+    },
+    {
+      "path": "src/renderer/utils/historyPromptPresentation.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "98ae65a534f7439c65913c924c7b952d233612d3ce72c8b1be11227c2524dd02",
+      "output": "src/renderer/utils/historyPromptPresentation.mjs.cjs",
+      "outputSHA256": "ae8340e656a9ed6a84ecc08d6415ae664fce15245363a00345998e5d7bc2c951",
+      "dependencies": [
+        "src/shared/history-entry-identity.mjs"
+      ]
+    },
+    {
+      "path": "src/shared/history-entry-identity.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "fa1b681cfe30ffef72ca17cdf0eceb048949d543650b9910d8a05cdecbc7ce8b",
+      "output": "src/shared/history-entry-identity.mjs.cjs",
+      "outputSHA256": "2c3a4cac323a4ba511d1149fb76f6331ba7b2cd24eb6d9204e160c6622d53a94",
+      "dependencies": [
+        "src/shared/history-entry-identity.cjs"
+      ]
+    },
+    {
+      "path": "src/renderer/components/Workspace/HistoryPanel.tsx",
+      "kind": "extracted-declarations",
+      "names": [
+        "LOCAL_PROMPT_PREFIX",
+        "LOCAL_REWIND_PREFIX",
+        "LOCAL_COMPACT_ERROR_PREFIX",
+        "LOCAL_PROMPT_FAILURE_TTL_MS",
+        "normalizeHistoryPromptText",
+        "normalizeHistoryPromptIdentityText",
+        "isLocalPromptEntry",
+        "isLocalRewindEntry",
+        "isLocalCompactErrorEntry",
+        "findServerPromptEntry",
+        "serverHasPromptEntry",
+        "mergeServerAndLocalEntries",
+        "entryClockMs",
+        "shouldCarryAfterRewindTarget",
+        "buildRewindPreviewEntries",
+        "entryMatchesSuppressedPrompt",
+        "filterSuppressedPromptEntries"
+      ],
+      "currentSHA256": "23bbfdc494c0f9adb424644dc932f4248d669b83c77629906b00b088987a53fe",
+      "selectedSHA256": "0b94606968691bf0eb331e844d697265486887a7defedd79a987ffc7c3cd5d45"
+    },
+    {
+      "path": "src/renderer/utils/historyPromptHandoffs.ts",
+      "kind": "extracted-declarations",
+      "names": [
+        "HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS",
+        "historyPromptFailureHasRecoveryOwner",
+        "ORCHESTRATION_COMPLETION_HANDOFF_PREFIX",
+        "ORCHESTRATION_COMPLETION_SOURCE_PREFIX",
+        "legacyOrchestrationCompletionMatchesCanonicalEntry"
+      ],
+      "currentSHA256": "b4ad7133a5edbf551fe5647c89b23fa2af232e847b76648e7cd5bc3455290c94",
+      "selectedSHA256": "c2e673dcd3e0f381069259942150a1f6f50443bc2f390ab174bde0a948c2e688"
+    },
+    {
+      "path": "src/renderer/utils/primaryLocalCompat.ts",
+      "kind": "composed-pure-extract",
+      "currentSHA256": "f10305a587de54a2676eee5269d0a75732502ec9e262d3621fee666dd930b280",
+      "output": "src/renderer/utils/primaryLocalCompat.ts.cjs",
+      "outputSHA256": "a622a64f7620d40c4c3099aa3cccec10277521568b808951d7def65431251377",
+      "dependencies": [
+        "src/renderer/utils/historyLiveProjection.mjs",
+        "src/renderer/utils/historyRewindPreviewOwner.ts",
+        "src/renderer/utils/promptImageAttachments.mjs",
+        "src/renderer/utils/historyPromptPresentation.mjs"
+      ]
+    },
+    {
+      "path": "src/shared/prompt-image-attachments.mjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "00e14241dbf1698eb86940c331af2c6cf80d616b4b2ff40d7f5bf2181967f7f4",
+      "output": "src/shared/prompt-image-attachments.mjs.cjs",
+      "outputSHA256": "68248b3727ffa261442ba1c8eabd17034bff230c438219a8f884af43ae94e380",
+      "dependencies": [
+        "src/shared/prompt-web-images.cjs"
+      ]
+    },
+    {
+      "path": "src/shared/prompt-web-images.cjs",
+      "kind": "whole-static-module",
+      "currentSHA256": "d12e67d429731cfd07151b162eaa7675b6e6ad969007795ab650fbefc2850e6d",
+      "output": "src/shared/prompt-web-images.cjs.cjs",
+      "outputSHA256": "c7c54780befce9bc23399047052816d41761dca6eae08456365f805325a94856",
+      "dependencies": []
+    }
+  ],
+  "localCompatibilityGenerator": {
+    "path": "scripts/generate-history-primary-local-compat.cjs",
+    "sourceSHA256": "00380f7024e96976b80b27c7998d23b1ce09a19260497aa2765c910a24a57ced",
+    "parser": "node:module.stripTypeScriptTypes mode=strip; selected declarations only",
+    "scope": "CURRENT local prompt adoption, recovery retention and image identity grammar; other frozen modules unchanged"
+  }
+}

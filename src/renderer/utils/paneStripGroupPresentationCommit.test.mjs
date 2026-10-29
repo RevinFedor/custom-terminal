@@ -61,3 +61,42 @@ test('changed owner/order while flush awaits refuses new layout intent; no hidde
   const result=f.run({order:['b','a','c'],representative:'b'});f.state.splitPanes[0].tabs.reverse();release();
   await assert.rejects(result,/order_changed/);assert.equal(f.writes.filter(request=>request.stripColorGroupEdits?.[0].arrange).length,0);
 });
+test('ungroup removes only the exact visual definition, including inactive provenance, without changing placement, shown tab or membership',async()=>{
+  const f=fixture(),before={panes:f.state.splitPanes,membership:f.state.tabWorkflowMembership,catalog:f.state.tabCatalog,projects:f.state.openProjects};
+  f.state.tabCatalog.a={active:false};f.lease.entries=f.lease.entries.filter(entry=>entry.tabId!=='a');
+  await f.run({ungroup:true});assert.deepEqual(f.main.groups,[]);assert.equal(f.main.revision,2);
+  assert.equal(f.state.splitPanes,before.panes);assert.equal(f.state.tabWorkflowMembership,before.membership);
+  assert.equal(f.state.tabCatalog,before.catalog);assert.equal(f.state.openProjects,before.projects);
+  assert.deepEqual(f.state.splitPanes[0].tabs.map(entry=>entry.tabId),['a','b','c']);assert.equal(f.state.splitPanes[0].tabId,'b');
+  const edits=f.writes.filter(request=>request.stripColorGroupEdits);assert.equal(edits.length,1);
+  assert.equal(edits[0].stripColorGroupEdits[0].arrange,undefined);assert.equal(edits[0].stripColorGroupEdits[0].gather,undefined);
+});
+test('ungroup rejects partial selection and conflicting settings before any durable mutation',async()=>{
+  const f=fixture();f.lease.entries=f.lease.entries.slice(0,1);await assert.rejects(f.run({ungroup:true}),/selection_changed/);
+  for(const options of [{collapsed:true},{order:['a','b','c'],representative:'a'},{selectedTabId:'a'},{selectionReady:Promise.resolve(true)}])
+    await assert.rejects(f.run({ungroup:true,...options}),/selection_changed/);
+  assert.equal(f.writes.length,0);assert.equal(f.main.groups.length,1);
+});
+test('ungroup cannot overwrite a foreign definition or a changed owner/order/membership during the flush',async()=>{
+  const foreign=fixture();foreign.foreign();await assert.rejects(foreign.run({ungroup:true}),/revision_changed/);
+  assert.equal(foreign.main.groups[0].color,'#123456');
+  for(const change of ['owner','order','membership','activity','definition','lease']) {
+    const f=fixture();let release,current=true;f.lease.isCurrent=()=>current;
+    f.state.commitOrganization=()=>new Promise(resolve=>release=resolve);
+    const result=f.run({ungroup:true});
+    if(change==='owner')f.state.splitPanes[0].windowId='other';
+    if(change==='order')f.state.splitPanes[0].tabs.reverse();
+    if(change==='membership')f.state.tabWorkflowMembership.b={workflowId:'other',revision:2};
+    if(change==='activity')f.state.tabCatalog.b={active:false};
+    if(change==='definition')f.state.spaces[0].stripColorGroups={version:1,revision:2,groups:[{id:'g',revision:2,color:'#123456',tabIds:['a','b','c']}]};
+    if(change==='lease')current=false;
+    release();await assert.rejects(result,/changed/,change);
+    assert.equal(f.writes.filter(request=>request.stripColorGroupEdits).length,0,change);assert.equal(f.main.groups.length,1,change);
+  }
+});
+test('unknown ungroup ACK recovers the same immutable mutation and does not delete or revise twice',async()=>{
+  const f=fixture();f.lose();await assert.rejects(f.run({ungroup:true}),/lost ACK/);
+  assert.equal(f.state.spaces[0].stripColorGroups.groups.length,1,'no optimistic publication from a lost ACK');
+  f.recover();await f.run({ungroup:true});assert.deepEqual(f.main.groups,[]);assert.equal(f.main.revision,2);
+  const edits=f.writes.filter(request=>request.stripColorGroupEdits);assert.equal(edits.length,2);assert.deepEqual(edits[0],edits[1]);
+});

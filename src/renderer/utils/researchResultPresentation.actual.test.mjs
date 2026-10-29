@@ -43,7 +43,10 @@ test('actual busy listener handles late SC proof even with identical short body/
 
 test('History disclosure keeps the existing reveal owner, and Copy consumes the full original entry',()=>{
   const history=fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx',import.meta.url),'utf8');
-  const reply=history.slice(history.indexOf('const HistoryResearchReply ='),history.indexOf('const HistoryUserEntry ='));
+  const historyAst=ts.createSourceFile('HistoryPanel.tsx',history,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+  const reply=historyAst.statements.find(node=>ts.isVariableStatement(node)
+    &&node.declarationList.declarations.some(d=>d.name.getText(historyAst)==='HistoryResearchReply'))?.getText(historyAst);
+  assert.ok(reply,'assert only the actual Research reply, not the neighboring send timer');
   assert.match(reply,/useHistoryRevealToggle\(anchorRef, expanded, setExpanded\)/);
   assert.doesNotMatch(reply,/scrollTop|scrollIntoView|setTimeout|setInterval/);
   const user=history.slice(history.indexOf('const HistoryUserEntry ='),history.indexOf('const HistoryAssistantEntry ='));

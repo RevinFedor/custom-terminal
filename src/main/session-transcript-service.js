@@ -5,8 +5,11 @@ const { createHash } = require('node:crypto');
 const { canonicalSourceTicket } = require('./codex-canonical-source-proof');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
+const { causal: perfCausal } = require('./perf-causal-context');
 const { currentReadControl, withReadControl, isHistoryReadCancelled, isHistoryReadUnavailable, createDemandRegistry } = require('./history-read-control');
 const { historyIpcDemands } = require('./history-ipc-demand');
+const { createHistoryRootIpcBridge } = require('./history-root-ipc');
+const { historyReadCreditRefusal } = require('./history-read-error');
 const { findDirectCodexPayloadSourceLeaf } = require('./codex-payload-source-leaf');
 const { readSourceLeafPage, streamSourceLeaf } = require('./history-source-leaf');
 const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
@@ -82,6 +85,20 @@ const { codexSettingsWindowBaseline } = require('./codex-settings-history');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
+}
+
+// Only cold state initialization and its joined waiters opt into these phases.
+// Async spans describe elapsed waits (including other work on the thread), not
+// exclusive CPU. syncWork is used only around actual synchronous continuations.
+function transcriptInitPhase(name, fields, callback) {
+  if (!perfCausal.current()?.fields?.caller?.startsWith('transcript.init.')) return callback(false);
+  // Pending state stays in the existing heartbeat snapshot; the recorder emits
+  // only waits >=50ms. No per-phase async thread CPU or enter/return packet flood.
+  return perfCausal.run(name, fields, () => callback(true), { explicit: false });
+}
+function transcriptInitWork(name, fields, callback) {
+  if (!perfCausal.current()?.fields?.caller?.startsWith('transcript.init.')) return callback();
+  return perfCausal.syncWork(name, fields, callback);
 }
 
 function readControlOptions() {
@@ -361,16 +378,47 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:unsubscribe', async (_event, payload = {}) => this.unsubscribe(payload));
     ipcMain.handle('agent-transcript:refresh', async (_event, payload = {}) => this.refresh(payload));
     this.historyIpcDemands = historyIpcDemands;
+    if (this.historyReader?.call) this.historyRootIpc = createHistoryRootIpcBridge({
+      reader: this.historyReader, demands: this.historyIpcDemands,
+    });
     ipcMain.handle('agent-transcript:cancel-read', (event, payload) => this.historyIpcDemands.cancel(event, payload));
     const desktopRead = (method, payload) => payload.toolType === 'codex' && payload.readTransport === 'v8-1' && this.historyReader
       ? this.historyReader.call(method, payload, true) : this[method](payload);
-    const demanded = method => (event, payload = {}) => this.historyIpcDemands.run(event, payload,
-      request => desktopRead(method, request));
+    const demanded = method => (event, payload = {}) => {
+      if (this.historyRootIpc && payload.toolType === 'codex' && payload.readTransport === 'root-v1'
+        && (method === 'getHistory' || method === 'getToolPayload' || method==='getTimeline')) {
+        if(method==='getTimeline' && !['timeline-primary-v1','timeline-view-v1'].includes(payload.readProfile))
+          throw Object.assign(new Error('TIMELINE_ROOT_PROFILE_REQUIRED'),{code:'TIMELINE_ROOT_PROFILE_REQUIRED'});
+        return this.historyRootIpc.run(event, payload,
+          method === 'getToolPayload' ? 'openHistoryPayload' : 'openHistoryRoot');
+      }
+      return this.historyIpcDemands.run(event, payload, request => desktopRead(method, request));
+    };
+    for (const [channel, method] of [
+      ['agent-transcript:read-page', 'readHistoryRootPage'],
+      ['agent-transcript:fork-read-leaf', 'forkHistoryRootLeaf'],
+      ['agent-transcript:release-read-root', 'releaseHistoryRoot'],
+      ['agent-transcript:input-document', 'historyInputDocument'],
+    ]) ipcMain.handle(channel, (event, payload = {}) => {
+      if (!this.historyRootIpc) throw Object.assign(new Error('HISTORY_ROOT_READER_UNAVAILABLE'),
+        { code: 'HISTORY_ROOT_READER_UNAVAILABLE' });
+      return this.historyRootIpc.run(event, payload, method).catch(error => {
+        // Electron's rejected invoke does not preserve arbitrary Error fields.
+        // A typed read-only resource refusal crosses as a small result packet.
+        const refusal = method === 'readHistoryRootPage' && historyReadCreditRefusal(error);
+        if (refusal) return refusal;
+        throw error;
+      });
+    });
     ipcMain.handle('agent-transcript:get-timeline', demanded('getTimeline'));
     ipcMain.handle('agent-transcript:get-history', demanded('getHistory'));
     ipcMain.handle('agent-transcript:get-messages', demanded('getMessages'));
     ipcMain.handle('history:get-tool-payload', demanded('getToolPayload'));
-    ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
+    ipcMain.handle('agent-transcript:search-history', (event, payload = {}) => {
+      if(this.historyRootIpc&&payload.toolType==='codex'&&payload.readTransport==='root-v1'&&payload.readProfile==='history-search-v1')
+        return this.historyRootIpc.run(event,payload,'openHistoryRoot');
+      return this.searchHistory(payload);
+    });
     ipcMain.handle('agent-transcript:copy-codex-range', async (_event, payload = {}) => this.copyCodexVirtualRange(payload));
     ipcMain.handle('agent-transcript:export-codex-session', async (_event, payload = {}) => this.exportCodexSession(payload));
     ipcMain.handle('agent-transcript:resolve-physical-row', async (_event, payload = {}) => this.resolveCodexPhysicalRow(payload));
@@ -415,6 +463,11 @@ class SessionTranscriptService {
     // the child's physical file would let a RAM-stash hit bypass lineage.
     const payloadLineage = toolType === 'codex' ? this._resolveCodexLineage(sessionId, 'full') : null;
     if (payloadLineage?.kind === 'unresolved') return { success: false, error: 'lineage_unresolved', lineageReason: payloadLineage.reason };
+    if (payloadLineage?.kind === 'physical' && typeof this.readCodexPayloadPage === 'function') {
+      // The selected canonical leaf is authoritative. Identity, quota,
+      // cancellation and corruption failures never replay the old DTO route.
+      return this.readCodexPayloadPage(payload);
+    }
     const generationMatches = async () => {
       if (!payloadGeneration && toolType !== 'codex') return true;
       const file = await readBoundary(this._resolveFilePath(toolType, sessionId, cwd));
@@ -2172,6 +2225,19 @@ class SessionTranscriptService {
     if (lineage.kind === 'unresolved') {
       return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, matches: [] };
     }
+    if (lineage.kind === 'physical' && typeof this.searchCodexReadHistory === 'function') {
+      const searched = await readBoundary(this.searchCodexReadHistory(sessionId, payload.cwd, {
+        ...payload, type: searchType, limit: Math.max(1, Math.min(5000, Number(payload.limit) || 2000)),
+        ...readControlOptions(),
+      }));
+      if (!searched?.success) return { ...searched, success: false, matches: [] };
+      if (searched.rows === 0 && lineage.legacyForkEvent
+        && !isProvenEmptyCodexHistoryRewrite(lineage.legacyForkEvent, searched.sessionMeta)) {
+        return { success: false, error: 'lineage_unresolved', lineageReason: 'legacy-fork-event-without-raw-manifest', matches: [] };
+      }
+      const { sessionMeta, sourceSnapshot, filePath, ...response } = searched;
+      return { ...response, contentRevision: null, viewOwnerSessionId: sessionId, composite: false };
+    }
     const projected = lineage.kind === 'virtual'
       ? await this._projectCodexVirtual(lineage, payload.cwd)
       : await projectFromFile(sessionId, payload.cwd);
@@ -2725,7 +2791,8 @@ class SessionTranscriptService {
       // graph. The full entries graph still scales with transcript content;
       // this removes one allocation owner, not a whole-read bound. Minimal
       // old doubles without the API retain their compatibility path.
-      const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
+      const projectFromFile = typeof this.projectCodexReadHistory === 'function'
+        ? this.projectCodexReadHistory.bind(this) : this.codexData?._api?.projectCodexFullHistoryFromFile;
       // The page store is worker-owned. A seek reads positional metadata and
       // selected bodies, without resurrecting an evicted parser. Its key also
       // covers sidecars: a pending timing or prompt edit cannot reuse old data.
@@ -2786,6 +2853,7 @@ class SessionTranscriptService {
           tabId: payload.tabId,
           cacheOnly: payload.rewriteBaselineOnly === true,
           hydrate: rowWindowRequest,
+          dehydrate: payload.dehydrate === true,
           ...(payload.dehydrate === true ? {} : { payloadPolicy: 'full' }),
           ...readControlOptions(),
         }));
@@ -3323,10 +3391,18 @@ class SessionTranscriptService {
       return existing;
     }
 
+    const fields = { sessionId, caller: 'transcript.init.' + (toolType === 'codex' ? 'codex' : toolType === 'claude' ? 'claude' : 'other'),
+      cwdHash: 'sha256:' + createHash('sha256').update(typeof cwd === 'string' ? cwd : '').digest('hex').slice(0, 24) };
     const inflight = this.sessionInitInflight.get(key);
-    if (inflight) return inflight;
+    if (inflight) return perfCausal.run('transcript.init.join', {
+      ...fields, initAttemptId: inflight.transcriptInitAttempt, reason: 'await-existing-init',
+    }, () => inflight, { explicit: false });
 
-    const initialization = (async () => {
+    let initAttempt;
+    const initialization = perfCausal.run('transcript.init', { ...fields, reason: 'await-source-initialization' }, async () => {
+      const initSpan = perfCausal.current();
+      initAttempt = initSpan?.name === 'transcript.init' ? initSpan.spanId : undefined;
+      if (initAttempt) perfCausal.update({ initAttemptId: initAttempt });
       const filePath = await this._resolveFilePath(toolType, sessionId, cwd);
       const state = {
         key,
@@ -3352,13 +3428,18 @@ class SessionTranscriptService {
         lastUuid: null,
       };
       await this._refreshFile(state);
-      state.offset = state.size;
-      this.sessions.set(key, state);
+      transcriptInitWork('transcript.init.publish-state', { sourceBytes: state.size, rows: 1 }, () => {
+        state.offset = state.size;
+        this.sessions.set(key, state);
+      });
       if (toolType === 'codex') {
         await this._seedCodexContextObservation(state, 'state-init');
       }
       return state;
-    })();
+    });
+    // One bounded scalar on the existing in-flight Promise, not another
+    // registry/lease. Joiners retain their own parent span and name this owner.
+    if (initAttempt) initialization.transcriptInitAttempt = initAttempt;
     this.sessionInitInflight.set(key, initialization);
 
     try {
@@ -3371,74 +3452,90 @@ class SessionTranscriptService {
   }
 
   async _resolveFilePath(toolType, sessionId, cwd) {
-    const cacheKey = toolType + ':' + sessionId;
-    const cached = this.resolvedPathCache.get(cacheKey);
-    if (cached) {
-      // Existence check only — a vanished file (deleted session) falls
-      // through to a fresh discovery walk.
-      try {
-        await fs.promises.access(cached);
-        return cached;
-      } catch {
-        this.resolvedPathCache.delete(cacheKey);
+    return transcriptInitPhase('transcript.init.resolve', { mode: 'unresolved' }, async diagnostic => {
+      const cacheKey = toolType + ':' + sessionId;
+      const cached = this.resolvedPathCache.get(cacheKey);
+      if (cached) {
+        // Existence check only — a vanished file (deleted session) falls
+        // through to a fresh discovery walk.
+        try {
+          await transcriptInitPhase('transcript.init.path-access', { reason: 'path-memo-check' }, () => fs.promises.access(cached));
+          if (diagnostic) perfCausal.update({ mode: 'path-memo-hit', reason: 'representation-not-rechecked' });
+          return cached;
+        } catch {
+          this.resolvedPathCache.delete(cacheKey);
+        }
       }
-    }
-    let filePath = null;
-    if (toolType === 'codex') {
-      const found = await this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd);
-      filePath = found?.filePath || null;
-    } else {
-      const found = this.claudeData?.findSessionFile?.(sessionId, cwd);
-      filePath = found?.filePath || null;
-    }
-    if (filePath) this.resolvedPathCache.set(cacheKey, filePath);
-    return filePath;
+      let filePath = null;
+      if (toolType === 'codex') {
+        const found = await transcriptInitPhase('transcript.init.find-source', { reason: 'discovery-including-readview' },
+          () => this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd));
+        filePath = found?.filePath || null;
+        if (diagnostic) perfCausal.update({ mode: !filePath ? 'unresolved'
+          : found?.temporaryReadView === true ? 'zstd-readview' : found?.representation === 'jsonl' ? 'jsonl' : 'representation-unknown',
+        rows: filePath ? 1 : 0 });
+      } else {
+        const found = transcriptInitWork('transcript.init.find-source-sync', {}, () => this.claudeData?.findSessionFile?.(sessionId, cwd));
+        filePath = found?.filePath || null;
+        if (diagnostic) perfCausal.update({ mode: filePath ? 'claude-jsonl' : 'unresolved', rows: filePath ? 1 : 0 });
+      }
+      if (filePath) this.resolvedPathCache.set(cacheKey, filePath);
+      return filePath;
+    });
   }
 
   async _refreshFile(state) {
-    if (!state.filePath) {
-      state.filePath = await this._resolveFilePath(state.toolType, state.sessionId, state.cwd);
-    }
-    if (!state.filePath) return false;
-    try {
-      const stat = await fs.promises.stat(state.filePath);
-      const fileIdentity = stat.dev + ':' + stat.ino;
-      const replaced = !!state.fileIdentity && state.fileIdentity !== fileIdentity;
-      const ctimeChanged = Number.isFinite(state.ctimeMs) && state.ctimeMs !== stat.ctimeMs;
-      const rewritten = replaced || (!!state.fileIdentity && (stat.size < state.size
-        || (stat.size === state.size && (stat.mtimeMs !== state.mtimeMs || ctimeChanged))));
-      const changed = replaced || stat.size !== state.size || stat.mtimeMs !== state.mtimeMs || ctimeChanged;
-      state.size = stat.size;
-      state.mtimeMs = stat.mtimeMs;
-      state.ctimeMs = stat.ctimeMs;
-      state.fileIdentity = fileIdentity;
-      if (rewritten) {
-        // Atomic JSONL replacement keeps the path but changes the watched
-        // inode. Neither a byte cursor nor fs.watch survives that identity.
-        // The changed event reloads canonical rows; do not emit a fake live
-        // append by reading the new file at the old generation's offset.
-        state.offset = stat.size;
-        state.leftover = '';
-        state.sourceRewriteVersion = (state.sourceRewriteVersion || 0) + 1;
-        state.codexLeftoverBytes = null;
-        this.historyDeltaDigests.invalidateSession(state.toolType, state.sessionId);
-        historyPayloadStash.invalidateSession(state.toolType, state.sessionId);
-        if (state.toolType === 'codex') this.codexData?._api?.invalidateJsonlCache?.(state.filePath);
-        if (replaced && state.watcher) {
-          try { state.watcher.close(); } catch {}
-          state.watcher = null;
-          if (state.reconcileTimer) clearInterval(state.reconcileTimer);
-          state.reconcileTimer = null;
-          this._startWatcher(state);
-          console.log('[TranscriptService:WatchRebind] tool=' + state.toolType
-            + ' session=' + shortId(state.sessionId) + ' reason=file-replaced');
-        }
+    return transcriptInitPhase('transcript.init.refresh', {}, async diagnostic => {
+      if (!state.filePath) {
+        state.filePath = await this._resolveFilePath(state.toolType, state.sessionId, state.cwd);
       }
-      if (changed) state.version += 1;
-      return changed;
-    } catch {
-      return false;
-    }
+      if (!state.filePath) {
+        if (diagnostic) perfCausal.update({ mode: 'unresolved', reason: 'no-resolved-path' });
+        return false;
+      }
+      try {
+        const stat = await transcriptInitPhase('transcript.init.stat', {}, () => fs.promises.stat(state.filePath));
+        return transcriptInitWork('transcript.init.stat-apply', { sourceBytes: stat.size }, () => {
+          const fileIdentity = stat.dev + ':' + stat.ino;
+          const replaced = !!state.fileIdentity && state.fileIdentity !== fileIdentity;
+          const ctimeChanged = Number.isFinite(state.ctimeMs) && state.ctimeMs !== stat.ctimeMs;
+          const rewritten = replaced || (!!state.fileIdentity && (stat.size < state.size
+            || (stat.size === state.size && (stat.mtimeMs !== state.mtimeMs || ctimeChanged))));
+          const changed = replaced || stat.size !== state.size || stat.mtimeMs !== state.mtimeMs || ctimeChanged;
+          state.size = stat.size;
+          state.mtimeMs = stat.mtimeMs;
+          state.ctimeMs = stat.ctimeMs;
+          state.fileIdentity = fileIdentity;
+          if (rewritten) {
+            // Atomic JSONL replacement keeps the path but changes the watched
+            // inode. Neither a byte cursor nor fs.watch survives that identity.
+            // The changed event reloads canonical rows; do not emit a fake live
+            // append by reading the new file at the old generation's offset.
+            state.offset = stat.size;
+            state.leftover = '';
+            state.sourceRewriteVersion = (state.sourceRewriteVersion || 0) + 1;
+            state.codexLeftoverBytes = null;
+            this.historyDeltaDigests.invalidateSession(state.toolType, state.sessionId);
+            historyPayloadStash.invalidateSession(state.toolType, state.sessionId);
+            if (state.toolType === 'codex') this.codexData?._api?.invalidateJsonlCache?.(state.filePath);
+            if (replaced && state.watcher) {
+              try { state.watcher.close(); } catch {}
+              state.watcher = null;
+              if (state.reconcileTimer) clearInterval(state.reconcileTimer);
+              state.reconcileTimer = null;
+              this._startWatcher(state);
+              console.log('[TranscriptService:WatchRebind] tool=' + state.toolType
+                + ' session=' + shortId(state.sessionId) + ' reason=file-replaced');
+            }
+          }
+          if (changed) state.version += 1;
+          return changed;
+        });
+      } catch (error) {
+        if (diagnostic) perfCausal.update({ mode: 'stat-unavailable', reason: typeof error?.code === 'string' ? error.code : 'stat-failed' });
+        return false;
+      }
+    });
   }
 
   _startWatcher(state) {
@@ -3534,28 +3631,48 @@ class SessionTranscriptService {
   }
 
   async _seedCodexContextObservation(state, reason = 'seed') {
-    if (!this.onCodexContextObservation || !state?.filePath || state.size <= 0) return null;
-    try {
-      const observation = await readLatestCodexContextObservation(state.filePath, {
-        endOffset: state.size,
-      });
-      if (observation?.kind === 'value' || observation?.kind === 'invalidated') {
-        this._publishCodexContextObservation(state, observation, {
-          source: 'tail-seed',
-          reason,
-        });
-      } else {
-        console.log('[TranscriptService:CodexContext] seed unknown session='
-          + shortId(state.sessionId)
-          + ' reason=' + (observation?.reason || 'unknown')
-          + ' scanned=' + Number(observation?.scannedBytes || 0));
+    return transcriptInitPhase('transcript.init.context-seed', { reason }, async diagnostic => {
+      if (!this.onCodexContextObservation || !state?.filePath || state.size <= 0) {
+        if (diagnostic) perfCausal.update({ mode: 'skipped', reason: !this.onCodexContextObservation
+          ? 'no-observer' : !state?.filePath ? 'no-resolved-path' : 'nonpositive-source-size' });
+        return null;
       }
-      return observation;
-    } catch (error) {
-      console.warn('[TranscriptService:CodexContext] seed failed session='
-        + shortId(state.sessionId) + ' error=' + (error?.message || error));
-      return null;
-    }
+      try {
+        const observation = await transcriptInitPhase('transcript.init.context-tail', {
+          sourceBytes: state.size, reason: 'bounded-tail-await-not-exclusive-cpu',
+        }, async traced => {
+          const stats = traced ? {} : null;
+          const value = await readLatestCodexContextObservation(state.filePath, {
+            endOffset: state.size, framingStats: stats,
+          });
+          if (traced) perfCausal.update({
+            framingCopiedBytes: stats.copiedBytes ?? null, framingMaxCarryBytes: stats.maxCarryBytes ?? null,
+            framingMaxCarryBlocks: stats.maxCarryBlocks ?? null, framingLineAssemblies: stats.lineAssemblies ?? null,
+          });
+          return value;
+        });
+        if (diagnostic) perfCausal.update({ bytes: observation?.scannedBytes, mode: observation?.kind || 'unknown',
+          rows: observation?.kind === 'value' || observation?.kind === 'invalidated' ? 1 : 0 });
+        if (observation?.kind === 'value' || observation?.kind === 'invalidated') {
+          transcriptInitWork('transcript.init.context-publish', { bytes: observation.scannedBytes, rows: 1 },
+            () => this._publishCodexContextObservation(state, observation, {
+            source: 'tail-seed',
+            reason,
+          }));
+        } else {
+          console.log('[TranscriptService:CodexContext] seed unknown session='
+            + shortId(state.sessionId)
+            + ' reason=' + (observation?.reason || 'unknown')
+            + ' scanned=' + Number(observation?.scannedBytes || 0));
+        }
+        return observation;
+      } catch (error) {
+        if (diagnostic) perfCausal.update({ mode: 'seed-failed', reason: typeof error?.code === 'string' ? error.code : 'tail-seed-failed' });
+        console.warn('[TranscriptService:CodexContext] seed failed session='
+          + shortId(state.sessionId) + ' error=' + (error?.message || error));
+        return null;
+      }
+    });
   }
 
   async _broadcastCodexDelta(state, oldSize) {
@@ -3599,10 +3716,6 @@ class SessionTranscriptService {
     const completeEnd = buf.lastIndexOf(10) + 1;
     state.codexLeftoverBytes = Buffer.from(buf.subarray(completeEnd));
     state.leftover = state.codexLeftoverBytes.toString('utf8');
-    const lines = [];
-    for (let from = 0, newline; (newline = buf.indexOf(10, from)) >= 0; from = newline + 1) {
-      lines.push(buf.subarray(from, newline + 1));
-    }
     let sent = 0;
     let parsed = 0;
     let skippedLiveUsers = 0;
@@ -3613,10 +3726,13 @@ class SessionTranscriptService {
         .filter(Boolean),
     );
     let lineByteOffset = bufferBaseOffset;
-    for (let i = 0; i < lines.length; i++) {
-      const rawLine = lines[i].subarray(0, -1).toString('utf8');
+    // Consume each complete physical line directly from the validated batch.
+    // Keep only this line's view; no native array of every appended record.
+    for (let from = 0, newline, i = 0; (newline = buf.indexOf(10, from)) >= 0; from = newline + 1, i++) {
+      const lineBytes = buf.subarray(from, newline + 1);
+      const rawLine = lineBytes.subarray(0, -1).toString('utf8');
       const recordByteOffset = lineByteOffset;
-      lineByteOffset += lines[i].length;
+      lineByteOffset += lineBytes.length;
       const recordEndByteOffset = lineByteOffset;
       const line = rawLine.trim();
       if (!line) continue;
@@ -3645,7 +3761,7 @@ class SessionTranscriptService {
         const sourceTicket = record.type === 'response_item' && record.payload?.type === 'message'
           && record.payload?.role === 'assistant'
           ? canonicalSourceTicket({ filePath: state.filePath, stat: readStat,
-            start: recordByteOffset, bytes: lines[i],
+            start: recordByteOffset, bytes: lineBytes,
             isCurrent: () => this.sessions.get(state.key) === state
               && (state.sourceRewriteVersion || 0) === rewriteVersion
               && state.fileIdentity === `${readStat.dev}:${readStat.ino}` }) : null;

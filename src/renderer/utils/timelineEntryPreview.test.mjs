@@ -5,6 +5,12 @@ import { createHash } from 'node:crypto';
 import { timelineFinalPreview, resolveTimelineFullResponse, timelinePromptPreview,
   resolveTimelinePromptImages, timelineGroupPreview, timelinePreviewModelLabel, timelineResearchModelLabel } from './timelineEntryPreview.mjs';
 import { timelineAutomaticPromptVariant } from './timelineEntryPreview.mjs';
+
+test('a waiting-outcome notice is not mislabeled as a capacity retry', () => {
+  assert.equal(timelineAutomaticPromptVariant({ semanticTags: [
+    { kind: 'prompt-origin', source: 'system', systemSource: 'tab-message-outcome' },
+  ] }), null);
+});
 import { projectHistoryServicePromptBody } from './historyOrchestrationPromptPresentation.mjs';
 import { timelineMarkerKind } from './timelineMarkerPresentation.mjs';
 import { projectTimelineLiveUserMessage } from './timelineTranscriptRefresh.mjs';

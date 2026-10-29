@@ -1,7 +1,8 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import fs from 'node:fs';import vm from 'node:vm';import {transformSync} from 'esbuild';
 import * as model from '../../utils/paneStripSelectionModel.mjs';
-import {readPaneStripOwnerEntries,capturePaneStripGroupDrag} from '../../utils/paneStripGroupsModel.mjs';
+import * as groups from '../../utils/paneStripGroupsModel.mjs';
+import {registerPaneStripOutsideSelection} from '../../utils/paneStripOutsideSelection.mjs';
 const source=fs.readFileSync(new URL('./PaneStripSelection.tsx',import.meta.url),'utf8');
 const code=transformSync(source,{loader:'tsx',format:'cjs'}).code;
 function fixture(){
@@ -21,10 +22,14 @@ function fixture(){
       slots[i]={deps,cleanup:old?.cleanup};effects.push(()=>{slots[i].cleanup?.();slots[i].cleanup=cb();});}},
   };
   const module={exports:{}};
-  vm.runInNewContext(code,{module,exports:module.exports,require:name=>{
+  const window={addEventListener(){},removeEventListener(){}};
+  vm.runInNewContext(code,{module,exports:module.exports,window,require:name=>{
     if(name==='react')return hooks;
     if(name.endsWith('paneStripSelectionModel.mjs'))return model;
-    if(name.endsWith('paneStripGroupsModel.mjs'))return {readPaneStripOwnerEntries,capturePaneStripGroupDrag};
+    if(name.endsWith('paneStripGroupsModel.mjs'))return groups;
+    if(name.endsWith('paneStripOutsideSelection.mjs'))return {registerPaneStripOutsideSelection};
+    if(name.endsWith('paneTabDragBridge'))return {getPaneTabDragSnapshot:()=>({active:false}),subscribePaneTabDrag:()=>()=>{}};
+    if(name.endsWith('paneTabPointerBridge'))return {getPaneTabPointerSnapshot:()=>({active:false}),subscribePaneTabPointer:()=>()=>{}};
     if(name.endsWith('useWorkspaceStore'))return {useWorkspaceStore:{getState:()=>state}};
     throw Error(name);
   }});

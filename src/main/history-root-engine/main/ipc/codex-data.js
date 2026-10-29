@@ -1,0 +1,13465 @@
+const rootDate = require('../history-paged-date');
+const { ipcMain } = require('node:worker_threads').isMainThread
+  && process.env.NOTED_HISTORY_READER_PROCESS !== '1' ? require('electron') : {};
+const path = require('path');
+const fs = require('fs');
+const { isCodexRolloutFile, resolveExistingRollout } = require('../codex-rollout-format');
+const { prepareCodexRolloutReadFile, materializeCodexRolloutForMutation,
+  assertCodexRolloutReadViewCurrent, codexRolloutReadViewBacking } = require('../codex-rollout-read-views');
+const { causal: perfCausal } = require('../perf-causal-context');
+const { drainProjectionSteps, createProjectionControl } = require('../codex-turns-projection');
+const { currentReadControl, createDemandRegistry, isHistoryReadCancelled,
+  isHistoryReadUnavailable } = require('../history-read-control');
+const { timelineResponsePreview } = require('../../shared/timeline-response-preview.cjs');
+const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
+const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
+const { normalizeCodexTextPhase } = require('../../shared/history-text-phase.cjs');
+const os = require('os');
+const crypto = require('crypto');
+const { createCodexRawLiteralResolver } = require('../codex-exec-raw-literals');
+const { inspectCodexSettledEmission, matchCodexSettledResults } = require('../codex-exec-result-attribution');
+const {
+  codexNativeQuestionDefinition,
+  registerNativeQuestionDefinition,
+  proveCodexNativeQuestionReply,
+} = require('../../shared/native-question-reply.cjs');
+const questionReplyFingerprint = (value) => rootText.isPagedText(value) ? rootText.hash(value, 'sha256')
+  : crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
+const { commitPreparedFork } = require('../fork-commit');
+const { cloneCodexPromptPresentationsForProvenChild } = require('../history-prompt-presentations');
+const { cloneProjectionGraphAsync, measureProjectionGraphBytes, createProjectionIdentityMap, retainCheckpoint, forkProjectionCheckpoints } = require('../codex-projection-checkpoint');
+const { HistoryProjectionArena, projectionArenaOf } = require('../history-projection-arena');
+const { readRootedJsonlRange, matchesRootedSessionHead } = require('../codex-root-jsonl');
+const rootText = require('../history-paged-text');
+const rootOps = require('../history-root-operations');
+const rootJsText = require('../codex-root-js-text');
+const { classifyRootShell, recoverCommand } = require('../codex-root-shell');
+const rootPatchText = require('../codex-root-patch-text');
+const rootMachineText = require('../codex-root-machine-text');
+const { createRootPromptText } = require('../codex-root-prompt-text');
+const { CodexRootProjectionOwner, appendRootSourceProof, trimRootSourceProof, verifyRootSourcePrefix, checkpointRootAt } = require('../codex-root-projection-owner');
+const { dehydrateHistoryEntries, historyPayloadStash } = require('../history-payload-dehydrate');
+const {
+  buildHistoryRevision,
+  validateHistoryRevision,
+} = require('../history-revision');
+const { buildChildProcessEnv } = require('../child-process-env');
+const {
+  createCodexSubagentTracker,
+  extractCodexSpawnIdentities,
+  normalizeCodexSubagentCall,
+  isCodexSubagentControlCall,
+  isCodexSubagentNamespace,
+  isCodexSubagentSpawnCall,
+} = require('../codex-subagent-cards');
+const {
+  findCodexAgentFile,
+  readAgentCompletionProof,
+} = require('../subagent-transcript');
+const {
+  getCodexProcessActionGeneration,
+} = require('../codex-process-action-ownership');
+const { promptFingerprint } = require('../claude-prompt-carriers');
+const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
+const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
+const { summarizeResultText, projectResultText } = require('../codex-result-text');
+const { createCodexResultReader } = require('../codex-result-reader');
+const { createCodexResumeSourceReader } = require('../codex-resume-source');
+const { historyPreparationActivity } = require('../history-preparation-activity');
+const { prepareHistoryRowWindow } = require('../history-entry-window');
+const { CodexReadFence, retryInvalidatedCodexRead } = require('../codex-read-fence');
+const { CodexSourceGenerations } = require('../codex-source-generations');
+const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
+const { codexSettingsHistoryValues, codexSettingsHistoryEntry } = require('../codex-settings-history');
+const {
+  codexUserCarrierTextsMatch,
+  codexUserMessageAuditText,
+  codexUserMessagePresentationText,
+  codexUserMessageImageRefs,
+  mergeCodexUserMessageImageRefs,
+  groupCodexPreferredUserMessageAuditRecords,
+  isCodexEnvironmentContextUserText,
+  isCodexGoalContinuationUserText,
+  isCodexProjectInstructionsUserText,
+  isCodexTurnAbortedUserText,
+} = require('../codex-prompt-audit');
+const {
+  RESULT_PROOF_CODES,
+} = require('../orchestration-result-proof');
+const {
+  classifyHistoryAction,
+  historyActionPresentationMeta,
+} = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  formatCopyAction,
+} = require('../copy-action-format');
+const {
+  deriveCodexForkSnapshot,
+  mapTimelineEntryUuidsAcrossFork,
+} = require('../session-history-events');
+const {
+  CodexAccountProfileManager,
+  DEFAULT_PROFILE_ID,
+  buildCodexProcessPath,
+} = require('../codex-account-profiles');
+const {
+  buildCodexHistoryContextItem,
+} = require('../agent-history-context-injection');
+const { execFile } = require('child_process');
+const { createCodexUsagePolling } = require('../codex-usage-polling');
+const { fetchCodexCreditExpiration, createCodexCreditExpirationReader } = require('../codex-credit-expiration');
+
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
+const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
+const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CODEX_RESET_CREDITS_API_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const USAGE_ACCOUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
+const USAGE_ACCOUNTS_ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+// Main checks all connected accounts every 30 seconds. Keep the
+// successful response briefly reusable for concurrent readers while allowing
+// the next scheduled check to reach OpenAI without forcing profile probes.
+const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 25 * 1000;
+const CODEX_REMOTE_USAGE_STALE_MS = 6 * 60 * 1000;
+const CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS = 60 * 1000;
+const CODEX_REMOTE_USAGE_TIMEOUT_MS = 15 * 1000;
+const CODEX_RESET_CREDITS_TIMEOUT_MS = 4 * 1000;
+const CODEX_USAGE_PERSISTENCE_KEY = 'codexUsageAccounts.v1';
+const CODEX_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
+const CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS = 2 * 60;
+const CODEX_USAGE_REGRESSION_POINTS = 10;
+const CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS = 3 * 1000;
+const CODEX_USAGE_INCONSISTENT_WARNING = 'OpenAI returned inconsistent usage. Showing the last verified value.';
+const CODEX_USAGE_TAIL_CHUNK_BYTES = 1024 * 1024;
+const CODEX_USAGE_TAIL_MAX_BYTES = 16 * 1024 * 1024;
+const CODEX_LATEST_USAGE_FILE_LIMIT = 24;
+const CODEX_LATEST_USAGE_TAIL_BYTES = 2 * 1024 * 1024;
+const CODEX_RESET_DRIFT_TOLERANCE_SECONDS = 10 * 60;
+const CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS = 30 * 60 * 1000;
+const CODEX_USAGE_SCAN_DAYS = 10;
+const CODEX_USAGE_RATE_ROWS_LIMIT = 5000;
+const CODEX_JSONL_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+const CODEX_JSONL_WRITE_CHUNK_BYTES = 4 * 1024 * 1024;
+const CODEX_COMPACT_RAW_IMAGES = Symbol('codexCompactRawImages');
+const CODEX_REWRITE_ORIGIN = Symbol('codexRewriteOrigin');
+// Raw file bytes are only a lower bound: parsed JSON strings/objects cost
+// substantially more. Keep one oversized active rollout if necessary, but do
+// not retain an unbounded collection of fully parsed sessions forever.
+const CODEX_JSONL_CACHE_MAX_RAW_BYTES = 768 * 1024 * 1024;
+// The byte budget is the real memory bound; the file cap only limits entry
+// count. At 3, a workspace with a couple of open codex tabs plus usage/
+// timeline reads of other sessions evicted the ACTIVE 73MB rollout between
+// its own refreshes — every live append then cost a full 3.1s re-parse
+// instead of the incremental range read (tab-3163, 06.08 11:37 loadMs=3147).
+const CODEX_JSONL_CACHE_MAX_FILES = 6;
+// Потолок на ОДИН файл, который вообще разрешено разбирать в память целиком.
+//
+// Почему он обязан быть: в проде лежат пять файлов больше гигабайта (максимум
+// 1369 МБ). Разобранные объекты стоят кратно больше исходных байтов, поэтому
+// один такой разбор гарантированно убивает процесс — «нехватка памяти» и
+// мгновенное закрытие приложения без единой строки в логе. Именно так ушёл
+// вылет 19.08 08:41: за три минуты память поднялась с 2.0 до 3.6 ГБ на потоке
+// полных чтений, среди которых был файл на 717 МБ.
+//
+// Потолок считается по размеру на диске, а картинки внутри сжатий отбрасываются
+// ещё до разбора (см. stripCompactedInlineImages), поэтому фактический вес в
+// памяти в разы меньше числа ниже. Замерено на реальном файле пользователя
+// (1340 МБ): без обрезки разбор занимает 1725 МБ памяти, с обрезкой — 532 МБ.
+// 1.5 ГБ на диске — это заведомо выше любого файла, который встречается в
+// проде (максимум 1369 МБ), и заведомо ниже того, что убивает процесс после
+// обрезки. Отказ здесь честный и виден в логе; молчаливое падение всего
+// приложения — нет.
+const CODEX_JSONL_PARSE_MAX_BYTES = 1536 * 1024 * 1024;
+const CODEX_SESSION_META_HEAD_MAX_BYTES = 512 * 1024;
+const CODEX_SESSION_META_HEAD_CHUNK_BYTES = 16 * 1024;
+const CODEX_SESSION_META_HEAD_MAX_RECORDS = 32;
+
+let modelCache = null;
+let modelCacheInflight = null;
+let usageAccountsCache = null;
+let usageAccountsRefreshInFlight = null;
+let usageAccountsLastAttemptAt = null;
+let usageAccountsLastError = null;
+let usageAccountsLastErrorAt = 0;
+let codexUsageStateStore = null;
+let codexOperationSourceResolver = null;
+
+function setCodexOperationSourceResolver(resolver) {
+  codexOperationSourceResolver = typeof resolver === 'function' ? resolver : null;
+}
+
+async function loadCodexOperationSource(sessionId, cwd, options = {}) {
+  return codexOperationSourceResolver
+    ? codexOperationSourceResolver({ sessionId, cwd, ...options })
+    : loadSessionRecords(sessionId, cwd, options);
+}
+let codexUsageStateHydrated = false;
+let codexAccountProfileManager = null;
+let codexAccountProfileCleanupBound = false;
+let codexUsagePolling = null;
+const codexManagedUsageInflight = new Map();
+const codexManagedUsageAccounts = new Map();
+let codexCreditExpirationReader = null;
+
+async function readCodexCreditExpiration(auth, force) {
+  // This route is challenged by Cloudflare through Node fetch. Chromium's
+  // network stack accepts the same Codex OAuth, without a separate web login.
+  const { net, app } = require('electron');
+  if (!net?.fetch) return Promise.resolve(null);
+  await app.whenReady();
+  codexCreditExpirationReader ||= createCodexCreditExpirationReader({ fetchImpl: (url, options) => net.fetch(url, options) });
+  return codexCreditExpirationReader.read(auth, { force });
+}
+const codexRemoteUsageByAccount = new Map();
+const codexRemoteUsageInflight = new Map();
+const codexActiveUsageOverrides = new Map();
+const loggedRollbackKeys = new Set();
+const _codexJsonlCache = new Map();
+const _codexRecordSnapshots = new WeakMap();
+let _codexJsonlCacheRawBytes = 0;
+const _codexSessionSelectSkipLogged = new Set();
+const _codexJsonlInflight = new Map();
+const _codexJsonlDemands = createDemandRegistry();
+const _codexReadFence = new CodexReadFence();
+let _codexExternalReadPrepare = null;
+const _codexSourceGenerations = new CodexSourceGenerations({ pinned: (filePath) => (
+  _codexReadFence.active.has(filePath) || _codexJsonlCache.has(filePath)
+  || [..._codexHistoryProjectors.values()].some(cached => cached.filePath === filePath)
+) });
+
+function rememberCodexSourceGeneration(filePath, stat, ticket, sessionId = null) {
+  _codexReadFence.assertCurrent(ticket);
+  const observed = _codexSourceGenerations.observe(filePath, stat, sessionId);
+  if (observed.rewritten) {
+    _codexReadFence.invalidate(filePath, null, ticket);
+    _codexProjectionStorage?.onRewrite?.(filePath);
+    for (const id of observed.sessions) historyPayloadStash.invalidateSession('codex', id);
+  }
+  return observed.generation;
+}
+
+function isCodexSourceSnapshotCurrent(snapshot) {
+  if (!snapshot?.sourceGeneration) return true;
+  const source = _codexSourceGenerations.get(snapshot.filePath);
+  return !!source && !source.rewritePending && source.generation === snapshot.sourceGeneration;
+}
+function getCodexPayloadGeneration(filePath, stat, sessionId) {
+  const observed = _codexSourceGenerations.observe(filePath, stat, sessionId);
+  if (observed.rewritten) {
+    _codexReadFence.invalidate(filePath);
+    _codexProjectionStorage?.onRewrite?.(filePath);
+    for (const id of observed.sessions) historyPayloadStash.invalidateSession('codex', id);
+  }
+  return observed.generation;
+}
+async function beginCodexSourceRead(filePath, sessionId) {
+  await _codexExternalReadPrepare?.(filePath);
+  const ticket = _codexReadFence.begin(filePath, 'composite');
+  try {
+    const stat = await fs.promises.stat(filePath);
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
+    return { ticket, snapshot: { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, sourceGeneration, linkKind: 'end' } };
+  } catch (error) { _codexReadFence.finish(ticket); throw error; }
+}
+async function assertCodexSourceRead(read) {
+  _codexReadFence.assertCurrent(read.ticket);
+  const stat = await fs.promises.stat(read.snapshot.filePath);
+  _codexReadFence.assertCurrent(read.ticket);
+  if (!codexSourceSnapshotMatchesStat(read.snapshot, stat)) {
+    throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+  }
+}
+// Final Main admission must also check the actual ticket after synchronous
+// application callbacks; awaiting another stat alone leaves a reentrancy gap.
+function assertCodexSourceReadCurrent(read, resolverBinding = null) {
+  _codexReadFence.assertCurrent(read.ticket);
+  if (!isCodexSourceSnapshotCurrent(read.snapshot)) {
+    throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+  }
+  // A late cold scan can retarget this SID's memo while an older memo hit
+  // awaits access(A). Unchanged A bytes cannot prove the now-current binding.
+  // Only turns admission supplies this optional binding; ordinary source
+  // readers retain their existing physical fence contract and lookup policy.
+  if (resolverBinding) {
+    const sessionsDir = resolverBinding.sessionsDir ?? CODEX_SESSIONS_DIR;
+    const memoKey = resolverBinding.sessionId + ':' + (sessionsDir || '');
+    if (resolverBinding.sessionId !== read.snapshot.sessionId
+      || resolverBinding.filePath !== read.snapshot.filePath
+      || codexSessionFilePathMemo.get(memoKey) !== resolverBinding.filePath) {
+      throw Object.assign(new Error('Codex resolver binding changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+    }
+  }
+}
+const _codexHistoryContextInflight = new Map();
+
+function deleteCodexJsonlCacheEntry(filePath) {
+  const cached = _codexJsonlCache.get(filePath);
+  if (!cached) return false;
+  _codexJsonlCache.delete(filePath);
+  _codexJsonlCacheRawBytes = Math.max(0, _codexJsonlCacheRawBytes - (Number(cached.size) || 0));
+  return true;
+}
+
+function pruneCodexJsonlCache(protectedFilePath) {
+  while (
+    _codexJsonlCache.size > CODEX_JSONL_CACHE_MAX_FILES ||
+    _codexJsonlCacheRawBytes > CODEX_JSONL_CACHE_MAX_RAW_BYTES
+  ) {
+    let victim = null;
+    for (const filePath of _codexJsonlCache.keys()) {
+      if (filePath !== protectedFilePath) {
+        victim = filePath;
+        break;
+      }
+    }
+    if (!victim) break; // one oversized active rollout is kept to avoid reparsing on every click
+    const cached = _codexJsonlCache.get(victim);
+    deleteCodexJsonlCacheEntry(victim);
+    console.log('[CodexJsonlCache] evict file=' + path.basename(victim) +
+      ' sizeKB=' + Math.round((Number(cached?.size) || 0) / 1024) +
+      ' remainingFiles=' + _codexJsonlCache.size +
+      ' remainingRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)));
+  }
+}
+
+function setCodexJsonlCacheEntry(filePath, cached) {
+  deleteCodexJsonlCacheEntry(filePath);
+  _codexJsonlCache.set(filePath, cached);
+  _codexJsonlCacheRawBytes += Number(cached?.size) || 0;
+  cached.compressedBacking = codexRolloutReadViewBacking(filePath);
+  _codexRecordSnapshots.set(cached.records, {
+    filePath, size: cached.size, mtimeMs: cached.mtimeMs, ctimeMs: cached.ctimeMs,
+    fileIdentity: cached.fileIdentity, sourceGeneration: cached.sourceGeneration || '',
+    ...(cached.compressedBacking ? { compressedBacking: cached.compressedBacking } : {}),
+  });
+  pruneCodexJsonlCache(filePath);
+}
+
+function touchCodexJsonlCacheEntry(filePath, cached) {
+  _codexJsonlCache.delete(filePath);
+  _codexJsonlCache.set(filePath, cached);
+}
+
+function getCodexJsonlCacheStats() {
+  return {
+    files: _codexJsonlCache.size,
+    rawBytes: _codexJsonlCacheRawBytes,
+    filePaths: [..._codexJsonlCache.keys()],
+  };
+}
+
+function getCodexJsonlSourceSnapshot(filePath, sessionId, records = null) {
+  const cached = records ? _codexRecordSnapshots.get(records) : _codexJsonlCache.get(filePath);
+  if (cached) {
+    return {
+      filePath,
+      size: cached.size,
+      mtimeMs: cached.mtimeMs,
+      fileIdentity: cached.fileIdentity,
+      ctimeMs: cached.ctimeMs,
+      sourceGeneration: cached.sourceGeneration || '',
+      ...(cached.compressedBacking ? { compressedBacking: cached.compressedBacking } : {}),
+      sessionId: sessionId || path.basename(filePath, '.jsonl'),
+      linkKind: 'end',
+    };
+  }
+  // A newer filesystem stat cannot attest to an older returned array after
+  // LRU eviction. Missing read provenance must not manufacture a revision.
+  return null;
+}
+
+function compactPreview(value, max = 120) {
+  return rootText.isPagedText(value) ? rootText.preview(value, max)
+    : String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function recordTimestamp(record) {
+  return record?.timestamp || record?.time || record?.created_at || new Date().toISOString();
+}
+
+function stableUuid(sessionId, index, prefix = 'codex') {
+  return `${prefix}-${sessionId || 'unknown'}-${index}`;
+}
+
+function codexRecordPhysicalSessionId(record, fallbackSessionId) {
+  const physical = typeof record?.__physicalSessionId === 'string'
+    ? record.__physicalSessionId.trim()
+    : '';
+  return physical || fallbackSessionId;
+}
+
+function stableUuidForRecord(fallbackSessionId, record, prefix = 'codex') {
+  return stableUuid(codexRecordPhysicalSessionId(record, fallbackSessionId), record?.__line, prefix);
+}
+
+function stableSourceIdentity(sessionId, record, prefix = 'codex') {
+  const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+  const position = Number.isFinite(record?.__byteOffset)
+    ? Number(record.__byteOffset)
+    : Number(record?.__line ?? -1);
+  return `${prefix}-source-${physicalSessionId || 'unknown'}-${position}`;
+}
+
+function getCodexUserRecordIdentity(record, sessionId) {
+  return { uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+    sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user') };
+}
+
+function addStableSourceIdentityAlias(entry, alias) {
+  const normalized = typeof alias === 'string' ? alias.trim() : '';
+  if (!entry || !normalized || normalized === entry.sourceIdentity) return;
+  const aliases = Array.isArray(entry.sourceIdentityAliases)
+    ? entry.sourceIdentityAliases.filter((value) => (
+        typeof value === 'string'
+        && value
+        && value !== entry.sourceIdentity
+      ))
+    : [];
+  if (!aliases.includes(normalized)) aliases.push(normalized);
+  entry.sourceIdentityAliases = aliases;
+}
+
+function promoteStableSourceIdentity(entry, nextIdentity) {
+  if (!entry || typeof nextIdentity !== 'string' || !nextIdentity) return;
+  const previousIdentity = typeof entry.sourceIdentity === 'string'
+    ? entry.sourceIdentity
+    : '';
+  entry.sourceIdentity = nextIdentity;
+  const aliases = Array.isArray(entry.sourceIdentityAliases)
+    ? entry.sourceIdentityAliases.filter((value) => (
+        typeof value === 'string'
+        && value
+        && value !== nextIdentity
+      ))
+    : [];
+  if (previousIdentity && previousIdentity !== nextIdentity && !aliases.includes(previousIdentity)) {
+    aliases.push(previousIdentity);
+  }
+  if (aliases.length > 0) entry.sourceIdentityAliases = aliases;
+  else delete entry.sourceIdentityAliases;
+}
+
+function codexPromptPresentationAuditIdentity(record, text) {
+  const auditTimestamp = String(recordTimestamp(record) || '').trim();
+  const transportHash = rootText.isPagedText(text) ? rootText.hash(text).slice(0, 16) : promptAuditFingerprint(text || '');
+  return auditTimestamp && transportHash
+    ? { auditTimestamp, transportHash }
+    : null;
+}
+
+function addCodexPromptPresentationAuditAlias(entry, identity) {
+  if (!entry || !identity?.auditTimestamp || !identity?.transportHash) return;
+  if (
+    entry.promptPresentationAuditTimestamp === identity.auditTimestamp
+    && entry.promptPresentationTransportHash === identity.transportHash
+  ) return;
+  const aliases = Array.isArray(entry.promptPresentationAuditAliases)
+    ? entry.promptPresentationAuditAliases.filter((candidate) => (
+        candidate?.auditTimestamp
+        && candidate?.transportHash
+      ))
+    : [];
+  if (!aliases.some((candidate) => (
+    candidate.auditTimestamp === identity.auditTimestamp
+    && candidate.transportHash === identity.transportHash
+  ))) aliases.push(identity);
+  entry.promptPresentationAuditAliases = aliases;
+}
+
+function promoteCodexPromptPresentationAuditIdentity(entry, record, text) {
+  if (!entry) return;
+  const next = codexPromptPresentationAuditIdentity(record, text);
+  if (!next) return;
+  const previous = entry.promptPresentationAuditTimestamp
+    && entry.promptPresentationTransportHash
+    ? {
+        auditTimestamp: entry.promptPresentationAuditTimestamp,
+        transportHash: entry.promptPresentationTransportHash,
+      }
+    : null;
+  entry.promptPresentationAuditTimestamp = next.auditTimestamp;
+  entry.promptPresentationTransportHash = next.transportHash;
+  // The alias helper skips the current primary identity. Promote first so
+  // the earlier audited carrier survives as an alias of the canonical event.
+  if (previous) addCodexPromptPresentationAuditAlias(entry, previous);
+  if (Array.isArray(entry.promptPresentationAuditAliases)) {
+    entry.promptPresentationAuditAliases = entry.promptPresentationAuditAliases.filter((candidate) => !(
+      candidate.auditTimestamp === next.auditTimestamp
+      && candidate.transportHash === next.transportHash
+    ));
+    if (entry.promptPresentationAuditAliases.length === 0) {
+      delete entry.promptPresentationAuditAliases;
+    }
+  }
+}
+
+function parseTimestampMs(value) {
+  const ms = value ? rootDate.parseDate(value) : NaN;
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+function pathsAreSameOrNested(a, b) {
+  if (!a || !b) return false;
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  if (left === right) return true;
+  const isNestedRelative = (relativePath) => (
+    !!relativePath &&
+    relativePath !== '..' &&
+    !relativePath.startsWith('..' + path.sep) &&
+    !path.isAbsolute(relativePath)
+  );
+  const leftToRight = path.relative(left, right);
+  if (isNestedRelative(leftToRight)) return true;
+  const rightToLeft = path.relative(right, left);
+  return isNestedRelative(rightToLeft);
+}
+
+function safeJsonParse(value, fallback = null) {
+  if (rootText.isPagedText(value)) return rootText.parseJson(value, fallback);
+  if (typeof value !== 'string') return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function decodeBase64UrlJson(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function shortKnowledgeDocsPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  const normalized = filePath.replace(/\\/g, '/').trim();
+  if (!normalized) return null;
+  const segs = normalized.split('/').filter(Boolean);
+  const baseName = segs[segs.length - 1] || '';
+  const docsIndex = segs.findIndex((seg) => seg.toLowerCase() === 'docs');
+  const lower = normalized.toLowerCase();
+  const semanticIndexSibling = (() => {
+    if (docsIndex < 0 || !path.isAbsolute(normalized)) return false;
+    try {
+      const parent = path.join('/', ...segs.slice(0, docsIndex));
+      return fs.existsSync(path.join(parent, '.semantic-index.json'));
+    } catch {
+      return false;
+    }
+  })();
+  const isDocsPath = docsIndex >= 0 && (
+    !path.isAbsolute(normalized) ||
+    semanticIndexSibling ||
+    lower === 'docs' ||
+    lower.startsWith('docs/') ||
+    lower.includes('/docs/')
+  );
+  const isClaudeMd = baseName === 'CLAUDE.md';
+  if (!isDocsPath && !isClaudeMd) return null;
+  return docsIndex >= 0
+    ? segs.slice(docsIndex).join('/')
+    : baseName;
+}
+
+// Same path normalization/display predicates as history-action-grammar, but
+// components and joins stay on pages. Only a filesystem probe uses bounded
+// native pathname scratch, through the existing discovery boundary.
+function rootTimelinePath(value, arena, { target = false } = {}) {
+  let normalized = rootText.coerce(value || '').trim();
+  if (/['"]/.test(normalized.charAt(0))) normalized = normalized.slice(1);
+  if (/['"]/.test(normalized.charAt(normalized.length - 1))) normalized = normalized.slice(0, -1);
+  normalized = rootText.replaceLiteral(normalized, '\\', '/');
+  if (target && normalized.startsWith('./')) normalized = normalized.slice(2);
+  return rootText.build(arena, (function* () {
+    let slash = false;
+    for (const part of rootText.chunks(normalized)) for (const char of part) {
+      if (char !== '/' || !slash) yield char;
+      slash = char === '/';
+    }
+  })());
+}
+function rootTimelineDisplayPath(value, arena) {
+  const parts = arena.make('array');
+  for (const part of rootText.splitLiteral(value, '/')) if (part) parts.push(part);
+  if (!parts.length) return value;
+  const docs = parts.findIndex(part => rootText.equal(part.toLowerCase(), 'docs'));
+  return docs >= 0 ? rootText.concat(parts.slice(docs), '/', arena) : parts[parts.length - 1];
+}
+function rootTimelineResolvePath(value, cwd, arena) {
+  // path.resolve requires an absolute cwd; callers check that before entry.
+  let result = normalizeHistoryPatchPath(value, cwd);
+  if (result.length > 1 && result.endsWith('/')) result = result.slice(0, -1);
+  return result;
+}
+function rootTimelineDocsPresentation(raw, arena) {
+  if (raw.family !== 'edit') return {};
+  let target = '';
+  if (['Read', 'Edit', 'Write', 'MultiEdit', 'Update'].includes(raw.toolName)) {
+    target = raw.args?.file_path || raw.args?.path || '';
+  } else if (raw.toolName === 'Bash') {
+    const command = raw.args?.command;
+    if (!rootText.isPagedText(command)) return historyActionPresentationMeta(raw);
+    const shell = require('../codex-root-shell');
+    target = shell.editInfo(command, raw.bashWord || shell.effectiveWord(command), arena).target || '';
+  } else return historyActionPresentationMeta(raw);
+  const normalized = rootTimelinePath(target, arena, { target: true });
+  const display = rootTimelineDisplayPath(rootTimelinePath(target, arena), arena);
+  let docs = false, base = '';
+  for (const part of rootText.splitLiteral(normalized, '/')) if (part) {
+    base = part; if (rootText.equal(part.toLowerCase(), 'docs')) docs = true;
+  }
+  docs ||= rootText.equal(base, 'CLAUDE.md');
+  return { fileEditTarget: normalized || undefined, docsKind: docs ? 'edit' : '', targetLabel: display, targetKey: normalized };
+}
+
+function addUniqueAttr(entry, key, value) {
+  if (!entry || !value) return;
+  const arena = projectionArenaOf(entry);
+  const list = Array.isArray(entry[key]) ? entry[key] : (arena ? arena.make('array') : []);
+  if (!list.includes(value)) {
+    if (arena) { list.push(value); entry[key] = list; }
+    else entry[key] = [...list, value];
+  }
+}
+
+function addDocsEdited(entry, filePath, cwd) {
+  const arena = rootOps.arenaOf(entry, filePath, cwd);
+  if (arena) {
+    if (rootText.isText(filePath) && filePath.trim()) {
+      const target = rootText.isText(cwd) && cwd.startsWith('/')
+        ? rootTimelineResolvePath(filePath.trim(), cwd, arena) : filePath.trim();
+      addUniqueAttr(entry, 'fileEdits', target);
+    }
+    // Preserve shortKnowledgeDocsPath's grammar, including its existing
+    // semantic-index sibling probe for a terminal absolute docs directory.
+    if (!rootText.isText(filePath) || !filePath) return;
+    const normalized = rootText.replaceLiteral(filePath, '\\', '/').trim();
+    const parts = arena.make('array');
+    for (const part of rootText.splitLiteral(normalized, '/')) if (part) parts.push(part);
+    const docsIndex = parts.findIndex(part => rootText.equal(part.toLowerCase(), 'docs'));
+    let docs = docsIndex >= 0 && (!normalized.startsWith('/') || rootText.includesAsciiIgnoreCase(normalized, '/docs/'));
+    if (docsIndex >= 0 && !docs) {
+      try {
+        const probe = rootText.concat(['/', rootText.concat(parts.slice(0, docsIndex), '/', arena), '/.semantic-index.json'], '', arena);
+        docs = fs.existsSync(require('../codex-root-discovery').nativeDirectoryPath(probe, arena));
+      } catch { docs = false; }
+    }
+    const base = parts[parts.length - 1] || '';
+    if (docs || rootText.equal(base, 'CLAUDE.md')) addUniqueAttr(entry, 'docsEdited', docsIndex >= 0
+      ? rootText.concat(parts.slice(docsIndex), '/', arena) : base);
+    return;
+  }
+  if (typeof filePath === 'string' && filePath.trim()) {
+    const target = typeof cwd === 'string' && path.isAbsolute(cwd) ? path.resolve(cwd, filePath.trim()) : filePath.trim();
+    addUniqueAttr(entry, 'fileEdits', target);
+  }
+  const shortName = shortKnowledgeDocsPath(filePath);
+  if (shortName) addUniqueAttr(entry, 'docsEdited', shortName);
+}
+
+function addSemanticDocsEdits(entry, actions, cwd) {
+  for (const action of Array.isArray(actions) ? actions : []) {
+    const raw = action?.rawTool;
+    if (!raw) continue;
+    const arena = rootOps.arenaOf(entry, raw.args);
+    const presentation = arena ? rootTimelineDocsPresentation(raw, arena) : historyActionPresentationMeta({
+      toolName: raw.toolName,
+      args: raw.args || {},
+      family: raw.family,
+      bashWord: raw.bashWord,
+      bashDetail: raw.bashDetail,
+      mcpServer: raw.mcpServer,
+      mcpMethod: raw.mcpMethod,
+    });
+    if (presentation.fileEditTarget) {
+      const workdir = raw.args?.workdir || raw.args?.cwd || cwd;
+      const target = arena && rootText.isText(workdir) && workdir.startsWith('/')
+        ? rootTimelineResolvePath(presentation.fileEditTarget, workdir, arena)
+        : typeof workdir === 'string' && path.isAbsolute(workdir)
+          ? path.resolve(workdir, presentation.fileEditTarget) : presentation.fileEditTarget;
+      addUniqueAttr(entry, 'fileEdits', target);
+    }
+    if (presentation.docsKind !== 'edit') continue;
+    const docsPath = presentation.targetLabel || presentation.targetKey;
+    if (docsPath) addUniqueAttr(entry, 'docsEdited', docsPath);
+  }
+}
+
+function extractPatchTouchedFiles(patchText) {
+  if (!rootText.isText(patchText) || !patchText.includes('*** Begin Patch')) return [];
+  const files = rootOps.arrayFor(patchText);
+  for (const header of rootPatchText.headers(patchText)) files.push(header.filePath);
+  return files;
+}
+
+function skipJsQuotedValue(source, start) {
+  const char = rootText.reader(source).at;
+  const quote = char(start);
+  if (quote !== '"' && quote !== "'" && quote !== '`') return start;
+  for (let index = start + 1; index < source.length; index += 1) {
+    if (char(index) === '\\') {
+      index += 1;
+      continue;
+    }
+    if (char(index) === quote) return index + 1;
+  }
+  return source.length;
+}
+
+function skipJsComment(source, start) {
+  const char = rootText.reader(source).at;
+  if (char(start) !== '/') return start;
+  if (char(start + 1) === '/') {
+    const newline = source.indexOf('\n', start + 2);
+    return newline < 0 ? source.length : newline + 1;
+  }
+  if (char(start + 1) === '*') {
+    const end = source.indexOf('*/', start + 2);
+    return end < 0 ? source.length : end + 2;
+  }
+  return start;
+}
+
+function findJsToolCallArguments(source, callee) {
+  const char = rootText.reader(source).at;
+  if (!rootText.isText(source) || !source || !callee) return [];
+  const calls = rootOps.arrayFor(source);
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = char(index);
+    if (ch === '"' || ch === "'" || ch === '`') {
+      index = skipJsQuotedValue(source, index) - 1;
+      continue;
+    }
+    if (ch === '/') {
+      const afterComment = skipJsComment(source, index);
+      if (afterComment !== index) {
+        index = afterComment - 1;
+        continue;
+      }
+    }
+    if (ch !== callee[0] || !source.startsWith(callee, index)) continue;
+    const before = index > 0 ? char(index - 1) : '';
+    if (before && /[\w$]/.test(before)) continue;
+    let open = index + callee.length;
+    while (/\s/.test(char(open) || '')) open += 1;
+    if (char(open) !== '(') continue;
+
+    let depth = 1;
+    let cursor = open + 1;
+    for (; cursor < source.length; cursor += 1) {
+      const inner = char(cursor);
+      if (inner === '"' || inner === "'" || inner === '`') {
+        cursor = skipJsQuotedValue(source, cursor) - 1;
+        continue;
+      }
+      if (inner === '/') {
+        const afterComment = skipJsComment(source, cursor);
+        if (afterComment !== cursor) {
+          cursor = afterComment - 1;
+          continue;
+        }
+      }
+      if (inner === '(') depth += 1;
+      if (inner === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (depth !== 0) continue;
+    calls.push({
+      start: index,
+      end: cursor + 1,
+      argumentsText: source.slice(open + 1, cursor),
+    });
+    index = cursor;
+  }
+  return calls;
+}
+
+function decodeSimpleJsString(source, start = 0) {
+  const char = rootText.reader(source).at;
+  while (/\s/.test(char(start) || '')) start += 1;
+  const quote = char(start);
+  if (quote !== '"' && quote !== "'" && quote !== '`') return null;
+  const value = rootJsText.accumulator(source);
+  for (let index = start + 1; index < source.length; index += 1) {
+    const ch = char(index);
+    if (ch === quote) return value.finish();
+    if (ch !== '\\') {
+      value.write(ch);
+      continue;
+    }
+    index += 1;
+    if (index >= source.length) return null;
+    const escaped = char(index);
+    const simpleEscapes = {
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      b: '\b',
+      f: '\f',
+      v: '\v',
+      '0': '\0',
+      '\\': '\\',
+      '"': '"',
+      "'": "'",
+      '`': '`',
+    };
+    if (Object.prototype.hasOwnProperty.call(simpleEscapes, escaped)) {
+      value.write(simpleEscapes[escaped]);
+      continue;
+    }
+    if (escaped === 'u' && /^[0-9a-fA-F]{4}$/.test(source.slice(index + 1, index + 5))) {
+      value.write(String.fromCharCode(parseInt(source.slice(index + 1, index + 5), 16)));
+      index += 4;
+      continue;
+    }
+    if (escaped === 'x' && /^[0-9a-fA-F]{2}$/.test(source.slice(index + 1, index + 3))) {
+      value.write(String.fromCharCode(parseInt(source.slice(index + 1, index + 3), 16)));
+      index += 2;
+      continue;
+    }
+    if (escaped === '\n') continue;
+    value.write(escaped);
+  }
+  return null;
+}
+
+function findLastJsVariableInitializer(source, identifier, end = source.length) {
+  const char = rootText.reader(source).at;
+  let found = -1;
+  for (let index = 0; index < Math.min(end, source.length); index += 1) {
+    const ch = char(index);
+    if (ch === '"' || ch === "'" || ch === '`') {
+      index = skipJsQuotedValue(source, index) - 1;
+      continue;
+    }
+    if (ch === '/') {
+      const afterComment = skipJsComment(source, index);
+      if (afterComment !== index) {
+        index = afterComment - 1;
+        continue;
+      }
+    }
+    const keyword = 'clv'.includes(ch) ? rootJsText.keyword(source, index) : null;
+    if (!keyword) continue;
+    const before = index > 0 ? char(index - 1) : '';
+    if (before && /[\w$]/.test(before)) continue;
+    let cursor = skipJsTrivia(source, index + keyword.length);
+    const nameMatch = rootJsText.identifier(source, cursor);
+    if (!nameMatch || !rootText.equal(nameMatch.value, identifier)) continue;
+    cursor = skipJsTrivia(source, nameMatch.end);
+    if (char(cursor) !== '=') continue;
+    found = skipJsTrivia(source, cursor + 1);
+  }
+  return found;
+}
+
+function resolveSimpleJsCallArgument(source, call, argumentText) {
+  const direct = decodeSimpleJsString(argumentText);
+  if (direct != null) return direct;
+  const identifier = rootJsText.exactIdentifier(argumentText);
+  if (!identifier) return null;
+  const initializer = findLastJsVariableInitializer(source, identifier, call.start);
+  if (initializer < 0) return null;
+  return decodeSimpleJsString(source, initializer);
+}
+
+function extractExecDocsSearchQuery(argumentsText) {
+  const queryMatch = rootText.isPagedText(argumentsText)
+    ? require('../history-paged-pattern').exec(/\b(?:query|q)\s*:\s*/g, argumentsText)
+    : /\b(?:query|q)\s*:\s*/g.exec(argumentsText || '');
+  if (!queryMatch) return null;
+  return decodeSimpleJsString(argumentsText, queryMatch.index + queryMatch[0].length);
+}
+
+function collectCodexExecDocsAttributes(currentUser, source, cwd) {
+  if (!currentUser || !rootText.isText(source)) return;
+
+  for (const call of findJsToolCallArguments(source, 'tools.apply_patch')) {
+    const patchText = resolveSimpleJsCallArgument(source, call, call.argumentsText);
+    if (!patchText) continue;
+    for (const filePath of extractPatchTouchedFiles(patchText)) {
+      addDocsEdited(currentUser, filePath, cwd);
+    }
+  }
+
+  for (const call of findJsToolCallArguments(source, 'tools.mcp__knowledge__docs_search')) {
+    const query = extractExecDocsSearchQuery(call.argumentsText);
+    if (query) addUniqueAttr(currentUser, 'docsSearchQueries', query);
+  }
+}
+
+function skipJsTrivia(source, start = 0) {
+  const char = rootText.reader(source).at;
+  let index = start;
+  while (index < source.length) {
+    if (/\s/.test(char(index))) {
+      index += 1;
+      continue;
+    }
+    const afterComment = skipJsComment(source, index);
+    if (afterComment !== index) {
+      index = afterComment;
+      continue;
+    }
+    break;
+  }
+  return index;
+}
+
+function decodeSimpleJsStringToken(source, start = 0) {
+  const char = rootText.reader(source).at;
+  let index = skipJsTrivia(source, start);
+  const quote = char(index);
+  if (quote !== '"' && quote !== "'" && quote !== '`') return null;
+  const value = rootJsText.accumulator(source);
+  // A backtick string with `${…}` in it is a TEMPLATE: its real value exists
+  // only at runtime. Reading it as a finished literal is what put `${file}`
+  // and `${content.split("` on screen as a file name and a diff — the parser
+  // handed the source of the value to a card that promised the value itself.
+  // Refusing it here lets the caller fall back to the authoritative
+  // patch-apply event, which names the files that actually changed.
+  let template = false;
+  for (index += 1; index < source.length; index += 1) {
+    const ch = char(index);
+    if (ch === quote) return (quote === '`' && template) ? null : { value: value.finish(), end: index + 1 };
+    if (quote === '`' && ch === '$' && char(index + 1) === '{') template = true;
+    if (ch !== '\\') {
+      value.write(ch);
+      continue;
+    }
+    index += 1;
+    if (index >= source.length) return null;
+    const escaped = char(index);
+    const simpleEscapes = {
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      b: '\b',
+      f: '\f',
+      v: '\v',
+      '0': '\0',
+      '\\': '\\',
+      '"': '"',
+      "'": "'",
+      '`': '`',
+    };
+    if (Object.prototype.hasOwnProperty.call(simpleEscapes, escaped)) {
+      value.write(simpleEscapes[escaped]);
+      continue;
+    }
+    if (escaped === 'u' && /^[0-9a-fA-F]{4}$/.test(source.slice(index + 1, index + 5))) {
+      value.write(String.fromCharCode(parseInt(source.slice(index + 1, index + 5), 16)));
+      index += 4;
+      continue;
+    }
+    if (escaped === 'x' && /^[0-9a-fA-F]{2}$/.test(source.slice(index + 1, index + 3))) {
+      value.write(String.fromCharCode(parseInt(source.slice(index + 1, index + 3), 16)));
+      index += 2;
+      continue;
+    }
+    if (escaped === '\n') continue;
+    value.write(escaped);
+  }
+  return null;
+}
+
+// Safe, deliberately small JS-literal reader for orchestrated exec arguments.
+// It understands the JSON-like subset emitted by Codex (objects, arrays,
+// strings, numbers and primitives) without eval/vm execution of rollout text.
+function parseSimpleJsLiteralAt(source, start = 0, depth = 0) {
+  const char = rootText.reader(source).at;
+  if (depth > 24) return null;
+  let index = skipJsTrivia(source, start);
+  const stringToken = decodeSimpleJsStringToken(source, index);
+  if (stringToken) return stringToken;
+
+  if (char(index) === '{') {
+    const arena = rootOps.arenaOf(source);
+    const value = arena ? arena.make('object') : {};
+    index = skipJsTrivia(source, index + 1);
+    while (index < source.length && char(index) !== '}') {
+      let keyToken = decodeSimpleJsStringToken(source, index);
+      let key;
+      if (keyToken) {
+        key = keyToken.value;
+        index = keyToken.end;
+      } else {
+        const match = rootJsText.identifier(source, index);
+        if (!match) return null;
+        key = match.value;
+        index = match.end;
+      }
+      index = skipJsTrivia(source, index);
+      if (char(index) !== ':') return null;
+      const parsed = parseSimpleJsLiteralAt(source, index + 1, depth + 1);
+      if (!parsed) return null;
+      if (arena) arena.assignLiteral(arena.owner(value), key, parsed.value);
+      else value[key] = parsed.value;
+      index = skipJsTrivia(source, parsed.end);
+      if (char(index) === ',') {
+        index = skipJsTrivia(source, index + 1);
+        continue;
+      }
+      if (char(index) !== '}') return null;
+    }
+    if (char(index) !== '}') return null;
+    return { value, end: index + 1 };
+  }
+
+  if (char(index) === '[') {
+    const value = rootOps.arrayFor(source);
+    index = skipJsTrivia(source, index + 1);
+    while (index < source.length && char(index) !== ']') {
+      const parsed = parseSimpleJsLiteralAt(source, index, depth + 1);
+      if (!parsed) return null;
+      value.push(parsed.value);
+      index = skipJsTrivia(source, parsed.end);
+      if (char(index) === ',') {
+        index = skipJsTrivia(source, index + 1);
+        continue;
+      }
+      if (char(index) !== ']') return null;
+    }
+    if (char(index) !== ']') return null;
+    return { value, end: index + 1 };
+  }
+
+  const numberMatch = rootJsText.number(source, index);
+  if (numberMatch) return numberMatch;
+  for (const [token, value] of [['true', true], ['false', false], ['null', null], ['undefined', null]]) {
+    if (source.startsWith(token, index) && !/[\w$]/.test(char(index + token.length) || '')) {
+      return { value, end: index + token.length };
+    }
+  }
+  return null;
+}
+
+function resolveSimpleJsCallValue(source, call, resolveRawLiteral) {
+  const direct = parseSimpleJsLiteralAt(call.argumentsText || '', 0);
+  if (direct) return direct.value;
+  const rawLiteral = resolveRawLiteral?.(call);
+  if (rawLiteral != null) return rawLiteral;
+  const identifier = rootJsText.exactIdentifier(call.argumentsText);
+  if (!identifier) return null;
+  const initializer = findLastJsVariableInitializer(source, identifier, call.start);
+  if (initializer < 0) return null;
+  return parseSimpleJsLiteralAt(source, initializer)?.value ?? null;
+}
+
+function findCodexExecNestedCalls(source) {
+  const char = rootText.reader(source).at;
+  if (!rootText.isText(source) || !source) return [];
+  const calls = rootOps.arrayFor(source);
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = char(index);
+    if (ch === '"' || ch === "'" || ch === '`') {
+      index = skipJsQuotedValue(source, index) - 1;
+      continue;
+    }
+    if (ch === '/') {
+      const afterComment = skipJsComment(source, index);
+      if (afterComment !== index) {
+        index = afterComment - 1;
+        continue;
+      }
+    }
+    if (ch !== 't' || !source.startsWith('tools.', index)) continue;
+    const before = index > 0 ? char(index - 1) : '';
+    if (before && /[\w$]/.test(before)) continue;
+    const nameStart = index + 'tools.'.length;
+    const nameMatch = rootJsText.identifier(source, nameStart);
+    if (!nameMatch) continue;
+    let toolName = nameMatch.value;
+    let namespace = '';
+    let open = skipJsTrivia(source, nameStart + toolName.length);
+    if (char(open) === '.' && isCodexSubagentNamespace(toolName)) {
+      const memberStart = skipJsTrivia(source, open + 1);
+      const member = rootJsText.identifier(source, memberStart);
+      if (!member) continue;
+      namespace = toolName;
+      toolName = member.value;
+      open = skipJsTrivia(source, memberStart + toolName.length);
+    }
+    if (char(open) !== '(') continue;
+
+    let depth = 1;
+    let cursor = open + 1;
+    for (; cursor < source.length; cursor += 1) {
+      const inner = char(cursor);
+      if (inner === '"' || inner === "'" || inner === '`') {
+        cursor = skipJsQuotedValue(source, cursor) - 1;
+        continue;
+      }
+      if (inner === '/') {
+        const afterComment = skipJsComment(source, cursor);
+        if (afterComment !== cursor) {
+          cursor = afterComment - 1;
+          continue;
+        }
+      }
+      if (inner === '(') depth += 1;
+      if (inner === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (depth !== 0) continue;
+    calls.push({
+      toolName,
+      ...(namespace ? { namespace } : {}),
+      start: index,
+      end: cursor + 1,
+      argumentsText: source.slice(open + 1, cursor),
+    });
+    index = cursor;
+  }
+  return calls;
+}
+
+function codexHistoryLogicalCalls(call) {
+  const source = call?.toolName === 'exec' && rootText.isText(call?.args?.input) ? call.args.input : '';
+  if (!source) return [normalizeCodexSubagentCall(call || {})];
+  const resolveRawLiteral = createCodexRawLiteralResolver(source);
+  return findCodexExecNestedCalls(source).map((nestedCall, index) => {
+    const parsed = resolveSimpleJsCallValue(source, nestedCall, resolveRawLiteral);
+    const args = parsed && typeof parsed === 'object' && !rootText.isText(parsed) ? parsed
+      : rootText.isText(parsed) ? { input: parsed }
+        : { input: compactPreview(nestedCall.argumentsText, 1000) };
+    return { ...normalizeCodexSubagentCall({ ...nestedCall, args }), index };
+  });
+}
+
+function normalizeCodexHistoryTextPart(text) {
+  let current = rootText.coerce(text || '');
+  for (let depth = 0; depth < 2; depth += 1) {
+    const trimmed = current.trim();
+    if (!trimmed || (trimmed.charAt(0) !== '{' && trimmed.charAt(0) !== '[')) break;
+    const parsed = safeJsonParse(trimmed);
+    if (!parsed || Array.isArray(parsed) || !Array.isArray(parsed.content)) break;
+    const content = parsed.content.map((item) => {
+      if (!item) return '';
+      if (rootText.includesAsciiIgnoreCase(rootText.coerce(item.type || ''), 'image') || item.image_url) return '[Image output]';
+      return rootText.isText(item.text) ? item.text : '';
+    }).filter(Boolean);
+    if (content.length === 0) break;
+    current = joinCodexHistoryText(content, '\n');
+  }
+  if (rootText.equal(current.trim(), '{}') || rootText.equal(current.trim(), '[]')) return '';
+  return stripBase64Images(current);
+}
+
+function joinCodexHistoryText(values, separator = '\n') {
+  return rootText.concat(values, separator, projectionArenaOf(values));
+}
+
+// These header regexes have observable legacy grammar. The cheap prefix
+// exclusion handles an arbitrary ordinary output without coercing its leaf.
+function codexOutputHeaderMatches(text, pattern, kind) {
+  if (!text) return false;
+  return rootText.isPagedText(text) ? rootMachineText.outputHeader(text, kind) : pattern.test(text);
+}
+
+function codexHistoryOutputParts(rawOutput) {
+  if (rawOutput == null) return [];
+  if (!Array.isArray(rawOutput)) {
+    return [normalizeCodexHistoryTextPart(rootText.isText(rawOutput) ? rawOutput
+      : projectionArenaOf(rawOutput) ? rootOps.stringifyPaged(rawOutput, projectionArenaOf(rawOutput), 2) : stringifyCompact(rawOutput))];
+  }
+  const arena = projectionArenaOf(rawOutput);
+  const parts = arena ? arena.make('array') : [];
+  for (const item of rawOutput) {
+    if (!item) continue;
+    const type = rootText.coerce(item.type || '');
+    if (rootText.includesAsciiIgnoreCase(type, 'image') || item.image_url) {
+      parts.push('[Image output]');
+      continue;
+    }
+    const text = rootText.isText(item.text)
+      ? item.text
+      : (rootText.isText(item.output_text) ? item.output_text : '');
+    if (text) parts.push(normalizeCodexHistoryTextPart(text));
+  }
+  if (codexOutputHeaderMatches(parts[0], /^Script completed\b[\s\S]*\nOutput:\n?$/, 'completed')) {
+    parts.shift();
+  } else if (parts.length > 1 && codexOutputHeaderMatches(parts[0], /^Script running\b[\s\S]*\nOutput:\n?$/, 'running')) {
+    parts.shift();
+  }
+  return parts;
+}
+
+/**
+ * Background cell id announced by Codex when a command keeps running.
+ *
+ * The announcement is a MACHINE line, and its id is always a plain number.
+ * Matching `[^\s]+` anywhere in the output made any PROSE mentioning the
+ * phrase look like a real announcement — and a tool output is mostly prose:
+ * file contents, diffs, an agent quoting our own docs. Scar 2026-07-31
+ * (prod tab-2634): a command printed our documentation sentence «Orchestrated
+ * `exec` может вернуть `Script running with cell ID N`», the parser captured
+ * "N`," as the cell id, and the card was filed away as background work under
+ * an id no `wait` could ever name. Its spinner never stopped — 809 live tool
+ * cards opened against 808 closed, and the one left over was whatever command
+ * happened to be on screen.
+ *
+ * Anchoring to a line start and demanding digits keeps the real announcement
+ * (a line of its own) and rejects every quotation of it: prose that mentions
+ * the phrase mid-sentence no longer matches, and a literal `N` is not a
+ * number. A false negative is cheap — the card stays inline and settles
+ * normally; a false positive strands it forever.
+ */
+function codexHistoryCellId(rawOutput) {
+  // When a streaming cell already emitted output, the presentation splitter
+  // removes its machine header. Read that first block before splitting too.
+  const header = Array.isArray(rawOutput) && rootText.isText(rawOutput[0]?.text) ? rawOutput[0].text : '';
+  const parts = codexHistoryOutputParts(rawOutput);
+  const text = rootText.concat((function* () { yield header; yield* parts; })(), '\n',
+    projectionArenaOf(parts) || rootText.info(header)?.arena || rootText.info(parts[0])?.arena);
+  if (!text.includes('Script running with cell ID')) return null;
+  return rootText.isPagedText(text) ? rootMachineText.cellId(text)
+    : /^\s*Script running with cell ID\s+(\d+)\s*$/m.exec(text)?.[1] || null;
+}
+
+function codexHistorySettledOutputParts(rawOutput) {
+  return codexHistoryOutputParts(rawOutput).filter(part =>
+    !codexOutputHeaderMatches(part, /^Script running with cell ID\s+\d+\b[\s\S]*\nOutput:\n?$/, 'settled'));
+}
+
+function parseApplyPatchHunks(body) {
+  const hunks = rootOps.arrayFor(body);
+  let current = null;
+  const flush = () => {
+    if (!current) return;
+    const oldString = current.oldLines.join('\n');
+    const newString = current.newLines.join('\n');
+    if ((oldString || newString) && !rootText.equal(oldString, newString)) {
+      hunks.push({ old_string: oldString, new_string: newString });
+    }
+    current = null;
+  };
+  for (const line of rootText.splitLiteral(rootText.coerce(body || ''), '\n')) {
+    if (line.startsWith('@@')) {
+      flush();
+      current = { oldLines: rootOps.arrayFor(body), newLines: rootOps.arrayFor(body) };
+      continue;
+    }
+    if (line.startsWith('*** Move to:') || line === '\\ No newline at end of file') continue;
+    if (!current) current = { oldLines: rootOps.arrayFor(body), newLines: rootOps.arrayFor(body) };
+    if (line.startsWith('+')) current.newLines.push(line.slice(1));
+    else if (line.startsWith('-')) current.oldLines.push(line.slice(1));
+    else {
+      const context = line.startsWith(' ') ? line.slice(1) : line;
+      current.oldLines.push(context);
+      current.newLines.push(context);
+    }
+  }
+  flush();
+  return hunks;
+}
+
+function parseApplyPatchHistoryActions(patchText) {
+  if (!rootText.isText(patchText) || !patchText.includes('*** Begin Patch')) return [];
+  const headers = rootOps.arrayFor(patchText);
+  for (const header of rootPatchText.headers(patchText)) headers.push(header);
+  return headers.map((header, index) => {
+    const next = headers[index + 1];
+    const endMarker = patchText.indexOf('*** End Patch', header.bodyStart);
+    const bodyEnd = next?.headerStart ?? (endMarker >= 0 ? endMarker : patchText.length);
+    let body = patchText.slice(header.bodyStart, bodyEnd);
+    if (body.startsWith('\n')) body = body.slice(1);
+    if (body.endsWith('\n')) body = body.slice(0, -1);
+    if (header.kind === 'Add') {
+      const content = rootPatchText.lines(body).map((line) => line.startsWith('+') ? line.slice(1) : line).join('\n');
+      return { toolName: 'Write', args: { file_path: header.filePath, content } };
+    }
+    const hunks = parseApplyPatchHunks(body);
+    if (hunks.length > 1) {
+      return { toolName: 'MultiEdit', args: { file_path: header.filePath, edits: hunks } };
+    }
+    return {
+      toolName: 'Edit',
+      ...(header.kind === 'Delete' ? { diffStatsKnown: false } : {}),
+      args: {
+        file_path: header.filePath,
+        old_string: hunks[0]?.old_string || '',
+        new_string: header.kind === 'Delete' ? '' : (hunks[0]?.new_string || ''),
+      },
+    };
+  });
+}
+
+function parseHistoryUnifiedDiffHunks(unifiedDiff) {
+  if (!rootText.isText(unifiedDiff) || !unifiedDiff.includes('@@')) return null;
+  const lines = rootPatchText.lines(unifiedDiff);
+  const hunks = rootOps.arrayFor(unifiedDiff);
+  let current = null;
+  const flush = () => {
+    if (!current) return true;
+    const oldCount = current.entries.reduce(
+      (count, entry) => count + (entry.tag === 'add' ? 0 : 1),
+      0,
+    );
+    const newCount = current.entries.reduce(
+      (count, entry) => count + (entry.tag === 'del' ? 0 : 1),
+      0,
+    );
+    if (oldCount !== current.oldLines || newCount !== current.newLines) return false;
+    hunks.push({
+      oldStart: current.oldStart,
+      newStart: current.newStart,
+      entries: current.entries,
+    });
+    current = null;
+    return true;
+  };
+
+  for (const line of lines) {
+    const header = rootPatchText.unifiedHeader(line);
+    if (header) {
+      if (!flush()) return null;
+      current = {
+        oldStart: Number(header[1]),
+        oldLines: header[2] == null ? 1 : Number(header[2]),
+        newStart: Number(header[3]),
+        newLines: header[4] == null ? 1 : Number(header[4]),
+        entries: rootOps.arrayFor(unifiedDiff),
+      };
+      continue;
+    }
+    if (!current || line === '\\ No newline at end of file' || line === '') continue;
+    const prefix = line.charAt(0);
+    if (prefix === ' ') current.entries.push({ tag: 'eq', line: line.slice(1) });
+    else if (prefix === '+') current.entries.push({ tag: 'add', line: line.slice(1) });
+    else if (prefix === '-') current.entries.push({ tag: 'del', line: line.slice(1) });
+    else return null;
+  }
+  if (!flush()) return null;
+  return hunks.length > 0 ? hunks : null;
+}
+
+function historyDiffHunkStrings(hunk) {
+  return {
+    old_string: hunk.entries
+      .filter((entry) => entry.tag !== 'add')
+      .map((entry) => entry.line)
+      .join('\n'),
+    new_string: hunk.entries
+      .filter((entry) => entry.tag !== 'del')
+      .map((entry) => entry.line)
+      .join('\n'),
+  };
+}
+
+function parseCodexPatchApplyChanges(payload) {
+  if (payload?.type !== 'patch_apply_end' || payload.success !== true) return null;
+  const changes = payload.changes;
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) return null;
+  const actions = rootOps.arrayFor(changes);
+
+  for (const [filePath, rawChange] of rootOps.entries(changes)) {
+    const change = rawChange && typeof rawChange === 'object' && !rootText.isText(rawChange) ? rawChange : null;
+    if (!change) return null;
+    const changeType = (rootText.isPagedText(change.type) ? '' : String(change.type || '').toLowerCase());
+    if (changeType === 'update') {
+      const diffHunks = parseHistoryUnifiedDiffHunks(change.unified_diff);
+      if (!diffHunks) return null;
+      const edits = diffHunks.map(historyDiffHunkStrings);
+      actions.push(diffHunks.length === 1
+        ? {
+            toolName: 'Edit',
+            args: {
+              file_path: change.move_path || filePath,
+              ...edits[0],
+            },
+            diffHunks,
+          }
+        : {
+            toolName: 'MultiEdit',
+            args: {
+              file_path: change.move_path || filePath,
+              edits,
+            },
+            diffHunks,
+          });
+      continue;
+    }
+    if (changeType === 'add') {
+      const content = rootText.isText(change.content) ? change.content : '';
+      actions.push({
+        toolName: 'Write',
+        ...(!rootText.isText(change.content) ? { diffStatsKnown: false } : {}),
+        args: { file_path: change.move_path || filePath, content },
+        diffHunks: [{
+          oldStart: 0,
+          newStart: 1,
+          entries: rootPatchText.lines(content).map((line) => ({ tag: 'add', line })),
+        }],
+      });
+      continue;
+    }
+    if (changeType === 'delete') {
+      // Real rollouts often omit `content` on deletes (only the fact of the
+      // deletion is recorded). That is still an authoritative edit action —
+      // demanding content here used to void the WHOLE event, which left
+      // computed-patch calls rendering as the junk «Edit (patch)».
+      const content = rootText.isText(change.content) ? change.content : '';
+      actions.push({
+        toolName: 'Edit',
+        ...(!rootText.isText(change.content) ? { diffStatsKnown: false } : {}),
+        args: {
+          file_path: filePath,
+          old_string: content,
+          new_string: '',
+        },
+        ...(content
+          ? {
+            diffHunks: [{
+              oldStart: 1,
+              newStart: 0,
+              entries: rootPatchText.lines(content).map((line) => ({ tag: 'del', line })),
+            }],
+          }
+          : {}),
+      });
+      continue;
+    }
+    return null;
+  }
+  return actions.length > 0 ? actions : null;
+}
+
+function normalizeHistoryPatchPath(filePath, cwd) {
+  return require('../codex-root-path').normalizePatchPath(filePath, cwd);
+}
+
+function expectedHistoryPatchPaths(patchText, cwd) {
+  const arena = rootOps.arenaOf(patchText, cwd), paths = arena ? arena.make('set') : new Set();
+  for (const filePath of extractPatchTouchedFiles(patchText)) {
+    const normalized = normalizeHistoryPatchPath(filePath, cwd); if (normalized) paths.add(normalized);
+  }
+  return paths;
+}
+
+function codexPatchEventPathSet(payload, cwd) {
+  if (!parseCodexPatchApplyChanges(payload)) return null;
+  const changes = payload?.changes;
+  const arena = rootOps.arenaOf(changes, cwd), paths = arena ? arena.make('set') : new Set();
+  for (const filePath of rootOps.keys(changes || {})) {
+    const normalized = normalizeHistoryPatchPath(filePath, cwd); if (normalized) paths.add(normalized);
+  }
+  return paths;
+}
+
+function sameHistoryPatchPaths(left, right) {
+  if (!left || !right || left.size === 0 || left.size !== right.size) return false;
+  for (const filePath of left) {
+    if (!right.has(filePath)) return false;
+  }
+  return true;
+}
+
+function codexNestedApplyPatchTexts(call) {
+  if (call?.toolName !== 'exec' || !rootText.isText(call?.args?.input)) return [];
+  const source = call.args.input;
+  const values = rootOps.arrayFor(source);
+  for (const nestedCall of findCodexExecNestedCalls(source)) {
+    if (nestedCall.toolName !== 'apply_patch') continue;
+    const parsed = resolveSimpleJsCallValue(source, nestedCall);
+    if (rootText.isText(parsed) && parsed.includes('*** Begin Patch')) values.push(parsed);
+  }
+  return values;
+}
+
+function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
+  const direct = pendingCalls.get(payload?.call_id);
+  if (direct?.toolName === 'apply_patch') {
+    direct.patchApplyEvents.push(payload);
+    return true;
+  }
+  // The event's call_id names the EXEC call itself when apply_patch ran
+  // nested inside `tools.exec(...)`. With a computed patch text the path
+  // comparison below has nothing to compare (the literal parser cannot
+  // resolve `const patch = header + files.map(...)`), so the same-call_id
+  // exec that visibly invokes tools.apply_patch is the authoritative owner.
+  if (direct?.toolName === 'exec'
+      && rootText.isText(direct?.args?.input)
+      && direct.args.input.includes('apply_patch')) {
+    direct.patchApplyEvents.push(payload);
+    return true;
+  }
+
+  const eventPaths = codexPatchEventPathSet(payload, cwd);
+  if (!eventPaths) return false;
+  const eventTurnId = rootText.coerce(payload?.turn_id || '');
+  let candidate = null, candidates = 0;
+  for (const call of pendingCalls.values()) {
+    if (call.toolName !== 'exec') continue;
+    if (eventTurnId && call.turnId && !rootText.equal(eventTurnId,call.turnId)) continue;
+    const matches = codexNestedApplyPatchTexts(call).some((patchText) => (
+      sameHistoryPatchPaths(expectedHistoryPatchPaths(patchText, cwd), eventPaths)
+    ));
+    if (matches) { candidate = call; candidates++; }
+  }
+  if (candidates === 1) {
+    candidate.patchApplyEvents.push(payload);
+    return true;
+  }
+  if (candidates > 1) return false;
+
+  // Last resort — ORDER, because identity is not available at all.
+  //
+  // The event names itself `exec-<uuid>`, which is a DIFFERENT id space from
+  // the call's `call_<id>`: measured over 40 rollouts, 1540 of 1540 events
+  // failed the direct id lookup. Path comparison rescues only literal
+  // patches; every computed one (`const patch = "…" + files.map(…)`, a
+  // template literal with `${file}`) has no text to compare, which is exactly
+  // why those cards printed the placeholder subject `(patch)` / `${file}`
+  // instead of the files that changed.
+  //
+  // What IS reliable is the protocol's own sequencing: Codex emits the event
+  // while the call is still open (verified: 27/27 events arrive before their
+  // call's output) and never runs two patch calls concurrently — across the
+  // same 40 rollouts, 1531 of 1540 events had EXACTLY ONE open apply_patch
+  // call and not one had two. So when precisely one open call invokes
+  // apply_patch, it is the owner. Two open candidates is ambiguous and the
+  // event is dropped rather than guessed: a wrong attachment would print
+  // someone else's files.
+  let open = null, openCount = 0;
+  for (const call of pendingCalls.values()) {
+    if (eventTurnId && call.turnId && !rootText.equal(eventTurnId,call.turnId)) continue;
+    if (call.toolName === 'apply_patch') { open = call; openCount++; continue; }
+    if (call.toolName === 'exec'
+        && rootText.isText(call?.args?.input)
+        && call.args.input.includes('apply_patch')) {
+      open = call; openCount++;
+    }
+  }
+  if (openCount !== 1) return false;
+  open.patchApplyEvents.push(payload);
+  return true;
+}
+
+function takeCanonicalCodexPatchActions(call, patchText, usedEventIndexes) {
+  const expectedPaths = expectedHistoryPatchPaths(patchText, call?.cwd);
+  if (expectedPaths.size === 0) return null;
+  const candidates = rootOps.arrayFor(patchText, call?.args);
+  const events = Array.isArray(call?.patchApplyEvents) ? call.patchApplyEvents : [];
+  for (let index = 0; index < events.length; index += 1) {
+    if (usedEventIndexes.has(index)) continue;
+    const actions = parseCodexPatchApplyChanges(events[index]);
+    if (!actions) continue;
+    const actualPaths = codexPatchEventPathSet(events[index], call?.cwd);
+    if (sameHistoryPatchPaths(expectedPaths, actualPaths)) {
+      candidates.push({ index, actions });
+    }
+  }
+  // Two pending patches touching the same file are ambiguous. Keep the
+  // input-derived card, but do not borrow line metadata from the wrong event.
+  if (candidates.length !== 1) return null;
+  usedEventIndexes.add(candidates[0].index);
+  return candidates[0].actions;
+}
+
+function humanizeCodexToolName(toolName) {
+  return rootText.humanize(rootText.coerce(toolName || 'Tool'));
+}
+
+function firstCodexToolDetail(args) {
+  if (!args || typeof args !== 'object') return '';
+  const direct = args.query || args.q || args.path || args.file_path || args.location || args.uri || args.pattern || args.prompt;
+  if (rootText.isText(direct)) return direct;
+  const query = Array.isArray(args.search_query) ? args.search_query[0]?.q : null;
+  if (rootText.isText(query)) return query;
+  return '';
+}
+
+/**
+ * A short, safe subject for an MCP card header.
+ *
+ * `prompt` is deliberately NOT a candidate. For send/delegate tools it is
+ * the whole user task (often several thousand characters), not a summary.
+ * Putting it into `args.summary` made a COLLAPSED `terminal · delegate to
+ * session` row print the complete delegated instruction inline. The prompt
+ * remains in `args` for the explicitly expanded body and row copy.
+ */
+function firstCodexMcpDetail(args) {
+  if (!args || typeof args !== 'object') return '';
+  const direct = args.label || args.query || args.q || args.path || args.file_path
+    || args.location || args.uri || args.pattern;
+  if (rootText.isText(direct)) return direct;
+  const query = Array.isArray(args.search_query) ? args.search_query[0]?.q : null;
+  return rootText.isText(query) ? query : '';
+}
+
+function normalizeCodexHistoryCall(toolName, args, namespace = '') {
+  const identity = normalizeCodexSubagentCall({ toolName: rootText.coerce(toolName || 'tool'), namespace });
+  const name = identity.toolName;
+  namespace = identity.namespace;
+  const input = args && typeof args === 'object' ? args : { input: args };
+  const qualifiedName = namespace && namespace.startsWith('mcp__')
+    ? rootText.concat([namespace, '__', name])
+    : name;
+
+  if (qualifiedName === 'apply_patch') {
+    const patchText = rootText.isText(input.input) ? input.input : '';
+    const actions = parseApplyPatchHistoryActions(patchText);
+    if (actions.length > 0) return actions;
+    // No readable patch and no authoritative apply event (the caller tries
+    // that first). Verified cause in production: the script that was to BUILD
+    // the patch crashed, so nothing was ever applied. Claiming «Edit» here
+    // painted a failed run as a successful file change — the row now says a
+    // patch was attempted and names no file it did not touch.
+    return [{ toolName: 'Patch', args: { summary: 'Patch not applied' } }];
+  }
+  if (qualifiedName === 'exec_command' || qualifiedName === 'run_command' || qualifiedName === 'restart_process' || qualifiedName === 'kill_process' || qualifiedName === 'run_chain') {
+    let command = input.cmd || input.command || input.input || '';
+    // Unparsed nested arguments arrive as the RAW `{cmd,workdir:"…"}` source
+    // (shorthand/variable args defeat the literal parser). That junk must
+    // never become the command: recover the cmd string by regex, else drop.
+    if (rootText.isText(command) && command.trim().startsWith('{')) {
+      command = recoverCommand(command);
+    }
+    return [{
+      toolName: 'Bash',
+      args: {
+        command: command || humanizeCodexToolName(qualifiedName),
+        description: input.justification || '',
+        ...(rootText.isText(input.workdir) ? { workdir: input.workdir } : {}),
+        ...(rootText.isText(input.cwd) ? { cwd: input.cwd } : {}),
+      },
+    }];
+  }
+  if (qualifiedName === 'write_stdin') {
+    const arena = projectionArenaOf(input);
+    const target = input.session_id != null ? rootText.concat(['session ', input.session_id], '', arena) : 'terminal';
+    return [{ toolName: 'Bash', args: { command: rootText.concat(['Write to ', target, ': ', rootText.coerce(input.chars || '').slice(0, 200)], '', arena) } }];
+  }
+  if (qualifiedName === 'view_image') {
+    return [{ toolName: 'Read', args: { file_path: input.path || '(image)' } }];
+  }
+  if (qualifiedName === 'web__run') {
+    return [{ toolName: 'WebSearch', args: { query: firstCodexToolDetail(input) || 'Web request' } }];
+  }
+  if (qualifiedName === 'image_gen__imagegen') {
+    return [{ toolName: 'Image', args: { summary: firstCodexToolDetail(input) || 'Generate image' } }];
+  }
+  if (
+    qualifiedName.startsWith('mcp__') ||
+    qualifiedName === 'read_mcp_resource' ||
+    qualifiedName === 'list_mcp_resources' ||
+    qualifiedName === 'list_mcp_resource_templates'
+  ) {
+    const rest = qualifiedName.startsWith('mcp__') ? qualifiedName.slice(5) : qualifiedName;
+    const separator = rest.indexOf('__');
+    const server = separator >= 0 ? rest.slice(0, separator) : rest;
+    const method = separator >= 0 ? rest.slice(separator + 2) : '';
+    const action = separator >= 0 ? rootText.concat([server, ' · ', rootText.replaceLiteral(method, '__', ' ')])
+      : humanizeCodexToolName(qualifiedName);
+    const detail = firstCodexMcpDetail(input);
+    const mcpServer = separator >= 0 ? server : (server || 'mcp');
+    const mcpMethod = method;
+    return [{
+      toolName: 'MCP',
+      mcpServer,
+      mcpMethod,
+      args: projectionArenaOf(input)
+        ? projectionArenaOf(input).assign({ summary: detail ? rootText.concat([action,' — ',detail], '', projectionArenaOf(input)) : action },input)
+        : { summary: detail ? `${action} — ${detail}` : action, ...input },
+    }];
+  }
+  if (qualifiedName === 'update_plan') {
+    const active = Array.isArray(input.plan) ? input.plan.find((item) => item?.status === 'in_progress')?.step : '';
+    return [{ toolName: 'Plan', args: { summary: active || input.explanation || 'Update task plan' } }];
+  }
+  if (qualifiedName === 'request_user_input') {
+    const question = Array.isArray(input.questions) ? input.questions[0]?.question : '';
+    return [{ toolName: 'Question', args: { summary: question || 'Request user input' } }];
+  }
+  if (qualifiedName === 'wait') {
+    return [{ toolName: 'Wait', args: { summary: input.cell_id ? rootText.concat(['Task ', input.cell_id], '', projectionArenaOf(input)) : 'Background task' } }];
+  }
+  // In-process subagents. The durable parser builds full Task cards; the LIVE
+  // stream reaches this same decoder, and its shape decides whether the agent
+  // is visible as background work at all.
+  //
+  // A live spawn must therefore emit the SAME `tool: 'Task'` card shape the
+  // durable side uses — the background-chip strip recognises subagents by that
+  // shape alone. Emitting a generic `Subagent` tool row rendered a plausible
+  // card but was invisible to the strip: E2E ct-e2e24 showed a `default` agent
+  // running 41s with three recomputes inside its lifetime and `count=0` in all
+  // of them, while the log said `projected=Subagent`. Explorer only "worked"
+  // earlier because its durable reload happened to land inside the window.
+  //
+  // Never surface the v2 encrypted message; task_name/agent_type are the
+  // readable identity.
+  if (namespace === 'multi_agent_v1' || namespace === 'collaboration') {
+    if (qualifiedName === 'spawn_agent') {
+      const label = rootText.coerce(input.task_name || '').trim()
+        || (rootText.isText(input.message) && !input.message.startsWith('gAAAA')
+          ? input.message.slice(0, 60)
+          : 'Subagent');
+      const agentType = rootText.coerce(input.agent_type || '').trim();
+      const description = agentType ? rootText.concat([label, ' (', agentType, ')']) : label;
+      // `running` is the live truth: a spawn that was rejected or already
+      // finished is re-projected by the durable parser, which wins by source
+      // identity and carries the terminal status.
+      // toolUseId is stamped by the caller, which owns the call identity.
+      return [{ tool: 'Task', description, subagentStatus: 'running',
+        subagentSpawn: { namespace, args: {
+          ...(rootText.isText(input.task_name) ? { task_name: input.task_name } : {}),
+          ...(rootText.isText(input.agent_type) ? { agent_type: input.agent_type } : {}),
+          ...(rootText.isText(input.message) && !input.message.startsWith('gAAAA')
+            ? { message: input.message } : {}),
+        } } }];
+    }
+    if (qualifiedName === 'wait_agent') {
+      return [{ toolName: 'Wait', args: { summary: 'Waiting for subagents' } }];
+    }
+  }
+  return [{ toolName: humanizeCodexToolName(qualifiedName), args: input }];
+}
+
+function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan = null, source = '', pending = false } = {}) {
+  const parts = codexHistoryOutputParts(rawOutput);
+  if (settledPlan) {
+    const output = codexHistorySettledOutputParts(rawOutput);
+    const matched = matchCodexSettledResults(settledPlan, output, { allowPartial: pending });
+    for (let index = 0; index < callGroups.length; index += 1) {
+      const result = matched?.get(index);
+      for (const action of callGroups[index]) {
+        if (result) {
+          action.result = result.value === undefined ? '' : joinCodexHistoryText(codexHistoryOutputParts(result.value));
+          action.isError = !!isError || result.isError;
+        } else if (!pending) {
+          action.result = '';
+          action.isError = !!isError;
+        }
+      }
+    }
+    if (!matched && !pending) {
+      // The enclosing exec owns these bytes. Do not attach them to a guessed
+      // child; keep the actual script/output available as a separate card.
+      callGroups.push([{
+        toolName: 'Script', args: { command: source },
+        result: joinCodexHistoryText(output), isError: !!isError,
+      }]);
+    }
+    return;
+  }
+  const perCall = callGroups.length === parts.length
+    ? parts
+    : callGroups.length === 1
+      ? [joinCodexHistoryText(parts)]
+      : callGroups.map((_, index) => index === callGroups.length - 1 ? joinCodexHistoryText(parts) : '');
+  for (let index = 0; index < callGroups.length; index += 1) {
+    for (const action of callGroups[index]) {
+      action.result = perCall[index] ?? '';
+      action.isError = !!isError;
+    }
+  }
+}
+
+function codexHistoryActionsForCall(call, rawOutput, isError) {
+  const source = call?.toolName === 'exec' && rootText.isText(call?.args?.input)
+    ? call.args.input
+    : '';
+  const callId = call?.callId == null ? '' : rootText.coerce(call.callId);
+  const nested = source ? findCodexExecNestedCalls(source) : [];
+  const settledPlan = nested.length ? inspectCodexSettledEmission(source, nested) : null;
+  const resolveRawLiteral = createCodexRawLiteralResolver(source);
+  const callGroups = rootOps.arrayFor(source, call?.args);
+  const arena = rootOps.arenaOf(source, call?.args);
+  const usedPatchEventIndexes = arena ? arena.make('set') : new Set();
+
+  if (nested.length > 0) {
+    for (const nestedCall of nested) {
+      const parsed = resolveSimpleJsCallValue(source, nestedCall, resolveRawLiteral);
+      const args = parsed && typeof parsed === 'object' && !rootText.isText(parsed)
+        ? parsed
+        : (rootText.isText(parsed) ? { input: parsed } : { input: compactPreview(nestedCall.argumentsText, 1000) });
+      let canonicalPatchActions = null;
+      if (nestedCall.toolName === 'apply_patch') {
+        if (rootText.isText(parsed)) {
+          canonicalPatchActions = takeCanonicalCodexPatchActions(call, parsed, usedPatchEventIndexes);
+        }
+        // Computed patch text (`const patch = header + files.map(...)`):
+        // the literal parser cannot resolve it, which used to leave the
+        // junk «Edit (patch)» card. The patch_apply_end event on this SAME
+        // call_id carries the authoritative per-file changes — when exactly
+        // one unclaimed event exists, its actions are the truth.
+        if (!canonicalPatchActions) {
+          const events = Array.isArray(call?.patchApplyEvents) ? call.patchApplyEvents : [];
+          const free = arena ? arena.make('array') : [];
+          for (let index = 0; index < events.length; index += 1) {
+            if (usedPatchEventIndexes.has(index)) continue;
+            const actions = parseCodexPatchApplyChanges(events[index]);
+            if (actions) free.push({ index, actions });
+          }
+          if (free.length === 1) {
+            usedPatchEventIndexes.add(free[0].index);
+            canonicalPatchActions = free[0].actions;
+          }
+        }
+      }
+      callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(nestedCall.toolName, args, nestedCall.namespace || ''));
+    }
+  } else if (call?.toolName === 'exec') {
+    // An exec that calls no tool at all is a plain snippet Codex ran in its
+    // own sandbox to check something (`text(typeof atob)`). «Orchestration»
+    // was an invented category the user could not place — it named nothing
+    // the model did. It is a script run, so it says so and joins the noise
+    // class like every other run (as its own row it split neighbouring
+    // groups in two).
+    const lookup = rootText.word(source, 'ALL_TOOLS');
+    callGroups.push([{
+      toolName: lookup ? 'Tool Search' : 'Script',
+      // The snippet IS the invocation, so it goes to the body like any other
+      // run; the header must not try to read JS as a shell line (it produced
+      // «Run const example» — the first two tokens of the source). `Script`
+      // has its own headline rule: one word, source in the body.
+      args: lookup ? { summary: 'Inspect available tools' } : { command: source },
+    }]);
+  } else {
+    const patchText = call?.toolName === 'apply_patch' && rootText.isText(call?.args?.input)
+      ? call.args.input
+      : null;
+    const canonicalPatchActions = patchText
+      ? takeCanonicalCodexPatchActions(call, patchText, usedPatchEventIndexes)
+      : null;
+    callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(call?.toolName, call?.args || {}, call?.namespace || ''));
+  }
+
+  const cellId = call?.toolName === 'exec' ? codexHistoryCellId(rawOutput) : null;
+  // `undefined` + no error means this is the call record, not an empty
+  // successful result. Keeping call-only actions pending is required by every
+  // consumer that joins exact tool start/end evidence (including linked-file
+  // own-edit suppression). An explicit empty string is still a real result.
+  if ((!cellId || settledPlan) && (rawOutput !== undefined || isError)) {
+    assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan, source, pending: !!cellId });
+  }
+  // One syntactic spawn in an exec loop can return N actual native receipts.
+  // Their IDs, not source-code guesses about the loop, define cardinality.
+  const spawnGroups = callGroups.filter(group => group.some(action => action.subagentSpawn));
+  let canonicalIndex = 0;
+  for (const group of callGroups) for (const action of group) action.__canonicalIndex = canonicalIndex++;
+  const outputParts = rawOutput === undefined ? [] : codexHistoryOutputParts(rawOutput);
+  for (let groupIndex = 0; groupIndex < callGroups.length; groupIndex += 1) {
+    const group = callGroups[groupIndex];
+    const spawn = group.find(action => action.subagentSpawn);
+    if (!spawn) continue;
+    const scope = settledPlan ? joinCodexHistoryText(group.map(action => action.result || ''))
+      : outputParts.length === callGroups.length ? outputParts[groupIndex]
+      : spawnGroups.length === 1 ? joinCodexHistoryText(outputParts) : '';
+    const identities = extractCodexSpawnIdentities(scope, spawn.subagentSpawn.namespace);
+    if (identities.length) {
+      callGroups[groupIndex] = identities.map(identity => {
+        const nativeKey = identity.agent_id || identity.task_name;
+        const base = spawn.description === 'Subagent' ? identity.nickname || identity.task_name || 'Subagent'
+          : rootText.concat([spawn.description, identity.nickname ? rootText.concat([' — ', identity.nickname]) : '']);
+        return { ...spawn, description: base, baseDescription: base,
+          toolUseId: source ? rootText.concat([callId,':subagent:',nativeKey]) : callId, agentSessionId: identity.agent_id || undefined,
+          startedAt: rootDate.parseDate(call?.timestamp || '') || undefined,
+          subagentStatus: 'running',
+          subagentSpawn: { ...spawn.subagentSpawn, accepted: true, identity, parentCallId: callId },
+          result: undefined };
+      });
+    } else {
+      spawn.subagentSpawn = { ...spawn.subagentSpawn, accepted: rawOutput === undefined || cellId ? null : false,
+        parentCallId: callId };
+      spawn.toolUseId = rootText.concat([callId,':spawn:',String(groupIndex)]);
+      if (isError) { spawn.spawnRejected = true; spawn.subagentStatus = 'interrupted'; }
+    }
+  }
+  const recordTime = historyRecordTimeFromRecord(call?.record, 'tool-call', call?.toolName === 'exec' ? 'container' : 'record');
+  const actions = callGroups.flat().map((action, index) => {
+    // A subagent card is already in its final shape — wrapping it as a raw
+    // tool row would hide it from the background-chip strip, which recognises
+    // subagents by `tool: 'Task'` alone (E2E ct-e2e24: live spawns projected
+    // as generic tool rows never produced a chip).
+    if (action?.tool === 'Task') {
+      return {
+        ...action,
+        ...(recordTime ? { recordTime } : {}),
+        ...(callId && !action.toolUseId ? { toolUseId: callId } : {}),
+        ...(action.result === undefined ? {} : { result: action.result }),
+      };
+    }
+    // Grouping identity, stamped at normalization time so the renderer's
+    // series-collapsing works identically for Claude and Codex — and so
+    // row-window stubs can carry the same fields without content.
+    const classified = rootText.isPagedText(action.toolName) && !action.mcpServer
+      ? { family: 'other' }
+      : action.mcpServer ? { family: 'mcp', mcpServer: action.mcpServer, mcpMethod: action.mcpMethod || '' }
+      : action.toolName === 'Bash' && rootText.isPagedText(action.args?.command)
+      ? classifyRootShell(action.args.command)
+      : classifyHistoryAction({
+      toolName: action.toolName,
+      args: action.args,
+      mcpServer: action.mcpServer,
+      mcpMethod: action.mcpMethod,
+    });
+    return {
+      tool: '__raw__',
+      rawTool: {
+        ...(recordTime ? { recordTime } : {}),
+        ...(callId ? { toolUseId: rootText.concat([callId,':canonical:',String(action.__canonicalIndex ?? index)]) } : {}),
+        toolName: action.toolName,
+        args: action.args || {},
+        family: classified.family,
+        bashWord: classified.bashWord,
+        bashDetail: classified.bashDetail,
+        mcpServer: classified.mcpServer,
+        mcpMethod: classified.mcpMethod,
+        result: action.result,
+        isError: action.isError,
+        diffHunks: action.diffHunks,
+        ...(action.diffStatsKnown === false ? { diffStatsKnown: false } : {}),
+      },
+    };
+  });
+  return { actions, cellId, ...(settledPlan ? { settledOutput: true } : {}) };
+}
+
+function fillPendingCodexHistoryActions(actions, rawOutput, isError, sourceRecordLine) {
+  const groups = (actions || []).map((action) => [action.rawTool]);
+  assignCodexHistoryResults(groups, rawOutput, isError);
+  for (const action of actions || []) {
+    if (!action.rawTool) continue;
+    action.rawTool.resultSourceLine = sourceRecordLine;
+    delete action.rawTool.resultRef;
+  }
+}
+
+function parseToolArguments(payload) {
+  if (payload?.arguments != null) {
+    return rootText.isText(payload.arguments)
+      ? safeJsonParse(payload.arguments, { raw: payload.arguments })
+      : payload.arguments;
+  }
+  if (payload?.input != null && !rootText.isText(payload.input)) return payload.input;
+  return {};
+}
+
+function collectCodexDocsAttributes(currentUser, payload, cwd) {
+  if (!currentUser || !payload || typeof payload !== 'object') return;
+  const toolName = payload.name || payload.tool_name || '';
+  const namespace = payload.namespace || '';
+  const args = parseToolArguments(payload) || {};
+
+  if ((namespace === 'mcp__knowledge' && toolName === 'docs_search') || toolName === 'mcp__knowledge__docs_search') {
+    const query = args.query || args.q || '';
+    if (query) addUniqueAttr(currentUser, 'docsSearchQueries', query);
+  }
+
+  if (toolName === 'apply_patch') {
+    const patchText = rootText.isText(payload.input)
+      ? payload.input
+      : (rootText.isText(payload.arguments) ? payload.arguments : '');
+    for (const filePath of extractPatchTouchedFiles(patchText)) {
+      addDocsEdited(currentUser, filePath, cwd);
+    }
+  }
+
+  if (toolName === 'exec') {
+    const source = rootText.isText(payload.input)
+      ? payload.input
+      : (rootText.isText(payload.arguments) ? payload.arguments : '');
+    collectCodexExecDocsAttributes(currentUser, source, cwd);
+  }
+
+  // Keep Timeline on the same semantic grammar as History. This covers
+  // nested exec_command calls whose shell body writes docs via Python/cat/sed
+  // instead of apply_patch — the transport tool name itself says only `exec`.
+  // Do not run the full nested-call decoder for every search/read command in a
+  // giant rollout: skip exec snippets without a supported patch/command call.
+  // Classify commands with the shared grammar, not a second list of writers.
+  const editCapableTransport = toolName === 'exec'
+    || toolName === 'apply_patch'
+    || toolName === 'exec_command'
+    || toolName === 'run_command';
+  let semanticSource = '';
+  try {
+    semanticSource = rootText.isText(payload.arguments)
+      ? payload.arguments
+      : rootText.isText(payload.input)
+        ? payload.input
+        : rootOps.arenaOf(payload) ? rootOps.stringifyPaged(payload.arguments ?? payload.input ?? args, rootOps.arenaOf(payload)) : JSON.stringify(payload.arguments ?? payload.input ?? args);
+  } catch {
+    semanticSource = '';
+  }
+  if (!editCapableTransport || (toolName === 'exec'
+    && !require('../history-paged-pattern').test(/\b(?:apply_patch|exec_command|run_command)\s*\(/, semanticSource))) return;
+  const callArgs = payload.arguments != null
+    ? parseToolArguments(payload)
+    : (rootText.isText(payload.input) ? { input: payload.input } : (payload.input || args));
+  const decoded = codexHistoryActionsForCall({
+    callId: payload.call_id || payload.id || '',
+    toolName,
+    namespace,
+    args: callArgs && typeof callArgs === 'object' ? callArgs : { value: callArgs },
+  }, '', false);
+  addSemanticDocsEdits(currentUser, decoded.actions, cwd);
+}
+
+function extractTextContent(content) {
+  if (!content) return '';
+  if (rootText.isText(content)) return content;
+  if (!Array.isArray(content)) {
+    if (rootText.isText(content.text)) return content.text;
+    if (rootText.isText(content.value)) return content.value;
+    return '';
+  }
+  const arena = projectionArenaOf(content);
+  const parts = (function* () {
+    for (const part of content) {
+      if (!part) continue;
+      if (rootText.isText(part)) yield part;
+      else if (rootText.isText(part.text)) yield part.text;
+      else if (rootText.isText(part.value)) yield part.value;
+    }
+  })();
+  return rootText.concat(parts, '\n', arena);
+}
+
+function formatReplacementHistory(replacementHistory) {
+  if (!Array.isArray(replacementHistory) || replacementHistory.length === 0) return '';
+  const arena = projectionArenaOf(replacementHistory);
+  const chunks = (function* () {
+    for (const item of replacementHistory) {
+      if (!item || typeof item !== 'object') continue;
+      if (item.type === 'message') {
+        const role = item.role || 'message';
+        const content = extractTextContent(item.content);
+        const hasImage = Array.isArray(item.content) && item.content.some(part => part?.type === 'input_image' || part?.image_url || part?.image);
+        const body = rootText.concat([content, hasImage ? '[image omitted]' : ''].filter(Boolean), '\n', arena).trim();
+        if (body) yield rootText.concat(['### ', role, '\n', body], '', arena);
+        continue;
+      }
+      if (item.type === 'compaction') { yield '### compaction\n[encrypted compaction state]'; continue; }
+      const body = extractTextContent(item.content || item.message || item.text).trim();
+      if (body) yield rootText.concat(['### ', item.type || 'record', '\n', body], '', arena);
+    }
+  })();
+  return rootText.concat(chunks, '\n\n', arena);
+}
+
+function extractReasoning(summary) {
+  if (!summary) return '';
+  if (rootText.isText(summary)) return summary;
+  if (!Array.isArray(summary)) return '';
+  return summary.map((item) => {
+    if (!item) return '';
+    if (rootText.isText(item)) return item;
+    return item.text || item.summary || item.content || '';
+  }).filter(Boolean).join('\n');
+}
+
+function compactEventContent(payload) {
+  const replacement = formatReplacementHistory(payload?.replacement_history || payload?.replacementHistory);
+  return replacement || payload?.message || payload?.summary || payload?.text || payload?.content || 'Conversation compacted';
+}
+
+function compactEventTitle(payload) {
+  return payload?.message || payload?.summary || payload?.text || payload?.content || 'Conversation compacted';
+}
+
+// Codex does not currently emit this for encrypted compaction v2, but accept
+// only explicitly post-compact fields if a future protocol adds one. Generic
+// usage.total_tokens is the PRE-compaction window and must never be reused.
+function compactPostTokenCount(payload) {
+  const value = rootText.number(
+    payload?.post_tokens
+    ?? payload?.postTokens
+    ?? payload?.compacted_tokens
+    ?? payload?.compactedTokens,
+  );
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+function isCompactPayload(payload) {
+  return rootText.includesAsciiIgnoreCase(rootText.coerce(payload?.type || payload?.name || ''), 'compact');
+}
+
+// A single Codex compaction is written twice: the authoritative top-level
+// `compacted` snapshot and a later event_msg telemetry companion. The number
+// of technical records between them is not stable, so line-distance heuristics
+// turn one compaction into two markers. Pair by semantic order instead: keep a
+// pending top-level event through token/context bookkeeping and consume the
+// next compact-like event before the next real user turn.
+function codexCompactCompanionPairs(records, { recordIdentity = false } = {}) {
+  const pairs = new Map();
+  const pendingTopLevelLines = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    if (record?.type === 'compacted') {
+      if (Number.isFinite(rootText.number(record.__line))) pendingTopLevelLines.push(recordIdentity ? record : rootText.number(record.__line));
+      continue;
+    }
+    if (record?.type === 'event_msg' && isCompactPayload(payload)) {
+      if (pendingTopLevelLines.length > 0 && Number.isFinite(rootText.number(record.__line))) {
+        pairs.set(pendingTopLevelLines.shift(), recordIdentity ? record : rootText.number(record.__line));
+      }
+      continue;
+    }
+    if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      const text = codexUserMessagePresentationText(record);
+      if (isCodexTurnAbortedUserText(text)) continue;
+      pendingTopLevelLines.length = 0;
+    }
+  }
+  return pairs;
+}
+
+function codexCompactCompanionLines(records) {
+  return new Set(codexCompactCompanionPairs(records).values());
+}
+
+async function walkJsonlFiles(rootDir, maxFiles = 4000, { includeCompressed = false } = {}) {
+  const out = [];
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || includeCompressed && isCodexRolloutFile(entry.name)) && !entry.name.includes('.with-rollbacks-backup')) {
+        out.push(full);
+        if (out.length >= maxFiles) return;
+      }
+    }
+  }
+  await walk(rootDir);
+  return out;
+}
+
+async function inspectJsonlFiles(rootDir, maxFiles = 4000) {
+  const files = [];
+  const errors = [];
+  let truncated = false;
+
+  async function walk(dir) {
+    if (truncated) return;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      errors.push({
+        stage: 'walk',
+        path: dir,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      });
+      return;
+    }
+    for (const entry of entries) {
+      if (truncated) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.includes('.with-rollbacks-backup')) {
+        if (files.length >= maxFiles) {
+          truncated = true;
+          return;
+        }
+        files.push(full);
+      }
+    }
+  }
+
+  await walk(rootDir);
+  return { files, errors, truncated };
+}
+
+async function parseJsonlFile(filePath, options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  demand?.assertCurrent();
+  return perfCausal.run('codex.raw-records', { fileIdentity: filePath,
+    caller: perfCausal.current()?.name || _describeJsonlReadCaller(),
+    mode: options.forceFresh === true ? 'force-fresh' : 'lookup' }, async () => {
+  if (options.forceFresh === true) {
+    // A task_complete append can land while another reader is still consuming
+    // the previous file size. Await and discard that snapshot before the
+    // orchestration result reader takes its authoritative final view.
+    while (_codexJsonlInflight.has(filePath)) {
+      const pending = _codexJsonlInflight.get(filePath);
+      try {
+        await pending;
+      } catch {
+        // The fresh read below owns the retry and the resulting error.
+      }
+      demand?.assertCurrent();
+      if (_codexJsonlInflight.get(filePath) === pending) {
+        _codexJsonlInflight.delete(filePath);
+      }
+    }
+    invalidateCodexJsonlCache(filePath, { readRefresh: true });
+  }
+  const records = await _codexJsonlDemands.run(filePath, demand, async jobControl => {
+    jobControl.assertCurrent();
+    // This map is now only the forceFresh barrier. Borrowing belongs to the
+    // demand registry: C must not join an abandoned A/B generation just because
+    // its stream has not reached the next cooperative boundary yet.
+    const load = _parseJsonlFileIncremental(filePath);
+    _codexJsonlInflight.set(filePath, load);
+    try { return await load; }
+    finally {
+      if (_codexJsonlInflight.get(filePath) === load) _codexJsonlInflight.delete(filePath);
+    }
+  });
+  demand?.assertCurrent();
+  return copyCodexRecordSnapshot(records);
+  });
+}
+
+function copyCodexRecordSnapshot(records) {
+  return perfCausal.run('codex.snapshot-copy', { snapshotRecords: records.length }, () => {
+  const copy = records.slice();
+  const snapshot = _codexRecordSnapshots.get(records);
+  if (snapshot) _codexRecordSnapshots.set(copy, snapshot);
+  return copy;
+  });
+}
+
+function codexRecordTypeFromPrefix(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+  const prefix = buffer.subarray(0, Math.min(buffer.length, 4096)).toString('utf8');
+  const match = /"type"\s*:\s*"([^"]+)"/.exec(prefix);
+  return match?.[1] || null;
+}
+
+async function readCodexSessionMetadata(filePath, options = {}) {
+  if (typeof filePath === 'string' && filePath.endsWith('.jsonl.zst')) filePath = (await prepareCodexRolloutReadFile(filePath)).filePath;
+  const maxBytes = Math.max(1, Number(options.maxBytes) || CODEX_SESSION_META_HEAD_MAX_BYTES);
+  const chunkBytes = Math.max(1, Math.min(
+    maxBytes,
+    Number(options.chunkBytes) || CODEX_SESSION_META_HEAD_CHUNK_BYTES
+  ));
+  const maxRecords = Math.max(1, Number(options.maxRecords) || CODEX_SESSION_META_HEAD_MAX_RECORDS);
+  const metadataRecords = [];
+  let bytesRead = 0;
+  let scannedRecords = 0;
+  let pending = Buffer.alloc(0);
+  let stoppedAtNonMetadata = false;
+  let fileHandle;
+
+  const result = () => ({
+    records: metadataRecords,
+    meta: getSessionMeta(metadataRecords),
+    bytesRead,
+    scannedRecords,
+    stoppedAtNonMetadata,
+    truncated: bytesRead >= maxBytes,
+  });
+
+  try {
+    fileHandle = await fs.promises.open(filePath, 'r');
+    while (bytesRead < maxBytes && scannedRecords < maxRecords) {
+      const buffer = Buffer.allocUnsafe(Math.min(chunkBytes, maxBytes - bytesRead));
+      const read = await fileHandle.read(buffer, 0, buffer.length, bytesRead);
+      if (read.bytesRead === 0) break;
+      bytesRead += read.bytesRead;
+      pending = pending.length > 0
+        ? Buffer.concat([pending, buffer.subarray(0, read.bytesRead)])
+        : Buffer.from(buffer.subarray(0, read.bytesRead));
+
+      let newlineIndex = pending.indexOf(0x0a);
+      while (newlineIndex >= 0 && scannedRecords < maxRecords) {
+        const lineBuffer = pending.subarray(0, newlineIndex);
+        pending = Buffer.from(pending.subarray(newlineIndex + 1));
+        const line = lineBuffer.toString('utf8').trim();
+        const lineNumber = scannedRecords;
+        scannedRecords += 1;
+        if (line) {
+          let record = null;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            // A corrupt/in-progress line is not metadata. Once the metadata
+            // prefix is complete, discovery must not continue into payloads.
+          }
+          if (record?.type === 'session_meta' && record.payload) {
+            metadataRecords.push({ ...record, __line: lineNumber });
+          } else if (metadataRecords.length > 0) {
+            stoppedAtNonMetadata = true;
+            return result();
+          }
+        }
+        newlineIndex = pending.indexOf(0x0a);
+      }
+
+      if (metadataRecords.length > 0 && pending.length > 0) {
+        const nextType = codexRecordTypeFromPrefix(pending);
+        if (nextType && nextType !== 'session_meta') {
+          stoppedAtNonMetadata = true;
+          return result();
+        }
+      }
+    }
+
+    if (pending.length > 0 && scannedRecords < maxRecords) {
+      const line = pending.toString('utf8').trim();
+      if (line) {
+        try {
+          const record = JSON.parse(line);
+          if (record?.type === 'session_meta' && record.payload) {
+            metadataRecords.push({ ...record, __line: scannedRecords });
+          }
+        } catch {
+          // The bounded head may end in the middle of a non-metadata record.
+        }
+      }
+    }
+    return result();
+  } finally {
+    await fileHandle?.close();
+  }
+}
+
+/**
+ * Картинки внутри записи о сжатии контекста — единственное, что делает файлы
+ * истории гигантскими, и единственное, что мы из них НЕ показываем.
+ *
+ * Как получается гигабайт. При переполнении контекста Codex сохраняет всю
+ * предыдущую переписку одной строкой, и каждое следующее сжатие включает в
+ * себя предыдущее. Скриншот, попавший в диалог один раз, копируется в каждое
+ * последующее сжатие. Замерено на реальном файле пользователя: 1340 МБ, из них
+ * 1260 МБ — 64 строки сжатий, а внутри них 1236 МБ (98%) — картинки, вписанные
+ * прямо в текст. Без них тот же файл весит 104 МБ.
+ *
+ * Почему их можно выбросить именно из PARSED/PRESENTATION памяти. Показ сжатия
+ * и так подставляет вместо картинки пометку «[image omitted]» (см.
+ * formatReplacementHistory) — то есть до экрана эти байты не доходят. Но
+ * Fork/Edit/Delete являются write-path: они получают невидимые raw ranges и
+ * при записи потоково возвращают точные data URL, сверяя SHA-256. Смешение
+ * этих границ 20.08 создало resumable fork с буквальным image_url=
+ * "[image omitted]"; OpenAI затем отклонял каждый turn как invalid URL.
+ * Именно бессмысленное удержание base64 в UI-памяти убило приложение 19.08
+ * 08:41, а их потеря на persistence-boundary сломала fork днём позже.
+ *
+ * Границы. Режется ТОЛЬКО содержимое записи `compacted`. Картинки в обычных
+ * сообщениях не трогаются: они нужны для повтора запроса с изображением
+ * (см. materializeBuffer в main). Обрезка делается по сырому тексту строки ДО
+ * разбора — иначе гигабайт всё равно окажется в памяти, просто чуть позже.
+ * Raw descriptor хранит только file offsets + hashes, не сами base64.
+ */
+const CODEX_COMPACT_IMAGE_DATA_URL = /"(image_url|imageUrl)"\s*:\s*"data:image\/[^"]*"/g;
+
+function describeCompactedInlineImages(rawLine, rawLineBuffer, filePath, lineStartOffset) {
+  if (typeof rawLine !== 'string' || rawLine.length < 4096) return null;
+  if (!Buffer.isBuffer(rawLineBuffer) || rawLineBuffer.length === 0) return null;
+  if (rawLine.lastIndexOf('"type":"compacted"', 400) === -1) return null;
+  if (rawLine.indexOf('"data:image/') === -1) return null;
+  const images = [];
+  let previousCharOffset = 0;
+  let previousByteOffset = 0;
+  let searchFrom = 0;
+  while (searchFrom < rawLine.length) {
+    const snakeIndex = rawLine.indexOf('"image_url"', searchFrom);
+    const camelIndex = rawLine.indexOf('"imageUrl"', searchFrom);
+    let key = null;
+    let keyIndex = -1;
+    if (snakeIndex >= 0 && (camelIndex < 0 || snakeIndex < camelIndex)) {
+      key = 'image_url';
+      keyIndex = snakeIndex;
+    } else if (camelIndex >= 0) {
+      key = 'imageUrl';
+      keyIndex = camelIndex;
+    } else {
+      break;
+    }
+    let cursor = keyIndex + key.length + 2;
+    while (/\s/.test(rawLine[cursor] || '')) cursor += 1;
+    if (rawLine[cursor] !== ':') {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    cursor += 1;
+    while (/\s/.test(rawLine[cursor] || '')) cursor += 1;
+    if (rawLine[cursor] !== '"' || !rawLine.startsWith('data:image/', cursor + 1)) {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    const closingQuote = rawLine.indexOf('"', cursor + 1);
+    if (closingQuote < 0) break;
+    const valueCharStart = cursor;
+    const valueCharEnd = closingQuote + 1;
+    const bytesBefore = Buffer.byteLength(rawLine.slice(previousCharOffset, valueCharStart));
+    const start = Number(lineStartOffset) + previousByteOffset + bytesBefore;
+    // data URLs and their JSON quotes are ASCII, so their character length is
+    // the exact byte length. The surrounding JSON may contain Unicode; that is
+    // why `bytesBefore` above is measured explicitly.
+    const byteLength = valueCharEnd - valueCharStart;
+    const relativeStart = start - Number(lineStartOffset);
+    const rawValueBuffer = rawLineBuffer.subarray(relativeStart, relativeStart + byteLength);
+    images.push({
+      key,
+      filePath,
+      start,
+      endExclusive: start + byteLength,
+      byteLength,
+      sha256: crypto.createHash('sha256').update(rawValueBuffer).digest('hex'),
+    });
+    previousCharOffset = valueCharEnd;
+    previousByteOffset = start + byteLength - Number(lineStartOffset);
+    searchFrom = valueCharEnd;
+  }
+  return images.length > 0 ? { images } : null;
+}
+
+function stripCompactedInlineImages(line) {
+  // Дешёвая проверка перед дорогой заменой: обычные строки не должны платить.
+  if (line.length < 4096) return line;
+  if (line.lastIndexOf('"type":"compacted"', 400) === -1) return line;
+  if (line.indexOf('"data:image/') === -1) return line;
+  return line.replace(CODEX_COMPACT_IMAGE_DATA_URL, '"$1":"[image omitted]"');
+}
+
+let _codexAuditAddressReader;
+function readAuditRecordAddress(filePath, offset) {
+  _codexAuditAddressReader ||= require('../codex-audit-address-reader').createCodexAuditAddressReader({ readJsonlRange });
+  return _codexAuditAddressReader.read(filePath, offset);
+}
+
+async function readJsonlRange(filePath, startByte, endByte, options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  const assertCurrent = () => { demand?.assertCurrent(); options.assertCurrent?.(); };
+  assertCurrent();
+  await _codexExternalReadPrepare?.(filePath);
+  assertCurrent();
+  const records = options.records || [];
+  const collectRecords = options.collectRecords !== false;
+  let lineCount = Number(options.lineCount) || 0;
+  let parsed = 0;
+  let errors = 0;
+  let leftoverBuffer = Buffer.isBuffer(options.leftoverBuffer)
+    ? Buffer.from(options.leftoverBuffer)
+    : Buffer.from(String(options.leftover || ''), 'utf8');
+  let nextChunkOffset = Math.max(0, Number(startByte) || 0);
+  let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
+  const metrics = options.metrics;
+  if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0,
+    parseMs: 0, consumeMs: 0, framingMs: 0, readWaitMs: 0, maxBufferedBytes: 0,
+    maxCollectedRecords: records.length, maxConsumerRecords: 0 });
+
+  const consume = async (chunk) => {
+    assertCurrent();
+    if (!chunk?.length) return;
+    const framingStarted = metrics ? performance.now() : 0;
+    const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const dataStartOffset = leftoverBuffer.length > 0
+      ? leftoverStartOffset
+      : nextChunkOffset;
+    const data = leftoverBuffer.length > 0
+      ? Buffer.concat([leftoverBuffer, chunkBuffer])
+      : chunkBuffer;
+    if (metrics) {
+      metrics.maxBufferedBytes = Math.max(metrics.maxBufferedBytes, data.length);
+      metrics.framingMs += performance.now() - framingStarted;
+    }
+    let lineStart = 0;
+    let newlineIndex = data.indexOf(0x0a, lineStart);
+    while (newlineIndex >= 0) {
+      assertCurrent();
+      const parseStarted = metrics ? performance.now() : 0;
+      const rawLineBuffer = data.subarray(lineStart, newlineIndex);
+      if (metrics) metrics.maxRecordBytes = Math.max(metrics.maxRecordBytes, rawLineBuffer.length);
+      const rawLineText = rawLineBuffer.toString('utf8');
+      const rawLine = rawLineText.trim();
+      const line = stripCompactedInlineImages(rawLine);
+      if (line) {
+        let decorated;
+        try {
+          const record = JSON.parse(line);
+          decorated = {
+            ...record,
+            __line: lineCount,
+            __byteOffset: dataStartOffset + lineStart,
+          };
+          const rawImages = collectRecords && describeCompactedInlineImages(
+            rawLineText,
+            rawLineBuffer,
+            filePath,
+            dataStartOffset + lineStart,
+          );
+          if (rawImages) {
+            Object.defineProperty(decorated, CODEX_COMPACT_RAW_IMAGES, {
+              value: rawImages,
+              enumerable: false,
+              configurable: false,
+              writable: false,
+            });
+          }
+          if (collectRecords) records.push(decorated);
+          if (metrics) metrics.maxCollectedRecords = Math.max(metrics.maxCollectedRecords, records.length);
+          parsed += 1;
+        } catch {
+          errors += 1;
+        }
+        if (metrics) metrics.parseMs += performance.now() - parseStarted;
+        // A consumer failure is not a malformed JSON record. Its owner must
+        // discard the staged cursor rather than silently skip a valid event.
+        if (decorated && typeof options.onRecord === 'function') {
+          assertCurrent();
+          if (metrics) metrics.maxConsumerRecords = 1;
+          const consumeStarted = metrics ? performance.now() : 0;
+          const consumed = options.onRecord(decorated, {
+            filePath, fromByte: dataStartOffset + lineStart,
+            toByte: dataStartOffset + newlineIndex + 1, startLine: lineCount,
+          });
+          if (consumed && typeof consumed.then === 'function') await consumed;
+          assertCurrent();
+          if (metrics) metrics.consumeMs += performance.now() - consumeStarted;
+        }
+      }
+      lineCount += 1;
+      lineStart = newlineIndex + 1;
+      newlineIndex = data.indexOf(0x0a, lineStart);
+    }
+    const tailStarted = metrics ? performance.now() : 0;
+    leftoverBuffer = Buffer.from(data.subarray(lineStart));
+    if (metrics) metrics.framingMs += performance.now() - tailStarted;
+    leftoverStartOffset = dataStartOffset + lineStart;
+    nextChunkOffset += chunkBuffer.length;
+  };
+
+  if (endByte >= startByte) {
+    let handle = null;
+    let readError = null;
+    const expected = options.sourceStat;
+    const assertSource = actual => {
+      if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino
+        || actual.size < expected.size
+        || (actual.size === expected.size
+          && (actual.mtimeMs !== expected.mtimeMs || actual.ctimeMs !== expected.ctimeMs)))) {
+        throw Object.assign(new Error('Codex source changed during bounded read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+      }
+    };
+    try {
+      if (expected) {
+        handle = await fs.promises.open(filePath, 'r');
+        assertCurrent();
+        assertSource(await handle.stat());
+      }
+      const stream = fs.createReadStream(filePath, {
+        start: startByte,
+        end: endByte,
+        ...(handle ? { fd: handle.fd, autoClose: false } : {}),
+        highWaterMark: Math.max(1, Number(options.highWaterMark) || CODEX_JSONL_READ_CHUNK_BYTES),
+      });
+      let readWaitStarted = metrics ? performance.now() : 0;
+      for await (const chunk of stream) {
+        assertCurrent();
+        if (metrics) metrics.readWaitMs += performance.now() - readWaitStarted;
+        if (typeof options.onChunk === 'function') options.onChunk(chunk, nextChunkOffset);
+        await consume(chunk);
+        if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
+        // Progress follows processed chunks, not the filesystem's read-ahead.
+        options.onProgress?.(nextChunkOffset - startByte);
+        if (demand?.checkpoint) await demand.checkpoint();
+        assertCurrent();
+        if (metrics) readWaitStarted = performance.now();
+      }
+      if (handle) {
+        assertCurrent();
+        // The same descriptor owns the bytes and both fstats. A pathname may
+        // have been replaced while its old descriptor was still readable.
+        assertSource(await handle.stat());
+        assertSource(await fs.promises.stat(filePath));
+        if (nextChunkOffset - startByte !== endByte - startByte + 1) {
+          throw Object.assign(new Error('Codex source range was truncated during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        }
+      }
+    } catch (error) { readError = error; throw error; }
+    finally {
+      try { await handle?.close(); }
+      catch (error) {
+        // Async-iterator cancellation can already close the stream descriptor.
+        // A cleanup EBADF must never replace the typed demand/source failure.
+        if (!readError) throw error;
+      }
+    }
+  }
+
+  assertCurrent();
+  return {
+    records,
+    lineCount,
+    parsed,
+    errors,
+    leftoverBuffer,
+    leftover: leftoverBuffer.toString('utf8'),
+  };
+}
+
+async function scanCodexStableSourceRewindProof(filePath, {
+  targetSourceLine,
+  actionStartedAtMs,
+  expectedSubmit = null,
+} = {}) {
+  const targetLine = Number(targetSourceLine);
+  const actionAt = Number(actionStartedAtMs);
+  const hasExpectedSubmit = expectedSubmit !== null && expectedSubmit !== undefined;
+  const expectedSubmitLen = Number(expectedSubmit?.expectedLen);
+  const expectedSubmitHash = String(expectedSubmit?.expectedHash || '');
+  const expectedSubmitSentAt = Number(expectedSubmit?.sentAtMs);
+  const expectedSubmitFileSize = Number(expectedSubmit?.sourceFileSize);
+  if (!filePath
+    || !Number.isInteger(targetLine)
+    || targetLine < 0
+    || !Number.isFinite(actionAt)
+    || (hasExpectedSubmit && (
+      expectedSubmit?.expectedLen === null
+      || expectedSubmit?.expectedLen === undefined
+      || !Number.isSafeInteger(expectedSubmitLen)
+      || expectedSubmitLen < 0
+      || !/^[a-f0-9]{16}$/i.test(expectedSubmitHash)
+      || !Number.isFinite(expectedSubmitSentAt)
+      || expectedSubmitSentAt < actionAt
+      || expectedSubmit?.sourceFileSize === null
+      || expectedSubmit?.sourceFileSize === undefined
+      || !Number.isSafeInteger(expectedSubmitFileSize)
+      || expectedSubmitFileSize < 0
+    ))) {
+    return {
+      complete: false,
+      error: hasExpectedSubmit
+        ? 'codex_stable_source_submit_scan_identity_invalid'
+        : 'codex_stable_source_scan_input_invalid',
+      targetRecord: null,
+      taskStartedRecord: null,
+      userMessageRecord: null,
+      threadRolledBackRecord: null,
+    };
+  }
+
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  let nextChunkOffset = 0;
+  let lineNumber = 0;
+  let parseErrors = 0;
+  let targetRecord = null;
+  let taskStartedRecord = null;
+  let pendingTaskStartedRecord = null;
+  let pendingSubmitUserRecord = null;
+  let userMessageRecord = null;
+  let threadRolledBackRecord = null;
+  let stoppedAtProof = false;
+  let submitMismatchCount = 0;
+
+  const inspectLine = (lineBuffer, byteOffset) => {
+    const sourceLine = lineNumber;
+    lineNumber += 1;
+    const raw = lineBuffer.toString('utf8').trim();
+    if (!raw) return false;
+    const couldMatter = sourceLine === targetLine
+      || (sourceLine > targetLine
+        && ((raw.includes('"event_msg"')
+          && (raw.includes('"task_started"')
+            || raw.includes('"user_message"')
+            || raw.includes('"task_complete"')
+            || raw.includes('"turn_aborted"')
+            || raw.includes('"thread_rolled_back"')))
+          || (raw.includes('"response_item"') && raw.includes('"message"') && raw.includes('"user"'))));
+    if (!couldMatter) return false;
+    let record;
+    try {
+      record = JSON.parse(raw);
+    } catch {
+      parseErrors += 1;
+      return false;
+    }
+    const decorated = { ...record, __line: sourceLine, __byteOffset: byteOffset };
+    if (sourceLine === targetLine) {
+      targetRecord = decorated;
+      return false;
+    }
+    const userText = codexUserMessageAuditText(decorated);
+    const authoredUser = userText !== null
+      && !isCodexEnvironmentContextUserText(userText)
+      && !isCodexProjectInstructionsUserText(userText)
+      && !isCodexTurnAbortedUserText(userText)
+      && !isCodexGoalContinuationUserText(userText);
+    if (record?.type !== 'event_msg' && !authoredUser) return false;
+    const timestampMs = parseTimestampMs(record.timestamp);
+    if (!Number.isFinite(timestampMs) || timestampMs < actionAt) return false;
+    if (record.payload?.type === 'task_started') {
+      if (hasExpectedSubmit) {
+        if (timestampMs >= expectedSubmitSentAt && byteOffset >= expectedSubmitFileSize) {
+          pendingTaskStartedRecord = decorated;
+          pendingSubmitUserRecord = null;
+        }
+      } else if (!taskStartedRecord) {
+        taskStartedRecord = decorated;
+      }
+    } else if (authoredUser) {
+      if (hasExpectedSubmit) {
+        // One task owns its first logical user input. Its response/event pair
+        // may arrive in separate records; use the existing carrier grammar so
+        // a canonical companion can confirm the same slot, never steering.
+        if (!pendingTaskStartedRecord) return false;
+        if (pendingSubmitUserRecord
+          && groupCodexPreferredUserMessageAuditRecords([
+            { record: pendingSubmitUserRecord }, { record: decorated },
+          ]).length !== 1) {
+          pendingTaskStartedRecord = null;
+          pendingSubmitUserRecord = null;
+          submitMismatchCount += 1;
+          return false;
+        }
+        const actualText = codexUserMessageAuditText(decorated, {
+          // Match the exact transport identity used by the live post-Enter
+          // Codex audit. Presentation normalization is a different proof
+          // domain and must not authorize recovery.
+          preserveProviderImageMarkup: true,
+        });
+        const actualLen = typeof actualText === 'string' ? actualText.length : -1;
+        const actualHash = typeof actualText === 'string'
+          ? promptAuditFingerprint(actualText)
+          : null;
+        const exactSubmit = timestampMs >= expectedSubmitSentAt
+          && byteOffset >= expectedSubmitFileSize
+          && actualLen === expectedSubmitLen
+          && actualHash === expectedSubmitHash;
+        if (exactSubmit && pendingTaskStartedRecord) {
+          taskStartedRecord = pendingTaskStartedRecord;
+          userMessageRecord = {
+            ...decorated,
+            __auditTextLength: actualLen,
+            __auditHash: actualHash,
+          };
+        } else {
+          submitMismatchCount += 1;
+        }
+        if (pendingSubmitUserRecord || exactSubmit) {
+          pendingTaskStartedRecord = null;
+          pendingSubmitUserRecord = null;
+        } else {
+          // Pairing needs text and physical position, not retained image bytes.
+          pendingSubmitUserRecord = { type: decorated.type, __line: sourceLine,
+            __byteOffset: byteOffset, payload: decorated.type === 'response_item'
+              ? { type: 'message', role: 'user', content: [{ type: 'input_text', text: userText }] }
+              : { type: 'user_message', message: userText } };
+        }
+      } else if (!userMessageRecord) {
+        userMessageRecord = decorated;
+      }
+    } else if (record.payload?.type === 'thread_rolled_back' && !threadRolledBackRecord) {
+      threadRolledBackRecord = decorated;
+      pendingTaskStartedRecord = null;
+      pendingSubmitUserRecord = null;
+    } else if (record.payload?.type === 'task_complete' || record.payload?.type === 'turn_aborted') {
+      pendingTaskStartedRecord = null;
+      pendingSubmitUserRecord = null;
+    }
+    return !!taskStartedRecord && !!userMessageRecord;
+  };
+
+  try {
+    const stream = fs.createReadStream(filePath, {
+      highWaterMark: CODEX_JSONL_READ_CHUNK_BYTES,
+    });
+    for await (const chunk of stream) {
+      const chunkStart = nextChunkOffset;
+      nextChunkOffset += chunk.length;
+      const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+      const dataStart = pending.length > 0 ? pendingStart : chunkStart;
+      let cursor = 0;
+      let newlineIndex = data.indexOf(0x0a, cursor);
+      while (newlineIndex >= 0) {
+        if (inspectLine(data.subarray(cursor, newlineIndex), dataStart + cursor)) {
+          stoppedAtProof = true;
+          stream.destroy();
+          break;
+        }
+        cursor = newlineIndex + 1;
+        newlineIndex = data.indexOf(0x0a, cursor);
+      }
+      if (stoppedAtProof) break;
+      pending = Buffer.from(data.subarray(cursor));
+      pendingStart = dataStart + cursor;
+    }
+    if (!stoppedAtProof && pending.length > 0) {
+      inspectLine(pending, pendingStart);
+    }
+    return {
+      complete: parseErrors === 0,
+      error: parseErrors > 0 ? 'codex_stable_source_scan_parse_failed' : null,
+      parseErrors,
+      scannedBytes: nextChunkOffset,
+      scannedLines: lineNumber,
+      stoppedAtProof,
+      expectedSubmitMatched: hasExpectedSubmit
+        ? !!taskStartedRecord && !!userMessageRecord
+        : null,
+      submitMismatchCount,
+      targetRecord,
+      taskStartedRecord,
+      userMessageRecord,
+      threadRolledBackRecord,
+    };
+  } catch (error) {
+    return {
+      complete: false,
+      error: error?.message || String(error),
+      parseErrors,
+      scannedBytes: nextChunkOffset,
+      scannedLines: lineNumber,
+      stoppedAtProof,
+      expectedSubmitMatched: hasExpectedSubmit
+        ? !!taskStartedRecord && !!userMessageRecord
+        : null,
+      submitMismatchCount,
+      targetRecord,
+      taskStartedRecord,
+      userMessageRecord,
+      threadRolledBackRecord,
+    };
+  }
+}
+
+/** Наши кадры стека вызова, ради ответа «кто заказал полное чтение файла».
+ * Только имена функций проекта: кадры Node и внутренние обёртки шума дают
+ * больше, чем смысла. */
+function _describeJsonlReadCaller() {
+  try {
+    const stack = String(new Error().stack || '').split('\n').slice(2, 40);
+    const names = [];
+    for (const line of stack) {
+      const m = line.match(/at\s+(?:async\s+)?([A-Za-z_$][\w$.]*)\s/);
+      if (!m) continue;
+      const name = m[1];
+      if (name.startsWith('_parseJsonlFile') || name === 'parseJsonlFile') continue;
+      if (name.startsWith('process.') || name.startsWith('Object.')) continue;
+      if (names[names.length - 1] === name) continue;
+      names.push(name);
+      if (names.length >= 4) break;
+    }
+    return names.length ? names.join('<') : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function _parseJsonlFileIncremental(filePath) {
+  return retryInvalidatedCodexRead(async () => {
+    currentReadControl()?.assertCurrent();
+    await _codexExternalReadPrepare?.(filePath);
+    currentReadControl()?.assertCurrent();
+    const ticket = _codexReadFence.begin(filePath, 'raw');
+    try { return await _parseJsonlFileIncrementalOnce(filePath, ticket); }
+    finally { _codexReadFence.finish(ticket); }
+  });
+}
+
+async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
+  const assertCurrent = () => { currentReadControl()?.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  assertCurrent();
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+  } catch {
+    deleteCodexJsonlCacheEntry(filePath);
+    return [];
+  }
+
+  assertCurrent();
+  const cached = _codexJsonlCache.get(filePath);
+  const fileIdentity = stat.dev + ':' + stat.ino;
+  const sameFile = cached?.fileIdentity === fileIdentity
+    && cached.sourceGeneration === _codexSourceGenerations.get(filePath)?.generation
+    && !_codexSourceGenerations.get(filePath)?.rewritePending;
+  if (sameFile && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs
+    && cached.ctimeMs === stat.ctimeMs) {
+    perfCausal.update({ mode: 'memory-hit', sourceBytes: stat.size, deltaBytes: 0,
+      recordsBefore: cached.records.length, recordsAfter: cached.records.length });
+    touchCodexJsonlCacheEntry(filePath, cached);
+    return cached.records;
+  }
+
+  // Файл, который нельзя разобрать целиком, не разбираем вовсе. Дописи к уже
+  // разобранному файлу (ветка ниже) под запрет не попадают: там читается
+  // только новый хвост, а не весь файл.
+  if (!sameFile && stat.size > CODEX_JSONL_PARSE_MAX_BYTES) {
+    perfCausal.update({ mode: 'size-refused', sourceBytes: stat.size, deltaBytes: null });
+    console.warn('[CodexJsonlCache] refused file=' + path.basename(filePath)
+      + ' sizeMB=' + Math.round(stat.size / (1024 * 1024))
+      + ' maxMB=' + Math.round(CODEX_JSONL_PARSE_MAX_BYTES / (1024 * 1024))
+      + ' by=' + _describeJsonlReadCaller());
+    return [];
+  }
+
+  if (sameFile && stat.size > cached.size) {
+    const prevSize = cached.size;
+    const prevLineCount = cached.lineCount || 0;
+    perfCausal.update({ mode: 'append', sourceBytes: stat.size, deltaBytes: stat.size - prevSize, recordsBefore: cached.records.length });
+    const result = await readJsonlRange(filePath, prevSize, stat.size - 1, {
+      sourceStat: stat,
+      // Stage appended records separately. If the stream fails mid-read, the
+      // previous size checkpoint remains valid and its cached array must stay
+      // untouched or the retry would append duplicates.
+      records: [],
+      lineCount: prevLineCount,
+      leftoverBuffer: cached.leftoverBuffer,
+      leftover: cached.leftover,
+    });
+    assertCurrent();
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
+    perfCausal.run('codex.raw-cache-publication', { mode: 'append', recordsAfter: cached.records.length + result.records.length }, () => {
+    for (const record of result.records) {
+      cached.records.push(record);
+    }
+    setCodexJsonlCacheEntry(filePath, {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      fileIdentity,
+      ctimeMs: stat.ctimeMs,
+      sourceGeneration,
+      lineCount: result.lineCount,
+      leftover: result.leftover,
+      leftoverBuffer: result.leftoverBuffer,
+      records: cached.records,
+    });
+    });
+    perfCausal.update({ recordsAfter: cached.records.length });
+    console.log('[CodexJsonlCache] append file=' + path.basename(filePath) +
+      ' bytes=' + (stat.size - prevSize) +
+      ' parsed=' + result.parsed +
+      ' errors=' + result.errors +
+      ' total=' + cached.records.length +
+      ' leftoverBytes=' + result.leftoverBuffer.length +
+      ' cacheFiles=' + _codexJsonlCache.size +
+      ' cacheRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)));
+    return cached.records;
+  }
+
+  const finishPreparation = historyPreparationActivity.begin({ kind: 'history', bytes: stat.size });
+  perfCausal.update({ mode: cached ? 'rewrite-or-shrink' : 'first-read', sourceBytes: stat.size,
+    deltaBytes: stat.size, recordsBefore: cached?.records.length ?? 0 });
+  try {
+    const result = await readJsonlRange(filePath, 0, stat.size - 1, { sourceStat: stat });
+    assertCurrent();
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
+    perfCausal.run('codex.raw-cache-publication', { mode: 'full', recordsAfter: result.records.length }, () => {
+    setCodexJsonlCacheEntry(filePath, {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      fileIdentity,
+      ctimeMs: stat.ctimeMs,
+      sourceGeneration,
+      lineCount: result.lineCount,
+      leftover: result.leftover,
+      leftoverBuffer: result.leftoverBuffer,
+      records: result.records,
+    });
+    });
+    perfCausal.update({ recordsAfter: result.records.length });
+    console.log('[CodexJsonlCache] full file=' + path.basename(filePath) +
+      ' sizeKB=' + Math.round(stat.size / 1024) +
+      ' records=' + result.records.length +
+      ' errors=' + result.errors +
+      ' leftoverBytes=' + result.leftoverBuffer.length +
+      ' cacheFiles=' + _codexJsonlCache.size +
+      ' cacheRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)) +
+      (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read')
+      // Кто именно заказал полное чтение. Без этого в проде видно ЧТО читается,
+      // но не видно КЕМ: 19.08 05:38–05:41 через кэш прогнали 195 разных файлов,
+      // память ушла с 2.0 до 3.6 ГБ и процесс упал — а в логе не было ни одного
+      // вызывающего. Стек здесь стоит дёшево (одно полное чтение — сотни
+      // миллисекунд) и печатается только в этот момент, не на попадания в кэш.
+      + ' by=' + _describeJsonlReadCaller());
+    return result.records;
+  } finally { finishPreparation(); }
+}
+
+function invalidateCodexJsonlCache(filePath, { readRefresh = false, sourceAppend = false } = {}) {
+  if (!filePath) return;
+  for (const listener of _codexReadInvalidationListeners) listener({ filePath, readRefresh, sourceAppend });
+  _codexReadFence.invalidate(filePath);
+  if (!readRefresh && !sourceAppend) _codexSourceGenerations.invalidate(filePath);
+  if (!readRefresh) _codexResultReader?.invalidate(filePath);
+  deleteCodexJsonlCacheEntry(filePath);
+  // Every explicit rewrite path (edit/delete-range/fork, forceFresh reads)
+  // funnels through here — burn the resumable projector too. Stat admission
+  // catches replacement/shrink/same-size writes, but a larger same-inode file
+  // alone cannot prove an unchanged prefix. In-place rewrite+growth still
+  // requires this explicit writer invalidation.
+  // A proven app-owned append keeps the complete old prefix useful. Cancel
+  // in-flight reads above, but do not discard a warm parser just to add a row.
+  if (!sourceAppend || readRefresh) invalidateCodexHistoryProjectors(filePath);
+}
+
+let _codexResultReader = null;
+function codexResultReader() {
+  if (!_codexResultReader) _codexResultReader = createCodexResultReader({
+    readJsonlRange, createTimelineProjector: createCodexTimelineProjector,
+    buildResult: buildCodexProviderTurnAssistantResult, extractText: extractTextContent,
+    userIdentity: getCodexUserRecordIdentity,
+    isCompactPayload, extractReasoning,
+    findExecutionContext: findCodexPromptExecutionContext,
+    collectLegacy: collectCodexTurnAssistantBlocks,
+  });
+  return _codexResultReader;
+}
+
+async function loadCodexProviderResult(request) {
+  return codexResultReader().load(request);
+}
+
+async function loadCodexObservedExecution(request) {
+  return codexResultReader().loadObservedExecution(request);
+}
+
+async function loadLatestCodexObservedExecution(request) {
+  return codexResultReader().loadLatestObservedExecution(request);
+}
+
+async function loadCodexHistoricalObservedExecution(request) {
+  return codexResultReader().loadHistoricalObservedExecution(request);
+}
+
+function readCachedCodexCompletedResponse(request) {
+  return _codexResultReader?.readCachedCompleted(request)
+    || { known: false, reason: 'result_cache_cold' };
+}
+
+function readCachedCodexInputInterval(request) {
+  return _codexResultReader?.readCachedInputInterval(request)
+    || { known: false, reason: 'result_cache_cold' };
+}
+
+function getSessionMeta(records) {
+  for (const record of records) {
+    if (record?.type === 'session_meta') return record.payload || {};
+  }
+  return {};
+}
+
+function getSessionMetaRecord(records) {
+  for (const record of records) {
+    if (record?.type === 'session_meta') return record;
+  }
+  return null;
+}
+
+function getCodexForkLiveStartLine(records, meta) {
+  if (!meta?.forked_from_id) return undefined;
+  const startedAtMs = parseTimestampMs(meta.timestamp);
+  if (!Number.isFinite(startedAtMs)) return undefined;
+
+  for (const record of records) {
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg' || payload.type !== 'task_started') continue;
+
+    const payloadStartedAt = Number(payload.started_at);
+    if (Number.isFinite(payloadStartedAt) && payloadStartedAt > 0) {
+      if (payloadStartedAt * 1000 >= startedAtMs - 1000) return record.__line;
+      continue;
+    }
+
+    const recordAtMs = parseTimestampMs(record.timestamp);
+    if (Number.isFinite(recordAtMs) && recordAtMs >= startedAtMs + 1000) return record.__line;
+  }
+
+  return undefined;
+}
+
+async function findCodexLinkedLiveBoundary(filePath, options = {}) {
+  const metadata = await readCodexSessionMetadata(filePath);
+  const meta = metadata.meta || {};
+  const metadataStartedAtMs = parseTimestampMs(meta.timestamp);
+  const requestedStartedAtMs = Number(options.startedAtMs);
+  // A rollout may have been created by a native Codex rewind long before the
+  // current `resume` launch. In that case metadata time proves only historical
+  // creation; current ownership starts at the newer launch boundary. Taking
+  // the older timestamp used to classify copied/history turns as live proof.
+  const liveThresholdCandidates = [metadataStartedAtMs, requestedStartedAtMs]
+    .filter((value) => Number.isFinite(value));
+  const liveThresholdMs = liveThresholdCandidates.length > 0
+    ? Math.max(...liveThresholdCandidates) - 1000
+    : null;
+
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  let nextChunkOffset = 0;
+  let scannedLines = 0;
+
+  const inspectLine = (lineBuffer, byteOffset) => {
+    scannedLines += 1;
+    // The legacy predicate searches these exact ASCII JSON tokens. Check the
+    // bytes before UTF8 conversion: tool/message bodies can be many MiB and
+    // have no role in locating a task boundary. Candidate parsing, offsets,
+    // malformed-line tolerance and the final partial-tail boundary stay exact.
+    if (!lineBuffer.includes('"task_started"') || !lineBuffer.includes('"event_msg"')) return null;
+    const line = lineBuffer.toString('utf8').trim();
+    if (!line.includes('"task_started"') || !line.includes('"event_msg"')) return null;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      return null;
+    }
+    if (record?.type !== 'event_msg' || record.payload?.type !== 'task_started') return null;
+
+    const rawStartedAt = Number(record.payload.started_at);
+    const payloadStartedAtMs = Number.isFinite(rawStartedAt)
+      ? (rawStartedAt > 1e12 ? rawStartedAt : rawStartedAt * 1000)
+      : null;
+    const recordStartedAtMs = parseTimestampMs(record.timestamp);
+    const isLive = Number.isFinite(liveThresholdMs)
+      ? (Number.isFinite(payloadStartedAtMs)
+        ? payloadStartedAtMs >= liveThresholdMs
+        : Number.isFinite(recordStartedAtMs) && recordStartedAtMs >= liveThresholdMs + 2000)
+      : true;
+    if (!isLive) return null;
+    return {
+      byteOffset,
+      turnId: record.payload.turn_id || null,
+      startedAtMs: payloadStartedAtMs,
+      recordTimestamp: record.timestamp || null,
+    };
+  };
+
+  const stream = fs.createReadStream(filePath, { highWaterMark: CODEX_JSONL_READ_CHUNK_BYTES });
+  for await (const chunk of stream) {
+    const chunkStart = nextChunkOffset;
+    nextChunkOffset += chunk.length;
+    const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+    const dataStart = pending.length > 0 ? pendingStart : chunkStart;
+    let cursor = 0;
+    let newlineIndex = data.indexOf(0x0a, cursor);
+    while (newlineIndex >= 0) {
+      const hit = inspectLine(data.subarray(cursor, newlineIndex), dataStart + cursor);
+      if (hit) {
+        stream.destroy();
+        return {
+          found: true,
+          offset: hit.byteOffset,
+          scannedBytes: nextChunkOffset,
+          scannedLines,
+          sessionId: meta.id || null,
+          metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+          ...hit,
+        };
+      }
+      cursor = newlineIndex + 1;
+      newlineIndex = data.indexOf(0x0a, cursor);
+    }
+    pending = Buffer.from(data.subarray(cursor));
+    pendingStart = dataStart + cursor;
+  }
+
+  if (pending.length > 0) {
+    const hit = inspectLine(pending, pendingStart);
+    if (hit) {
+      return {
+        found: true,
+        offset: hit.byteOffset,
+        scannedBytes: nextChunkOffset,
+        scannedLines,
+        sessionId: meta.id || null,
+        metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+        ...hit,
+      };
+    }
+  }
+
+  return {
+    found: false,
+    // Keep an incomplete final JSONL record inside the live watcher boundary.
+    offset: pending.length > 0 ? pendingStart : nextChunkOffset,
+    scannedBytes: nextChunkOffset,
+    scannedLines,
+    sessionId: meta.id || null,
+    metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+    turnId: null,
+    startedAtMs: null,
+    recordTimestamp: null,
+  };
+}
+
+function getTimelineSessionMeta(records) {
+  const metaRecord = getSessionMetaRecord(records);
+  const meta = metaRecord?.payload || {};
+  const forkLiveStartLine = getCodexForkLiveStartLine(records, meta);
+  return {
+    id: meta.id,
+    ...(meta.session_id == null ? {} : { session_id: meta.session_id }),
+    forked_from_id: meta.forked_from_id,
+    forked_from_ordinal_exclusive: meta.forked_from_ordinal_exclusive,
+    history_mode: meta.history_mode,
+    history_base: meta.history_base,
+    timestamp: meta.timestamp,
+    cwd: meta.cwd,
+    sourceLine: metaRecord?.__line,
+    forkLiveStartLine,
+  };
+}
+
+function getSessionMetas(records) {
+  return records
+    .filter((record) => record?.type === 'session_meta' && record.payload)
+    .map((record) => record.payload);
+}
+
+function recordsReferenceSession(records, sessionId) {
+  if (!sessionId) return false;
+  // Only the rollout's own (first) metadata describes its direct launch edge.
+  // Later session_meta records are copied transcript ancestry. Treating those
+  // as ownership lets an ancestor tab steal a sibling rollout after the real
+  // owner closes (tab-165/tab-194 incident, 2026-07-22).
+  const rootMeta = getSessionMeta(records);
+  return rootMeta?.forked_from_id === sessionId;
+}
+
+function isCodexSubagentSession(meta) {
+  if (!meta) return false;
+  if (meta.thread_source === 'subagent') return true;
+  if (meta.parent_thread_id) return true;
+  if (meta.source && typeof meta.source === 'object' && meta.source.subagent) return true;
+  return false;
+}
+
+function isCodexTuiSession(meta) {
+  if (!meta) return false;
+  if (meta.originator && meta.originator !== 'codex-tui') return false;
+  if (meta.source === 'exec') return false;
+  return true;
+}
+
+function isFreshCodexLaunchSession(meta) {
+  if (!isCodexTuiSession(meta)) return false;
+  if (isCodexSubagentSession(meta)) return false;
+  if (meta.thread_source && meta.thread_source !== 'user') return false;
+  return true;
+}
+
+function isCodexUserTuiSession(meta) {
+  return isCodexTuiSession(meta)
+    && !isCodexSubagentSession(meta)
+    && (!meta?.thread_source || meta.thread_source === 'user');
+}
+
+function codexSessionSkipReason(meta, { sourceSessionId }) {
+  if (sourceSessionId) {
+    return 'source-mismatch';
+  }
+  if (!isCodexTuiSession(meta)) return 'not-tui-session';
+  if (isCodexSubagentSession(meta)) return 'subagent-session';
+  if (meta.thread_source && meta.thread_source !== 'user') return 'non-user-thread';
+  return null;
+}
+
+function logCodexSessionCandidateSkip(meta, filePath, reason, { sourceSessionId }) {
+  const sessionId = meta?.id || 'unknown';
+  const key = [sessionId, path.basename(filePath || ''), reason, sourceSessionId || 'fresh'].join(':');
+  if (_codexSessionSelectSkipLogged.has(key)) return;
+  _codexSessionSelectSkipLogged.add(key);
+  console.log('[CodexSessionSelect] skip session=' + sessionId +
+    ' reason=' + reason +
+    ' file=' + path.basename(filePath || '') +
+    ' cwd=' + (meta?.cwd || 'n/a') +
+    ' threadSource=' + (meta?.thread_source || 'n/a') +
+    ' parent=' + (meta?.parent_thread_id || 'n/a') +
+    ' forkedFrom=' + (meta?.forked_from_id || 'n/a') +
+    ' originator=' + (meta?.originator || 'n/a') +
+    ' source=' + (sourceSessionId || 'n/a'));
+}
+
+// sessionId → filePath memo. The sessions tree holds hundreds of rollouts
+// (dozens over 100MB); the full walk plus metadata reads costs ~400ms of
+// main-loop time, and every consumer (subscribe, timeline, history, hover)
+// used to pay it again after any state teardown. A rollout never moves once
+// created; existence is re-verified before reuse and a miss falls through to
+// the normal walk.
+const codexSessionFilePathMemo = new Map();
+
+async function locateCodexSessionFile(sessionId, cwd, {
+  rootedIdentity = null,
+  allowContentScan = true,
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}) {
+  if (!sessionId) return null;
+  const roots = sessionsDir === CODEX_SESSIONS_DIR
+    ? [sessionsDir, path.join(CODEX_HOME, 'archived_sessions')] : [sessionsDir];
+  if (!roots.some(root => fs.existsSync(root))) return null;
+
+  const memoKey = sessionId + ':' + (sessionsDir || '');
+  const memoized = codexSessionFilePathMemo.get(memoKey);
+  if (memoized) {
+    try {
+      const resolved = await resolveExistingRollout(memoized);
+      if (resolved.state !== 'present') throw Object.assign(Error('Source unavailable'), { code: resolved.state === 'unknown' ? 'CODEX_SOURCE_UNAVAILABLE' : 'ENOENT' });
+      codexSessionFilePathMemo.set(memoKey, resolved.filePath);
+      return { filePath: resolved.filePath, representation: resolved.representation };
+    } catch {
+      codexSessionFilePathMemo.delete(memoKey);
+    }
+  }
+
+  const files = [];
+  let suffixHit = null;
+  for (const root of roots) {
+    const discovered = await walkJsonlFiles(root, 4000, { includeCompressed: true });
+    files.push(...discovered);
+    const matching = discovered.filter(file => path.basename(file).includes(sessionId) && isCodexRolloutFile(file));
+    suffixHit = matching.find(file => file.endsWith('.jsonl')) || matching[0];
+    if (suffixHit) break;
+  }
+  if (suffixHit) {
+    const physical = await resolveExistingRollout(suffixHit);
+    if (physical.state === 'unknown') throw Object.assign(Error('Codex source unavailable'), { code: 'CODEX_SOURCE_UNAVAILABLE' });
+    if (physical.state === 'present') {
+      codexSessionFilePathMemo.set(memoKey, physical.filePath);
+      return { filePath: physical.filePath, representation: physical.representation };
+    }
+  }
+  if (!allowContentScan) return null;
+
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  for (const filePath of files) {
+    // Native compressed names contain their exact UUID. Do not transcode an
+    // entire archive merely because an unrelated/missing UUID was requested.
+    if (filePath.endsWith('.jsonl.zst')) continue;
+    if (rootedIdentity) {
+      let matched;
+      try { matched = await rootedIdentity(filePath); }
+      catch (error) { if (['ENOENT','ENOTDIR'].includes(error.code)) continue; throw error; }
+      if (!matched) continue;
+      codexSessionFilePathMemo.set(memoKey,filePath);
+      return { filePath };
+    }
+    let metadata;
+    try {
+      metadata = await readCodexSessionMetadata(filePath);
+    } catch {
+      continue;
+    }
+    const meta = metadata.meta;
+    if (meta?.id !== sessionId) continue;
+    if (normalizedCwd && meta.cwd && path.resolve(meta.cwd) !== normalizedCwd) {
+      // Keep searching for an exact cwd match, but accept this below if it is
+      // the only match.
+      codexSessionFilePathMemo.set(memoKey, filePath);
+      return { filePath };
+    }
+    codexSessionFilePathMemo.set(memoKey, filePath);
+    return { filePath };
+  }
+  return null;
+}
+
+async function findCodexSessionFile(sessionId, cwd, options = {}) {
+  const found = await locateCodexSessionFile(sessionId, cwd, options);
+  if (!found) return null;
+  const readable = await prepareCodexRolloutReadFile(found.filePath);
+  await assertCodexRolloutReadViewCurrent(readable.filePath);
+  return { ...found, ...readable };
+}
+
+async function findLatestCodexSession({
+  cwd,
+  sinceMs = 0,
+  sourceSessionId = null,
+  excludeSessionIds = [],
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}) {
+  if (!fs.existsSync(sessionsDir)) return null;
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const excludedSessionIds = new Set((Array.isArray(excludeSessionIds) ? excludeSessionIds : [])
+    .filter(Boolean)
+    .map(String));
+  const files = await walkJsonlFiles(sessionsDir);
+  const candidates = [];
+
+  for (const filePath of files) {
+    let stat;
+    try {
+      stat = await fs.promises.stat(filePath);
+    } catch {
+      continue;
+    }
+    if (sinceMs && stat.mtimeMs < sinceMs - 5000) continue;
+    candidates.push({ filePath, mtimeMs: stat.mtimeMs });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const relatedFallbacks = [];
+  for (const candidate of candidates.slice(0, 80)) {
+    let metadata;
+    try {
+      metadata = await readCodexSessionMetadata(candidate.filePath);
+    } catch {
+      continue;
+    }
+    const meta = metadata.meta;
+    if (!meta?.id) continue;
+    if (excludedSessionIds.has(String(meta.id))) continue;
+    if (sourceSessionId && meta.id === sourceSessionId) continue;
+    const metaCwd = meta.cwd ? path.resolve(meta.cwd) : null;
+    const cwdMatched = !normalizedCwd || (metaCwd && metaCwd === normalizedCwd);
+    const cwdRelated = !normalizedCwd || (metaCwd && pathsAreSameOrNested(metaCwd, normalizedCwd));
+    const sourceMatched = !!sourceSessionId && recordsReferenceSession(metadata.records, sourceSessionId);
+    if (sourceSessionId && !sourceMatched) {
+      if (cwdMatched || cwdRelated) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId }), { sourceSessionId });
+      }
+      continue;
+    }
+    const sessionStartedMs = parseTimestampMs(meta.timestamp);
+    const metadataFreshForLaunch = !sinceMs || (
+      Number.isFinite(sessionStartedMs)
+      && sessionStartedMs >= sinceMs - 5000
+    );
+    let linkedLiveBoundary = null;
+    if (!metadataFreshForLaunch) {
+      // Fresh launches must never adopt an old same-cwd rollout. A linked
+      // resume may reopen an existing direct child, but only a task_started
+      // after this launch proves that the old file is active again.
+      if (!sourceSessionId || !sourceMatched) continue;
+      linkedLiveBoundary = await findCodexLinkedLiveBoundary(candidate.filePath, {
+        startedAtMs: sinceMs,
+      });
+      if (!linkedLiveBoundary?.found) continue;
+    }
+    if (sourceSessionId && !isFreshCodexLaunchSession(meta)) {
+      if (cwdMatched || cwdRelated || sourceMatched) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId: null }), { sourceSessionId });
+      }
+      continue;
+    }
+    if (!sourceSessionId && !isFreshCodexLaunchSession(meta)) {
+      if (cwdMatched || cwdRelated) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId }), { sourceSessionId });
+      }
+      continue;
+    }
+    if (!cwdMatched && !sourceMatched) {
+      if (cwdRelated) {
+        relatedFallbacks.push({
+          sessionId: meta.id,
+          filePath: candidate.filePath,
+          cwd: meta.cwd,
+          cwdMatched: false,
+          cwdRelated: true,
+          sourceMatched,
+          threadSource: meta.thread_source || null,
+          parentThreadId: meta.parent_thread_id || null,
+          forkedFromId: meta.forked_from_id || null,
+          originator: meta.originator || null,
+        });
+      }
+      continue;
+    }
+    return {
+      sessionId: meta.id,
+      filePath: candidate.filePath,
+      cwd: meta.cwd,
+      cwdMatched,
+      cwdRelated,
+      sourceMatched,
+      sourceMatchMode: sourceMatched ? 'direct-fork' : null,
+      metadataStartedAtMs: Number.isFinite(sessionStartedMs) ? sessionStartedMs : null,
+      metadataFreshForLaunch,
+      reopenedExisting: !metadataFreshForLaunch,
+      linkedLiveBoundary,
+      threadSource: meta.thread_source || null,
+      parentThreadId: meta.parent_thread_id || null,
+      forkedFromId: meta.forked_from_id || null,
+      originator: meta.originator || null,
+    };
+  }
+  return relatedFallbacks[0] || null;
+}
+
+async function inspectCodexSessionMetadataIndex(
+  sessionsDir = CODEX_SESSIONS_DIR,
+  dependencies = {},
+) {
+  const walkFiles = dependencies.inspectJsonlFiles || inspectJsonlFiles;
+  const readMetadata = dependencies.readCodexSessionMetadata || readCodexSessionMetadata;
+  let walkResult;
+  try {
+    walkResult = await walkFiles(sessionsDir);
+  } catch (error) {
+    walkResult = {
+      files: [],
+      errors: [{
+        stage: 'walk',
+        path: sessionsDir,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      }],
+      truncated: false,
+    };
+  }
+  const files = Array.isArray(walkResult)
+    ? walkResult
+    : (Array.isArray(walkResult?.files) ? walkResult.files : []);
+  const errors = Array.isArray(walkResult?.errors) ? [...walkResult.errors] : [];
+  const truncated = walkResult?.truncated === true;
+  const entries = [];
+
+  for (const filePath of files) {
+    let metadata;
+    try {
+      metadata = await readMetadata(filePath);
+    } catch (error) {
+      errors.push({
+        stage: 'metadata-read',
+        path: filePath,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      });
+      continue;
+    }
+    const meta = metadata?.meta || {};
+    if (!meta.id) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_metadata_missing',
+        message: 'Readable JSONL could not be classified because session metadata is missing',
+      });
+      continue;
+    }
+    entries.push({
+      meta,
+      filePath,
+    });
+  }
+
+  return {
+    entries,
+    errors,
+    truncated,
+    filesScanned: files.length,
+  };
+}
+
+async function inspectCodexDirectChildSessions({
+  sourceSessionId,
+  cwd,
+  sinceMs,
+  untilMs,
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}, dependencies = {}) {
+  if (!sourceSessionId) {
+    return {
+      complete: false,
+      children: [],
+      errors: [{
+        stage: 'input',
+        path: sessionsDir,
+        code: 'source_session_id_required',
+        message: 'sourceSessionId is required for direct-child discovery',
+      }],
+      truncated: false,
+      filesScanned: 0,
+    };
+  }
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const lowerBound = Number(sinceMs);
+  const upperBound = Number(untilMs);
+  const hasLowerBound = Number.isFinite(lowerBound) && lowerBound > 0;
+  const hasUpperBound = Number.isFinite(upperBound) && upperBound > 0;
+  const index = await inspectCodexSessionMetadataIndex(sessionsDir, dependencies);
+  const errors = [...index.errors];
+  const children = [];
+
+  for (const { meta, filePath } of index.entries) {
+    if (!meta.id
+      || meta.id === sourceSessionId
+      || meta.forked_from_id !== sourceSessionId
+      || !isCodexUserTuiSession(meta)) {
+      continue;
+    }
+    if (normalizedCwd && (!meta.cwd || path.resolve(meta.cwd) !== normalizedCwd)) {
+      continue;
+    }
+    const createdAtMs = parseTimestampMs(meta.timestamp);
+    if (!Number.isFinite(createdAtMs)) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_timestamp_invalid',
+        message: 'Direct child metadata has no usable creation timestamp',
+      });
+      continue;
+    }
+    if (hasLowerBound && createdAtMs < lowerBound) continue;
+    if (hasUpperBound && createdAtMs > upperBound) continue;
+    children.push({
+      sessionId: meta.id,
+      filePath,
+      cwd: meta.cwd || null,
+      forkedFromId: meta.forked_from_id,
+      createdAtMs,
+    });
+  }
+
+  children.sort((left, right) => left.createdAtMs - right.createdAtMs);
+  return {
+    complete: errors.length === 0 && !index.truncated,
+    children,
+    errors,
+    truncated: index.truncated,
+    filesScanned: index.filesScanned,
+  };
+}
+
+function resolveCodexDescendantLineage(meta, sourceSessionId, metadataBySessionId, conflicts) {
+  const source = String(sourceSessionId || '');
+  let currentId = String(meta?.id || '');
+  if (!source || !currentId || currentId === source) {
+    return {
+      proven: false,
+      reason: currentId === source ? 'source-is-not-descendant' : 'lineage-id-missing',
+    };
+  }
+
+  const seen = new Set([currentId]);
+  const chain = [currentId];
+  let depth = 0;
+  while (currentId) {
+    if (conflicts.has(currentId)) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-conflict',
+        conflictSessionId: currentId,
+        chain,
+      };
+    }
+    const current = metadataBySessionId.get(currentId)?.meta || null;
+    if (!current) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-metadata-missing',
+        missingSessionId: currentId,
+        chain,
+      };
+    }
+    const parentId = current.forked_from_id ? String(current.forked_from_id) : '';
+    if (!parentId) {
+      return {
+        proven: false,
+        incomplete: false,
+        reason: 'different-lineage-root',
+        rootSessionId: currentId,
+        chain,
+      };
+    }
+    depth += 1;
+    if (parentId === source) {
+      return {
+        proven: true,
+        incomplete: false,
+        reason: depth === 1 ? 'direct-child' : 'descendant',
+        depth,
+        relation: depth === 1 ? 'direct-child' : 'descendant',
+        chain: [...chain, source],
+      };
+    }
+    if (seen.has(parentId)) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-cycle',
+        cycleSessionId: parentId,
+        chain: [...chain, parentId],
+      };
+    }
+    seen.add(parentId);
+    chain.push(parentId);
+    currentId = parentId;
+  }
+  return {
+    proven: false,
+    incomplete: true,
+    reason: 'lineage-metadata-missing',
+    chain,
+  };
+}
+
+async function inspectCodexDescendantSessions({
+  sourceSessionId,
+  cwd,
+  sinceMs,
+  untilMs,
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}, dependencies = {}) {
+  if (!sourceSessionId) {
+    return {
+      complete: false,
+      descendants: [],
+      errors: [{
+        stage: 'input',
+        path: sessionsDir,
+        code: 'source_session_id_required',
+        message: 'sourceSessionId is required for descendant discovery',
+      }],
+      truncated: false,
+      filesScanned: 0,
+    };
+  }
+
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const lowerBound = Number(sinceMs);
+  const upperBound = Number(untilMs);
+  const hasLowerBound = Number.isFinite(lowerBound) && lowerBound > 0;
+  const hasUpperBound = Number.isFinite(upperBound) && upperBound > 0;
+  const index = await inspectCodexSessionMetadataIndex(sessionsDir, dependencies);
+  const errors = [...index.errors];
+  const metadataBySessionId = new Map();
+  const conflicts = new Set();
+
+  for (const entry of index.entries) {
+    const { meta, filePath } = entry;
+    if (!isCodexUserTuiSession(meta)) continue;
+    if (normalizedCwd && (!meta.cwd || path.resolve(meta.cwd) !== normalizedCwd)) continue;
+    const sessionId = String(meta.id);
+    const existing = metadataBySessionId.get(sessionId);
+    if (existing && existing.filePath !== filePath) {
+      conflicts.add(sessionId);
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'duplicate_session_id',
+        message: 'Multiple rollout files claim the same Codex session ID',
+        sessionId,
+        otherPath: existing.filePath,
+      });
+      continue;
+    }
+    metadataBySessionId.set(sessionId, entry);
+  }
+
+  const descendants = [];
+  const reportedLineageErrors = new Set();
+  for (const { meta, filePath } of metadataBySessionId.values()) {
+    if (meta.id === sourceSessionId || !meta.forked_from_id) continue;
+    const createdAtMs = parseTimestampMs(meta.timestamp);
+    const validTimestamp = Number.isFinite(createdAtMs);
+    if (validTimestamp) {
+      if (hasLowerBound && createdAtMs < lowerBound) continue;
+      if (hasUpperBound && createdAtMs > upperBound) continue;
+    }
+
+    const lineage = resolveCodexDescendantLineage(
+      meta,
+      sourceSessionId,
+      metadataBySessionId,
+      conflicts,
+    );
+    if (!lineage.proven) {
+      if (lineage.incomplete) {
+        const errorKey = [
+          meta.id,
+          lineage.reason,
+          lineage.missingSessionId || lineage.conflictSessionId || lineage.cycleSessionId || '',
+        ].join(':');
+        if (!reportedLineageErrors.has(errorKey)) {
+          reportedLineageErrors.add(errorKey);
+          errors.push({
+            stage: 'lineage-classify',
+            path: filePath,
+            code: lineage.reason,
+            message: 'A fresh Codex rollout has an incomplete ancestry chain',
+            sessionId: meta.id,
+            ...lineage,
+          });
+        }
+      }
+      continue;
+    }
+    if (!validTimestamp) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_timestamp_invalid',
+        message: 'Descendant metadata has no usable creation timestamp',
+        sessionId: meta.id,
+      });
+      continue;
+    }
+    descendants.push({
+      sessionId: meta.id,
+      filePath,
+      cwd: meta.cwd || null,
+      forkedFromId: meta.forked_from_id,
+      createdAtMs,
+      lineageDepth: lineage.depth,
+      lineageRelation: lineage.relation,
+      lineageChain: lineage.chain,
+    });
+  }
+
+  descendants.sort((left, right) => (
+    left.createdAtMs - right.createdAtMs
+    || left.lineageDepth - right.lineageDepth
+    || left.sessionId.localeCompare(right.sessionId)
+  ));
+  return {
+    complete: errors.length === 0 && !index.truncated,
+    descendants,
+    errors,
+    truncated: index.truncated,
+    filesScanned: index.filesScanned,
+  };
+}
+
+function selectSingleProvenCodexRewindRecoveryCandidate(evaluatedCandidates) {
+  const evaluated = Array.isArray(evaluatedCandidates) ? evaluatedCandidates : [];
+  const proven = evaluated.filter(candidate => candidate?.targetProof?.proven === true);
+  if (proven.length === 1) {
+    return {
+      status: 'selected',
+      selected: proven[0],
+      proven,
+      evaluated,
+    };
+  }
+  return {
+    status: 'unresolved',
+    reason: proven.length === 0
+      ? 'no-proven-descendant'
+      : 'multiple-proven-descendants',
+    selected: null,
+    proven,
+    evaluated,
+  };
+}
+
+async function findCodexDirectChildSessions(options = {}) {
+  const inspection = await inspectCodexDirectChildSessions(options);
+  if (!inspection.complete) {
+    const error = new Error('Codex direct-child discovery was incomplete');
+    error.code = 'CODEX_SESSION_DISCOVERY_INCOMPLETE';
+    error.inspection = inspection;
+    throw error;
+  }
+  return inspection.children;
+}
+
+async function findCodexDescendantSessions(options = {}) {
+  const inspection = await inspectCodexDescendantSessions(options);
+  if (!inspection.complete) {
+    const error = new Error('Codex descendant discovery was incomplete');
+    error.code = 'CODEX_SESSION_DISCOVERY_INCOMPLETE';
+    error.inspection = inspection;
+    throw error;
+  }
+  return inspection.descendants;
+}
+
+function pushAssistantEntry(
+  entries,
+  sessionId,
+  record,
+  turnIndex,
+  content,
+  thinking,
+  actions,
+  identityLine = record.__line,
+  identityByteOffset = record.__byteOffset,
+  textPhase = undefined,
+) {
+  if (!content && !thinking && (!actions || actions.length === 0)) return;
+  for (const action of actions || []) {
+    if (action.rawTool) action.rawTool.resultSourceLine = record.__line;
+  }
+  const identityRecord = {
+    __line: identityLine,
+    __byteOffset: identityByteOffset,
+  };
+  entries.push({
+    uuid: stableUuid(sessionId, identityLine, 'codex-assistant'),
+    sourceIdentity: stableSourceIdentity(sessionId, identityRecord, 'codex-assistant'),
+    sourceRecordLine: record.__line,
+    role: 'assistant',
+    timestamp: recordTimestamp(record),
+    content: content || '',
+    ...(content && historyRecordTimeFromRecord(record) ? { recordTime: historyRecordTimeFromRecord(record) } : {}),
+    thinking: thinking || undefined,
+    actions: actions && actions.length > 0 ? actions : undefined,
+    sessionId,
+    turnIndex,
+    // partial_answer is stable answer content even if tools follow it. Keep
+    // it separate from commentary without promoting it to a turn's final.
+    textPhase: textPhase || undefined,
+  });
+}
+
+function applyRollback(list, numTurns, rooted = null) {
+  const requestedTurns = Number(numTurns || 0);
+  const beforeCount = list.length;
+  if (!requestedTurns || requestedTurns <= 0) {
+    return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
+  }
+  const turnIds = rooted ? rooted.make('array') : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const tid = list[i].turnIndex;
+    if (typeof tid !== 'number') continue;
+    if (!turnIds.includes(tid)) turnIds.push(tid);
+    if (turnIds.length >= requestedTurns) break;
+  }
+  if (turnIds.length === 0) {
+    return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
+  }
+  const remove = rooted ? rooted.make('set') : new Set();
+  for (const id of turnIds) remove.add(id);
+  let removedEntries = 0;
+  const removedPreview = [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const entry = list[i];
+    if (!remove.has(entry.turnIndex)) continue;
+    removedEntries += 1;
+    if (removedPreview.length < 4) {
+      removedPreview.push({
+        role: entry.role || entry.type || 'entry',
+        turnIndex: entry.turnIndex,
+        line: entry.uuid ? String(entry.uuid).split('-').pop() : undefined,
+        text: compactPreview(entry.content || entry.thinking || ''),
+      });
+    }
+    list.splice(i, 1);
+  }
+  return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: turnIds, removedEntries, removedPreview };
+}
+
+function logCodexRollback(context, sessionId, record, result) {
+  if (!result) return;
+  const line = Number(record?.__line ?? -1);
+  const key = `${context}:${sessionId || 'unknown'}:${line}:${result.requestedTurns}:${result.removedTurnIds.join(',')}:${result.removedEntries}`;
+  if (loggedRollbackKeys.has(key)) return;
+  loggedRollbackKeys.add(key);
+  if (loggedRollbackKeys.size > 1000) loggedRollbackKeys.clear();
+  const sid = sessionId ? String(sessionId).slice(0, 8) : 'unknown';
+  const removedTurns = result.removedTurnIds.length > 0 ? result.removedTurnIds.join(',') : 'none';
+  const preview = result.removedPreview.map((item) => (
+    `${item.role}@t${item.turnIndex}${item.line ? `/L${item.line}` : ''}:${JSON.stringify(item.text)}`
+  )).join(' | ');
+  console.warn(
+    `[CodexRollback] context=${context} session=${sid}` +
+    ` line=${line + 1} requested=${result.requestedTurns}` +
+    ` removedTurns=${removedTurns} removedEntries=${result.removedEntries}` +
+    ` before=${result.beforeCount} after=${result.afterCount}` +
+    (preview ? ` preview=${preview}` : ' preview=empty/no-op')
+  );
+}
+
+function lastCodexTimelineUser(entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i]?.type === 'user') return entries[i];
+  }
+  return null;
+}
+
+function isCodexSubagentNotification(payload = {}) {
+  if (payload.type !== 'user_message') return false;
+  const text = payload.message || extractTextContent(payload.content) || '';
+  return rootText.coerce(text).includes('<subagent_notification>');
+}
+
+const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
+
+function buildCodexInterruptedHistoryEntry(record, sessionId, turnIndex, { live = false } = {}) {
+  const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+  if (live && (!physicalSessionId || record?.type !== 'event_msg' || record.payload?.type !== 'turn_aborted'
+    || !Number.isSafeInteger(record.__byteOffset) || record.__byteOffset < 0)) return null;
+  const sourceIdentity = stableSourceIdentity(sessionId, record, 'codex-interrupted');
+  return { uuid: live && !Number.isSafeInteger(record.__line) ? sourceIdentity
+      : stableUuidForRecord(sessionId, record, 'codex-interrupted'),
+    sourceIdentity, role: 'interrupted', timestamp: recordTimestamp(record),
+    content: CODEX_INTERRUPTED_HISTORY_TEXT, sessionId: physicalSessionId,
+    ...(Number.isInteger(turnIndex) ? { turnIndex } : {}), serviceCarrier: 'turn-aborted' };
+}
+const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
+
+const { codexProviderErrorEntry } = require('../codex-provider-error');
+
+/**
+ * Resumable Timeline projector — same contract as the history projector
+ * below (feed in file order; finalize without consuming state), same reason:
+ * a live giant refreshed its Timeline through a full 74K-record replay, and
+ * with two giants open the records cache thrashed (evict/full parse every
+ * ~10s, live 07.08 09:56). Timeline enrichment mutates the LAST user entry
+ * retroactively (token_count/task_complete arrive after the row was pushed),
+ * which is resumable by construction — the mutated object is the retained
+ * one; finalize hands out shallow copies so callers never alias live state.
+ *
+ * Also tracks the session-meta head and the fork live-start boundary so
+ * getTimelineSessionMeta no longer needs the records array.
+ */
+function rememberCodexNativeQuestion(definitions, record, sessionId, turnIndex) {
+  const payload = record?.payload || {};
+  if (record?.type !== 'response_item' || payload.type !== 'function_call'
+    || !['request_user_input_async', 'functions.request_user_input_async'].includes(payload.name)
+    || !['', 'functions'].includes(payload.namespace || '')) return;
+  const args = parseToolArguments(payload), callId = payload.call_id;
+  const arena = rootOps.arenaOf(args, definitions);
+  const operations = arena ? rootOps.operations(arena) : undefined;
+  registerNativeQuestionDefinition(definitions, codexNativeQuestionDefinition({
+    toolName: payload.name, namespace: payload.namespace || '', callId,
+    args, turnIndex,
+    physicalSessionId: codexRecordPhysicalSessionId(record, sessionId),
+    sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-assistant'),
+  }, questionReplyFingerprint, operations), operations);
+}
+
+function attachCodexQuestionReplyProof(entry, definitions, physicalSessionId) {
+  const content = entry.content;
+  const arena = rootOps.arenaOf(content, definitions);
+  const proof = proveCodexNativeQuestionReply(content, definitions, physicalSessionId, questionReplyFingerprint,
+    arena ? rootOps.operations(arena) : undefined);
+  if (proof) entry.questionReplyProof = proof;
+  else delete entry.questionReplyProof;
+}
+
+// Paged implementation of the shared response-preview contract. The complete
+// answer is hashed as UTF-8 chunks; its first 2048 UTF-16 units remain pages.
+function rootTimelineResponsePreview(entry) {
+  if (!entry || !rootText.isText(entry.uuid) || !entry.uuid
+    || !rootText.isText(entry.content) || !entry.content.trim()) return undefined;
+  const limit = require('../../shared/timeline-response-preview.cjs').TIMELINE_RESPONSE_PREVIEW_LIMIT;
+  let content = entry.content.slice(0, limit);
+  if (/[\uD800-\uDBFF]$/.test(content.charAt(content.length - 1))) content = content.slice(0, -1);
+  const stamp = entry.timestamp;
+  const timestamp = rootText.isText(stamp)
+    && /(?:Z|[+-]\d{2}:\d{2})$/i.test(rootText.small(stamp.slice(-6), 6))
+    && Number.isFinite(rootDate.parseDate(stamp)) ? stamp : undefined;
+  return {
+    version: 1, uuid: entry.uuid,
+    ...(entry.sourceIdentity ? { sourceIdentity: entry.sourceIdentity } : {}),
+    ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+    ...(timestamp ? { timestamp } : {}),
+    content, contentLength: entry.content.length,
+    contentHash: rootText.hash(entry.content, 'sha256'),
+    truncated: content.length < entry.content.length,
+  };
+}
+
+function rootTimelineAgentLabel(value) {
+  value = rootText.coerce(value);
+  const match = require('../history-paged-pattern').exec(/\s+·\s+running\s*$/i, value);
+  return match ? value.slice(0, match.index) : value;
+}
+
+function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = false, metadataOnly = false, rooted } = {}) {
+  if (rooted && !(rooted instanceof HistoryProjectionArena)) throw new TypeError('HistoryProjectionArena required');
+  if (rooted && !rooted.inStep) return rooted.step(() => createCodexTimelineProjector(sessionId, seed, { mutationOnly, metadataOnly, rooted }));
+  // A distinct register block permits an eventual shared arena with History.
+  // Native seeds belong to the legacy factory; rooted continuation is a checkpoint.
+  if (rooted) seed = rooted.state().timeline ||= rooted.make('object');
+  const own = value => rooted ? rooted.own(value) : value;
+  const list = () => rooted ? rooted.make('array') : [];
+  const map = () => rooted ? rooted.make('map') : new Map();
+  const sameOwner = (a, b) => rooted ? rooted.same(a, b) : a === b;
+  const prompt = rooted ? createRootPromptText(rooted) : null;
+  const presentUserText = prompt?.presentation || codexUserMessagePresentationText;
+  const imageRefsFor = prompt?.imageRefs || codexUserMessageImageRefs;
+  const mergeImageRefs = prompt?.mergeRefs || mergeCodexUserMessageImageRefs;
+  const matchesUserText = prompt?.matches || codexUserCarrierTextsMatch;
+  const goalUserText = prompt?.goal || isCodexGoalContinuationUserText;
+  const abortedUserText = prompt?.aborted || isCodexTurnAbortedUserText;
+  const environmentUserText = prompt?.environment || isCodexEnvironmentContextUserText;
+  const instructionsUserText = prompt?.instructions || isCodexProjectInstructionsUserText;
+  const entries = seed.entries ?? (rooted ? (seed.entries = list()) : list());
+  const questionDefinitions = seed.questionDefinitions ?? (rooted ? (seed.questionDefinitions = map()) : map());
+  const pendingResponseUsers = seed.pendingResponseUsers ?? (rooted ? (seed.pendingResponseUsers = list()) : list());
+  const pendingFileEditCalls = seed.pendingFileEditCalls ?? (rooted ? (seed.pendingFileEditCalls = map()) : map());
+  const pendingSubagentCalls = seed.pendingSubagentCalls ?? (rooted ? (seed.pendingSubagentCalls = map()) : map());
+  let pendingResponsePreview = seed.pendingResponsePreview ?? null;
+  let pendingResponsePreviewOwner = seed.pendingResponsePreviewOwner ?? null;
+  let currentUser = seed.currentUser ?? null;
+  let currentTurnIndex = seed.currentTurnIndex ?? -1;
+  let latestModel = seed.latestModel ?? null;
+  let latestEffort = seed.latestEffort ?? null;
+  let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
+  let pendingCompactCompanions = seed.pendingCompactCompanions ?? 0;
+  let metaRecord = seed.metaRecord ?? null;
+  let metaRecordPhysicalSessionId = seed.metaRecordPhysicalSessionId ?? null;
+  let forkLiveStartLine = seed.forkLiveStartLine;
+  let forkStartedAtMs = seed.forkStartedAtMs ?? NaN;
+  let currentTurnCanonicalUserText = seed.currentTurnCanonicalUserText ?? null;
+  let currentTurnCanonicalUserEntry = seed.currentTurnCanonicalUserEntry ?? null;
+  let sessionCwd = seed.sessionCwd ?? '';
+  let consumedRecords = seed.consumedRecords ?? 0;
+
+  const attachSubagentLaunch = (entry, payload, record) => {
+    if (!entry) return;
+    const callId = rootText.coerce(payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-agent'));
+    const call = own({
+      callId,
+      toolName: payload.name || payload.tool_name || payload.type,
+      namespace: payload.namespace || '',
+      args: parseToolArguments(payload),
+    });
+    if (!codexHistoryLogicalCalls(call).some(isCodexSubagentSpawnCall)) return;
+    // Reuse the exact History decoder: current Codex often wraps
+    // `collaboration.spawn_agent` inside one custom `exec` call, so checking
+    // only the outer tool name would miss the launch marker on Timeline.
+    if (!Array.isArray(entry.subAgents)) entry.subAgents = list();
+    const keys = list();
+    for (const card of codexHistoryActionsForCall(call, undefined, false).actions || []) {
+      if (card.tool !== 'Task') continue;
+      const key = rooted ? rootText.concat(['task:', card.toolUseId || callId], '', rooted) : 'task:' + (card.toolUseId || callId);
+      const label = rooted ? rootTimelineAgentLabel(card.description || 'Agent') : String(card.description || 'Agent').replace(/\s+·\s+running\s*$/i, '');
+      keys.push(key);
+      if (!entry.subAgents.some(agent => sameOwner(agent?.key, key))) entry.subAgents.push({ key, label });
+    }
+    pendingSubagentCalls.set(callId, { call, userOwner: entry, keys });
+  };
+
+  const feed = (record) => {
+    const payload = record.payload || {};
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    if (!mutationOnly && !metadataOnly) rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+
+    if (record.type === 'session_meta') {
+      if (payload.cwd) sessionCwd = payload.cwd;
+      // A native full Fork can contain its own header followed by copied
+      // ancestor headers in the SAME file. Physical provenance alone must not
+      // let the later copy replace that file's identity. Virtual projections
+      // may still upgrade from an ancestor segment to the child's first header.
+      if (!metaRecord || (physicalSessionId === sessionId && metaRecordPhysicalSessionId !== sessionId)) {
+        metaRecord = own({ payload, __line: record.__line });
+        metaRecordPhysicalSessionId = physicalSessionId;
+        if (payload.forked_from_id && physicalSessionId === sessionId) {
+          forkStartedAtMs = parseTimestampMs(payload.timestamp);
+        }
+      }
+      return;
+    }
+
+    // Fork live boundary: first task_started proving the fork's own live run
+    // (mirrors getCodexForkLiveStartLine, evaluated incrementally).
+    if (
+      forkLiveStartLine === undefined
+      && Number.isFinite(forkStartedAtMs)
+      && record.type === 'event_msg'
+      && payload.type === 'task_started'
+    ) {
+      const payloadStartedAt = rootText.number(payload.started_at);
+      if (Number.isFinite(payloadStartedAt) && payloadStartedAt > 0) {
+        if (payloadStartedAt * 1000 >= forkStartedAtMs - 1000) forkLiveStartLine = record.__line;
+      } else {
+        const recordAtMs = parseTimestampMs(record.timestamp);
+        if (Number.isFinite(recordAtMs) && recordAtMs >= forkStartedAtMs + 1000) {
+          forkLiveStartLine = record.__line;
+        }
+      }
+    }
+
+    // Legacy full History needs only this exact metadata/boundary reducer.
+    // Do not construct a second complete Timeline graph for that request.
+    if (metadataOnly) return;
+
+    if (record.type === 'compacted') {
+      pendingCompactCompanions += 1;
+      const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
+      entries.push({
+        uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
+        type: 'compact',
+        timestamp: recordTimestamp(record),
+        content: compactEventTitle(payload),
+        sourceLine: record.__line,
+        preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+        postTokens: compactPostTokenCount(payload),
+        compactEncrypted: true,
+        sessionId: physicalSessionId,
+        turnIndex: currentTurnIndex,
+      });
+      return;
+    }
+
+    if (record.type === 'turn_context') {
+      if (payload.cwd) sessionCwd = payload.cwd;
+      latestModel = payload.model || latestModel;
+      latestEffort = payload.effort || latestEffort;
+      if (currentUser) currentUser.responseModel = latestModel || currentUser.responseModel;
+      return;
+    }
+
+    if (record.type === 'event_msg') {
+      if (!mutationOnly && payload.type === 'patch_apply_end' && parseCodexPatchApplyChanges(payload)
+        && attachCodexPatchApplyEvent(pendingFileEditCalls, payload, sessionCwd)) {
+        for (const call of pendingFileEditCalls.values()) {
+          if (!call.patchApplyEvents.includes(payload) || !call.userOwner) continue;
+          addSemanticDocsEdits(call.userOwner, codexHistoryActionsForCall(call, undefined, false).actions, call.cwd);
+        }
+      }
+      if (payload.type === 'task_started') {
+        currentTurnCanonicalUserText = null;
+        currentTurnCanonicalUserEntry = null;
+      }
+      if (payload.type === 'user_message') {
+        const text = presentUserText(record);
+        const goalContinuation = goalUserText(text);
+        // Service record, not a user turn: a fire-and-forget subagent
+        // announces completion via <subagent_notification> inside a user
+        // message. Full history feeds it to the card tracker; Timeline must
+        // not mint a phantom dot for it.
+        if (isCodexSubagentNotification(payload)) return;
+        if (abortedUserText(text)
+          || environmentUserText(text)
+          || instructionsUserText(text)) return;
+        // Companion pairing window closes at the next REAL user turn (same
+        // counter semantics as the old whole-file pre-pass). Injected
+        // environment context above is service input, not that boundary.
+        pendingCompactCompanions = 0;
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          matchesUserText(candidate.text, text)
+        ));
+        if (pendingIndex >= 0) {
+          const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
+          pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
+          promoteStableSourceIdentity(
+            pending.entry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          pending.entry.timestamp = recordTimestamp(record);
+          pending.entry.content = goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : text;
+          pending.entry.isGoalContinuation = goalContinuation || undefined;
+          pending.entry.sourceLine = record.__line;
+          pending.entry.sessionId = physicalSessionId;
+          pending.entry.hasImage = Array.isArray(payload.images) ? payload.images.length > 0 : false;
+          const imageRefs = mergeImageRefs(imageRefsFor(record), pending.entry.imagePaths);
+          if (imageRefs.length > 0) pending.entry.imagePaths = imageRefs;
+          pending.entry.hasImage ||= imageRefs.length > 0;
+          currentUser = pending.entry;
+        } else {
+          currentTurnIndex += 1;
+          const entry = own({
+            uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+            sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+            type: 'user',
+            timestamp: recordTimestamp(record),
+            content: goalContinuation
+              ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+              : text,
+            isGoalContinuation: goalContinuation || undefined,
+            sourceLine: record.__line,
+            hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
+            ...(imageRefsFor(record).length > 0 ? { imagePaths: imageRefsFor(record) } : {}),
+            sessionId: physicalSessionId,
+            turnIndex: currentTurnIndex,
+            responseModel: latestModel || undefined,
+            responseEffort: latestEffort || undefined,
+          });
+          entries.push(entry);
+          currentUser = entry;
+          pendingResponsePreview = null;
+          pendingResponsePreviewOwner = null;
+        }
+        currentTurnCanonicalUserText = text;
+        currentTurnCanonicalUserEntry = currentUser;
+        if (!mutationOnly) attachCodexQuestionReplyProof(currentUser, questionDefinitions, physicalSessionId);
+      } else if (payload.type === 'thread_rolled_back') {
+        const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1), rooted);
+        for (const [id, definition] of questionDefinitions) {
+          if (rollback.removedTurnIds.includes(definition.turnIndex)) questionDefinitions.delete(id);
+        }
+        if (rooted) {
+          // The removed-turn collection may itself be huge. The logger needs
+          // only a bounded diagnostic sample; the full rollback stays paged.
+          const removedTurnIds = [];
+          for (let index = 0; index < Math.min(4, rollback.removedTurnIds.length); index++) removedTurnIds.push(rollback.removedTurnIds[index]);
+          logCodexRollback('timeline', sessionId, record, { ...rollback, removedTurnIds });
+        } else logCodexRollback('timeline', sessionId, record, rollback);
+        if (rooted) {
+          currentTurnIndex = -1;
+          for (const entry of entries) if (typeof entry.turnIndex === 'number') currentTurnIndex = Math.max(currentTurnIndex, entry.turnIndex);
+        } else currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        currentUser = lastCodexTimelineUser(entries);
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
+        currentTurnCanonicalUserEntry = currentUser;
+        currentTurnCanonicalUserText = currentUser?.isGoalContinuation
+          ? null
+          : currentUser?.content || null;
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
+      } else if (payload.type === 'token_count') {
+        const info = payload.info || {};
+        latestTokenCountInfo = info;
+        const last = info.last_token_usage || {};
+        const total = info.total_token_usage || {};
+        if (currentUser) {
+          currentUser.responseTokens = Number(last.total_tokens || last.output_tokens || 0) || undefined;
+          currentUser.responseModel = latestModel || currentUser.responseModel;
+          currentUser.responseEffort = latestEffort || currentUser.responseEffort;
+          const contextWindow = Number(info.model_context_window || 0);
+          const totalTokens = Number(total.total_tokens || 0);
+          if (contextWindow > 0 && totalTokens > 0) {
+            currentUser.contextPct = Math.min(100, Math.max(0, (totalTokens / contextWindow) * 100));
+          }
+          // Per-turn API usage from THIS request's last_token_usage. Codex re-sends
+          // full history each turn, so `last` is exactly this turn's billing receipt
+          // (per-entry is honest; do NOT sum across a range — counters overlap).
+          // Shape differs from Claude: Codex exposes cached_input_tokens (cache-read
+          // analogue; no cache_creation) and splits output into reasoning vs answer.
+          const lastInput = Number(last.input_tokens || 0);
+          const lastCached = Number(last.cached_input_tokens || 0);
+          const lastOutput = Number(last.output_tokens || 0);
+          const lastReasoning = Number(last.reasoning_output_tokens || 0);
+          if (lastInput > 0 || lastOutput > 0) {
+            currentUser.codexUsage = {
+              inputCached: lastCached,
+              inputUncached: Math.max(0, lastInput - lastCached),
+              outputAnswer: Math.max(0, lastOutput - lastReasoning),
+              outputReasoning: lastReasoning,
+            };
+          }
+          // Subscription quota snapshot (5h / weekly). Same source the toolbar usage
+          // chip reads; surfaced here too so the detail panel can show "where this
+          // turn left my budget" without a second lookup. resets_at → epoch seconds.
+          const limits = buildCodexUsageFromRateLimits(payload.rate_limits);
+          if (limits && (limits.five_hour || limits.seven_day)) {
+            currentUser.codexLimits = {
+              fiveHourPct: limits.five_hour?.utilization ?? null,
+              fiveHourResetsAt: limits.five_hour?.resets_at ?? null,
+              weeklyPct: limits.seven_day?.utilization ?? null,
+              weeklyResetsAt: limits.seven_day?.resets_at ?? null,
+              planType: limits.plan_type ?? null,
+            };
+          }
+        }
+      } else if (payload.type === 'task_complete' && currentUser) {
+        currentUser.responseComplete = true;
+        if (!payload.error && !currentUser.responsePreview && sameOwner(pendingResponsePreviewOwner, currentUser)) {
+          currentUser.responsePreview = pendingResponsePreview || undefined;
+        }
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
+        pendingResponseUsers.length = 0;
+      } else if (payload.type === 'turn_aborted') {
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
+      } else if (isCompactPayload(payload)) {
+        if (pendingCompactCompanions > 0) {
+          pendingCompactCompanions -= 1;
+          return;
+        }
+        const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
+        entries.push({
+          uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
+          type: 'compact',
+          timestamp: recordTimestamp(record),
+          content: compactEventTitle(payload),
+          sourceLine: record.__line,
+          preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+          postTokens: compactPostTokenCount(payload),
+          compactEncrypted: true,
+          sessionId: physicalSessionId,
+          turnIndex: currentTurnIndex,
+        });
+      }
+      return;
+    }
+
+    if (record.type === 'response_item') {
+      if (payload.type === 'message' && payload.role === 'user') {
+        const text = presentUserText(record);
+        const goalContinuation = goalUserText(text);
+        if (!text
+          || text.includes('<subagent_notification>')
+          || abortedUserText(text)
+          || environmentUserText(text)
+          || instructionsUserText(text)) return;
+        if (currentTurnCanonicalUserText
+          && matchesUserText(currentTurnCanonicalUserText, text)) {
+          const imageRefs = mergeImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
+            imageRefsFor(record));
+          if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
+          if (currentTurnCanonicalUserEntry) currentTurnCanonicalUserEntry.hasImage ||= imageRefs.length > 0;
+          addStableSourceIdentityAlias(
+            currentTurnCanonicalUserEntry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          return;
+        }
+        pendingCompactCompanions = 0;
+        currentTurnIndex += 1;
+        const content = Array.isArray(payload.content) ? payload.content : [];
+        const entry = own({
+          uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+          type: 'user',
+          timestamp: recordTimestamp(record),
+          content: goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : text,
+          isGoalContinuation: goalContinuation || undefined,
+          sourceLine: record.__line,
+          hasImage: content.some((part) => rooted
+            ? rootText.includesAsciiIgnoreCase(rootText.coerce(part?.type || ''), 'image')
+            : String(part?.type || '').toLowerCase().includes('image')),
+          sessionId: physicalSessionId,
+          turnIndex: currentTurnIndex,
+          responseModel: latestModel || undefined,
+          responseEffort: latestEffort || undefined,
+          ...(imageRefsFor(record).length > 0 ? { imagePaths: imageRefsFor(record) } : {}),
+        });
+        if (!mutationOnly) attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
+        entries.push(entry);
+        currentUser = entry;
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
+        pendingResponseUsers.push({ entry, text });
+        return;
+      }
+      // Mutation proof needs the same canonical carrier/compact/rollback
+      // reducer, not another scan of retained tool code or answer enrichment.
+      // This private mode is never published as the rich UI projection.
+      if (mutationOnly) return;
+      if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        // An untyped interim note before work is not a completed answer.
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
+        collectCodexDocsAttributes(currentUser, payload, sessionCwd);
+        attachSubagentLaunch(currentUser, payload, record);
+        const toolName = payload.name || payload.tool_name || '';
+        const args = payload.arguments != null ? parseToolArguments(payload)
+          : (rootText.isText(payload.input) ? { input: payload.input } : payload.input || {});
+        if (currentUser && (toolName === 'apply_patch' || toolName === 'exec'
+          && rootText.isText(args?.input)
+          && findCodexExecNestedCalls(args.input).some(call => call.toolName === 'apply_patch'))) {
+          const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
+          pendingFileEditCalls.set(callId, { callId, toolName, args,
+            cwd: sessionCwd, userOwner: currentUser,
+            turnId: rootText.coerce(payload.turn_id || payload.internal_chat_message_metadata_passthrough?.turn_id || ''),
+            patchApplyEvents: [] });
+        }
+      }
+      if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+        pendingFileEditCalls.delete(payload.call_id || payload.id);
+        const callId = payload.call_id || payload.id;
+        const pending = pendingSubagentCalls.get(callId);
+        pendingSubagentCalls.delete(callId);
+        if (pending) {
+          const cards = codexHistoryActionsForCall(pending.call, payload.output, !!payload.is_error).actions
+            .filter(action => action.tool === 'Task' && action.subagentSpawn?.accepted === true);
+          if (cards.length) {
+            pending.userOwner.subAgents = pending.userOwner.subAgents.filter(agent => !pending.keys.includes(agent.key));
+            for (const card of cards) {
+              const key = rooted ? rootText.concat(['task:', card.toolUseId], '', rooted) : 'task:' + card.toolUseId;
+              if (!pending.userOwner.subAgents.some(agent => sameOwner(agent.key, key))) {
+                pending.userOwner.subAgents.push({ key, label: card.description });
+              }
+            }
+          }
+        }
+      }
+      if (payload.type === 'reasoning' && currentUser) {
+        currentUser.responseHasThinking = true;
+      } else if (payload.type === 'message' && payload.role === 'assistant' && currentUser) {
+        currentUser.responseModel = payload.model || latestModel || currentUser.responseModel;
+        const preview = (rooted ? rootTimelineResponsePreview : timelineResponsePreview)({
+          uuid: stableUuidForRecord(sessionId, record, 'codex-assistant'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-assistant'),
+          sessionId: physicalSessionId,
+          timestamp: record.timestamp,
+          content: extractTextContent(payload.content),
+        });
+        if (payload.phase === 'final_answer' && preview) {
+          currentUser.responsePreview = preview;
+          pendingResponsePreview = null;
+          pendingResponsePreviewOwner = null;
+        } else if (!payload.phase && preview) {
+          pendingResponsePreview = own(preview);
+          pendingResponsePreviewOwner = currentUser;
+        }
+      }
+    }
+  };
+
+  function* finalizeSteps() {
+    const length = entries.length, result = new Array(length);
+    for (let index = 0; index < length; index++) {
+      yield;
+      if (!(index in entries)) continue;
+      const entry = entries[index];
+      result[index] = {
+        ...entry,
+        ...(entry.questionReplyProof ? { questionReplyProof: { ...entry.questionReplyProof,
+          links: entry.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
+        ...(entry.imagePaths ? { imagePaths: entry.imagePaths.map(ref => ({ ...ref })) } : {}),
+        ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview } } : {}),
+        ...(Array.isArray(entry.subAgents)
+          ? { subAgents: entry.subAgents.map((agent) => ({ ...agent })) }
+          : {}),
+      };
+    }
+    return result;
+  }
+  const finalize = () => drainProjectionSteps(finalizeSteps());
+
+  const getSessionMeta = () => {
+    const meta = metaRecord?.payload || {};
+    return {
+      id: meta.id,
+      ...(meta.session_id == null ? {} : { session_id: meta.session_id }),
+      forked_from_id: meta.forked_from_id,
+      forked_from_ordinal_exclusive: meta.forked_from_ordinal_exclusive,
+      history_mode: meta.history_mode,
+      history_base: meta.history_base,
+      timestamp: meta.timestamp,
+      cwd: meta.cwd,
+      sourceLine: metaRecord?.__line,
+      forkLiveStartLine,
+    };
+  };
+
+
+  if (rooted) {
+    const syncRoot = () => Object.assign(seed, {
+      entries, questionDefinitions, pendingResponseUsers, pendingFileEditCalls, pendingSubagentCalls, consumedRecords,
+      pendingResponsePreview, pendingResponsePreviewOwner, currentUser, currentTurnIndex,
+      latestModel, latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
+      metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, sessionCwd,
+    });
+    const loadRegisters = () => {
+      ({ consumedRecords, pendingResponsePreview, pendingResponsePreviewOwner, currentUser, currentTurnIndex,
+        latestModel, latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
+        metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
+        currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, sessionCwd } = seed);
+    };
+    syncRoot();
+    function* finalizeRootSteps(options = {}) {
+      // Timeline needs no pending-tail materialization: enrichment is already
+      // on its user owner. Publish the same ordered graph on a frozen CoW view,
+      // without a native DTO, per-row clones or a second retained owner index.
+      const view = rooted.fork();
+      let result, primaryError, failed = false;
+      try {
+        result = view.step(() => view.publish(view.state().timeline.entries));
+        rooted.metrics.finalizerSteps++;
+        options.onRootStep?.({ ...rooted.stats(), rootPublished: true });
+        // Do not transfer the result until the private view was closed.
+        view.close();
+        const published = result; result = null; return published;
+      } catch (error) { primaryError = error; failed = true; throw error; }
+      finally {
+        let cleanupError;
+        try { result?.release(); } catch (error) { cleanupError = error; }
+        try { view.close(); } catch (error) { cleanupError ||= error; }
+        if (cleanupError && !failed) throw cleanupError;
+        if (cleanupError && failed) console.warn('[CodexTimeline] secondary root cleanup failure',
+          cleanupError.code || cleanupError.message, 'primary:', primaryError?.code || primaryError?.message);
+      }
+    }
+    return {
+      feed(record) {
+        try { return rooted.step(() => { feed(own(record)); consumedRecords++; syncRoot(); }); }
+        catch (error) { loadRegisters(); throw error; }
+      },
+      finalizeRootSteps,
+      finalizeRoot: options => drainProjectionSteps(finalizeRootSteps(options)),
+      exportRoot: () => rooted.checkpoint(),
+      getConsumedRecords: () => consumedRecords,
+      getSessionMeta,
+      rootStats: () => rooted.stats(),
+      close: () => rooted.close(),
+    };
+  }
+
+  return {
+    feed,
+    finalize,
+    finalizeSteps,
+    getSessionMeta,
+    exportState: () => ({
+      entries, questionDefinitions, pendingResponseUsers, pendingFileEditCalls, pendingSubagentCalls, currentUser, currentTurnIndex, latestModel,
+      pendingResponsePreview, pendingResponsePreviewOwner,
+      latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
+      metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, sessionCwd,
+    }),
+    // Cost accounting reads the retained projector state directly; callers
+    // still receive cloned rows through finalize().
+    peekEntries: () => entries,
+  };
+}
+
+function buildCodexTimeline(records, sessionId) {
+  const projector = createCodexTimelineProjector(sessionId);
+  for (const record of Array.isArray(records) ? records : []) {
+    projector.feed(record);
+  }
+  return projector.finalize();
+}
+
+function buildCodexMutationTimeline(records, sessionId) {
+  const projector = createCodexTimelineProjector(sessionId, {}, { mutationOnly: true });
+  for (const record of Array.isArray(records) ? records : []) projector.feed(record);
+  return projector.finalize();
+}
+
+async function buildCodexTimelineCooperatively(records, sessionId, control) {
+  const projector = createCodexTimelineProjector(sessionId);
+  await control.drain('timelineFeed', (function* () {
+    for (const record of Array.isArray(records) ? records : []) {
+      projector.feed(record);
+      control.stats.timelineFedRecords++;
+      yield;
+    }
+  })());
+  return control.drain('timelineFinalize', projector.finalizeSteps());
+}
+
+/**
+ * Resumable full-history projector.
+ *
+ * The one-shot `buildCodexFullHistory(records)` pass made every refresh of a
+ * live session O(whole file): one appended tool result re-projected all 74K
+ * records of a 730MB rollout (~3.5s of main loop, tab-3163/3233 ping-pong,
+ * live 07.08 09:56). The projector keeps the pass's accumulated state —
+ * entries, pending calls, exec cells, subagent tracker, thinking buffer —
+ * so a refresh feeds ONLY the appended records.
+ *
+ * Contract:
+ * - `feed(record)` consumes exactly one parsed rollout record. Records must
+ *   arrive in file order; identity fields (__line/__byteOffset) come from
+ *   the JSONL reader and are stable across incremental re-reads.
+ * - `finalize()` returns the presentation array WITHOUT consuming state: the
+ *   in-flight tail (pending calls materialized as live cards) is built on a
+ *   copy each time, so `feed` may continue afterwards. Calling it twice in a
+ *   row returns equal results.
+ * - The compact-companion pre-pass of the old builder is folded into a
+ *   forward counter (its transitions only ever depended on records already
+ *   seen), so no whole-file pre-scan remains.
+ *
+ * Mutation rules the resumability leans on (same as the one-shot pass):
+ * Task cards are shared by reference between state entries and the tracker
+ * and are mutated in place by later records; background exec cells fill
+ * results into already-pushed action objects. `finalize` mutating a card via
+ * the own-transcript last resort is monotone (completed never reverts except
+ * by an explicit resume record, which arrives through `feed`).
+ */
+function refreshCodexSubagentCards(cards, sessionId) {
+  return drainProjectionSteps(refreshCodexSubagentCardSteps(cards, sessionId));
+}
+
+function* refreshCodexSubagentCardSteps(cards, sessionId, sourceOptions = {}) {
+  for (const card of cards) {
+    yield;
+    const generation = card.processOwnerSource && getCodexProcessActionGeneration(card.processOwnerSource);
+    if (generation) card.processGeneration = generation;
+    else delete card.processGeneration;
+  }
+  let tracked = 0, resolved = 0;
+  for (const card of cards) {
+    yield;
+    if (!(card.subagentStatus === 'running'
+      || (card.subagentStatus === 'completed' && (!Number(card.completedAt)
+        || card.completionTimingSource === 'parent')))) continue;
+    tracked++;
+    if (!card.agentSessionId) continue;
+    const timingKey = String(card.startedAt || 0) + ':' + String(card.completedAt || 0);
+    if (card.subagentStatus === 'completed' && card.completionTimingAttemptKey === timingKey) continue;
+    card.completionTimingAttemptKey = timingKey;
+    const filePath = findCodexAgentFile({ agentSessionId: card.agentSessionId, sessionsDir: sourceOptions.sessionsDir,
+      rooted: projectionArenaOf(card) });
+    if (!filePath) continue;
+    const completion = readAgentCompletionProof({ toolType: 'codex', filePath, notBefore: card.startedAt,
+      rooted: projectionArenaOf(card) });
+    if (!completion.finished) continue;
+    if (card.subagentStatus === 'running') resolved++;
+    card.subagentStatus = 'completed';
+    card.description = card.baseDescription;
+    if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
+    if (completion.completedAt > 0) {
+      card.completedAt = completion.completedAt;
+      card.completionTimingSource = 'child';
+      if (Number(card.startedAt) > 0) card.durationMs = Math.max(0, completion.completedAt - Number(card.startedAt));
+    }
+  }
+  if (resolved) console.log('[CodexSubagents] closed by own transcript: ' + resolved
+    + '/' + tracked + ' session=' + String(sessionId).slice(0, 8));
+}
+
+function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink, rooted, sourceOptions = {}, canonicalStore } = {}) {
+  if (!rooted && !catalogSink) return require('../codex-owned-history').createOwnedCodexHistoryProjector(
+    createCodexHistoryProjector, sessionId, seed, { sourceOptions,
+      canonicalStore: canonicalStore || _codexProjectionStorage?.canonicalStore?.() });
+  if (rooted && !(rooted instanceof HistoryProjectionArena)) throw new TypeError('HistoryProjectionArena required');
+  if (rooted && catalogSink) throw new TypeError('rooted canonical and catalog projection are distinct owners');
+  if (rooted && !rooted.inStep) return rooted.step(() => createCodexHistoryProjector(sessionId, seed, { rooted, sourceOptions }));
+  if (rooted) seed = rooted.state();
+  const own = value => rooted ? rooted.own(value) : value;
+  const sameOwner = (left, right) => rooted ? rooted.same(left, right) : left === right;
+  const list = () => rooted ? rooted.make('array') : [];
+  const map = () => rooted ? rooted.make('map') : new Map();
+  const promptText = rooted ? createRootPromptText(rooted) : null;
+  const presentUserText = promptText?.presentation || codexUserMessagePresentationText;
+  const userImageRefs = promptText?.imageRefs || codexUserMessageImageRefs;
+  const mergeImageRefs = promptText?.mergeRefs || mergeCodexUserMessageImageRefs;
+  const compareUserText = promptText?.matches || codexUserCarrierTextsMatch;
+  const environmentUserText = promptText?.environment || isCodexEnvironmentContextUserText;
+  const goalUserText = promptText?.goal || isCodexGoalContinuationUserText;
+  const instructionsUserText = promptText?.instructions || isCodexProjectInstructionsUserText;
+  const abortedUserText = promptText?.aborted || isCodexTurnAbortedUserText;
+  const auditUserText = promptText?.fingerprint || promptAuditFingerprint;
+  // Opt-in catalog projection: ownership, row placement and rollback still
+  // belong to this reducer. The sink detaches payloads, never reduces turns.
+  const retainUserText = (text, record) => catalogSink?.retainUserText?.(text, record) ?? text;
+  const userTextsMatch = (left, right) => catalogSink?.userTextsMatch
+    ? catalogSink.userTextsMatch(left, right) : compareUserText(left, right);
+  const bindUserRecordByteOffset = (entry, record) => {
+    // The selected physical carrier owns the byte boundary. Missing/invalid
+    // coordinates remain unavailable, never line-number or identity parsing.
+    const offset = record?.__byteOffset;
+    if (Number.isSafeInteger(offset) && offset >= 0) entry.recordByteOffset = offset;
+    else delete entry.recordByteOffset;
+  };
+  const retainUserEntry = (entry, record) => {
+    bindUserRecordByteOffset(entry, record);
+    return catalogSink?.onUserEntry?.(entry, record);
+  };
+  const pushProjectedAssistantEntry = (...args) => {
+    const target = args[0], before = target.length;
+    pushAssistantEntry(...args);
+    for (let index = before; index < target.length; index++) {
+      catalogSink?.onAssistantEntry?.(target[index], args[2]);
+    }
+  };
+  const entries = seed.entries ?? (rooted ? (seed.entries = list()) : []);
+  const questionDefinitions = seed.questionDefinitions ?? (rooted ? (seed.questionDefinitions = map()) : new Map());
+  const pendingResponseUsers = seed.pendingResponseUsers ?? (rooted ? (seed.pendingResponseUsers = list()) : []);
+  const pendingProjectInstructions = seed.pendingProjectInstructions ?? (rooted ? (seed.pendingProjectInstructions = list()) : []);
+  const pendingCalls = seed.pendingCalls ?? (rooted ? (seed.pendingCalls = map()) : new Map());
+  const pendingExecCells = seed.pendingExecCells ?? (rooted ? (seed.pendingExecCells = map()) : new Map());
+  if (rooted && !seed.subagents) seed.subagents = own({ cardByCallId: map(), cardByAgentKey: map() });
+  const subagents = createCodexSubagentTracker(seed.subagents, { own });
+  const registerSubagentSpawn = (call) => {
+    const card = subagents.registerSpawn(call);
+    card.processOwnerSource = {
+      sessionId: call?.physicalSessionId || sessionId,
+      callId: call?.parentCallId || call?.callId,
+      sourceByteOffset: call?.byteOffset,
+    };
+    const processGeneration = getCodexProcessActionGeneration(card.processOwnerSource);
+    if (processGeneration) card.processGeneration = processGeneration;
+    return card;
+  };
+  const trackDecodedSubagents = (actions, call, observedAt) => actions.map(action => {
+    if (action.tool !== 'Task' || !action.subagentSpawn) return action;
+    const proof = action.subagentSpawn;
+    // An unprinted exec receipt is not an accepted child identity.
+    if (!proof.accepted) return action;
+    const id = action.toolUseId;
+    let card = subagents.getCard(id);
+    if (!card) {
+      card = registerSubagentSpawn({ ...call, callId: id, parentCallId: call.callId,
+        args: proof.args || {} });
+      subagents.attachSpawnOutput(id, proof.identity, observedAt);
+      card.baseDescription = action.baseDescription || action.description;
+      card.description = card.baseDescription;
+    }
+    return card;
+  });
+  const absorbNestedSubagentControls = (call, output, observedAt) => {
+    if (call.toolName !== 'exec') return;
+    const logical = codexHistoryLogicalCalls(call);
+    const parts = codexHistoryOutputParts(output);
+    const controls = logical.filter(isCodexSubagentControlCall);
+    for (const control of controls) {
+      const scoped = parts.length === logical.length ? parts[control.index]
+        : controls.length === 1 && logical.length === 1 ? joinCodexHistoryText(parts) : null;
+      if (scoped !== null) subagents.absorbControlOutput({ ...control, timestamp: call.timestamp }, scoped, observedAt);
+    }
+  };
+  let sessionCwd = seed.sessionCwd ?? '';
+  let currentTurnIndex = seed.currentTurnIndex ?? -1;
+  let pendingThinking = seed.pendingThinking ?? '';
+  let pendingThinkingOwner = seed.pendingThinkingOwner ?? null;
+  const unrenderedThinkingByUser = seed.unrenderedThinkingByUser ?? (rooted ? (seed.unrenderedThinkingByUser = map()) : new Map());
+  const discardedUserOwners = rooted ? (seed.discardedUserOwners ||= rooted.make('set')) : new WeakSet();
+  const sourceUuidAliasesByUser = rooted ? (seed.sourceUuidAliasesByUser ||= map()) : new WeakMap();
+  for (const { owner, discarded, aliases } of (rooted ? [] : seed.userMetadata || [])) {
+    if (discarded) discardedUserOwners.add(owner);
+    if (aliases.length) sourceUuidAliasesByUser.set(owner, aliases);
+  }
+  const rememberUserUuidAlias = (entry, uuid) => {
+    if (!entry || !uuid) return;
+    const aliases = sourceUuidAliasesByUser.get(entry) || list();
+    if (!aliases.includes(uuid)) {
+      if (rooted) { aliases.push(uuid); sourceUuidAliasesByUser.set(entry, aliases); }
+      else sourceUuidAliasesByUser.set(entry, [...aliases, uuid]);
+    }
+  };
+  let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
+  let lastDisplayedModel = seed.lastDisplayedModel ?? null;
+  let lastDisplayedEffort = seed.lastDisplayedEffort ?? null;
+  let lastModelEntry = seed.lastModelEntry ?? null;
+  let lastEffortEntry = seed.lastEffortEntry ?? null;
+  // Inline companion counter (was codexCompactCompanionLines): a top-level
+  // `compacted` snapshot arms it; the next compact-like event_msg before a
+  // real user turn is that snapshot's telemetry twin and renders nothing.
+  let pendingCompactCompanions = seed.pendingCompactCompanions ?? 0;
+  let consumedRecords = seed.consumedRecords ?? 0;
+  let currentTurnCanonicalUserText = seed.currentTurnCanonicalUserText ?? null;
+  let currentTurnCanonicalUserEntry = seed.currentTurnCanonicalUserEntry ?? null;
+  let currentInterruptedNotice = seed.currentInterruptedNotice ?? null;
+  let cachedUserOwner = seed.cachedUserOwner ?? null;
+  const currentUserOwner = () => {
+    if (currentTurnCanonicalUserEntry) cachedUserOwner = currentTurnCanonicalUserEntry;
+    if (cachedUserOwner?.turnIndex === currentTurnIndex) return cachedUserOwner;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry.turnIndex === currentTurnIndex && (entry.role === 'user' || entry.role === 'goal') && !entry.serviceCarrier) {
+        cachedUserOwner = entry;
+        return entry;
+      }
+    }
+    return null;
+  };
+
+  const pushInterruptedNotice = (record) => {
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    const sourceIdentity = stableSourceIdentity(sessionId, record, 'codex-interrupted');
+    // A protocol run may emit both the reserved user carrier and turn_aborted.
+    // They describe one boundary, so retain the second identity as an alias
+    // instead of drawing the same notice twice.
+    if (
+      currentInterruptedNotice?.turnIndex === currentTurnIndex
+      && currentInterruptedNotice.physicalSessionId === physicalSessionId
+    ) {
+      addStableSourceIdentityAlias(currentInterruptedNotice.entry, sourceIdentity);
+      return;
+    }
+    const entry = own(buildCodexInterruptedHistoryEntry(record, sessionId, currentTurnIndex));
+    entries.push(entry);
+    currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
+  };
+
+  const pushProviderErrorNotice = (record) => {
+    const entry = own(codexProviderErrorEntry(record, sessionId, currentTurnIndex));
+    if (entry) entries.push(entry);
+  };
+
+  // Both feed and the optional async catalog preparation use this exact
+  // classification. Only a carrier which actually compares aliases may
+  // request the corresponding old texts from the sink.
+  const userCarrierKind = (record, text) => {
+    if (text.includes('<subagent_notification>')) return 'subagent';
+    if (abortedUserText(text)) return 'interrupted';
+    if ((record.type === 'response_item' && !text) || environmentUserText(text)) return 'ignored';
+    if (instructionsUserText(text)) return 'instructions';
+    return 'user';
+  };
+  const userMatchCandidates = (record, text) => {
+    const kind = userCarrierKind(record, text);
+    if (kind === 'instructions') return pendingProjectInstructions.map(item => item.text);
+    if (kind !== 'user') return [];
+    return record.type === 'event_msg' ? pendingResponseUsers.map(item => item.text)
+      : currentTurnCanonicalUserText ? [currentTurnCanonicalUserText] : [];
+  };
+
+  const queueProjectInstructions = (record, text) => {
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    const existingIndex = pendingProjectInstructions.findIndex((candidate) => (
+      userTextsMatch(candidate.text, text)
+    ));
+    if (existingIndex >= 0) {
+      // Prefer event_msg when a protocol generation emits both carriers. The
+      // row is still held until the following real user turn supplies its
+      // structural coordinate.
+      if (record?.type === 'event_msg') {
+        const pending = pendingProjectInstructions[existingIndex];
+        pending.record = catalogSink ? null : record;
+        pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
+        promoteStableSourceIdentity(
+          pending.entry,
+          stableSourceIdentity(sessionId, record, 'codex-user'),
+        );
+        pending.entry.timestamp = recordTimestamp(record);
+        pending.entry.recordTime = historyRecordTimeFromRecord(record);
+        pending.entry.sessionId = physicalSessionId;
+        bindUserRecordByteOffset(pending.entry, record);
+      }
+      return;
+    }
+    const entry = own({
+      uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+      sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+      role: 'user',
+      timestamp: recordTimestamp(record),
+      content: text,
+      recordTime: historyRecordTimeFromRecord(record),
+      sessionId: physicalSessionId,
+      turnIndex: currentTurnIndex + 1,
+      serviceCarrier: 'project-instructions',
+    });
+    entries.push(entry);
+    retainUserEntry(entry, record);
+    pendingProjectInstructions.push({ record: catalogSink ? null : record, text: retainUserText(text, record), entry });
+  };
+
+  const flushProjectInstructions = (turnIndex) => {
+    for (const pending of pendingProjectInstructions) pending.entry.turnIndex = turnIndex;
+    pendingProjectInstructions.length = 0;
+  };
+
+  const feed = (record) => {
+    consumedRecords += 1;
+    const payload = record.payload || {};
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    if (catalogSink?.questionMetadata !== false) {
+      rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+    }
+
+    if (record.type === 'session_meta') {
+      if (!sessionCwd) sessionCwd = payload.cwd || '';
+      return;
+    }
+
+    if (record.type === 'turn_context'
+      || (record.type === 'event_msg' && payload.type === 'thread_settings_applied')) {
+      const { model, effort } = codexSettingsHistoryValues(record) || {};
+      const nextTurnIndex = currentTurnIndex + 1;
+      if (model && !rootText.equal(model, lastDisplayedModel)) {
+        lastModelEntry = own({ ...codexSettingsHistoryEntry(record, sessionId, 'model', model), turnIndex: nextTurnIndex });
+        entries.push(lastModelEntry);
+        lastDisplayedModel = model;
+      } else if (model && lastModelEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
+        const alias = stableSourceIdentity(sessionId, record, 'codex-model');
+        lastModelEntry.sourceIdentityAliases ||= list();
+        const aliases = lastModelEntry.sourceIdentityAliases;
+        if (alias !== lastModelEntry.sourceIdentity && aliases[aliases.length - 1] !== alias) aliases.push(alias);
+      }
+      if (effort && !rootText.equal(effort, lastDisplayedEffort)) {
+        lastEffortEntry = own({ ...codexSettingsHistoryEntry(record, sessionId, 'effort', effort), turnIndex: nextTurnIndex });
+        entries.push(lastEffortEntry);
+        lastDisplayedEffort = effort;
+      } else if (effort && lastEffortEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
+        const alias = stableSourceIdentity(sessionId, record, 'codex-effort');
+        lastEffortEntry.sourceIdentityAliases ||= list();
+        const aliases = lastEffortEntry.sourceIdentityAliases;
+        if (alias !== lastEffortEntry.sourceIdentity && aliases[aliases.length - 1] !== alias) aliases.push(alias);
+      }
+      return;
+    }
+
+    if (record.type === 'compacted') {
+      pendingProjectInstructions.length = 0;
+      pendingCompactCompanions += 1;
+      const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
+      entries.push({
+        uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
+        sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
+        role: 'compact',
+        timestamp: recordTimestamp(record),
+        content: 'Conversation compacted',
+        sourceRecordLine: record.__line,
+        compactSummary: compactEventContent(payload),
+        preTokens: rootText.number(last.total_tokens || last.input_tokens || 0) || undefined,
+        postTokens: compactPostTokenCount(payload),
+        compactEncrypted: true,
+        sessionId: physicalSessionId,
+        turnIndex: currentTurnIndex,
+      });
+      return;
+    }
+
+    if (record.type === 'event_msg') {
+      if ((payload.type === 'task_complete' || payload.type === 'turn_aborted')
+        && pendingThinking && pendingThinkingOwner) {
+        // Optional Inbox result projection retains the existing reasoning
+        // buffer even when no assistant/tool row consumed it before the end.
+        unrenderedThinkingByUser.set(pendingThinkingOwner, pendingThinking);
+      }
+      if (payload.type === 'task_started') {
+        currentTurnCanonicalUserText = null;
+        currentTurnCanonicalUserEntry = null;
+      }
+      if (
+        payload.type === 'user_message'
+        || payload.type === 'task_started'
+        || payload.type === 'task_complete'
+        || payload.type === 'turn_aborted'
+      ) {
+        pendingThinking = '';
+      }
+      if (payload.type === 'patch_apply_end') {
+        attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
+      } else if (payload.type === 'user_message') {
+        const userText = presentUserText(record);
+        const goalContinuation = goalUserText(userText);
+        const carrierKind = userCarrierKind(record, userText);
+        // Third subagent completion path: a fire-and-forget child announces
+        // its outcome via <subagent_notification> INSIDE a user message —
+        // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
+        // (E2E-proven zombie: card climbed 4m+ as running). Feed the tracker
+        // and keep the service record out of the transcript, like Claude's
+        // <task-notification> filter.
+        if (carrierKind === 'subagent') {
+          subagents.onSubagentNotification(userText, recordTimestamp(record));
+          return;
+        }
+        if (carrierKind === 'interrupted') {
+          pushInterruptedNotice(record);
+          return;
+        }
+        if (carrierKind === 'ignored') return;
+        if (carrierKind === 'instructions') {
+          queueProjectInstructions(record, userText);
+          return;
+        }
+        currentInterruptedNotice = null;
+        // The companion pairing window closes at the next REAL user turn.
+        // Codex service carriers above do not create transcript boundaries.
+        pendingCompactCompanions = 0;
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          userTextsMatch(candidate.text, userText)
+        ));
+        if (pendingIndex >= 0) {
+          const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
+          rememberUserUuidAlias(pending.entry, pending.entry.uuid);
+          pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
+          promoteStableSourceIdentity(
+            pending.entry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          promoteCodexPromptPresentationAuditIdentity(pending.entry, record, userText);
+          pending.entry.timestamp = recordTimestamp(record);
+          pending.entry.recordTime = historyRecordTimeFromRecord(record);
+          pending.entry.role = goalContinuation ? 'goal' : 'user';
+          pending.entry.content = goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : userText;
+          pending.entry.serviceCarrier = goalContinuation
+            ? 'goal-continuation'
+            : undefined;
+          pending.entry.sessionId = physicalSessionId;
+          const imageRefs = mergeImageRefs(userImageRefs(record), pending.entry.imagePaths);
+          if (imageRefs.length > 0) pending.entry.imagePaths = imageRefs;
+          pending.entry.imageCount = Math.max(pending.entry.imageCount || 0, historyImageCountFromProviderRecord(record));
+          currentTurnCanonicalUserEntry = pending.entry;
+        } else {
+          currentTurnIndex += 1;
+          flushProjectInstructions(currentTurnIndex);
+          const entry = own({
+            uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+            sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+            promptPresentationAuditTimestamp: recordTimestamp(record),
+            promptPresentationTransportHash: auditUserText(userText),
+            role: goalContinuation ? 'goal' : 'user',
+            imageCount: historyImageCountFromProviderRecord(record),
+            timestamp: recordTimestamp(record),
+            recordTime: historyRecordTimeFromRecord(record),
+            content: goalContinuation
+              ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+              : userText,
+            serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
+            sessionId: physicalSessionId,
+            turnIndex: currentTurnIndex,
+            ...(userImageRefs(record).length > 0 ? { imagePaths: userImageRefs(record) } : {}),
+          });
+          entries.push(entry);
+          currentTurnCanonicalUserEntry = entry;
+        }
+        currentTurnCanonicalUserText = retainUserText(userText, record);
+        retainUserEntry(currentTurnCanonicalUserEntry, record);
+        if (catalogSink?.questionMetadata !== false) attachCodexQuestionReplyProof(currentTurnCanonicalUserEntry, questionDefinitions, physicalSessionId);
+      } else if (payload.type === 'thread_rolled_back') {
+        currentInterruptedNotice = null;
+        pendingProjectInstructions.length = 0;
+        const rollback = applyRollback(entries, rootText.number(payload.num_turns || payload.turns || 1), rooted);
+        // Invalidate references once at rollback, not an O(history) membership
+        // scan on every tool output. A later user can reuse the numeric index.
+        const removedTurns = rooted ? rooted.make('set') : new Set();
+        for (const id of rollback.removedTurnIds) removedTurns.add(id);
+        for (const [id, definition] of questionDefinitions) {
+          if (removedTurns.has(definition.turnIndex)) questionDefinitions.delete(id);
+        }
+        for (const owner of (function* () {
+          for (const call of pendingCalls.values()) yield call.userOwner;
+          yield* unrenderedThinkingByUser.keys(); yield pendingThinkingOwner;
+        })()) {
+          if (owner && removedTurns.has(owner.turnIndex)) discardedUserOwners.add(owner);
+        }
+        cachedUserOwner = null;
+        if (!catalogSink && !rooted) logCodexRollback('full-history', sessionId, record, rollback);
+        // The last rendered setting may have belonged to the removed turn.
+        // Do not attach a later provider observation to that detached row.
+        lastModelEntry = null;
+        lastEffortEntry = null;
+        for (let i = entries.length - 1; i >= 0 && (!lastModelEntry || !lastEffortEntry); i -= 1) {
+          if (!lastModelEntry && entries[i].settingsFact?.kind === 'model') lastModelEntry = entries[i];
+          if (!lastEffortEntry && entries[i].settingsFact?.kind === 'effort') lastEffortEntry = entries[i];
+        }
+        lastDisplayedModel = lastModelEntry?.settingsFact.value || null;
+        lastDisplayedEffort = lastEffortEntry?.settingsFact.value || null;
+        currentTurnIndex = -1;
+        currentTurnCanonicalUserEntry = null;
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          currentTurnIndex = Math.max(currentTurnIndex, typeof entry.turnIndex === 'number' ? entry.turnIndex : -1);
+          if (!currentTurnCanonicalUserEntry && (entry.role === 'user' || entry.role === 'goal')) currentTurnCanonicalUserEntry = entry;
+        }
+        currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.role === 'goal'
+          ? null
+          : (catalogSink?.userTextForEntry?.(currentTurnCanonicalUserEntry) ?? currentTurnCanonicalUserEntry?.content) || null;
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
+      } else if (payload.type === 'token_count') {
+        latestTokenCountInfo = payload.info || {};
+      } else if (payload.type === 'task_complete') {
+        pushProviderErrorNotice(record);
+        pendingResponseUsers.length = 0;
+        pendingProjectInstructions.length = 0;
+      } else if (payload.type === 'turn_aborted') {
+        pushInterruptedNotice(record);
+      } else if (payload.type === 'sub_agent_activity') {
+        // v2 collaboration: the only parent-side link spawn call → child
+        // rollout (agent_thread_id) + live status kinds started/interacted/
+        // interrupted. Mutates the already-pushed Task card in place.
+        subagents.onSubAgentActivity(payload, recordTimestamp(record));
+      } else if (isCompactPayload(payload)) {
+        if (pendingCompactCompanions > 0) {
+          pendingCompactCompanions -= 1;
+          return;
+        }
+        const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
+        entries.push({
+          uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
+          role: 'compact',
+          timestamp: recordTimestamp(record),
+          content: 'Conversation compacted',
+          sourceRecordLine: record.__line,
+          compactSummary: compactEventContent(payload),
+          preTokens: rootText.number(last.total_tokens || last.input_tokens || 0) || undefined,
+          postTokens: compactPostTokenCount(payload),
+          compactEncrypted: true,
+          sessionId: physicalSessionId,
+          turnIndex: currentTurnIndex,
+        });
+      }
+      return;
+    }
+
+    if (record.type !== 'response_item') return;
+
+    if (payload.type === 'message' && payload.role === 'user') {
+      const userText = presentUserText(record);
+      const goalContinuation = goalUserText(userText);
+      const carrierKind = userCarrierKind(record, userText);
+      // Codex currently persists fire-and-forget subagent completion in two
+      // legitimate carrier shapes. Older rollouts used event_msg
+      // user_message; newer/mixed protocol runs can write only a
+      // response_item user message. Both carry the same exact agent identity
+      // and must close the same Task card. A normal response_item is also the
+      // fallback visible user carrier when this Codex protocol run omits the
+      // paired event_msg; the block below upgrades it in place if that event
+      // eventually arrives.
+      if (carrierKind === 'subagent') {
+        subagents.onSubagentNotification(userText, recordTimestamp(record));
+        return;
+      }
+      if (carrierKind === 'interrupted') {
+        pushInterruptedNotice(record);
+        return;
+      }
+      if (carrierKind === 'ignored') return;
+      if (carrierKind === 'instructions') {
+        queueProjectInstructions(record, userText);
+        return;
+      }
+      currentInterruptedNotice = null;
+      if (currentTurnCanonicalUserText
+        && userTextsMatch(currentTurnCanonicalUserText, userText)) {
+        const imageRefs = mergeImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
+          userImageRefs(record));
+        if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
+        currentTurnCanonicalUserEntry.imageCount = Math.max(currentTurnCanonicalUserEntry.imageCount || 0, historyImageCountFromProviderRecord(record));
+        rememberUserUuidAlias(currentTurnCanonicalUserEntry, stableUuidForRecord(sessionId, record, 'codex-user'));
+        addStableSourceIdentityAlias(
+          currentTurnCanonicalUserEntry,
+          stableSourceIdentity(sessionId, record, 'codex-user'),
+        );
+        addCodexPromptPresentationAuditAlias(
+          currentTurnCanonicalUserEntry,
+          codexPromptPresentationAuditIdentity(record, userText),
+        );
+        return;
+      }
+      pendingCompactCompanions = 0;
+      currentTurnIndex += 1;
+      flushProjectInstructions(currentTurnIndex);
+      const entry = own({
+        uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+        sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+        promptPresentationAuditTimestamp: recordTimestamp(record),
+        promptPresentationTransportHash: auditUserText(userText),
+        role: goalContinuation ? 'goal' : 'user',
+        timestamp: recordTimestamp(record),
+        recordTime: historyRecordTimeFromRecord(record),
+        content: goalContinuation
+          ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+          : userText,
+        serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
+        sessionId: physicalSessionId,
+        turnIndex: currentTurnIndex,
+      });
+      entries.push(entry);
+      retainUserEntry(entry, record);
+      pendingResponseUsers.push({ entry, text: retainUserText(userText, record) });
+      if (catalogSink?.questionMetadata !== false) attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
+      const imageRefs = userImageRefs(record);
+      if (imageRefs.length > 0) entry.imagePaths = imageRefs;
+      entry.imageCount = historyImageCountFromProviderRecord(record);
+      return;
+    }
+
+    if (payload.type === 'reasoning') {
+      const text = extractReasoning(payload.summary);
+      if (text) {
+        pendingThinking = catalogSink ? 'x' : pendingThinking ? rootText.concat([pendingThinking, text], '\n', rooted) : text;
+        pendingThinkingOwner = currentUserOwner();
+      }
+      return;
+    }
+
+    if (payload.type === 'message' && payload.role === 'assistant') {
+      const text = extractTextContent(payload.content);
+      const textPhase = normalizeCodexTextPhase(payload.phase);
+      pushProjectedAssistantEntry(
+        entries, physicalSessionId, record, currentTurnIndex, text, pendingThinking, null,
+        record.__line, record.__byteOffset, textPhase,
+      );
+      pendingThinking = '';
+      return;
+    }
+
+    if (payload.type === 'agent_message') {
+      // v2 collaboration result carrier: FINAL_ANSWER payload is plaintext and
+      // becomes the Task card's result; interim MESSAGE payloads are encrypted
+      // and only prove liveness. Never rendered as a normal assistant row —
+      // author is the subagent, not this session's assistant.
+      subagents.onAgentMessage(payload, extractTextContent, recordTimestamp(record));
+      return;
+    }
+
+    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+      const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
+      const args = payload.arguments
+        ? (safeJsonParse(payload.arguments, { raw: payload.arguments }) || {})
+        : (payload.input && rootText.isText(payload.input)
+          ? { input: payload.input }
+          : (payload.input || {}));
+      const pendingCall = own({
+        callId,
+        toolName: payload.name || payload.tool_name || payload.type,
+        namespace: payload.namespace || '',
+        args: args && typeof args === 'object' ? args : { value: args },
+        cwd: sessionCwd,
+        turnId: rootText.coerce(
+          payload.turn_id
+          || payload.internal_chat_message_metadata_passthrough?.turn_id
+          || '',
+        ),
+        patchApplyEvents: [],
+        timestamp: recordTimestamp(record),
+        line: record.__line,
+        byteOffset: record.__byteOffset,
+        physicalSessionId,
+        userOwner: currentUserOwner(),
+        turnIndexAtCall: currentTurnIndex,
+        // Exact presentation slot at CALL time. Most calls close immediately,
+        // but a lost output can leave one pending for days. finalize() must
+        // materialize that orphan where the call happened, not append it after
+        // every later final answer (real session 7395…: old Search 12367 was
+        // rendered below answer 13737 although its byte offset was 35MB older).
+        entryIndexAtCall: entries.length,
+        record,
+      });
+      // Register spawn cards at CALL time: the v2 sub_agent_activity(started)
+      // event that binds the child thread id arrives BETWEEN the call and its
+      // output, so output-time registration would drop that linkage.
+      if (isCodexSubagentSpawnCall(pendingCall)) {
+        pendingCall.subagentCard = registerSubagentSpawn(pendingCall);
+      }
+      pendingCalls.set(callId, pendingCall);
+      return;
+    }
+
+    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+      const callId = payload.call_id || payload.id;
+      const call = pendingCalls.get(callId) || {
+        callId,
+        toolName: payload.name || payload.type,
+        namespace: payload.namespace || '',
+        args: {},
+        timestamp: recordTimestamp(record),
+        line: record.__line,
+        byteOffset: record.__byteOffset,
+        physicalSessionId,
+        userOwner: currentUserOwner(),
+        turnIndexAtCall: currentTurnIndex,
+      };
+      if (call.userOwner && discardedUserOwners.has(call.userOwner)) {
+        // A late output cannot adopt the next user after rollback reused the
+        // old numeric index. Pairing changes UUID on the same retained object.
+        pendingCalls.delete(callId);
+        return;
+      }
+      const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
+      const callOwnsThinking = sameOwner(pendingThinkingOwner, call.userOwner);
+      const callThinking = callOwnsThinking ? pendingThinking : '';
+      // Subagent lifecycle: spawn becomes a Task card (SubAgentBlock UX like
+      // the Claude SDK tab); v1 spawn output binds agent_id/nickname; control
+      // calls (wait/close/…) feed results into existing cards instead of
+      // rendering as generic "Spawn Agent"/"Wait Agent" JSON cards.
+      if (isCodexSubagentSpawnCall(call)) {
+        const card = call.subagentCard || registerSubagentSpawn(call);
+        subagents.attachSpawnOutput(call.callId, payload.output, recordTimestamp(record));
+        pushProjectedAssistantEntry(
+          entries,
+          call.physicalSessionId || physicalSessionId,
+          record,
+          callTurnIndex,
+          '',
+          callThinking,
+          [card],
+          call.line,
+          call.byteOffset,
+        );
+        if (callOwnsThinking) pendingThinking = '';
+        pendingCalls.delete(callId);
+        return;
+      }
+      if (isCodexSubagentControlCall(call)) {
+        const absorbed = subagents.absorbControlOutput(
+          call,
+          payload.output,
+          recordTimestamp(record),
+        );
+        if (absorbed) {
+          pushProjectedAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
+          if (callOwnsThinking) pendingThinking = '';
+          pendingCalls.delete(callId);
+          return;
+        }
+      }
+      const waitCellId = call.toolName === 'wait' ? rootText.coerce(call.args?.cell_id || '') : '';
+      const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
+      if (pendingCellActions) {
+        if (pendingCellActions.call) {
+          const continuation = codexHistoryCellId(payload.output);
+          for (const part of codexHistorySettledOutputParts(payload.output)) pendingCellActions.parts.push(part);
+          const combined = list();
+          if (continuation) combined.push({ type: 'input_text', text: rootText.concat(['Script running with cell ID ',continuation,'\nOutput:\n'], '', rooted) });
+          for (const text of pendingCellActions.parts) combined.push({ type: 'input_text', text });
+          const decoded = codexHistoryActionsForCall(pendingCellActions.call, combined, !!payload.is_error);
+          const actions = trackDecodedSubagents(decoded.actions, pendingCellActions.call, recordTimestamp(record));
+          const previous = map();
+          for (const action of pendingCellActions.actions) if (action.rawTool)
+            previous.set(action.rawTool.toolUseId, action.rawTool);
+          for (const action of actions) if (action.rawTool) {
+            const old = previous.get(action.rawTool.toolUseId);
+            action.rawTool.resultSourceLine = old && sameOwner(old.result, action.rawTool.result)
+              ? old.resultSourceLine : record.__line;
+          }
+          if (rooted) {
+            pendingCellActions.actions.length = 0;
+            for (const action of actions) pendingCellActions.actions.push(action);
+          } else pendingCellActions.actions.splice(0, pendingCellActions.actions.length, ...actions);
+          if (!continuation) {
+            pendingExecCells.delete(waitCellId);
+          } else if (!sameOwner(continuation, waitCellId)) {
+            pendingExecCells.delete(waitCellId);
+            pendingExecCells.set(continuation, pendingCellActions);
+          }
+        } else {
+          fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error, record.__line);
+          pendingExecCells.delete(waitCellId);
+        }
+        pushProjectedAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
+      } else {
+        const decoded = codexHistoryActionsForCall(call, payload.output, !!payload.is_error);
+        decoded.actions = trackDecodedSubagents(decoded.actions, call, recordTimestamp(record));
+        absorbNestedSubagentControls(call, payload.output, recordTimestamp(record));
+        // The call row owns the visible card identity. Completion enriches that
+        // same card instead of replacing it with an output-line row, preserving
+        // collapse state and Virtuoso measurement during streaming.
+        pushProjectedAssistantEntry(
+          entries,
+          call.physicalSessionId || physicalSessionId,
+          record,
+          callTurnIndex,
+          '',
+          callThinking,
+          decoded.actions,
+          call.line,
+          call.byteOffset,
+        );
+        // Every async cell retains its original call, not just raw-tool cards.
+        // A normal exec can also contain Task cards without rawTool; its wait
+        // must re-decode exact outputs to bind child receipts and ordinary
+        // results without shifting their positions or changing card owners.
+        if (decoded.cellId) pendingExecCells.set(decoded.cellId, {
+          call, actions: decoded.actions, parts: codexHistorySettledOutputParts(payload.output),
+        });
+      }
+      if (callOwnsThinking) pendingThinking = '';
+      pendingCalls.delete(callId);
+    }
+  };
+
+  let catalogPendingPlan = null;
+  // Canonical finalization decides eligibility before any asynchronous sink
+  // restores arguments. This also preserves seed/spawn registration order:
+  // a later wait_agent sees the same cards as the ordinary finalizer.
+  function* pendingCallFinalizations() {
+    for (const call of pendingCalls.values()) {
+      if (call.userOwner && discardedUserOwners.has(call.userOwner)) continue;
+      const waitCellId = call.toolName === 'wait' ? rootText.coerce(call.args?.cell_id || '') : '';
+      if (waitCellId && pendingExecCells.has(waitCellId)) continue;
+      if (isCodexSubagentSpawnCall(call)) {
+        if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
+        yield { call, kind: 'spawn' };
+      } else if (!(isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards())) {
+        yield { call, kind: 'decode' };
+      }
+    }
+  }
+
+  function* finalizeSteps(options = {}, preparedPlan = null) {
+    // A transcript-changed notification is emitted as soon as Codex appends
+    // the call, before its output exists. Keep that in-flight call in the
+    // canonical history snapshot so a live semantic tool card is not briefly
+    // replaced by an empty REST reload during a long-running command. A
+    // pending `wait` for a known async exec cell is intentionally hidden: the
+    // original projected card is already present in `entries` and owns the
+    // eventual result.
+    //
+    // Built on a COPY: pending calls stay pending and the thinking buffer is
+    // not consumed, so later `feed` calls attach them to their real records
+    // exactly as a fresh one-shot pass at that future moment would.
+    const tail = list();
+    const tailPlacements = list();
+    const rememberTailPlacement = (call, beforeLength) => {
+      const anchor = Number.isInteger(call?.entryIndexAtCall)
+        ? Math.max(0, Math.min(entries.length, call.entryIndexAtCall))
+        : entries.length;
+      for (let index = beforeLength; index < tail.length; index += 1) {
+        tailPlacements.push({ entry: tail[index], anchor });
+      }
+    };
+    let tailThinking = pendingThinking;
+    for (const { call, kind } of preparedPlan || catalogPendingPlan || pendingCallFinalizations()) {
+      yield;
+      const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
+      const callOwnsThinking = sameOwner(pendingThinkingOwner, call.userOwner);
+      const callThinking = callOwnsThinking ? tailThinking : '';
+      // In-flight spawn (no output yet): show a running Task card, not raw
+      // JSON. The card is cached on the call so repeated finalizes reuse ONE
+      // tracker identity instead of re-registering a fresh card (which would
+      // orphan the accumulated status of the previous one).
+      if (kind === 'spawn') {
+        const beforeLength = tail.length;
+        pushProjectedAssistantEntry(
+          tail,
+          call.physicalSessionId || sessionId,
+          call.record || { __line: call.line, timestamp: call.timestamp },
+          callTurnIndex,
+          '',
+          callThinking,
+          [call.subagentCard],
+        );
+        rememberTailPlacement(call, beforeLength);
+        if (callOwnsThinking) tailThinking = '';
+        continue;
+      }
+      const decoded = catalogSink?.pendingActionsForCall?.(call) ?? codexHistoryActionsForCall(call, undefined, false);
+      const beforeLength = tail.length;
+      pushProjectedAssistantEntry(
+        tail,
+        call.physicalSessionId || sessionId,
+        call.record || { __line: call.line, timestamp: call.timestamp },
+        callTurnIndex,
+        '',
+        callThinking,
+        decoded.actions
+      );
+      rememberTailPlacement(call, beforeLength);
+      if (callOwnsThinking) tailThinking = '';
+    }
+
+    // Last resort for cards the parent never closed, and exact timing source
+    // for cards a later list_agents query could only classify as completed.
+    // `wait_agent` is routinely
+    // called with no target, and its "Wait completed" output names nobody — so
+    // an agent that really finished can leave zero terminal trace in this
+    // rollout and keep animating the tab forever (live production tab: 12 of
+    // 36 spawns, 11 of them plainly finished in their own file). Each such
+    // agent is checked against its OWN transcript, which is authoritative
+    // about itself. Card mutation here is monotone — an explicit resume
+    // record arriving later through `feed` reopens it, same as a fresh pass.
+    if (!catalogSink && !preparedPlan) yield* refreshCodexSubagentCardSteps(rooted ? { [Symbol.iterator]: () => subagents.iterateCards() } : subagents.allCards(), sessionId, sourceOptions);
+
+    // Pending calls are presentation rows, but not necessarily TAIL rows. A
+    // current in-flight call naturally anchors at entries.length; an old call
+    // whose output was lost anchors at the number of rows that existed when
+    // its call record arrived. Buckets preserve provider arrival order when
+    // several concurrent calls share one slot.
+    const pendingByAnchor = map();
+    for (const placement of tailPlacements) {
+      yield;
+      const bucket = pendingByAnchor.get(placement.anchor) || list();
+      bucket.push(placement.entry);
+      pendingByAnchor.set(placement.anchor, bucket);
+    }
+    const presented = list();
+    const appendPresented = (source) => {
+      const turnIndex = source.turnIndex;
+      const entry = rooted ? rooted.assign(source) : { ...source };
+      delete entry.turnIndex;
+      const sourceUuidAliases = options?.includeTurnCoordinates === true
+        ? (sourceUuidAliasesByUser.get(source) || []).filter((uuid) => uuid !== source.uuid) : [];
+      if (options?.includeTurnCoordinates === true) {
+        entry.turnIndex = turnIndex;
+        if (sourceUuidAliases.length) entry.sourceUuidAliases = sourceUuidAliases;
+      }
+      presented.push(entry);
+    };
+    for (let index = 0; index <= entries.length; index += 1) {
+      yield;
+      const pending = pendingByAnchor.get(index);
+      if (pending) for (const entry of pending) { yield; appendPresented(entry); }
+      if (index < entries.length) appendPresented(entries[index]);
+    }
+    if (options?.includeTurnCoordinates === true) {
+      const projectedThinking = map();
+      for (const [owner, thinking] of unrenderedThinkingByUser) {
+        yield;
+        projectedThinking.set(owner, { thinking, pending: false });
+      }
+      if (tailThinking && pendingThinkingOwner) projectedThinking.set(pendingThinkingOwner, { thinking: tailThinking, pending: true });
+      for (const [owner, projected] of projectedThinking) {
+        yield;
+        if (discardedUserOwners.has(owner)) continue;
+        presented.push({
+          uuid: `codex-thinking-projection:${owner.uuid}`,
+          role: 'assistant', content: '', thinking: projected.thinking,
+          sessionId: owner.sessionId, turnIndex: owner.turnIndex,
+          projection: true, pending: projected.pending,
+        });
+      }
+    }
+    return presented;
+  }
+  const finalize = (options = {}) => drainProjectionSteps(finalizeSteps(options));
+
+  if (rooted) {
+    const syncRoot = () => Object.assign(seed, {
+      entries, questionDefinitions, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
+      pendingExecCells, sessionCwd, currentTurnIndex, pendingThinking, pendingThinkingOwner,
+      unrenderedThinkingByUser, latestTokenCountInfo, lastDisplayedModel, lastDisplayedEffort,
+      lastModelEntry, lastEffortEntry, pendingCompactCompanions, consumedRecords,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, currentInterruptedNotice, cachedUserOwner,
+    });
+    const loadRegisters = () => {
+      ({ sessionCwd, currentTurnIndex, pendingThinking, pendingThinkingOwner, latestTokenCountInfo,
+        lastDisplayedModel, lastDisplayedEffort, lastModelEntry, lastEffortEntry, pendingCompactCompanions,
+        consumedRecords, currentTurnCanonicalUserText, currentTurnCanonicalUserEntry,
+        currentInterruptedNotice, cachedUserOwner } = seed);
+    };
+    syncRoot();
+    function* finalizeRootViewSteps(options = {}) {
+      const plan = seed.rootFinalizationPlan;
+      const prepared = { *[Symbol.iterator]() {
+        for (let index = 0; index < plan.count; index++) yield plan.calls[index];
+      } };
+      const iterator = finalizeSteps(options, prepared);
+      try {
+        for (;;) {
+          const next = rooted.step(() => {
+            const next = iterator.next();
+            syncRoot();
+            rooted.metrics.finalizerSteps++;
+            return next.done ? { done: true, value: rooted.publish(next.value) } : { done: false };
+          });
+          try { options.onRootStep?.({ ...rooted.stats(),rootPublished: next.done }); }
+          catch (error) { if (next.done) next.value.release(); throw error; }
+          if (next.done) return next.value;
+          yield;
+        }
+      } finally { iterator.return?.(); }
+    }
+    function* finalizeRootSteps(options = {}) {
+      // Keep semantic mutations (spawn identity and own-child status) in the
+      // continuation. Reuse a paged plan; warm reads do not retain a new copy
+      // of every presentation row in the canonical owner index.
+      const plan = rooted.step(() => seed.rootFinalizationPlan ||= own({ calls: list(), count: 0 }));
+      const decisions = pendingCallFinalizations();
+      let count = 0;
+      try {
+        for (;;) {
+          const done = rooted.step(() => {
+            const next = decisions.next();
+            if (next.done) { plan.count = count; syncRoot(); return true; }
+            if (count < plan.calls.length) {
+              plan.calls[count].call = next.value.call; plan.calls[count].kind = next.value.kind;
+            } else plan.calls.push(next.value);
+            count++; syncRoot(); return false;
+          });
+          if (done) break;
+          options.onRootStep?.(rooted.stats()); yield;
+        }
+      } finally { decisions.return?.(); }
+      const refresh = refreshCodexSubagentCardSteps({ [Symbol.iterator]: () => subagents.iterateCards() }, sessionId, sourceOptions);
+      try {
+        for (;;) {
+          const next = rooted.step(() => { const next = refresh.next(); syncRoot(); return next; });
+          if (next.done) break;
+          options.onRootStep?.(rooted.stats()); yield;
+        }
+      } finally { refresh.return?.(); }
+      const viewArena = rooted.fork();
+      try {
+        // Same reducer and same finalizer on a CoW branch. No DTO or SQL clone.
+        const view = createCodexHistoryProjector(sessionId, {}, { rooted: viewArena, sourceOptions });
+        return yield* view._finalizeRootViewSteps(options);
+      } finally {
+        const measured = viewArena.stats();
+        for (const name of ['peakInputObjects','peakHandleCache','peakImportedStringChars',
+          'maxDecodedTextChars','maxUnboundedTextChars','maxOwnKeyArray','maxLegacyPromptArray',
+          'maxNumericScratchChars','maxPatternCaptureSlots','maxDiscoveryPathChars','maxDiscoveryComponentBytes',
+          'maxDiscoveryOpenDirectories','maxDiscoveryResidentDirents','maxDiscoveryPendingOnDisk',
+          'maxDateTokenChars','maxDateNativeSlots','maxDateNativeInputChars','maxJsAnalysisStackOnDisk',
+          'maxJsIslandSourceChars','maxJsAstDepth','maxJsNativeAstLeafChars','maxJsNativeAstArray','maxJsNativeAstObjects',
+          'maxJsNativeAstNodes','maxJsCompatibilitySourceChars','maxDiscoveryNativePathBytes',
+          'maxWin32PathComponentsOnDisk','maxJsGrammarRegisterFields','maxJsGrammarDepthOnDisk',
+          'maxJsCommentQueueOnDisk','maxJsTokenNativeChars','maxJsTokenNativeFields','maxJsNativeErrorChars','maxJsSyntaxErrorMessageChars',
+          'maxJsNativeErrorDetailChars','maxJsNativeErrorDetailFields','maxJsNativeErrorDetailArray'])
+          rooted.metrics[name] = Math.max(rooted.metrics[name] || 0, measured[name] || 0);
+        for (const name of ['numericTextUnits','patternSteps','patternFrameWrites','discoveryEntries','dateParses','jsIslandParses','jsCompatibilityParses','discoveryRecoveredStatEntries',
+          'discoveryRecheckedStatEntries','discoveryCloseFailures','jsPagedParseAttempts','jsPagedParses','jsPagedFallbacks',
+          'jsTokensRead','jsPagedAstNodes','jsGrammarSteps','jsGrammarFrameWrites','jsNativeParseErrors','jsPagedSyntaxErrors','jsLazyNativeErrors'])
+          rooted.metrics[name] = (rooted.metrics[name] || 0) + (measured[name] || 0);
+        rooted.metrics.unboundedTextMaterializations = (rooted.metrics.unboundedTextMaterializations || 0) + (measured.unboundedTextMaterializations || 0);
+        if (measured.lastUnboundedTextOperation) rooted.metrics.lastUnboundedTextOperation = measured.lastUnboundedTextOperation;
+        if (measured.lastJsPagedFallback) rooted.metrics.lastJsPagedFallback = measured.lastJsPagedFallback;
+        rooted.metrics.finalizerSteps += measured.finalizerSteps;
+        viewArena.close();
+      }
+    }
+    return {
+      feed(record) {
+        try { return rooted.step(() => { feed(own(record)); syncRoot(); }); }
+        catch (error) { loadRegisters(); throw error; }
+      },
+      finalizeRootSteps,
+      _finalizeRootViewSteps: finalizeRootViewSteps,
+      finalizeRoot: options => drainProjectionSteps(finalizeRootSteps(options)),
+      exportRoot: () => rooted.checkpoint(),
+      getConsumedRecords: () => consumedRecords,
+      rootStats: () => rooted.stats(),
+      close: () => rooted.close(),
+    };
+  }
+
+  return {
+    feed: catalogSink ? record => {
+      catalogPendingPlan = null;
+      feed(record);
+      catalogSink.afterFeed?.({ entries, pendingCalls, pendingExecCells,
+        pendingResponseUsers, pendingProjectInstructions, subagents: subagents.exportState(),
+        currentTurnCanonicalUserText });
+    } : feed,
+    // Only the opt-in sink needs these live control references, without the
+    // full checkpoint's O(history) user-metadata traversal on every record.
+    ...(catalogSink ? { catalogState: () => ({ pendingCalls, pendingExecCells,
+      pendingResponseUsers, pendingProjectInstructions, currentTurnCanonicalUserText }),
+      userMatchCandidates,
+      *pendingCallsForDecode() {
+        // The iterator registers missing spawn cards. Freeze its decisions
+        // once, otherwise a second pass could suppress an earlier seeded
+        // wait_agent after seeing a later spawn. Any feed starts a new plan.
+        catalogPendingPlan ||= [...pendingCallFinalizations()];
+        for (const { call, kind } of catalogPendingPlan) if (kind === 'decode') yield call;
+      },
+    } : {}),
+    finalize,
+    finalizeSteps,
+    getConsumedRecords: () => consumedRecords,
+    exportState: () => ({
+      entries, questionDefinitions, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
+      pendingExecCells, subagents: subagents.exportState(), sessionCwd, currentTurnIndex,
+      pendingThinking, pendingThinkingOwner, unrenderedThinkingByUser, latestTokenCountInfo,
+      lastDisplayedModel, lastDisplayedEffort, lastModelEntry, lastEffortEntry, pendingCompactCompanions, consumedRecords,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, currentInterruptedNotice,
+      cachedUserOwner,
+      userMetadata: [...new Set([
+        ...entries, ...pendingResponseUsers.map((item) => item.entry),
+        ...pendingProjectInstructions.map((item) => item.entry),
+        ...[...pendingCalls.values()].map((call) => call.userOwner),
+        ...unrenderedThinkingByUser.keys(), pendingThinkingOwner, cachedUserOwner,
+        currentTurnCanonicalUserEntry,
+      ].filter(Boolean))].map((owner) => ({
+        owner, discarded: discardedUserOwners.has(owner),
+        aliases: sourceUuidAliasesByUser.get(owner) || [],
+      })),
+    }),
+    // Live view of the accumulated rows, for cost accounting only. Excludes
+    // the in-flight tail (which finalize builds fresh each time) — that is a
+    // handful of rows and never the memory that matters.
+    peekEntries: () => entries,
+  };
+}
+
+function buildCodexFullHistory(records, sessionId) {
+  const projector = createCodexHistoryProjector(sessionId);
+  try {
+    for (const record of Array.isArray(records) ? records : []) projector.feed(record);
+    return projector.finalize();
+  } finally { projector.close(); }
+}
+
+async function buildCodexFullHistoryCooperatively(records, sessionId, control) {
+  const projector = createCodexHistoryProjector(sessionId);
+  try {
+    await control.drain('historyFeed', (function* () {
+      for (const record of Array.isArray(records) ? records : []) {
+        projector.feed(record); control.stats.historyFedRecords++; yield;
+      }
+    })());
+    return await control.drain('historyFinalize', projector.finalizeSteps());
+  } finally { projector.close(); }
+}
+
+// Addressable history evidence deliberately stays separate from the ordinary
+// Timeline/History projection. The latter is allowed to be broad and cheap;
+// this helper is used only after a caller has selected one exact turn.
+//
+// Tool rows are produced by the same history projector as the UI. Its
+// pendingCalls map pairs every output by call_id before an action receives its
+// result, including canonical nested calls inside Codex `exec`. We return the
+// unbounded provider facts here; the HTTP boundary is responsible for slicing
+// them before they ever leave main.
+function buildCodexTurnEvidence(records, sessionId, { userUuid, providerTurnIndex } = {}) {
+  const history = buildCodexFullHistory(records, sessionId);
+  const timeline = buildCodexTimeline(records, sessionId);
+  const exactUuid = typeof userUuid === 'string' && userUuid ? userUuid : null;
+  const exactIndex = Number.isInteger(providerTurnIndex) ? providerTurnIndex : null;
+  const timelineUser = exactUuid
+    ? timeline.find((entry) => entry?.type === 'user' && entry.uuid === exactUuid)
+    : (exactIndex != null
+      ? timeline.find((entry) => entry?.type === 'user' && entry.turnIndex === exactIndex)
+      : null);
+  const targetUser = timelineUser
+    ? history.find((entry) => entry?.role === 'user' && entry.uuid === timelineUser.uuid)
+    : null;
+  if (!timelineUser || !targetUser) {
+    return {
+      found: false,
+      reason: exactUuid && !timelineUser
+        ? 'exact_user_uuid_not_found_in_provider_projection'
+        : (timelineUser ? 'timeline_history_identity_mismatch' : 'codex_turn_not_found_in_provider_projection'),
+      operations: [],
+      settings: { status: 'unknown', reason: 'target_turn_not_found' },
+    };
+  }
+
+  const targetLine = Number.isFinite(timelineUser.sourceLine) ? timelineUser.sourceLine : null;
+  const nextUser = timeline.find((entry) => entry?.type === 'user'
+    && Number.isFinite(entry.sourceLine)
+    && targetLine != null
+    && entry.sourceLine > targetLine);
+  const nextLine = Number.isFinite(nextUser?.sourceLine) ? nextUser.sourceLine : Infinity;
+  const outputsByCallId = new Map();
+  const callsByCallId = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    if (record?.type === 'response_item'
+      && (payload.type === 'function_call' || payload.type === 'custom_tool_call')) {
+      const callId = payload.call_id || payload.id;
+      if (callId) {
+        callsByCallId.set(String(callId), {
+          timestamp: recordTimestamp(record),
+          sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+          toolName: payload.name || payload.tool_name || null,
+          namespace: payload.namespace || null,
+        });
+      }
+    }
+    if (record?.type !== 'response_item'
+      || (payload.type !== 'function_call_output' && payload.type !== 'custom_tool_call_output')) continue;
+    const callId = payload.call_id || payload.id;
+    if (!callId) continue;
+    outputsByCallId.set(String(callId), {
+      timestamp: recordTimestamp(record),
+      sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+      isError: payload.is_error === true,
+    });
+  }
+  const operations = [];
+  const historyStart = history.indexOf(targetUser);
+  const historyEnd = history.findIndex((entry, index) => index > historyStart && entry?.role === 'user');
+  const historyTurnEntries = history.slice(historyStart + 1, historyEnd < 0 ? history.length : historyEnd);
+  for (const entry of historyTurnEntries) {
+    if (entry?.role !== 'assistant') continue;
+    for (const action of Array.isArray(entry.actions) ? entry.actions : []) {
+      const raw = action?.rawTool;
+      if (raw) {
+        const operationId = String(raw.toolUseId || '');
+        const callId = operationId ? operationId.replace(/:canonical:\d+$/, '') : null;
+        const call = callId ? callsByCallId.get(callId) : null;
+        const output = callId ? outputsByCallId.get(callId) : null;
+        operations.push({
+          operationId: operationId || null,
+          callId,
+          toolName: raw.toolName || null,
+          mcpServer: raw.mcpServer || null,
+          mcpMethod: raw.mcpMethod || null,
+          input: raw.args || {},
+          result: output ? raw.result : undefined,
+          resultPresent: !!output,
+          isError: output?.isError === true,
+          callTimestamp: call?.timestamp || null,
+          callSourceLine: call?.sourceLine ?? null,
+          callScope: call?.toolName === 'exec' ? 'container' : 'provider_call',
+          resultTimestamp: output?.timestamp || null,
+          resultSourceLine: output?.sourceLine ?? null,
+        });
+      } else {
+        const callId = action?.toolUseId ? String(action.toolUseId) : null;
+        const call = callId ? callsByCallId.get(callId) : null;
+        const output = callId ? outputsByCallId.get(callId) : null;
+        operations.push({
+          operationId: callId,
+          callId,
+          toolName: action?.tool || null,
+          mcpServer: null,
+          mcpMethod: null,
+          input: null,
+          result: output ? action?.result : undefined,
+          resultPresent: !!output,
+          isError: output?.isError === true,
+          callTimestamp: call?.timestamp || null,
+          callSourceLine: call?.sourceLine ?? null,
+          callScope: call?.toolName === 'exec' ? 'container' : 'provider_call',
+          resultTimestamp: output?.timestamp || null,
+          resultSourceLine: output?.sourceLine ?? null,
+        });
+      }
+    }
+  }
+
+  let model = null;
+  let effort = null;
+  let modelSource = null;
+  let effortSource = null;
+  const changesDuringTurn = [];
+  const settingsInsideTurn = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    let nextModel = null;
+    let nextEffort = null;
+    let source = null;
+    if (record?.type === 'turn_context') {
+      nextModel = typeof payload.model === 'string' ? payload.model.trim() : '';
+      nextEffort = typeof payload.effort === 'string' ? payload.effort.trim() : '';
+      source = 'turn_context';
+    } else if (record?.type === 'event_msg' && payload.type === 'thread_settings_applied') {
+      const settings = payload.thread_settings || {};
+      nextModel = typeof settings.model === 'string' ? settings.model.trim() : '';
+      nextEffort = typeof (settings.reasoning_effort || settings.effort) === 'string'
+        ? String(settings.reasoning_effort || settings.effort).trim()
+        : '';
+      source = 'thread_settings_applied';
+    }
+    if (!source || (!nextModel && !nextEffort)) continue;
+    const fact = {
+      source,
+      timestamp: recordTimestamp(record),
+      sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+      ...(nextModel ? { model: nextModel } : {}),
+      ...(nextEffort ? { effort: nextEffort } : {}),
+    };
+    const line = Number.isFinite(record.__line) ? record.__line : null;
+    if (targetLine != null && line != null && line <= targetLine) {
+      if (nextModel) {
+        model = nextModel;
+        modelSource = fact;
+      }
+      if (nextEffort) {
+        effort = nextEffort;
+        effortSource = fact;
+      }
+    } else if (targetLine != null && line != null && line > targetLine && line < nextLine) {
+      settingsInsideTurn.push(fact);
+    }
+  }
+  let modelAtTurnStart = model;
+  let effortAtTurnStart = effort;
+  let modelAtTurnStartSource = modelSource;
+  let effortAtTurnStartSource = effortSource;
+  let activeModel = model;
+  let activeEffort = effort;
+  for (const fact of settingsInsideTurn) {
+    if (fact.model) {
+      if (!modelAtTurnStart) {
+        modelAtTurnStart = fact.model;
+        modelAtTurnStartSource = fact;
+      } else if (activeModel && fact.model !== activeModel) {
+        changesDuringTurn.push(fact);
+      }
+      activeModel = fact.model;
+    }
+    if (fact.effort) {
+      if (!effortAtTurnStart) {
+        effortAtTurnStart = fact.effort;
+        effortAtTurnStartSource = fact;
+      } else if (activeEffort && fact.effort !== activeEffort && !changesDuringTurn.includes(fact)) {
+        changesDuringTurn.push(fact);
+      }
+      activeEffort = fact.effort;
+    }
+  }
+
+  return {
+    found: true,
+    providerTurnIndex: timelineUser.turnIndex,
+    userUuid: timelineUser.uuid,
+    userTimestamp: timelineUser.timestamp || null,
+    operations,
+    settings: {
+      status: modelAtTurnStart || effortAtTurnStart
+        ? (changesDuringTurn.length > 0 ? 'changed_during_turn' : 'known_at_turn_start')
+        : 'unknown',
+      model: changesDuringTurn.length > 0 ? null : modelAtTurnStart,
+      effort: changesDuringTurn.length > 0 ? null : effortAtTurnStart,
+      modelAtTurnStart,
+      effortAtTurnStart,
+      modelSource: modelAtTurnStartSource,
+      effortSource: effortAtTurnStartSource,
+      modelAtTurnEnd: activeModel,
+      effortAtTurnEnd: activeEffort,
+      changesDuringTurn,
+      ...(targetLine == null ? { reason: 'target_turn_has_no_provider_source_line' } : {}),
+    },
+  };
+}
+
+// ── Per-session projector reuse (file-cursor based) ─────────────────────────
+// The projector cache turns a live-session History refresh from O(file) into
+// O(appended tail) — and, unlike the records cache, it does not need the
+// parsed records array at all after the first build: the cache record keeps a
+// FILE CURSOR (size/mtime consumed + carry-over of a partially written last
+// line, mirroring _parseJsonlFileIncremental's semantics exactly), and a
+// refresh reads only bytes [cursor.size, stat.size) straight from disk. Two
+// 730MB rollouts therefore stop fighting over the 768MB records budget: what
+// survives per giant is the projector state + projected entries (~150MB),
+// bounded by the byte budget below.
+//
+// Witness rules (same as the records cache): size+mtime equal → unchanged;
+// size grew → append-only tail read; size shrank or same-size-different-mtime
+// → the file was rewritten, burn and rebuild. Explicit rewrite paths
+// (edit/fork/forceFresh) additionally burn through invalidateCodexJsonlCache.
+//
+// The cache is bounded by BYTES, not by session count. Counting sessions was
+// the original bound (cap 2, chosen when a giant's projection cost ~150MB),
+// and it broke the moment row-level hydration made a giant cheap: an 18-row
+// session and a 16K-row session each took one slot, so opening eleven small
+// tabs evicted the giant and the return paid a full 5.5s re-parse (live
+// 07.08 17:45, tab-3163). A byte budget makes the bound describe the thing
+// it protects — main-process memory — instead of a proxy that no longer
+// correlates with it.
+const CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB = 400;
+// Empty and tiny sessions still retain two stateful projectors, maps, cursors
+// and metadata. Charge a conservative fixed floor so the BYTE budget also
+// bounds session count without a second, contradictory count-based truth.
+// At the 64MB minimum this permits at most 64 tiny sessions; at larger budgets
+// real projected content normally dominates long before the floor does.
+const CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES = 1024 * 1024;
+let _codexHistoryProjectorBudgetBytes = CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB * 1024 * 1024;
+let _codexHistoryProjectorBytes = 0;
+const _codexHistoryProjectors = new Map(); // sessionId → cache record
+const _codexRewriteReceipts = new Map(); // Coordinates only; shares the existing graph budget.
+let _codexRewriteReceiptBytes = 0;
+const _codexProjectorChains = new Map(); // sessionId → serialization tail
+let _codexProjectionStorage = null;
+let _codexRewriteProjectionPublisher = null;
+const _codexReadInvalidationListeners = new Set();
+function observeCodexReadInvalidation(listener) {
+  _codexReadInvalidationListeners.add(listener);
+  return () => _codexReadInvalidationListeners.delete(listener);
+}
+function setCodexProjectionStorage(storage) { _codexProjectionStorage = storage; }
+function setCodexRewriteProjectionPublisher(publish) { _codexRewriteProjectionPublisher = typeof publish === 'function' ? publish : null; }
+async function rememberCodexRewriteReceipt(receipt) {
+  const bytes = 1024 + receipt.records.length * 192 + (receipt.sourceProof?.length || 0) * 160
+    + await measureProjectionGraphBytes(receipt.headerRecord);
+  const previous = _codexRewriteReceipts.get(receipt.sessionId);
+  if (previous) _codexRewriteReceiptBytes -= previous.bytes;
+  _codexRewriteReceipts.delete(receipt.sessionId);
+  _codexRewriteReceipts.set(receipt.sessionId, { receipt, bytes });
+  _codexRewriteReceiptBytes += bytes;
+  // Optional coordinate reuse must not create an independent unbounded cache.
+  for (const [id, item] of _codexRewriteReceipts) {
+    if (_codexRewriteReceiptBytes <= _codexHistoryProjectorBudgetBytes / 4
+      && _codexRewriteReceiptBytes + _codexHistoryProjectorBytes + _codexSourceGenerations.bytes <= _codexHistoryProjectorBudgetBytes) break;
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
+}
+function restoreCodexSourceSnapshot(snapshot) {
+  return !!snapshot && _codexSourceGenerations.restore(snapshot.filePath, snapshot, snapshot.sessionId);
+}
+
+/**
+ * Budget is read once at startup from the app settings (see
+ * `historyProjectorBudgetMb` in SettingsModal) — changing it takes effect on
+ * restart, which is what the setting's own hint promises. Applying it live
+ * would mean re-costing every cached projector mid-flight for a knob nobody
+ * turns twice a session.
+ */
+function setCodexHistoryProjectorBudgetMb(valueMb) {
+  const parsed = Math.floor(Number(valueMb));
+  if (!Number.isFinite(parsed) || parsed <= 0) return _codexHistoryProjectorBudgetBytes;
+  // Floor keeps one giant resident whatever the user types; ceiling keeps a
+  // typo from claiming the whole V8 heap of the main process.
+  const clamped = Math.max(64, Math.min(2048, parsed));
+  _codexHistoryProjectorBudgetBytes = clamped * 1024 * 1024;
+  console.log('[CodexHistoryProjector] budget=' + clamped + 'MB'
+    + (clamped !== parsed ? ' requested=' + parsed + ' (clamped)' : ''));
+  return _codexHistoryProjectorBudgetBytes;
+}
+
+/**
+ * Approximate retained bytes of one projector's presentation.
+ *
+ * Sampled, not walked: the array can hold 16K rows and this runs on every
+ * cache insert. Heavy payloads already live in the shared payload stash
+ * (dehydration), so what is measured here is the presentation skeleton —
+ * exactly what the renderer-side estimator measures on its own copy, and its
+ * numbers matched production within the same order (12-30MB per session).
+ */
+const PROJECTOR_COST_SAMPLE_ROWS = 48;
+function estimateProjectorBytes(entries) {
+  const rows = Array.isArray(entries) ? entries.length : 0;
+  if (rows === 0) return 0;
+  let sampledBytes = 0;
+  let sampled = 0;
+  const step = Math.max(1, Math.floor(rows / PROJECTOR_COST_SAMPLE_ROWS));
+  for (let index = 0; index < rows; index += step) {
+    const entry = entries[index];
+    if (!entry) continue;
+    let bytes = 128; // object overhead + fixed identity fields
+    if (typeof entry.content === 'string') bytes += entry.content.length * 2;
+    if (typeof entry.thinking === 'string') bytes += entry.thinking.length * 2;
+    if (typeof entry.compactSummary === 'string') bytes += entry.compactSummary.length * 2;
+    const actions = Array.isArray(entry.actions) ? entry.actions : null;
+    if (actions) {
+      for (const action of actions) {
+        bytes += 96;
+        const raw = action && action.tool === '__raw__' ? action.rawTool : null;
+        if (!raw) continue;
+        if (typeof raw.result === 'string') bytes += raw.result.length * 2;
+        if (raw.args) {
+          // Args hold apply_patch bodies and command text — the biggest
+          // remaining non-dehydrated field.
+          for (const value of Object.values(raw.args)) {
+            if (typeof value === 'string') bytes += value.length * 2;
+            else bytes += 32;
+          }
+        }
+        if (Array.isArray(raw.diffHunks)) {
+          for (const hunk of raw.diffHunks) {
+            const lines = Array.isArray(hunk?.entries) ? hunk.entries.length : 0;
+            bytes += 64 + lines * 96;
+          }
+        }
+      }
+    }
+    sampledBytes += bytes;
+    sampled += 1;
+  }
+  if (sampled === 0) return rows * 128;
+  return Math.round((sampledBytes / sampled) * rows);
+}
+
+function estimateCodexProjectorCacheEntryBytes(historyEntries, timelineEntries) {
+  return Math.max(
+    CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
+    estimateProjectorBytes(historyEntries) + estimateProjectorBytes(timelineEntries),
+  );
+}
+
+function _dropProjectorEntry(sessionId) {
+  const cached = _codexHistoryProjectors.get(sessionId);
+  if (!cached) return false;
+  _codexHistoryProjectors.delete(sessionId);
+  cached.historyProjector.close?.();
+  for (const item of cached.checkpoints || []) item.state?.history?.release?.();
+  _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - (cached.approxBytes || 0));
+  return true;
+}
+
+function invalidateCodexHistoryProjectors(filePath = null) {
+  _codexReadFence.invalidate(filePath, 'projection');
+  for (const [id, item] of _codexRewriteReceipts) if (!filePath || item.receipt.targetSnapshot.filePath === filePath) {
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
+  if (!filePath) {
+    for (const sessionId of _codexHistoryProjectors.keys()) _dropProjectorEntry(sessionId);
+    _codexHistoryProjectorBytes = 0;
+    return;
+  }
+  for (const [sessionId, cached] of [..._codexHistoryProjectors]) {
+    if (cached.filePath === filePath) _dropProjectorEntry(sessionId);
+  }
+}
+
+function getCodexHistoryProjectorStats() {
+  return {
+    sessions: _codexHistoryProjectors.size,
+    approxBytes: _codexHistoryProjectorBytes + _codexRewriteReceiptBytes,
+    budgetBytes: _codexHistoryProjectorBudgetBytes,
+    sourceMetadataBytes: _codexSourceGenerations.bytes,
+    minimumSessionBytes: CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
+  };
+}
+
+/**
+ * Serialized per session: overlapping calls (renderer History refresh +
+ * Timeline + web client) must not feed the same projectors concurrently —
+ * later callers wait and then see an unchanged cursor.
+ */
+function _chainCodexProjection(sessionId, task) {
+  const previous = _codexProjectorChains.get(sessionId) || Promise.resolve();
+  const run = previous.catch(() => {}).then(task);
+  _codexProjectorChains.set(sessionId, run);
+  run.finally(() => {
+    if (_codexProjectorChains.get(sessionId) === run) {
+      _codexProjectorChains.delete(sessionId);
+    }
+  }).catch(() => {});
+  return run;
+}
+
+function codexProjectionControl(options = {}) {
+  const demand = options._readControl || options.control || currentReadControl();
+  const assertCurrent = () => { demand?.assertCurrent(); options.assertCurrent?.(); };
+  return { assertCurrent, schedule: demand?.checkpoint
+    ? () => demand.checkpoint() : () => new Promise(resolve => setImmediate(resolve)) };
+}
+
+async function feedCodexProjection(cached, records, options = {}) {
+  const control = codexProjectionControl(options);
+  for (const record of records) {
+    control.assertCurrent();
+    const metrics = cached.readMetrics;
+    const feedStarted = metrics ? performance.now() : 0;
+    cached.historyProjector.feed(record);
+    cached.timelineProjector.feed(record);
+    if (metrics) metrics.feedMs += performance.now() - feedStarted;
+    const count = cached.historyProjector.getConsumedRecords();
+    if (options.checkpoints !== false && count % 2048 === 0) {
+      const checkpointStarted = metrics ? performance.now() : 0;
+      const history = cached.historyProjector.exportState();
+      const candidate = { history, timeline: cached.timelineProjector.exportState() };
+      let transferred = false;
+      try {
+        const limit = _codexHistoryProjectorBudgetBytes / 4;
+        const admittedBytes = await measureProjectionGraphBytes(candidate,
+          { ...control, stopAfterBytes: limit });
+        if (admittedBytes <= limit) {
+          // History is already frozen and owned; only the legacy Timeline
+          // metadata graph needs copying. A refusal releases this exact pin.
+          const timeline = (await cloneProjectionGraphAsync(candidate.timeline, undefined, control)).value;
+          const state = { history, timeline };
+          control.assertCurrent();
+          const approxBytes = await measureProjectionGraphBytes(state, control);
+          if (approxBytes <= limit) {
+            retainCheckpoint(cached.checkpoints ||= [], { count, state, approxBytes });
+            transferred = true;
+          }
+        }
+      } finally { if (!transferred) history.release(); }
+      if (metrics) { metrics.checkpoints += 1; metrics.checkpointMs += performance.now() - checkpointStarted; }
+    }
+    if (count % 256 === 0) {
+      const yieldStarted = metrics ? performance.now() : 0;
+      await control.schedule();
+      control.assertCurrent();
+      if (metrics) metrics.yieldMs += performance.now() - yieldStarted;
+    }
+  }
+}
+
+// Cold legacy full History has a distinct request-owned canonical root. It never reuses
+// a cached/SSD continuation whose storage.prepare has detached payloads. One
+// reader-owned record feeds History plus Timeline metadata without a raw array.
+// The ordinary reducer now owns paged rows/pending records. This legacy caller
+// still returns a whole native DTO: framing, final materialization and the
+// receiving positional consumers are separate, unresolved memory boundaries.
+async function projectCodexFullHistoryStream(sessionId, cwd, options = {}) {
+  if (options.rootedOwner) return projectCodexFullHistoryFromFile(sessionId, cwd, options);
+  const controlOptions = codexProjectionControl(options);
+  controlOptions.assertCurrent();
+  const found = await findCodexSessionFile(sessionId, cwd,
+    options.sessionsDir ? { sessionsDir: options.sessionsDir } : {});
+  controlOptions.assertCurrent();
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  await _codexExternalReadPrepare?.(filePath);
+  controlOptions.assertCurrent();
+  const ticket = _codexReadFence.begin(filePath, 'history-full-stream');
+  const assertCurrent = () => { controlOptions.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  const control = createProjectionControl({ ...controlOptions, assertCurrent });
+  let finishPreparation = () => {}, historyProjector;
+  try {
+    const stat = await fs.promises.stat(filePath);
+    assertCurrent();
+    finishPreparation = historyPreparationActivity.begin({ kind: 'history', sessionId,
+      tabId: options.tabId, bytes: stat.size, source: { toolType: 'codex', cwd } });
+    historyProjector = createCodexHistoryProjector(sessionId);
+    const cached = { sessionId, historyProjector,
+      timelineProjector: createCodexTimelineProjector(sessionId, {}, { metadataOnly: true }) };
+    const metrics = {};
+    const read = await readJsonlRange(filePath, 0, stat.size - 1, {
+      sourceStat: stat, collectRecords: false, metrics, assertCurrent,
+      _readControl: options._readControl || options.control,
+      ...(options.highWaterMark ? { highWaterMark: options.highWaterMark } : {}),
+      onRecord: record => feedCodexProjection(cached, [record], {
+        ...options, assertCurrent, checkpoints: false,
+      }),
+      onProgress: bytes => finishPreparation.update?.({ completedBytes: bytes }),
+    });
+    assertCurrent();
+    finishPreparation.update?.({ completedBytes: stat.size, phase: 'preparing' });
+    const entries = await control.drain('historyFinalize', cached.historyProjector.finalizeSteps({
+      includeTurnCoordinates: options.includeTurnCoordinates === true,
+    }));
+    assertCurrent();
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
+    return { success: true, entries, sessionMeta: cached.timelineProjector.getSessionMeta(),
+      filePath, mode: 'full-stream', fedRecords: read.parsed, reusedRecords: 0,
+      readMetrics: { ...metrics, canonicalRows: entries.length,
+        timelineRows: cached.timelineProjector.peekEntries().length },
+      sourceSnapshot: { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, sourceGeneration, linkKind: 'end' } };
+  } finally { historyProjector?.close(); finishPreparation(); _codexReadFence.finish(ticket); }
+}
+
+// Explicit rooted producer on the same file discovery/fence/framing/feed path.
+// Legacy callers keep their DTO contract until the service/postprocessors are
+// migrated. The backing owner is mandatory and comes from the reader/cache.
+const CODEX_ROOT_TIMELINE_NAMESPACE = 'codex-timeline-v1';
+
+function projectCodexRootHistoryFromFile(sessionId, cwd, options) {
+  return projectCodexRootProjectionFromFile(sessionId, cwd, options, 'canonicalHistory');
+}
+
+// Same isolated reader and supplied store as History; no native Timeline DTO
+// or legacy projector cache is constructed. The owner is a distinct pin space.
+function projectCodexRootTimelineFromFile(sessionId, cwd, options = {}) {
+  if (!(options.rootedOwner instanceof CodexRootProjectionOwner)) throw new TypeError('CodexRootProjectionOwner required');
+  if (options.rootedOwner.namespace !== CODEX_ROOT_TIMELINE_NAMESPACE) {
+    throw new TypeError('Timeline owner namespace must be ' + CODEX_ROOT_TIMELINE_NAMESPACE);
+  }
+  return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(() =>
+    projectCodexRootProjectionFromFile(sessionId, cwd, options, 'timeline')));
+}
+
+async function projectCodexRootProjectionFromFile(sessionId, cwd, options, flavor) {
+  const rootedTimeline = flavor === 'timeline';
+  // Timeline uses a stable, separate pin namespace. Its continuation still
+  // belongs to the exact isolated reader implementation supplied by its
+  // controller; a restarted/new parser must not inherit an old interpretation.
+  const projectionSchema = rootedTimeline ? options.projectionSchema || 'timeline-root-v1' : null;
+  if(rootedTimeline && (typeof projectionSchema !== 'string' || projectionSchema.length > 256))
+    throw new TypeError('Timeline projection schema required');
+  const owner = options.rootedOwner;
+  if (!(owner instanceof CodexRootProjectionOwner)) throw new TypeError('CodexRootProjectionOwner required');
+  owner.assertOpen();
+  const demand = codexProjectionControl(options);
+  demand.assertCurrent();
+  const found = await findCodexSessionFile(sessionId,cwd,{
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+    rootedIdentity: filePath => matchesRootedSessionHead(filePath,sessionId,owner.store, {
+      control: options._readControl || options.control, assertCurrent: demand.assertCurrent,
+      highWaterMark: options.highWaterMark, observe: stats => options.observeIngest?.(stats) }),
+  });
+  demand.assertCurrent();
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  await _codexExternalReadPrepare?.(filePath);
+  demand.assertCurrent();
+  const ticket = _codexReadFence.begin(filePath,'projection-root');
+  const assertCurrent = () => { demand.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  const control = { ...demand, assertCurrent };
+  let arena, history, output, metadata, continuation, committed, supplied;
+  const checkpoints = [];
+  let finishPreparation = () => {};
+  let transferred = false;
+  try {
+    const stat = await fs.promises.stat(filePath); assertCurrent();
+    const identity = stat.dev + ':' + stat.ino;
+    committed = owner.read(sessionId,cwd);
+    const expectedPage = committed?.descriptor.page || 0;
+    supplied = options.rootCheckpoint ? owner.store.open(options.rootCheckpoint.descriptor || options.rootCheckpoint) : null;
+    const previous = supplied || committed;
+    let mode = 'rebuild', verificationBytes = 0;
+    if (previous) {
+      arena = new HistoryProjectionArena(owner.store,previous);
+      const file = arena.state().file;
+      if (file && (file.projectionFlavor || 'canonicalHistory') === flavor
+        && (!rootedTimeline || rootText.equal(file.projectionSchema,projectionSchema))
+        && rootText.equal(file.sessionId,sessionId) && rootText.equal(file.cwd,cwd || '')
+        && rootText.equal(file.filePath,filePath) && file.fileIdentity === identity && stat.size >= file.fileSize) {
+        // Even after restart, growth is not proof of an unchanged prefix.
+        // Compare exact retained bytes with bounded buffers, never re-project
+        // old records merely to discover whether their payload exists.
+        const verified = await verifyRootSourcePrefix(arena,filePath,file.fileSize,stat,control);
+        verificationBytes = verified.bytes;
+        if (verified.valid) mode = stat.size === file.fileSize ? 'unchanged' : 'append';
+      }
+    }
+    if (options.cacheOnly === true && mode !== 'unchanged') return { success: false, error: 'cached_projection_unavailable' };
+    if (mode === 'rebuild') { arena?.close(); arena = new HistoryProjectionArena(owner.store); }
+    else for (let i = 0; i < 4; i++) { const lease = owner.read(sessionId,cwd,i); if (lease) checkpoints.push(lease); }
+    const oldFile = mode === 'rebuild' ? null : arena.state().file;
+    const start = oldFile?.fileSize || 0;
+    trimRootSourceProof(arena,start);
+    const timeline = createCodexTimelineProjector(sessionId,oldFile?.timeline || {},
+      rootedTimeline ? { rooted: arena } : { metadataOnly: true });
+    history = rootedTimeline ? timeline
+      : createCodexHistoryProjector(sessionId,{}, { rooted: arena, sourceOptions: { sessionsDir: options.sessionsDir } });
+    const cached = { sessionId, historyProjector: history, timelineProjector: timeline };
+    const snapshot = { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+      fileIdentity: identity, linkKind: 'end' };
+    const file = { sessionId, cwd: cwd || '', filePath, fileIdentity: identity, projectionFlavor: flavor,
+      ...(rootedTimeline ? {projectionSchema} : {}),
+      fileSize: stat.size, fileMtimeMs: stat.mtimeMs, fileCtimeMs: stat.ctimeMs };
+    const observe = phase => options.observeRoot?.({ phase, consumedRecords: history.getConsumedRecords(), ...arena.stats() });
+    finishPreparation = historyPreparationActivity.begin({ kind: rootedTimeline ? 'timeline' : 'history',sessionId,tabId: options.tabId,
+      bytes: stat.size-start,source: { toolType: 'codex',cwd } });
+    const metrics = {};
+    const read = await readRootedJsonlRange(filePath,start,stat.size-1,{
+      arena,oldFile,
+      sourceStat: stat,collectRecords: false,metrics,assertCurrent,
+      _readControl: options._readControl || options.control,
+      highWaterMark: options.highWaterMark,
+      onChunk: chunk => appendRootSourceProof(arena,chunk),
+      observe: stats => options.observeIngest?.(stats),
+      onRecord: async (cursor,coordinate) => {
+        const record=arena.step(()=>{
+          // Non-object JSON roots have no provider fields; raw bytes remain
+          // in the frozen source proof, exactly as unknown provider records.
+          const value=cursor.kind==='object'?arena.own(cursor):arena.make('object');
+          value.__line=coordinate.startLine;value.__byteOffset=coordinate.fromByte;
+          return value;
+        });
+        if (rootedTimeline) timeline.feed(record);
+        else await feedCodexProjection(cached,[record],{ ...options,assertCurrent,checkpoints: false });
+        // Page writes cost more than the old in-memory feed. Return to the
+        // reader's demand loop after each owned record, including when the
+        // filesystem supplied many records in one chunk.
+        await control.schedule(); assertCurrent();
+        observe('feed');
+        if (history.getConsumedRecords() % owner.checkpointEvery === 0) {
+          assertCurrent();
+          const lease = checkpointRootAt(arena,file,rootedTimeline ? undefined : timeline.exportState(),coordinate.toByte,coordinate.startLine+1);
+          checkpoints.push(lease);
+          if (checkpoints.length > 4) checkpoints.shift().release();
+          observe('checkpoint');
+        }
+      },
+      onProgress: bytes => finishPreparation.update?.({ completedBytes: bytes }),
+    });
+    assertCurrent();
+    if (mode !== 'unchanged') arena.step(() => { arena.state().file = { ...file,lineCount: read.lineCount,
+      ingest:'paged-jsonl-v1',partial:read.partial,
+      ...(rootedTimeline ? {} : { timeline: timeline.exportState() }) }; });
+    const iterator = history.finalizeRootSteps({ includeTurnCoordinates: options.includeTurnCoordinates === true,
+      onRootStep: stats => options.observeRoot?.({ phase: 'view-step',consumedRecords: history.getConsumedRecords(),...stats }) });
+    try {
+      for (let steps = 0;; steps++) {
+        assertCurrent();
+        const next = iterator.next();
+        if (next.done) output = next.value;
+        observe('finalization');
+        if (next.done) break;
+        if (steps % 64 === 63) { await control.schedule(); assertCurrent(); }
+      }
+    } finally { iterator.return?.(); }
+    assertCurrent();
+    // Resolve the fixed metadata fields before forking: a lazy child first
+    // adopted on the parent after fork would have no identity in that fork.
+    const sessionMetadata = arena.step(() => timeline.getSessionMeta());
+    continuation = history.exportRoot();
+    const metadataArena = arena.fork();
+    try { metadata = metadataArena.step(() => metadataArena.publish(sessionMetadata)); }
+    finally { metadataArena.close(); }
+    observe('publication');
+    // Same-size replacement, truncate and cancellation cannot publish a
+    // newer cursor over bytes that no longer match this read's source.
+    const after = await fs.promises.stat(filePath);
+    assertCurrent();
+    if (after.dev !== stat.dev || after.ino !== stat.ino || after.size < stat.size
+      || after.size === stat.size && (after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs)) {
+      throw Object.assign(new Error('Codex source changed before root publication'),{ code:'CODEX_SOURCE_READ_INVALIDATED' });
+    }
+    if (after.size > stat.size) {
+      // Growth alone does not prove append: an external writer may rewrite
+      // the old prefix and append in the same interval. Retain the frozen
+      // prefix only after another exact, bounded comparison.
+      const publicationProof = await verifyRootSourcePrefix(arena,filePath,stat.size,after,control);
+      if (!publicationProof.valid) throw Object.assign(new Error('Codex source prefix changed before root publication'),
+        { code:'CODEX_SOURCE_READ_INVALIDATED' });
+      assertCurrent();
+    }
+    snapshot.sourceGeneration = rememberCodexSourceGeneration(filePath,stat,ticket,sessionId);
+    owner.commit(sessionId,cwd,continuation,expectedPage,checkpoints,assertCurrent);
+    const entries = output.cursor(), sessionMeta = metadata.cursor();
+    const rootStats = arena.stats();
+    let released = false;
+    const result = { success: true,representation: rootedTimeline ? 'codex-timeline-root-v1' : 'codex-canonical-root-v1',mode,
+      entries,sessionMeta,checkpoint: continuation,root: output,filePath,
+      sourceSnapshot: Object.freeze(snapshot),fedRecords: read.parsed,
+      reusedRecords: history.getConsumedRecords()-read.parsed,
+      readMetrics: { ...metrics,verificationBytes,canonicalRows: rootedTimeline ? 0 : entries.length,timelineRows: rootedTimeline ? entries.length : 0 },
+      rootStats, release() {
+        if (released) return; released = true;
+        output.release(); metadata.release(); continuation.release();
+      } };
+    transferred = true;
+    return rootedTimeline ? Object.freeze(result) : result;
+  } finally {
+    if (!transferred) { output?.release(); metadata?.release(); continuation?.release(); }
+    for (const lease of checkpoints) lease.release();
+    supplied?.release(); committed?.release(); arena?.close();
+    finishPreparation(); _codexReadFence.finish(ticket);
+  }
+}
+
+function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
+  return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
+    if (options.rootedOwner) return projectCodexRootHistoryFromFile(sessionId, cwd, options);
+    if (options.payloadPolicy === 'full') {
+      // A small/full hot graph can serve a runtime-only ownership refresh
+      // without replay. Completeness is affirmative and monotone: neither an
+      // SSD continuation nor an opaque prepare hook can claim it by absence
+      // of newly detached fields. Source changes never enter this shortcut.
+      if (_codexHistoryProjectors.get(sessionId)?.fullPayloadsPreserved === true) {
+        const advanced = await _advanceCodexProjection(sessionId, cwd, { ...options, cacheOnly: true });
+        if (advanced.success) {
+          try {
+            advanced.assertCurrent();
+            if (advanced.cached.fullPayloadsPreserved === true) {
+              const control = createProjectionControl({ ...codexProjectionControl(options), assertCurrent: advanced.assertCurrent });
+              // finalize refreshes Task cards and registers seeded pending
+              // spawns. Previously returned shallow rows may alias those
+              // cards, so even unchanged-source reuse needs a private graph.
+              // Strings are shared; graph shells remain O(graph), not bounded.
+              const history = advanced.cached.historyProjector.fork();
+              try {
+                const entries = await control.drain('historyFinalize', history.finalizeSteps({
+                  includeTurnCoordinates: options.includeTurnCoordinates === true,
+                }));
+                advanced.assertCurrent();
+                return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta(),
+                  fullPayloadsReused: true };
+              } finally { history.close(); }
+            }
+          } finally { advanced.finishPreparation(); }
+        }
+      }
+      codexProjectionControl(options).assertCurrent();
+      if (options.cacheOnly === true) return { success: false, error: 'cached_projection_unavailable' };
+      return projectCodexFullHistoryStream(sessionId, cwd, options);
+    }
+    const advanced = await _advanceCodexProjection(sessionId, cwd, options);
+    if (!advanced.success) return advanced;
+    try {
+      const controlOptions = codexProjectionControl(options);
+      const control = createProjectionControl({ ...controlOptions, assertCurrent: advanced.assertCurrent });
+      const entries = await control.drain('historyFinalize', advanced.cached.historyProjector.finalizeSteps({
+        includeTurnCoordinates: options.includeTurnCoordinates === true,
+      }));
+      const preparation = await prepareHistoryRowWindow(entries, options.hydrate, { yieldToMain: async () => {
+        advanced.assertCurrent(); await controlOptions.schedule(); advanced.assertCurrent();
+      } });
+      advanced.assertCurrent();
+      if (preparation?.elapsedMs >= 24) {
+        console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
+          + ' rows=' + preparation.rows + ' yields=' + preparation.yields
+          + ' maxSliceMs=' + preparation.maxSliceMs.toFixed(1)
+          + ' ms=' + preparation.elapsedMs.toFixed(1));
+      }
+      return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
+    } finally { advanced.finishPreparation(); }
+  }));
+}
+
+function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
+  return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
+    const advanced = await _advanceCodexProjection(sessionId, cwd, options);
+    if (!advanced.success) return advanced;
+    try {
+      const control = createProjectionControl({ ...codexProjectionControl(options), assertCurrent: advanced.assertCurrent });
+      const entries = await control.drain('timelineFinalize', advanced.cached.timelineProjector.finalizeSteps());
+      const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
+      advanced.assertCurrent();
+      return { ...advanced.result, entries, sessionMeta };
+    } finally { advanced.finishPreparation(); }
+  }));
+}
+
+function rememberCodexProjection(sessionId, cached) {
+  // LRU refresh + byte budget. Re-costed on every advance: an append grows
+  // the projection, and a stale cost would let the cache drift past its
+  // budget exactly on the sessions that grow fastest.
+  const previous = _codexHistoryProjectors.get(sessionId);
+  const previousCost = previous?.approxBytes || 0;
+  cached.approxBytes = (cached.checkpoints || []).reduce((bytes, item) => bytes + item.approxBytes, 0)
+    + (cached.rewriteReceipt?.records.length || 0) * 160
+    + Math.max(CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
+      (cached.historyProjector.retainedCost?.().estimatedJsBytes
+        ?? estimateProjectorBytes(cached.historyProjector.peekEntries()))
+      + estimateProjectorBytes(cached.timelineProjector.peekEntries()));
+  if (previous && previous.historyProjector !== cached.historyProjector) {
+    previous.historyProjector.close?.();
+    for (const item of previous.checkpoints || []) {
+      if (!(cached.checkpoints || []).includes(item)) item.state?.history?.release?.();
+    }
+  }
+  _codexHistoryProjectors.delete(sessionId);
+  _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - previousCost)
+    + cached.approxBytes;
+  _codexHistoryProjectors.set(sessionId, cached);
+  for (const [id, item] of _codexRewriteReceipts) {
+    if (_codexRewriteReceiptBytes + _codexHistoryProjectorBytes + _codexSourceGenerations.bytes <= _codexHistoryProjectorBudgetBytes) break;
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
+  const usedBeforeEvictionBytes = _codexHistoryProjectorBytes + _codexSourceGenerations.bytes;
+  const evicted = [];
+  while (
+    _codexHistoryProjectorBytes + _codexSourceGenerations.bytes > _codexHistoryProjectorBudgetBytes
+    && _codexHistoryProjectors.size > 1
+  ) {
+    // Never evict the session we just served (it is the newest key, and the
+    // size>1 guard keeps one giant resident even if it alone exceeds the
+    // budget — the alternative is re-parsing it on every single request).
+    const lruKey = _codexHistoryProjectors.keys().next().value;
+    if (lruKey === undefined || lruKey === sessionId) break;
+    evicted.push(lruKey);
+    _dropProjectorEntry(lruKey);
+  }
+  if (evicted.length > 0) {
+    console.log('[CodexHistoryProjector] evict sessions=' + evicted.map((id) => String(id).slice(0, 8)).join(',')
+      + ' reason=byte-budget'
+      + ' remaining=' + _codexHistoryProjectors.size
+      + ' usedBeforeMB=' + Math.round(usedBeforeEvictionBytes / (1024 * 1024))
+      + ' usedMB=' + Math.round(_codexHistoryProjectorBytes / (1024 * 1024))
+      + ' budgetMB=' + Math.round(_codexHistoryProjectorBudgetBytes / (1024 * 1024)));
+  }
+  _codexSourceGenerations.prune();
+}
+
+async function _advanceCodexProjection(sessionId, cwd, options = {}) {
+  const demandControl = codexProjectionControl(options);
+  demandControl.assertCurrent();
+  const startedAt = Date.now();
+  const found = await findCodexSessionFile(sessionId, cwd, {
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+  });
+  demandControl.assertCurrent();
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  await _codexExternalReadPrepare?.(filePath);
+  demandControl.assertCurrent();
+  const ticket = _codexReadFence.begin(filePath, 'projection');
+  const assertCurrent = () => { demandControl.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+    assertCurrent();
+  } catch (error) {
+    if (isHistoryReadCancelled(error) || isHistoryReadUnavailable(error)
+      || error?.code === 'CODEX_SOURCE_READ_INVALIDATED') {
+      _codexReadFence.finish(ticket); throw error;
+    }
+    invalidateCodexHistoryProjectors(filePath);
+    _codexReadFence.finish(ticket);
+    return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
+  }
+
+  const committed = _codexHistoryProjectors.get(sessionId) || null;
+  let cached = committed;
+  let releaseCold = null;
+  try {
+  if (cached && (cached.fileIdentity !== stat.dev + ':' + stat.ino || stat.size < cached.fileSize
+    || (stat.size === cached.fileSize && (cached.fileMtimeMs !== stat.mtimeMs || cached.fileCtimeMs !== stat.ctimeMs)))) {
+    // Do not forget a proven rewrite if the file grows again while this cold
+    // request waits for its turn. Growth must not resurrect the old prefix.
+    _codexSourceGenerations.invalidate(filePath);
+  }
+  const warm = cached && cached.filePath === filePath && cached.fileIdentity === stat.dev + ':' + stat.ino
+    && cached.sourceGeneration === _codexSourceGenerations.get(filePath)?.generation
+    && !_codexSourceGenerations.get(filePath)?.rewritePending
+    && (stat.size > cached.fileSize || (stat.size === cached.fileSize && cached.fileMtimeMs === stat.mtimeMs && cached.fileCtimeMs === stat.ctimeMs));
+  if (!warm && _codexProjectionStorage?.enterCold && !options.cacheOnly) {
+    releaseCold = await _codexProjectionStorage.enterCold();
+    assertCurrent();
+    stat = await fs.promises.stat(filePath);
+    assertCurrent();
+  }
+  if (!cached && _codexProjectionStorage && !options.cacheOnly) {
+    cached = await restoreCodexRewriteCheckpoint(options.rewriteReceipt, { sessionId, cwd, filePath, stat, ticket });
+    assertCurrent();
+  }
+  if (!cached && _codexProjectionStorage && !options.cacheOnly) {
+    const restored = await _codexProjectionStorage.read({ sessionId, cwd, filePath, stat });
+    assertCurrent();
+    if (restored && restoreCodexSourceSnapshot(restored.snapshot)) {
+      const { state, snapshot } = restored;
+      cached = {
+        sessionId,
+        timelineProjector: createCodexTimelineProjector(sessionId, state.timeline),
+        historyProjector: createCodexHistoryProjector(sessionId, state.history),
+        filePath, fileSize: snapshot.size, fileMtimeMs: snapshot.mtimeMs,
+        fileCtimeMs: snapshot.ctimeMs, fileIdentity: snapshot.fileIdentity,
+        sourceGeneration: snapshot.sourceGeneration,
+        lineCount: state.lineCount, leftoverBuffer: Buffer.from(state.leftoverBuffer),
+        sourceProof: state.sourceProof || [],
+      };
+      console.log('[CodexHistoryProjector] session=' + String(sessionId).slice(0, 8) + ' restored=ssd');
+    }
+  }
+  } catch (error) {
+    if (cached && cached !== committed) {
+      cached.historyProjector.close?.();
+      for (const item of cached.checkpoints || []) item.state?.history?.release?.();
+    }
+    releaseCold?.(); _codexReadFence.finish(ticket); throw error;
+  }
+  const fileIdentity = stat.dev + ':' + stat.ino;
+  let mode = 'rebuild';
+  if (cached && cached.filePath === filePath && cached.fileIdentity === fileIdentity
+    && cached.sourceGeneration === _codexSourceGenerations.get(filePath)?.generation
+    && !_codexSourceGenerations.get(filePath)?.rewritePending) {
+    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs
+      && cached.fileCtimeMs === stat.ctimeMs) mode = 'unchanged';
+    else if (stat.size > cached.fileSize) mode = 'append';
+  }
+  if (options.cacheOnly === true && mode !== 'unchanged') {
+    if (cached && cached !== committed) {
+      cached.historyProjector.close?.();
+      for (const item of cached.checkpoints || []) item.state?.history?.release?.();
+    }
+    releaseCold?.();
+    _codexReadFence.finish(ticket);
+    return { success: false, error: 'cached_projection_unavailable' };
+  }
+
+  let fedRecords = 0;
+  let readBytes = 0;
+  const endActivity = mode === 'rebuild'
+    ? historyPreparationActivity.begin({ kind: 'history', sessionId, tabId: options.tabId, bytes: stat.size,
+      source: { toolType: 'codex', cwd } })
+    : () => {};
+  const finishPreparation = () => { endActivity(); releaseCold?.(); _codexReadFence.finish(ticket); };
+  finishPreparation.update = (...args) => endActivity.update?.(...args);
+  let preparationTransferred = false;
+  try {
+    assertCurrent();
+    if (mode === 'append' && cached === committed) {
+      // Reducers mutate entries and pending-call aliases. Stage a CoW History;
+      // a cancelled read cannot advance the committed graph without its cursor.
+      // Timeline still requires an explicit native graph copy and remains an
+      // unresolved boundary. Each staged checkpoint owns an independent pin.
+      const timeline = (await cloneProjectionGraphAsync(cached.timelineProjector.exportState(),
+        undefined, { ...demandControl, assertCurrent })).value;
+      assertCurrent();
+      const historyProjector = cached.historyProjector.fork();
+      try {
+        cached = { ...cached, historyProjector,
+          timelineProjector: createCodexTimelineProjector(sessionId, timeline),
+          sourceProof: (cached.sourceProof || []).slice(),
+          ...(cached.preparedSourceProof ? { preparedSourceProof: cached.preparedSourceProof.slice() } : {}),
+          checkpoints: forkProjectionCheckpoints(cached.checkpoints || []),
+        };
+      } catch (error) { historyProjector.close(); throw error; }
+    }
+    if (mode === 'rebuild') {
+      if (cached && cached !== committed) {
+        cached.historyProjector.close?.();
+        for (const item of cached.checkpoints || []) item.state?.history?.release?.();
+      }
+      // Self-contained read up to OUR stat.size — deliberately not coupled to
+      // parseJsonlFile's records cache. Copying a cursor from that cache is
+      // racy (the file can grow between our stat and the shared parse, and a
+      // straddling last line cannot be reconstructed afterwards), and coupling
+      // would also keep giants pinned in the 768MB records budget for History's
+      // sake. First open, rewrite OR actual byte-budget eviction needs a
+      // rebuild, including a new send in a warm renderer. Keep its read and
+      // feed incremental too; usage/export retain their independent reader.
+      // One read feeds BOTH projections.
+      const timelineProjector = createCodexTimelineProjector(sessionId);
+      const historyProjector = createCodexHistoryProjector(sessionId);
+      readBytes = stat.size;
+      cached = {
+        sessionId,
+        historyProjector,
+        timelineProjector,
+        fullPayloadsPreserved: true,
+        filePath,
+        fileSize: stat.size,
+        fileMtimeMs: stat.mtimeMs,
+        fileIdentity,
+        fileCtimeMs: stat.ctimeMs,
+        lineCount: 0,
+        leftoverBuffer: Buffer.alloc(0),
+        sourceProof: [],
+      };
+      const metrics = { feedMs: 0, checkpointMs: 0, checkpoints: 0, yieldMs: 0 };
+      cached.readMetrics = metrics;
+      // Feed both existing parsers in physical order without also retaining
+      // every raw payload until EOF. The staged owner is published only after
+      // a complete read; failures cannot leave a partially advanced cache.
+      const result = await readJsonlRange(filePath, 0, stat.size - 1, {
+        sourceStat: stat,
+        collectRecords: false,
+        _readControl: options._readControl || options.control, assertCurrent,
+        onRecord: record => feedCodexProjection(cached, [record], { ...options, assertCurrent }),
+        onChunk: _codexProjectionStorage ? (chunk, offset) => cached.sourceProof.push({
+          offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex'),
+        }) : null,
+        onProgress: bytes => finishPreparation.update({ completedBytes: bytes }),
+        metrics,
+      });
+      delete cached.readMetrics;
+      fedRecords = result.parsed;
+      cached.lineCount = result.lineCount;
+      cached.leftoverBuffer = result.leftoverBuffer;
+      finishPreparation.update({ completedBytes: stat.size, phase: 'preparing' });
+      if (Date.now() - startedAt >= 500) {
+        console.log('[CodexHistoryRead] session=' + String(sessionId).slice(0, 8)
+          + ' startAbs=' + startedAt + ' endAbs=' + Date.now()
+          + ' bytes=' + metrics.bytes + ' chunks=' + metrics.chunks
+          + ' maxRecordBytes=' + metrics.maxRecordBytes
+          + ' maxBufferedBytes=' + metrics.maxBufferedBytes + ' framingMs=' + metrics.framingMs.toFixed(1)
+          + ' readWaitMs=' + metrics.readWaitMs.toFixed(1)
+          + ' parseMs=' + metrics.parseMs.toFixed(1) + ' feedMs=' + metrics.feedMs.toFixed(1)
+          + ' checkpointMs=' + metrics.checkpointMs.toFixed(1) + ' checkpoints=' + metrics.checkpoints
+          + ' yieldMs=' + metrics.yieldMs.toFixed(1) + ' consumeMs=' + metrics.consumeMs.toFixed(1));
+      }
+    } else if (mode === 'append') {
+      cached.rewriteReceipt = null;
+      const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
+        sourceStat: stat,
+        collectRecords: false,
+        _readControl: options._readControl || options.control, assertCurrent,
+        lineCount: cached.lineCount,
+        leftoverBuffer: cached.leftoverBuffer,
+        onRecord: record => feedCodexProjection(cached, [record], { ...options, assertCurrent }),
+        onChunk: _codexProjectionStorage && !cached.preparedSourceProof ? (chunk, offset) => (cached.sourceProof ||= []).push({
+          offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex'),
+        }) : null,
+      });
+      fedRecords = result.parsed;
+      readBytes = stat.size - cached.fileSize;
+      cached.fileSize = stat.size;
+      cached.fileMtimeMs = stat.mtimeMs;
+      cached.fileCtimeMs = stat.ctimeMs;
+      cached.lineCount = result.lineCount;
+      cached.leftoverBuffer = result.leftoverBuffer;
+      if (cached.preparedSourceProof) {
+        cached.sourceProof = cached.preparedSourceProof;
+        delete cached.preparedSourceProof;
+      }
+    }
+
+    assertCurrent();
+    cached.sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
+    _codexProjectionStorage?.onRead?.({ bytes: readBytes, mode });
+    if (_codexProjectionStorage && mode !== 'unchanged') {
+      const preparation = _codexProjectionStorage.prepare?.(cached);
+      if (_codexProjectionStorage.prepare) cached.fullPayloadsPreserved = cached.fullPayloadsPreserved === true
+        && preparation?.fullHistoryPreserved === true;
+      assertCurrent();
+      await _codexProjectionStorage.write({ sessionId, cwd, snapshot: {
+        filePath, size: cached.fileSize, mtimeMs: cached.fileMtimeMs,
+        ctimeMs: cached.fileCtimeMs, fileIdentity, sourceGeneration: cached.sourceGeneration,
+        sessionId, linkKind: 'end',
+      }, state: { history: cached.historyProjector.exportLegacyState(), timeline: cached.timelineProjector.exportState(),
+        lineCount: cached.lineCount, leftoverBuffer: cached.leftoverBuffer, sourceProof: cached.sourceProof || [] },
+        timelineEntries: cached.timelineProjector.finalize(), sessionMeta: cached.timelineProjector.getSessionMeta() });
+      assertCurrent();
+    }
+    rememberCodexProjection(sessionId, cached);
+    if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
+      console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
+        + ' mode=' + mode
+        + ' fed=' + fedRecords
+        + ' readKB=' + Math.round(readBytes / 1024)
+        + ' consumed=' + cached.historyProjector.getConsumedRecords()
+        + ' ms=' + (Date.now() - startedAt));
+    }
+    preparationTransferred = true;
+    return {
+      success: true,
+      cached,
+      finishPreparation,
+      assertCurrent,
+      result: {
+        success: true,
+        filePath,
+        mode,
+        fedRecords,
+        reusedRecords: cached.preparedReusedRecords || 0,
+        // Built from the CURSOR, not a fresh stat: the file may have grown
+        // again while we were reading, and a revision newer than the entries
+        // it labels would make the next ifRevision check falsely answer
+        // "unchanged".
+        sourceSnapshot: {
+          filePath,
+          size: cached.fileSize,
+          mtimeMs: cached.fileMtimeMs,
+          fileIdentity: cached.fileIdentity,
+          ctimeMs: cached.fileCtimeMs,
+          sourceGeneration: cached.sourceGeneration,
+          sessionId,
+          linkKind: 'end',
+        },
+      },
+    };
+  } catch (error) {
+    // The staged owner is private until rememberCodexProjection. Preserve the
+    // previous committed cache on cancellation or failed preparation.
+    if (cached && cached !== committed && cached.historyProjector !== committed?.historyProjector) {
+      cached.historyProjector.close?.();
+      for (const item of cached.checkpoints || []) {
+        if (!(committed?.checkpoints || []).includes(item)) item.state?.history?.release?.();
+      }
+    }
+    throw error;
+  } finally { if (!preparationTransferred) finishPreparation(); }
+}
+
+const CODEX_SHELL_TOOLS = new Set([
+  'exec_command', 'write_stdin', 'read_output', 'run_command', 'restart_process',
+  'kill_process', 'run_chain',
+]);
+// Both rollout generations: v1 multi_agent_v1 + v2 collaboration tool names.
+const CODEX_SUBAGENT_NAMES = new Set([
+  'spawn_agent', 'resume_agent', 'wait_agent', 'send_input', 'close_agent',
+  'send_message', 'followup_task', 'interrupt_agent', 'list_agents',
+]);
+const CODEX_OUTPUT_LIMIT = 60_000;
+
+function stringifyCompact(value, max = CODEX_OUTPUT_LIMIT) {
+  let text = '';
+  if (value == null) text = '';
+  else if (typeof value === 'string') text = value;
+  else text = JSON.stringify(value, null, 2);
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n\n[truncated ${text.length - max} chars]`;
+}
+
+function stripBase64Images(text) {
+  if (rootText.isPagedText(text)) return rootText.stripDataImages(text);
+  return String(text || '').replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+/g, '[image: base64 omitted]');
+}
+
+function summarizeToolSearchOutput(payload) {
+  const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+  if (tools.length === 0) return stringifyCompact(payload?.output || payload, 10_000);
+  const lines = [];
+  const visit = (node, prefix = '') => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'namespace' && node.name) {
+      lines.push(`${prefix}${node.name}/`);
+      const childPrefix = `${prefix}  `;
+      for (const child of Array.isArray(node.tools) ? node.tools : []) visit(child, childPrefix);
+      return;
+    }
+    if (node.name) {
+      lines.push(`${prefix}${node.name}`);
+    }
+  };
+  for (const tool of tools) visit(tool);
+  return lines.join('\n') || `[tool_search returned ${tools.length} tools]`;
+}
+
+function codexToolName(call) {
+  if (!call) return 'tool';
+  if (call.type === 'web_search_call') return 'web_search';
+  if (call.type === 'tool_search_call' || call.type === 'tool_search_output') return 'tool_search';
+  return call.toolName || call.name || call.tool_name || call.type || 'tool';
+}
+
+function codexToolGroup(call) {
+  const type = call?.type;
+  const name = codexToolName(call);
+  const namespace = call?.namespace || '';
+  if (type === 'web_search_call' || name === 'web_search') return 'web';
+  if (type === 'tool_search_call' || type === 'tool_search_output' || name === 'tool_search') return 'toolSearch';
+  if (namespace === 'multi_agent_v1' || namespace === 'collaboration' || CODEX_SUBAGENT_NAMES.has(name)) return 'subagent';
+  if (name === 'apply_patch') return 'editing';
+  if (namespace && namespace.startsWith('mcp__')) return 'mcp';
+  if (CODEX_SHELL_TOOLS.has(name)) return 'bash';
+  return 'tools';
+}
+
+function parseCodexCallArgs(call) {
+  if (!call) return {};
+  if (call.type === 'web_search_call') return call.action || {};
+  if (call.type === 'tool_search_call') return call.arguments || {};
+  if (call.args && typeof call.args === 'object') return call.args;
+  return parseToolArguments(call);
+}
+
+function normalizeCodexToolOutput(outputPayload) {
+  if (!outputPayload) return '';
+  if (outputPayload.type === 'tool_search_output') return summarizeToolSearchOutput(outputPayload);
+  const raw = outputPayload.output != null ? outputPayload.output : outputPayload.result;
+  if (raw == null) return '';
+  return stripBase64Images(stringifyCompact(raw));
+}
+
+function formatCodexToolForExport(call, outputPayload, opts) {
+  const group = codexToolGroup(call);
+  const name = codexToolName(call);
+  const args = parseCodexCallArgs(call);
+  const output = normalizeCodexToolOutput(outputPayload);
+  if (group === 'subagent') {
+    const subject = String(
+      args.task_name || args.label || args.target || args.agent_id
+      || (name === 'wait_agent' ? 'result' : 'subagent'),
+    ).trim();
+    // Result-only means the terminal result carrier, not the spawn receipt.
+    const result = opts.includeSubagentHistory || name === 'wait_agent' ? output : '';
+    return formatCopyAction({
+      toolName: 'Subagent',
+      description: subject,
+      args,
+      result,
+      isError: !!outputPayload?.is_error,
+    }, opts);
+  }
+
+  let actions = [];
+  if (call?.type === 'web_search_call' || name === 'web_search') {
+    actions = [{ toolName: 'WebSearch', args, result: output, isError: !!outputPayload?.is_error }];
+  } else if (call?.type === 'tool_search_call' || call?.type === 'tool_search_output' || name === 'tool_search') {
+    actions = [{ toolName: 'Tool Search', args, result: output, isError: !!outputPayload?.is_error }];
+  } else {
+    const decoded = codexHistoryActionsForCall({
+      callId: call?.call_id || call?.id || '',
+      toolName: name,
+      args,
+      namespace: call?.namespace || '',
+      patchApplyEvents: call?.patchApplyEvents,
+    }, output, !!outputPayload?.is_error);
+    actions = (decoded.actions || []).map((action) => (
+      action?.tool === 'Task'
+        ? {
+            toolName: 'Subagent',
+            description: action.description,
+            args: action.args || {},
+            result: action.result,
+            isError: action.isError,
+          }
+        : (action.rawTool || action)
+    ));
+  }
+
+  const formatted = actions
+    .map((action) => formatCopyAction(action, opts))
+    .filter(Boolean);
+  return formatted.length > 0 ? formatted.join('\n\n') : null;
+}
+
+function removeLastCodexTurns(entries, numTurns) {
+  const requested = Number(numTurns || 1);
+  if (!requested || requested <= 0) return;
+  const turns = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const tid = entries[i]?.turnIndex;
+    if (typeof tid !== 'number') continue;
+    if (!turns.includes(tid)) turns.push(tid);
+    if (turns.length >= requested) break;
+  }
+  const remove = new Set(turns);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (remove.has(entries[i]?.turnIndex)) entries.splice(i, 1);
+  }
+}
+
+function removeLastCodexRecordTurns(wrappers, numTurns) {
+  const requested = Number(numTurns || 1);
+  if (!requested || requested <= 0) return { removedTurns: [], removedRecords: 0 };
+  const turns = [];
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    const turnKey = wrappers[i]?.turnKey;
+    if (!Number.isFinite(turnKey)) continue;
+    if (!turns.includes(turnKey)) turns.push(turnKey);
+    if (turns.length >= requested) break;
+  }
+  if (turns.length === 0) return { removedTurns: [], removedRecords: 0 };
+  const remove = new Set(turns);
+  let removedRecords = 0;
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    if (!remove.has(wrappers[i]?.turnKey)) continue;
+    wrappers.splice(i, 1);
+    removedRecords += 1;
+  }
+  return { removedTurns: turns, removedRecords };
+}
+
+function maxCodexRecordTurnIndex(wrappers) {
+  let max = -1;
+  for (const wrapper of wrappers) {
+    if (typeof wrapper?.turnIndex === 'number' && wrapper.turnIndex > max) max = wrapper.turnIndex;
+  }
+  return max;
+}
+
+function normalizeCodexText(value) {
+  return String(value || '').replace(/\r\n/g, '\n').trim();
+}
+
+function isCodexPreUserRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
+  if (record?.type === 'turn_context') return true;
+  if (record?.type === 'response_item' && payload.type === 'message') {
+    return payload.role === 'user' || payload.role === 'developer';
+  }
+  return false;
+}
+
+function isCodexResponseUserRecord(record) {
+  const payload = record?.payload || {};
+  return record?.type === 'response_item' && payload.type === 'message' && payload.role === 'user';
+}
+
+function isCodexTurnPreambleRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'turn_context') return true;
+  if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
+  if (record?.type === 'event_msg' && payload.type === 'user_message') {
+    const text = codexUserMessageAuditText(record) || '';
+    return isCodexEnvironmentContextUserText(text)
+      || isCodexProjectInstructionsUserText(text);
+  }
+  if (record?.type !== 'response_item' || payload.type !== 'message') return false;
+  if (payload.role === 'developer') return true;
+  if (payload.role !== 'user') return false;
+  const text = codexUserMessageAuditText(record) || '';
+  return isCodexEnvironmentContextUserText(text)
+    || isCodexProjectInstructionsUserText(text);
+}
+
+function codexPendingStartForUserMessage(pending, message) {
+  if (!normalizeCodexText(message)) return pending.length;
+  let duplicateIdx = -1;
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const record = pending[i]?.record;
+    if (!isCodexResponseUserRecord(record)) continue;
+    const text = codexUserMessageAuditText(record) || '';
+    if (codexUserCarrierTextsMatch(text, message)) {
+      duplicateIdx = i;
+      break;
+    }
+  }
+  if (duplicateIdx < 0) {
+    // Some Codex protocol generations emit only event_msg/user_message. The
+    // preceding task_started + turn_context still belong to that new turn;
+    // leaving them on the previous turn creates an orphan settings/start pair
+    // after deletion. A task_started is the causal boundary. Without one, only
+    // a trailing turn_context can safely move with the user record.
+    let taskStartedIdx = -1;
+    for (let i = pending.length - 1; i >= 0; i -= 1) {
+      const record = pending[i]?.record;
+      if (record?.type === 'event_msg' && record.payload?.type === 'task_started') {
+        taskStartedIdx = i;
+        break;
+      }
+    }
+    let start = taskStartedIdx >= 0 ? taskStartedIdx : pending.length;
+    while (start > 0 && isCodexTurnPreambleRecord(pending[start - 1]?.record)) {
+      start -= 1;
+    }
+    return start;
+  }
+  let start = duplicateIdx;
+  while (start > 0 && isCodexTurnPreambleRecord(pending[start - 1]?.record)) start -= 1;
+  return start;
+}
+
+function cloneCodexRecordForWrite(record) {
+  if (!record || typeof record !== 'object') return {};
+  const {
+    __line: _sourceLine,
+    __byteOffset: _sourceByteOffset,
+    __byteEndOffset: _sourceByteEndOffset,
+    __physicalSessionId: _physicalSessionId,
+    __segmentId: _segmentId,
+    __segmentIndex: _segmentIndex,
+    ...cloned
+  } = record;
+  Object.defineProperty(cloned, CODEX_REWRITE_ORIGIN, {
+    value: record[CODEX_REWRITE_ORIGIN] || record,
+  });
+  const rawImages = record[CODEX_COMPACT_RAW_IMAGES];
+  if (rawImages) {
+    Object.defineProperty(cloned, CODEX_COMPACT_RAW_IMAGES, {
+      value: rawImages,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return cloned;
+}
+
+function isCodexCompactRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'compacted') return true;
+  if (record?.type === 'event_msg' && isCompactPayload(payload)) return true;
+  const payloadType = String(payload?.type || '').toLowerCase();
+  return record?.type === 'response_item' && payloadType.includes('compact');
+}
+
+function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
+  wrappers.push({
+    record,
+    turnIndex: typeof turnIndex === 'number' && turnIndex >= 0 ? turnIndex : null,
+    turnKey: Number.isFinite(extra.turnKey) ? Number(extra.turnKey) : null,
+    line: record?.__line,
+    ...extra,
+  });
+}
+
+function buildCodexVisibleRecordWrappers(records, sessionId) {
+  const wrappers = [];
+  const compactCompanionRecords = new Set(codexCompactCompanionPairs(records, { recordIdentity: true }).values());
+  // A composite view contains several physical line-number spaces. UUIDs keep
+  // those physical addresses; internal ownership uses one logical position.
+  const logicalPositions = records.some(record => record?.__physicalSessionId)
+    ? new Map(records.map((record, index) => [record, index])) : null;
+  const turnKeyFor = record => logicalPositions?.get(record) ?? Number(record?.__line);
+  const pending = [];
+  let currentTurnIndex = -1;
+  let currentTurnKey = null;
+  let currentTurnCanonicalUserText = null;
+
+  const flushPending = (turnIndex, batch = pending) => {
+    let cursor = 0;
+    // Response-only inputs (including Goal continuation) can precede the
+    // response/event pair of ANOTHER input without an assistant in between.
+    // Keep each exact physical carrier; the first fallback is not the whole
+    // batch and the next event must not absorb its prefix into the old turn.
+    for (let fallbackIndex = 0; fallbackIndex < batch.length; fallbackIndex += 1) {
+      if (!batch[fallbackIndex].fallbackUser) continue;
+      let turnStart = fallbackIndex;
+      while (turnStart > cursor && isCodexTurnPreambleRecord(batch[turnStart - 1].record)) turnStart -= 1;
+      for (let index = cursor; index < turnStart; index += 1) {
+        pushCodexVisibleWrapper(wrappers, batch[index].record, currentTurnIndex, {
+          turnKey: currentTurnKey,
+        });
+      }
+      currentTurnIndex = Math.max(currentTurnIndex, turnIndex) + 1;
+      currentTurnKey = turnKeyFor(batch[fallbackIndex].record);
+      for (let index = turnStart; index <= fallbackIndex; index += 1) {
+        const record = batch[index].record;
+        pushCodexVisibleWrapper(
+          wrappers,
+          record,
+          currentTurnIndex,
+          record === batch[fallbackIndex].record
+            ? {
+                sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+                kind: 'user',
+                turnKey: currentTurnKey,
+              }
+            : { turnKey: currentTurnKey },
+        );
+      }
+      cursor = fallbackIndex + 1;
+    }
+    for (let index = cursor; index < batch.length; index += 1) {
+      pushCodexVisibleWrapper(wrappers, batch[index].record, currentTurnIndex, {
+        turnKey: currentTurnKey,
+      });
+    }
+    batch.length = 0;
+  };
+
+  for (const record of records) {
+    const payload = record?.payload || {};
+
+    if (record?.type === 'event_msg' && payload.type === 'thread_rolled_back') {
+      // Materialize the current visible thread: old rolled-back turns and the
+      // rollback event itself are intentionally omitted from rewritten files.
+      if (pending.length > 0) flushPending(currentTurnIndex);
+      removeLastCodexRecordTurns(wrappers, Number(payload.num_turns || payload.turns || 1));
+      currentTurnIndex = maxCodexRecordTurnIndex(wrappers);
+      currentTurnKey = [...wrappers].reverse().find((wrapper) => Number.isFinite(wrapper?.turnKey))?.turnKey ?? null;
+      const lastUser = [...wrappers].reverse().find(wrapper => wrapper.kind === 'user');
+      const lastText = codexUserMessageAuditText(lastUser?.record) || null;
+      currentTurnCanonicalUserText = isCodexGoalContinuationUserText(lastText) ? null : lastText;
+      continue;
+    }
+
+    if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      if (isCodexSubagentNotification(payload)) {
+        if (pending.length > 0) flushPending(currentTurnIndex);
+        pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+          turnKey: currentTurnKey,
+        });
+        continue;
+      }
+      const text = codexUserMessageAuditText(record) || '';
+      if (isCodexTurnAbortedUserText(text)) {
+        if (pending.length > 0) flushPending(currentTurnIndex);
+        pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, { turnKey: currentTurnKey });
+        continue;
+      }
+      if (isCodexEnvironmentContextUserText(text)
+        || isCodexProjectInstructionsUserText(text)) {
+        pending.push({ record });
+        continue;
+      }
+      const turnStart = codexPendingStartForUserMessage(pending, text);
+      if (turnStart > 0) flushPending(currentTurnIndex, pending.splice(0, turnStart));
+      currentTurnIndex += 1;
+      currentTurnKey = turnKeyFor(record);
+      currentTurnCanonicalUserText = text;
+      for (let i = 0; i < pending.length; i++) {
+        pushCodexVisibleWrapper(wrappers, pending[i].record, currentTurnIndex, {
+          turnKey: currentTurnKey,
+        });
+      }
+      pending.length = 0;
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+        kind: 'user',
+        turnKey: currentTurnKey,
+      });
+      continue;
+    }
+
+    if (isCodexPreUserRecord(record)) {
+      if (record.type === 'event_msg' && payload.type === 'task_started') currentTurnCanonicalUserText = null;
+      const text = isCodexResponseUserRecord(record) ? codexUserMessageAuditText(record) || '' : '';
+      const fallbackUser = !!text && !text.includes('<subagent_notification>')
+        && !isCodexTurnAbortedUserText(text)
+        && !isCodexEnvironmentContextUserText(text)
+        && !isCodexProjectInstructionsUserText(text)
+        && !(currentTurnCanonicalUserText && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text));
+      pending.push({ record, fallbackUser });
+      continue;
+    }
+
+    if (pending.length > 0) {
+      flushPending(currentTurnIndex);
+    }
+
+    if (record?.type === 'compacted') {
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
+        kind: 'compact',
+        turnKey: null,
+      });
+      currentTurnKey = null;
+      continue;
+    }
+
+    if (record?.type === 'event_msg' && isCompactPayload(payload)) {
+      const isTopLevelCompanion = compactCompanionRecords.has(record);
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: isTopLevelCompanion ? null : stableUuidForRecord(sessionId, record, 'codex-compact'),
+        kind: isTopLevelCompanion ? undefined : 'compact',
+        turnKey: null,
+      });
+      currentTurnKey = null;
+      continue;
+    }
+
+    pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+      turnKey: currentTurnKey,
+    });
+  }
+
+  if (pending.length > 0) {
+    flushPending(currentTurnIndex);
+  }
+
+  return wrappers;
+}
+
+function planCodexTrailingServiceCarrierRemoval(records, sessionId, startUuid, endUuid) {
+  if (!startUuid || startUuid !== endUuid) return null;
+
+  const targetRecords = records.filter((record) => {
+    const text = codexUserMessageAuditText(record) || '';
+    return isCodexProjectInstructionsUserText(text)
+      && stableUuid(sessionId, record?.__line, 'codex-user') === startUuid;
+  });
+  if (targetRecords.length !== 1) return null;
+
+  const target = targetRecords[0];
+  const targetLine = Number(target.__line);
+  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
+  const hasFollowingRealTurn = wrappers.some((wrapper) => (
+    wrapper?.kind === 'user'
+      && Number.isFinite(wrapper?.line)
+      && Number(wrapper.line) > targetLine
+  ));
+  if (hasFollowingRealTurn) return null;
+
+  const previousRealTurnLine = wrappers.reduce((latest, wrapper) => (
+    wrapper?.kind === 'user'
+      && Number.isFinite(wrapper?.line)
+      && Number(wrapper.line) < targetLine
+      ? Math.max(latest, Number(wrapper.line))
+      : latest
+  ), -1);
+  const targetText = codexUserMessageAuditText(target) || '';
+  const shouldRemove = (record) => {
+    const recordLine = Number(record?.__line);
+    if (!Number.isFinite(recordLine) || recordLine <= previousRealTurnLine) return false;
+    const text = codexUserMessageAuditText(record) || '';
+    return isCodexProjectInstructionsUserText(text)
+      && codexUserCarrierTextsMatch(text, targetText);
+  };
+  const outputRecords = records
+    .filter((record) => !shouldRemove(record))
+    .map(cloneCodexRecordForWrite);
+  const removedCount = records.length - outputRecords.length;
+  if (removedCount < 1) return null;
+
+  const sourceTimeline = buildCodexMutationTimeline(records, sessionId);
+  const outputTimeline = buildCodexMutationTimeline(
+    outputRecords.map((record, index) => ({ ...record, __line: index })),
+    sessionId,
+  );
+  if (JSON.stringify(sourceTimeline.map(codexTimelineSemanticEntry))
+    !== JSON.stringify(outputTimeline.map(codexTimelineSemanticEntry))) {
+    return {
+      success: false,
+      error: 'Codex orphan service-carrier cleanup changed the visible Timeline',
+    };
+  }
+
+  return {
+    success: true,
+    outputRecords,
+    replacementRecords: [],
+    removedCount,
+    removedUsers: 0,
+    selectedCount: 1,
+    selectedTurns: [],
+    selectedTurnKeys: [],
+    selectedCompacts: [],
+    expectedRemainingCount: sourceTimeline.length,
+    repairKind: 'trailing-project-instructions',
+  };
+}
+
+function codexRolloutTimestamp(date = new Date()) {
+  return date.toISOString().slice(0, 19).replace(/:/g, '-');
+}
+
+function codexDateParts(date = new Date()) {
+  return {
+    yyyy: String(date.getUTCFullYear()),
+    mm: String(date.getUTCMonth() + 1).padStart(2, '0'),
+    dd: String(date.getUTCDate()).padStart(2, '0'),
+  };
+}
+
+const CODEX_COMPACT_IMAGE_PLACEHOLDER = /"(image_url|imageUrl)"\s*:\s*("\[image omitted\]")/g;
+
+function compactImagePlaceholderRanges(serialized) {
+  const ranges = [];
+  CODEX_COMPACT_IMAGE_PLACEHOLDER.lastIndex = 0;
+  let match;
+  while ((match = CODEX_COMPACT_IMAGE_PLACEHOLDER.exec(serialized))) {
+    const rawValue = match[2];
+    const valueStart = match.index + match[0].lastIndexOf(rawValue);
+    ranges.push({
+      key: match[1],
+      valueStart,
+      valueEnd: valueStart + rawValue.length,
+    });
+  }
+  CODEX_COMPACT_IMAGE_PLACEHOLDER.lastIndex = 0;
+  return ranges;
+}
+
+async function appendVerifiedCodexRawImage(handle, image) {
+  if (!image?.filePath
+    || !Number.isInteger(image.start)
+    || !Number.isInteger(image.endExclusive)
+    || image.endExclusive <= image.start
+    || image.byteLength !== image.endExclusive - image.start) {
+    throw new Error('Codex compact raw-image source is invalid');
+  }
+  const hash = crypto.createHash('sha256');
+  let bytes = 0;
+  const stream = fs.createReadStream(image.filePath, {
+    start: image.start,
+    end: image.endExclusive - 1,
+    highWaterMark: CODEX_JSONL_WRITE_CHUNK_BYTES,
+  });
+  for await (const chunk of stream) {
+    hash.update(chunk);
+    bytes += chunk.length;
+    await handle.appendFile(chunk);
+  }
+  if (bytes !== image.byteLength || hash.digest('hex') !== image.sha256) {
+    const error = new Error('Codex compact raw-image source changed before fork write');
+    error.code = 'codex_compact_raw_image_source_changed';
+    throw error;
+  }
+}
+
+async function appendCodexRecordWithRawImages(handle, serialized, rawImages) {
+  const placeholders = compactImagePlaceholderRanges(serialized);
+  const images = Array.isArray(rawImages?.images) ? rawImages.images : [];
+  if (placeholders.length !== images.length || images.length === 0) {
+    throw new Error('Codex compact raw-image placeholder count mismatch');
+  }
+  let cursor = 0;
+  for (let index = 0; index < placeholders.length; index += 1) {
+    const placeholder = placeholders[index];
+    const image = images[index];
+    if (placeholder.key !== image.key) {
+      throw new Error('Codex compact raw-image key order mismatch');
+    }
+    if (placeholder.valueStart > cursor) {
+      await handle.appendFile(serialized.slice(cursor, placeholder.valueStart), 'utf8');
+    }
+    await appendVerifiedCodexRawImage(handle, image);
+    cursor = placeholder.valueEnd;
+  }
+  await handle.appendFile(serialized.slice(cursor) + '\n', 'utf8');
+  return Buffer.byteLength(serialized + '\n') + images.reduce((delta, image, index) => (
+    delta + image.byteLength - Buffer.byteLength(serialized.slice(placeholders[index].valueStart, placeholders[index].valueEnd))
+  ), 0);
+}
+
+async function writeCodexJsonlExclusive(filePath, records) {
+  let handle = null;
+  let created = false;
+  try {
+    handle = await fs.promises.open(filePath, 'wx');
+    created = true;
+    let chunk = '';
+    let chunkBytes = 0;
+    let byteOffset = 0;
+    const writtenRecords = [];
+    const sourceHash = crypto.createHash('sha256');
+    let proofBytes = 0;
+    const writer = { appendFile: async (data, encoding) => {
+      const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data, encoding);
+      await handle.appendFile(bytes);
+      sourceHash.update(bytes); proofBytes += bytes.length;
+    } };
+
+    const flush = async () => {
+      if (!chunk || !handle) return;
+      await writer.appendFile(chunk, 'utf8');
+      chunk = '';
+      chunkBytes = 0;
+    };
+
+    for (const record of records) {
+      const writableRecord = cloneCodexRecordForWrite(record);
+      const serialized = JSON.stringify(writableRecord);
+      if (typeof serialized !== 'string') {
+        throw new Error('Codex edited fork contains a non-serializable record');
+      }
+      const rawImages = writableRecord[CODEX_COMPACT_RAW_IMAGES];
+      const remember = (bytes) => {
+        const writtenRecord = { ...writableRecord, __line: writtenRecords.length, __byteOffset: byteOffset };
+        if (rawImages) {
+          const placeholders = compactImagePlaceholderRanges(serialized);
+          let extraBytes = 0;
+          const images = rawImages.images.map((image, index) => {
+            const placeholder = placeholders[index];
+            const start = byteOffset + Buffer.byteLength(serialized.slice(0, placeholder.valueStart)) + extraBytes;
+            extraBytes += image.byteLength - Buffer.byteLength(serialized.slice(placeholder.valueStart, placeholder.valueEnd));
+            return { ...image, filePath, start, endExclusive: start + image.byteLength };
+          });
+          Object.defineProperty(writtenRecord, CODEX_COMPACT_RAW_IMAGES, { value: { images } });
+        }
+        writtenRecords.push(writtenRecord);
+        byteOffset += bytes;
+      };
+      if (rawImages) {
+        await flush();
+        remember(await appendCodexRecordWithRawImages(writer, serialized, rawImages));
+        continue;
+      }
+      if (writableRecord?.type === 'compacted'
+        && serialized.includes('"[image omitted]"')
+        && compactImagePlaceholderRanges(serialized).length > 0) {
+        const error = new Error('Codex compact image source is unavailable for fork write');
+        error.code = 'codex_compact_image_source_unavailable';
+        throw error;
+      }
+      const line = serialized + '\n';
+      const lineBytes = Buffer.byteLength(line);
+      remember(lineBytes);
+      if (chunkBytes > 0 && chunkBytes + lineBytes > CODEX_JSONL_WRITE_CHUNK_BYTES) {
+        await flush();
+      }
+      if (lineBytes >= CODEX_JSONL_WRITE_CHUNK_BYTES) {
+        await writer.appendFile(line, 'utf8');
+      } else {
+        chunk += line;
+        chunkBytes += lineBytes;
+      }
+    }
+    await flush();
+    const writtenStat = await handle.stat();
+    if (proofBytes !== writtenStat.size || byteOffset !== writtenStat.size) throw Error('codex_prepared_write_size_changed');
+    await handle.close();
+    handle = null;
+    return { records: writtenRecords, lineCount: writtenRecords.length, size: byteOffset,
+      sourceProof: [{ offset: 0, bytes: proofBytes, hash: sourceHash.digest('hex') }],
+      mtimeMs: writtenStat.mtimeMs, ctimeMs: writtenStat.ctimeMs,
+      dev: writtenStat.dev, ino: writtenStat.ino };
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    if (created) await fs.promises.unlink(filePath).catch(() => {});
+    throw error;
+  }
+}
+
+function codexSourceSnapshotMatchesStat(snapshot, stat) {
+  if (!snapshot || !stat) return false;
+  return Number(snapshot.size) === Number(stat.size)
+    && Number(snapshot.mtimeMs) === Number(stat.mtimeMs)
+    && (!snapshot.fileIdentity || snapshot.fileIdentity === stat.dev + ':' + stat.ino)
+    && (!Number.isFinite(snapshot.ctimeMs) || snapshot.ctimeMs === stat.ctimeMs);
+}
+
+async function replaceCodexSessionFileInPlace({
+  filePath,
+  records,
+  sourceSnapshot,
+  sessionId,
+  now = new Date(),
+}) {
+  if (!filePath || !Array.isArray(records) || !sourceSnapshot || !sessionId) {
+    throw Object.assign(new Error('codex_in_place_rewrite_input_invalid'), {
+      code: 'codex_in_place_rewrite_input_invalid',
+    });
+  }
+  const metadata = getSessionMeta(records);
+  if (!metadata?.id || metadata.id !== sessionId) {
+    throw Object.assign(new Error('codex_in_place_rewrite_session_identity_mismatch'), {
+      code: 'codex_in_place_rewrite_session_identity_mismatch',
+    });
+  }
+  let before = await fs.promises.stat(filePath);
+  if (!codexSourceSnapshotMatchesStat(sourceSnapshot, before)) {
+    throw Object.assign(new Error('codex_in_place_rewrite_source_changed'), {
+      code: 'codex_in_place_rewrite_source_changed',
+    });
+  }
+
+  const nativeSource = await materializeCodexRolloutForMutation(filePath);
+  if (nativeSource.representationMaterialized) {
+    filePath = nativeSource.filePath;
+    before = nativeSource.stat;
+    sourceSnapshot = { ...sourceSnapshot, filePath, size: nativeSource.stat.size,
+      mtimeMs: nativeSource.stat.mtimeMs, ctimeMs: nativeSource.stat.ctimeMs,
+      fileIdentity: nativeSource.stat.dev + ':' + nativeSource.stat.ino };
+  }
+
+  const nonce = process.pid + '-' + crypto.randomBytes(6).toString('hex');
+  const tempPath = filePath + '.noted-rewrite-' + nonce + '.tmp';
+  const backupPath = filePath + '.noted-backup-'
+    + now.toISOString().replace(/[:.]/g, '-') + '-' + nonce + '.bak';
+  let backupCreated = false;
+  try {
+    await writeCodexJsonlExclusive(tempPath, records);
+    await fs.promises.chmod(tempPath, before.mode & 0o777).catch(() => {});
+    const tempHandle = await fs.promises.open(tempPath, 'r+');
+    try { await tempHandle.sync(); } finally { await tempHandle.close(); }
+
+    // The backup is deliberately not .jsonl: Codex discovery must never see
+    // two files claiming the same session id. copyFile keeps the source live;
+    // the final rename then replaces it atomically on the same filesystem.
+    await fs.promises.copyFile(filePath, backupPath, fs.constants.COPYFILE_EXCL);
+    backupCreated = true;
+    const afterBackup = await fs.promises.stat(filePath);
+    if (!codexSourceSnapshotMatchesStat(sourceSnapshot, afterBackup)) {
+      throw Object.assign(new Error('codex_in_place_rewrite_source_changed'), {
+        code: 'codex_in_place_rewrite_source_changed',
+      });
+    }
+    await fs.promises.rename(tempPath, filePath);
+    historyPayloadStash.invalidateSession('codex', sessionId);
+    invalidateCodexJsonlCache(filePath);
+    invalidateCodexJsonlCache(tempPath);
+    invalidateCodexHistoryProjectors(sessionId);
+    return {
+      success: true,
+      sessionId,
+      filePath,
+      backupPath,
+      previousSize: before.size,
+      size: (await fs.promises.stat(filePath)).size,
+    };
+  } catch (error) {
+    await fs.promises.unlink(tempPath).catch(() => {});
+    if (backupCreated) await fs.promises.unlink(backupPath).catch(() => {});
+    throw error;
+  }
+}
+
+function buildCodexEmptySessionMetaRecord({ sessionId, cwd, timestamp }) {
+  return {
+    timestamp,
+    type: 'session_meta',
+    payload: {
+      session_id: sessionId,
+      id: sessionId,
+      timestamp,
+      cwd,
+      // Match the ownership class emitted by interactive Codex. The app's
+      // discovery layer intentionally excludes exec/app-server/subagent
+      // rollouts from user-tab writer adoption.
+      originator: 'codex-tui',
+      cli_version: '0.0.0',
+      source: 'cli',
+      thread_source: 'user',
+      model_provider: 'openai',
+    },
+  };
+}
+
+async function materializeEmptyCodexSession({
+  cwd,
+  sessionId = null,
+  now = new Date(),
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}) {
+  const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : null;
+  if (!exactCwd) {
+    const error = new Error('codex_empty_session_cwd_required');
+    error.code = 'codex_empty_session_cwd_required';
+    throw error;
+  }
+  const exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+    ? sessionId.trim()
+    : crypto.randomUUID();
+  const timestamp = now.toISOString();
+  const { yyyy, mm, dd } = codexDateParts(now);
+  const dir = path.join(sessionsDir, yyyy, mm, dd);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const records = [buildCodexEmptySessionMetaRecord({
+    sessionId: exactSessionId,
+    cwd: exactCwd,
+    timestamp,
+  })];
+
+  let filePath = '';
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const suffix = attempt === 0 ? '' : '-' + attempt;
+    filePath = path.join(
+      dir,
+      `rollout-${codexRolloutTimestamp(now)}-${exactSessionId}${suffix}.jsonl`,
+    );
+    try {
+      await writeCodexJsonlExclusive(filePath, records);
+      invalidateCodexJsonlCache(filePath);
+      return {
+        success: true,
+        committed: true,
+        sessionId: exactSessionId,
+        filePath,
+        createdAt: timestamp,
+        records,
+      };
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  const error = new Error('codex_empty_session_path_unavailable');
+  error.code = 'codex_empty_session_path_unavailable';
+  throw error;
+}
+
+function isCodexRealUserRecord(record) {
+  const text = codexUserMessageAuditText(record);
+  if (text === null) return false;
+  return !isCodexEnvironmentContextUserText(text)
+    && !isCodexProjectInstructionsUserText(text);
+}
+
+function inspectCodexConversationMaterialization(records, sessionId = null) {
+  const list = Array.isArray(records) ? records : [];
+  const meta = getSessionMeta(list);
+  const exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+    ? sessionId.trim()
+    : null;
+  if (!meta?.id || (exactSessionId && meta.id !== exactSessionId)) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      reason: 'session-meta-missing-or-mismatched',
+    };
+  }
+  const userRecords = list.filter(isCodexRealUserRecord).length;
+  const userTurns = buildCodexTimeline(list, meta.id)
+    .filter((entry) => entry?.type === 'user').length;
+  // A native fork can own only a header/settings tail while its conversation
+  // lives in a proven source prefix. Zero local users is not permission to
+  // clear its binding or unlink that tail. Readability belongs to the shared
+  // composite reader; malformed/unresolved lineage must also be preserved.
+  const linkedHistory = meta.forked_from_id != null || meta.history_base != null
+    || meta.forked_from_ordinal_exclusive != null
+    || (meta.history_mode != null && meta.history_mode !== 'legacy');
+  return {
+    materialized: userTurns > 0,
+    metadataOnly: userTurns === 0 && !linkedHistory,
+    userRecords,
+    userTurns,
+    reason: userTurns > 0 ? 'user-history-present'
+      : linkedHistory ? 'fork-history-requires-composite-read' : 'session-meta-only',
+  };
+}
+
+const CODEX_MATERIALIZATION_HEAD_MAX_BYTES = 512 * 1024;
+
+async function inspectCodexConversationMaterializationFromFile(
+  sessionId,
+  cwd,
+  options = {},
+) {
+  const exactSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!exactSessionId) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      userTurns: 0,
+      reason: 'session-id-missing',
+    };
+  }
+  const found = await findCodexSessionFile(exactSessionId, cwd, {
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+  });
+  if (!found?.filePath) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      userTurns: 0,
+      reason: 'session-file-missing',
+    };
+  }
+  const stat = await fs.promises.stat(found.filePath);
+  const maxBytes = Math.max(
+    1024,
+    Number(options.maxBytes) || CODEX_MATERIALIZATION_HEAD_MAX_BYTES,
+  );
+  const readBytes = Math.min(stat.size, maxBytes);
+  const parsed = readBytes > 0
+    ? await readJsonlRange(found.filePath, 0, readBytes - 1)
+    : { records: [], errors: 0 };
+  const projected = inspectCodexConversationMaterialization(
+    parsed.records || [],
+    exactSessionId,
+  );
+  // An empty read capability needs a COMPLETE standalone source, not a
+  // bounded negative materialization result or a provisional writer. Freeze
+  // the exact stat identity across this same bounded reader; never infer an
+  // empty thin fork from its lone header.
+  const after = await fs.promises.stat(found.filePath);
+  const meta = (parsed.records || [])[0]?.payload;
+  const standaloneEmpty = stat.size > 0 && stat.size <= maxBytes
+    && parsed.errors === 0 && parsed.leftoverBuffer?.length === 0 && parsed.records?.length === 1
+    && parsed.records[0].type === 'session_meta' && meta?.id === exactSessionId
+    && (meta.session_id == null || meta.session_id === exactSessionId)
+    && meta.forked_from_id == null && meta.history_base == null && meta.forked_from_ordinal_exclusive == null
+    && (meta.history_mode == null || meta.history_mode === 'legacy')
+    && (!cwd || typeof meta.cwd === 'string' && path.resolve(meta.cwd) === path.resolve(cwd))
+    && stat.dev === after.dev && stat.ino === after.ino && stat.size === after.size
+    && stat.mtimeMs === after.mtimeMs && stat.ctimeMs === after.ctimeMs;
+  if (projected.materialized === true || stat.size <= maxBytes) {
+    return {
+      ...projected,
+      filePath: found.filePath,
+      inspectedBytes: readBytes,
+      fileSize: stat.size,
+      bounded: stat.size > maxBytes,
+      ...(standaloneEmpty ? { emptyReadSource: { kind: 'standalone-metadata-only', version: 1,
+        sessionId: exactSessionId, filePath: found.filePath, size: after.size, mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs, fileIdentity: after.dev + ':' + after.ino } } : {}),
+    };
+  }
+  return {
+    materialized: false,
+    metadataOnly: false,
+    userRecords: Number(projected.userRecords || 0),
+    userTurns: Number(projected.userTurns || 0),
+    reason: 'materialization-unresolved-bounded-head',
+    filePath: found.filePath,
+    inspectedBytes: readBytes,
+    fileSize: stat.size,
+    bounded: true,
+  };
+}
+
+function rewriteCodexEditedForkMetadata(
+  records,
+  sourceSessionId,
+  cwd,
+  outputRecords,
+  newSessionId,
+  nowIso,
+) {
+  // This writer materializes all retained records, unlike native paginated
+  // Fork. A copied history_base/ordinal would borrow a second, unrelated prefix
+  // (tab-29). Keep ancestry, but explicitly describe a standalone rollout.
+  const firstMetaIndex = outputRecords.findIndex((record) => record?.type === 'session_meta');
+  for (let index = outputRecords.length - 1; index >= 0; index -= 1) {
+    if (outputRecords[index]?.type === 'session_meta'
+      && firstMetaIndex !== index) {
+      outputRecords.splice(index, 1);
+    }
+  }
+  const metaIdx = outputRecords.findIndex((record) => record?.type === 'session_meta');
+  if (metaIdx >= 0) {
+    const meta = outputRecords[metaIdx];
+    meta.timestamp = nowIso;
+    meta.payload = { ...(meta.payload || {}) };
+    meta.payload.id = newSessionId;
+    // Current Codex rollouts may carry both identity aliases. Keeping the
+    // copied source session_id next to the new id makes the edited rollout
+    // self-contradictory and causes the Resume settings proof to reject it.
+    // Both fields describe this new rollout; forked_from_id preserves ancestry.
+    meta.payload.session_id = newSessionId;
+    meta.payload.timestamp = nowIso;
+    meta.payload.cwd = cwd || meta.payload.cwd || getSessionMeta(records).cwd || '';
+    meta.payload.forked_from_id = sourceSessionId;
+    meta.payload.history_mode = 'legacy';
+    delete meta.payload.history_base;
+    delete meta.payload.forked_from_ordinal_exclusive;
+    if (!meta.payload.source) meta.payload.source = 'cli';
+    if (!meta.payload.thread_source) meta.payload.thread_source = 'user';
+  } else {
+    outputRecords.unshift({
+      timestamp: nowIso,
+      type: 'session_meta',
+      payload: {
+        id: newSessionId,
+        session_id: newSessionId,
+        timestamp: nowIso,
+        cwd: cwd || '',
+        originator: 'noted-terminal',
+        source: 'cli',
+        thread_source: 'user',
+        forked_from_id: sourceSessionId,
+        history_mode: 'legacy',
+      },
+    });
+  }
+}
+
+function normalizeCodexHistoryMutationSettingsProof(value, sourceSessionId) {
+  const model = typeof value?.model === 'string' ? value.model.trim() : '';
+  const effort = typeof value?.effort === 'string' ? value.effort.trim().toLowerCase() : '';
+  const proofAt = Number(value?.proofAt);
+  const ownerSessionId = typeof value?.sessionId === 'string' ? value.sessionId.trim() : '';
+  if (!model || !effort || !Number.isFinite(proofAt) || proofAt <= 0) return null;
+  if (ownerSessionId && ownerSessionId !== sourceSessionId) return null;
+  return {
+    model,
+    effort,
+    proofAt,
+    sessionId: sourceSessionId,
+    ...(typeof value?.fast === 'boolean' ? { fast: value.fast } : {}),
+  };
+}
+
+function resolveCodexHistoryMutationSettingsProof(records, sourceSessionId, explicitProof = null, operationSource = null) {
+  const normalizedExplicit = normalizeCodexHistoryMutationSettingsProof(explicitProof, sourceSessionId);
+  // A validated virtual reader borrows several physical sources. Its first
+  // metadata belongs to the frozen ancestor, not to the view/Resume owner.
+  // Only this exact loaded object grants that distinction; renderer hints and
+  // arbitrary wrong-session metadata still fail the ordinary source guard.
+  const firstMeta = records.find(record => record?.type === 'session_meta');
+  const physicalMetaOwner = operationSource?.composite === true
+    && operationSource.records === records
+    && operationSource.sessionMeta?.id === sourceSessionId
+    && operationSource.contentRevision
+    && firstMeta?.__physicalSessionId
+    ? firstMeta.__physicalSessionId : null;
+  const source = resolveCodexSourceSettingsProof(records, physicalMetaOwner || sourceSessionId);
+  if (source.status === 'found') {
+    const record = records[source.recordIndex];
+    const recordAt = Date.parse(record?.timestamp || '');
+    const sourceProofAt = Number.isFinite(recordAt) && recordAt > 0 ? recordAt : Date.now();
+    const matchingExplicit = normalizedExplicit
+      && normalizedExplicit.model === source.model
+      && normalizedExplicit.effort === source.effort
+      ? normalizedExplicit
+      : null;
+    return {
+      status: 'found',
+      model: source.model,
+      effort: source.effort,
+      proofAt: matchingExplicit
+        ? Math.max(sourceProofAt, matchingExplicit.proofAt)
+        : sourceProofAt,
+      sessionId: sourceSessionId,
+      sourceKind: source.sourceKind,
+      source: 'source-jsonl',
+      ...(matchingExplicit && typeof matchingExplicit.fast === 'boolean'
+        ? { fast: matchingExplicit.fast }
+        : {}),
+    };
+  }
+  if (source.status === 'invalid') return source;
+  if (normalizedExplicit) {
+    return {
+      status: 'found',
+      ...normalizedExplicit,
+      sourceKind: 'renderer-proof',
+      source: 'exact-renderer-proof',
+    };
+  }
+  return source;
+}
+
+function ensureCodexEditedForkSettingsProof(outputRecords, newSessionId, proof, nowIso) {
+  if (!proof || proof.status !== 'found') {
+    return { success: false, error: 'Codex history mutation settings proof is unavailable' };
+  }
+  let resolved = resolveCodexSourceSettingsProof(outputRecords, newSessionId);
+  if (resolved.status === 'found'
+    && resolved.model === proof.model
+    && resolved.effort === proof.effort) {
+    return { success: true, injected: false, proof };
+  }
+  if (resolved.status === 'invalid') {
+    return {
+      success: false,
+      error: 'Codex edited child settings metadata is invalid: ' + (resolved.reason || 'unknown'),
+    };
+  }
+  // Append the carried pair so it is the latest structured settings state of
+  // the edited thread. Inserting near session_meta would let an older retained
+  // turn_context later in the file override it during Resume proof.
+  outputRecords.push({
+    timestamp: nowIso,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: {
+        model: proof.model,
+        reasoning_effort: proof.effort,
+      },
+      source: 'noted-terminal-history-mutation',
+      source_session_id: proof.sessionId,
+      proof_at: proof.proofAt,
+    },
+  });
+  resolved = resolveCodexSourceSettingsProof(outputRecords, newSessionId);
+  if (resolved.status !== 'found'
+    || resolved.model !== proof.model
+    || resolved.effort !== proof.effort) {
+    return {
+      success: false,
+      error: 'Codex edited child settings proof validation failed',
+      status: resolved.status,
+      reason: resolved.reason,
+    };
+  }
+  return { success: true, injected: true, proof };
+}
+
+function persistCodexForkHistoryEvent({
+  sourceSessionId,
+  childSessionId,
+  sourceRecords,
+  outputRecords,
+  occurredAt,
+  forkMode,
+  origin = 'app',
+}) {
+  if (!codexUsageStateStore?.saveSessionForkEvent) return false;
+  const childRecords = (Array.isArray(outputRecords) ? outputRecords : [])
+    .map((record, index) => ({ ...record, __line: index }));
+  // Annotation identities depend on the SAME reducer's user/compact text and
+  // coordinates, not tool/docs enrichment. Sidecar copying below still uses
+  // the exact RAW physical records and its independent provenance checks.
+  const childTimeline = buildCodexMutationTimeline(childRecords, childSessionId);
+  const sourceTimeline = buildCodexMutationTimeline(
+    Array.isArray(sourceRecords) ? sourceRecords : [],
+    sourceSessionId,
+  );
+  const sourceTotalIterations = sourceTimeline.filter((entry) => entry?.type === 'user').length;
+  const mappings = mapTimelineEntryUuidsAcrossFork(sourceTimeline, childTimeline);
+  const event = codexUsageStateStore.saveSessionForkEvent({
+    operationKind: historyRewriteOperation(forkMode) || (['full', 'latest_compact'].includes(forkMode) ? 'fork' : 'provider'),
+    provider: 'codex',
+    sourceSessionId,
+    childSessionId,
+    entryUuids: childTimeline.map((entry) => entry.uuid).filter(Boolean),
+    entryMappings: mappings,
+    boundaryEntryUuid: childTimeline.at(-1)?.uuid || null,
+    snapshotComplete: true,
+    occurredAt,
+    forkMode,
+    origin,
+    isDirect: true,
+    afterIterationIndex: sourceTotalIterations > 0 ? sourceTotalIterations - 1 : null,
+    nextIterationIndex: sourceTotalIterations,
+  });
+  if (!event?.eventKey) throw new Error('fork_history_event_not_committed');
+  const presentations = cloneCodexPromptPresentationsForProvenChild(codexUsageStateStore, {
+    sourceSessionId,
+    childSessionId,
+    sourceRecords,
+    childRecords,
+  });
+  console.log('[HistoryPromptPresentation:CodexChild] source=' + sourceSessionId.slice(0, 8)
+    + ' child=' + childSessionId.slice(0, 8) + ' reason=' + forkMode
+    + ' matched=' + presentations.matchedRecordCount + ' cloned=' + presentations.cloned
+    + ' skipped=' + presentations.skipped + ' projection=' + presentations.stoppedReason);
+  if (codexUsageStateStore.copyTimelineMetadataForMappedFork) {
+    codexUsageStateStore.copyTimelineMetadataForMappedFork(
+      childSessionId,
+      mappings,
+      null,
+    );
+    codexUsageStateStore.markSessionForkMetadataCopied?.(event.eventKey);
+  }
+  return true;
+}
+
+async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords, options = {}) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const newSessionId = crypto.randomUUID();
+  const { yyyy, mm, dd } = codexDateParts(now);
+  const dir = path.join(CODEX_SESSIONS_DIR, yyyy, mm, dd);
+  await fs.promises.mkdir(dir, { recursive: true });
+
+  rewriteCodexEditedForkMetadata(
+    records,
+    sourceSessionId,
+    cwd,
+    outputRecords,
+    newSessionId,
+    nowIso,
+  );
+  const settingsProof = resolveCodexHistoryMutationSettingsProof(
+    records,
+    sourceSessionId,
+    options.codexSettingsProof,
+    options.operationSource,
+  );
+  const settingsReady = settingsProof?.status === 'found'
+    ? ensureCodexEditedForkSettingsProof(
+        outputRecords,
+        newSessionId,
+        settingsProof,
+        nowIso,
+      )
+    : options.requireSettingsProof === true
+      ? { success: false, error: 'Codex history mutation settings proof is unavailable' }
+      : { success: true, injected: false, proof: null };
+  if (!settingsReady.success) {
+    const error = new Error(settingsReady.error);
+    error.code = 'codex_history_mutation_settings_unproven';
+    error.reason = settingsProof?.reason || settingsReady.reason || 'settings-pair-absent';
+    throw error;
+  }
+
+  let filePath = '';
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const suffix = attempt === 0 ? '' : '-' + attempt;
+    filePath = path.join(dir, `rollout-${codexRolloutTimestamp(now)}-${newSessionId}${suffix}.jsonl`);
+    try {
+      if (typeof options.beforeWrite === 'function') options.beforeWrite();
+      const written = await writeCodexJsonlExclusive(filePath, outputRecords);
+      return {
+        newSessionId,
+        filePath,
+        createdAt: nowIso,
+        written,
+        ...(settingsProof?.status === 'found'
+          ? {
+              codexSettingsProof: {
+                model: settingsProof.model,
+                effort: settingsProof.effort,
+                proofAt: settingsProof.proofAt,
+                sessionId: newSessionId,
+                ...(typeof settingsProof.fast === 'boolean' ? { fast: settingsProof.fast } : {}),
+              },
+            }
+          : {}),
+        settingsProofInjected: settingsReady.injected === true,
+      };
+    } catch (error) {
+      if (error && error.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error('Could not allocate Codex edited fork path');
+}
+
+function sameCodexSourceSnapshot(cached, snapshot) {
+  return !!cached && !!snapshot && cached.filePath === snapshot.filePath
+    && cached.fileSize === snapshot.size && cached.fileMtimeMs === snapshot.mtimeMs
+    && cached.fileIdentity === snapshot.fileIdentity && cached.fileCtimeMs === snapshot.ctimeMs;
+}
+
+// Private Main-issued COW witness, not a public History hint or write authority.
+// The worker reuses ITS own immutable checkpoint; no large graph/raw array is
+// cloned across threads. A miss retains the ordinary canonical file reader.
+async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath, stat, ticket }) {
+  const miss = reason => {
+    if (receipt) console.log('[CodexRewriteProjection] owner=reader child=' + String(sessionId).slice(0, 8) + ' reused=0 reason=' + reason);
+    return null;
+  };
+  if (receipt?.schema !== 'codex-rewrite-prefix-v1' || receipt.sessionId !== sessionId
+    || receipt.targetSnapshot?.filePath !== filePath || !codexSourceSnapshotMatchesStat(receipt.targetSnapshot, stat)
+    || receipt.headerRecord?.payload?.id !== sessionId || receipt.headerRecord.payload.cwd !== cwd
+    || !Array.isArray(receipt.records) || !receipt.records.length || !Array.isArray(receipt.sourceProof)) return miss('prefix-witness-unavailable');
+  const source = _codexHistoryProjectors.get(receipt.sourceSessionId);
+  if (!source) return miss('worker-source-not-resident');
+  if (!sameCodexSourceSnapshot(source, receipt.sourceSnapshot)
+    || source.sourceGeneration !== _codexSourceGenerations.get(source.filePath)?.generation
+    || _codexSourceGenerations.get(source.filePath)?.rewritePending) return miss('source-snapshot-changed');
+  const checkpoint = [...(source.checkpoints || [])].reverse().find(item => item.count <= receipt.sourcePrefixCount);
+  if (!checkpoint) return miss('no-checkpoint-before-cut');
+  await _codexExternalReadPrepare?.(source.filePath);
+  const sourceTicket = _codexReadFence.begin(source.filePath, 'projection');
+  const control = codexProjectionControl({ assertCurrent: () => {
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+  } });
+  try {
+    control.assertCurrent();
+    if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))) return miss('source-stat-changed');
+    let proofBytes = 0;
+    for (const proof of receipt.sourceProof) {
+      if (proof.offset !== proofBytes || !Number.isSafeInteger(proof.bytes) || proof.bytes <= 0
+        || !/^[a-f0-9]{64}$/.test(proof.hash)) return null;
+      proofBytes += proof.bytes;
+    }
+    if (proofBytes !== stat.size) return null;
+    let previousSource = -1, previousOffset = -1;
+    for (let i = 0; i < receipt.records.length; i++) {
+      const pair = receipt.records[i];
+      if (!Number.isSafeInteger(pair.sourceIndex) || pair.sourceIndex <= previousSource
+        || !Number.isSafeInteger(pair.source?.__line) || pair.source.__line < 0
+        || !Number.isSafeInteger(pair.source.__byteOffset) || pair.source.__byteOffset < 0
+        || pair.target?.__line !== i || !Number.isSafeInteger(pair.target.__byteOffset)
+        || pair.target.__byteOffset <= previousOffset || pair.target.__byteOffset >= stat.size) return null;
+      previousSource = pair.sourceIndex; previousOffset = pair.target.__byteOffset;
+    }
+    const pairs = receipt.records.filter(pair => pair.sourceIndex < checkpoint.count);
+    if (!pairs.length) return null;
+    const boundary = receipt.records[pairs.length]?.target || receipt.prefixEnd;
+    if (boundary?.__line !== pairs.length || !Number.isSafeInteger(boundary.__byteOffset)
+      || boundary.__byteOffset <= pairs.at(-1).target.__byteOffset || boundary.__byteOffset > stat.size) return null;
+    const mapping = createProjectionIdentityMap(receipt.sourceSessionId, sessionId, pairs);
+    const state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform, control)).value;
+    state.timeline.metaRecord = { payload: receipt.headerRecord.payload, __line: 0 };
+    state.timeline.metaRecordPhysicalSessionId = sessionId;
+    state.timeline.forkStartedAtMs = parseTimestampMs(receipt.headerRecord.payload.timestamp);
+    state.timeline.forkLiveStartLine = Number.isSafeInteger(receipt.forkLiveStartLine)
+      && receipt.forkLiveStartLine < pairs.length ? receipt.forkLiveStartLine : undefined;
+    state.history.sessionCwd = cwd;
+    state.history.consumedRecords = pairs.length;
+    const backup = await cloneProjectionGraphAsync(state, undefined, control);
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+    if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))
+      || !codexSourceSnapshotMatchesStat(receipt.targetSnapshot, await fs.promises.stat(filePath))) return null;
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+    if (!restoreCodexSourceSnapshot(receipt.targetSnapshot)) return null;
+    control.assertCurrent();
+    console.log('[CodexRewriteProjection] owner=reader child=' + sessionId.slice(0, 8)
+      + ' reused=' + pairs.length + ' reason=exact-worker-checkpoint');
+    return { sessionId, filePath, fileSize: boundary.__byteOffset, fileIdentity: stat.dev + ':' + stat.ino,
+      fileMtimeMs: stat.mtimeMs, fileCtimeMs: stat.ctimeMs, sourceGeneration: receipt.targetSnapshot.sourceGeneration,
+      timelineProjector: createCodexTimelineProjector(sessionId, state.timeline),
+      historyProjector: createCodexHistoryProjector(sessionId, state.history),
+      lineCount: pairs.length, leftoverBuffer: Buffer.alloc(0), sourceProof: [],
+      preparedSourceProof: receipt.sourceProof, preparedReusedRecords: pairs.length,
+      checkpoints: backup.approxBytes <= _codexHistoryProjectorBudgetBytes / 4
+        ? [{ count: pairs.length, state: backup.value, approxBytes: backup.approxBytes }] : [] };
+  } catch (error) {
+    if (error.code === 'CODEX_SOURCE_READ_INVALIDATED' || isHistoryReadCancelled(error)
+      || isHistoryReadUnavailable(error)) throw error;
+    console.warn('[CodexRewriteProjection] worker checkpoint miss reason=' + (error.code || error.message));
+    return null;
+  } finally { _codexReadFence.finish(sourceTicket); }
+}
+
+function codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs, sourcePrefixCount, stat, filePath, sourceGeneration, sourceProof, reusedRecords = 0 }) {
+  return { schema: 'codex-rewrite-prefix-v1', sourceSessionId, sessionId, sourceSnapshot: loaded.sourceSnapshot,
+    targetSnapshot: { filePath, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: stat.dev + ':' + stat.ino,
+      ctimeMs: stat.ctimeMs, sourceGeneration, sessionId, linkKind: 'end' },
+    records: pairs.map(({ source, target, sourceIndex }) => ({ sourceIndex,
+      source: { __line: source.__line, __byteOffset: source.__byteOffset },
+      target: { __line: target.__line, __byteOffset: target.__byteOffset } })),
+    sourcePrefixCount, prefixEnd: { __line: pairs.length, __byteOffset: records[pairs.length]?.__byteOffset ?? stat.size },
+    headerRecord: { type: 'session_meta', payload: records[0]?.payload },
+    forkLiveStartLine: getCodexForkLiveStartLine(records.slice(0, pairs.length), records[0]?.payload),
+    sourceProof, reusedRecords };
+}
+
+// The write planner retains object provenance, not a text match. Only a
+// contiguous unchanged prefix (apart from the deliberately replaced header)
+// may reuse a parser checkpoint. Tombstone normalization/virtual ancestors
+// that changed earlier records correctly shorten that prefix to zero.
+function codexRewritePrefix(sourceRecords, outputRecords, writtenRecords) {
+  const pairs = [];
+  let sourceIndex = 0;
+  for (let index = 0; index < outputRecords.length; index += 1) {
+    const output = outputRecords[index];
+    // Native full copies may carry redundant ancestor headers. Both parsers
+    // ignore headers after the first physical header; the writer removes
+    // them. Their removal changes coordinates, not prefix parser state.
+    while (sourceIndex > 0 && sourceIndex < sourceRecords.length
+      && sourceRecords[sourceIndex] !== output[CODEX_REWRITE_ORIGIN]
+      && sourceRecords[sourceIndex].type === 'session_meta') sourceIndex += 1;
+    const source = sourceRecords[sourceIndex];
+    if (!source) break;
+    if (output[CODEX_REWRITE_ORIGIN] !== source) break;
+    if (source.type === 'session_meta') {
+      if (index !== 0 || source.payload?.cwd !== output.payload?.cwd) break;
+    } else if (source.payload !== output.payload || source.timestamp !== output.timestamp) break;
+    if (!source.timestamp && !source.time && !source.created_at) break;
+    if (source.__physicalSessionId && source.__physicalSessionId !== sourceRecords[0]?.payload?.id) break;
+    pairs.push({ source, target: writtenRecords[index], sourceIndex });
+    sourceIndex += 1;
+  }
+  return { pairs, sourcePrefixCount: sourceIndex };
+}
+
+async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, outputRecords }) {
+  return _chainCodexProjection(result.newSessionId, async () => {
+    // Called only AFTER atomic lineage commit, before any caller can rebind a
+    // tab. Cache acceleration failure cannot turn a committed edit into failure.
+    const sessionId = result.newSessionId;
+    const ticket = _codexReadFence.begin(result.filePath, 'projection');
+    let stagedCanonical = null;
+    try {
+      const records = result.written.records;
+      const source = _codexHistoryProjectors.get(sourceSessionId);
+      // A virtual source's child stat does NOT witness its inherited segments.
+      // Its exact composite reader remains authoritative; never seed it from a
+      // coincidentally cached projection of just that child's physical file.
+      const { pairs, sourcePrefixCount } = loaded.composite ? { pairs: [], sourcePrefixCount: 0 }
+        : codexRewritePrefix(loaded.records, outputRecords, records);
+      if (_codexRewriteProjectionPublisher) {
+        const stat = await fs.promises.stat(result.filePath);
+        if (!codexSourceSnapshotMatchesStat({ size: result.written.size, mtimeMs: result.written.mtimeMs,
+          ctimeMs: result.written.ctimeMs, fileIdentity: result.written.dev + ':' + result.written.ino }, stat)) throw Error('prepared_child_changed');
+        const sourceGeneration = rememberCodexSourceGeneration(result.filePath, stat, ticket, sessionId);
+        const receipt = codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs,
+          sourcePrefixCount, stat, filePath: result.filePath, sourceGeneration, sourceProof: result.written.sourceProof });
+        await rememberCodexRewriteReceipt(receipt);
+        setCodexJsonlCacheEntry(result.filePath, { size: stat.size, mtimeMs: stat.mtimeMs, lineCount: records.length,
+          fileIdentity: stat.dev + ':' + stat.ino, ctimeMs: stat.ctimeMs, sourceGeneration,
+          leftover: '', leftoverBuffer: Buffer.alloc(0), records });
+        await codexResumeSourceReader().seedPrepared(sessionId, records[0]?.payload?.cwd || '', { filePath: result.filePath, stat, records });
+        const prepared = await _codexRewriteProjectionPublisher({ receipt, cwd: records[0]?.payload?.cwd || '' });
+        _codexReadFence.assertCurrent(ticket);
+        if (!codexSourceSnapshotMatchesStat(receipt.targetSnapshot, await fs.promises.stat(result.filePath))) throw Error('prepared_child_changed');
+        _codexReadFence.assertCurrent(ticket);
+        if (!prepared?.success) throw Error(prepared?.error || 'worker_preparation_unavailable');
+        console.log('[CodexRewriteProjection] owner=history-worker child=' + sessionId.slice(0, 8)
+          + ' reused=' + (prepared.reusedRecords || 0) + ' fed=' + prepared.fedRecords + ' mode=' + prepared.mode);
+        return;
+      }
+      const checkpoint = sameCodexSourceSnapshot(source, loaded.sourceSnapshot)
+        ? [...(source.checkpoints || [])].reverse().find((item) => item.count <= sourcePrefixCount)
+        : null;
+      let reuseReason = loaded.composite ? 'composite-source'
+        : !source ? 'source-projection-missing'
+          : !sameCodexSourceSnapshot(source, loaded.sourceSnapshot) ? 'source-snapshot-changed'
+            : checkpoint ? 'exact-checkpoint' : 'no-checkpoint-before-cut';
+      let state = null;
+      let reusedRecords = 0;
+      if (checkpoint) {
+        try {
+          const checkpointPairs = pairs.filter((pair) => pair.sourceIndex < checkpoint.count);
+          const mapping = createProjectionIdentityMap(sourceSessionId, sessionId, checkpointPairs);
+          state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform)).value;
+          // session_meta is the only intentionally changed prefix record. Its
+          // source truth is the new physical header, never the ancestor header.
+          state.timeline.metaRecord = { payload: records[0].payload, __line: 0 };
+          state.timeline.metaRecordPhysicalSessionId = sessionId;
+          state.timeline.forkStartedAtMs = parseTimestampMs(records[0].payload.timestamp);
+          state.timeline.forkLiveStartLine = getCodexForkLiveStartLine(records.slice(0, checkpointPairs.length), records[0].payload);
+          state.history.sessionCwd = records[0].payload.cwd || '';
+          state.history.consumedRecords = checkpointPairs.length;
+          // Do not copy the ancestor's payload stash: a later result can have
+          // overwritten the same call id there. A child cache miss resolves from
+          // ITS prepared raw records through the existing getToolPayload path.
+          reusedRecords = checkpointPairs.length;
+        } catch (error) {
+          console.warn('[CodexRewriteProjection] checkpoint rejected: ' + error.message);
+          state = null;
+          reuseReason = 'checkpoint-transform-rejected';
+        }
+      }
+      const cached = {
+        sessionId,
+        timelineProjector: createCodexTimelineProjector(sessionId, state?.timeline),
+        historyProjector: createCodexHistoryProjector(sessionId, state?.history),
+        filePath: result.filePath, lineCount: records.length, leftoverBuffer: Buffer.alloc(0),
+        fileSize: result.written.size,
+        readMetrics: { feedMs: 0, checkpoints: 0, checkpointMs: 0, yieldMs: 0 },
+      };
+      stagedCanonical = cached;
+      if (state) {
+        const checkpointCopy = await cloneProjectionGraphAsync(state);
+        if (checkpointCopy.approxBytes <= _codexHistoryProjectorBudgetBytes / 4) {
+          cached.checkpoints = [{ count: reusedRecords, state: checkpointCopy.value, approxBytes: checkpointCopy.approxBytes }];
+        }
+      }
+      for (let index = reusedRecords; index < records.length; index += 256) {
+        await feedCodexProjection(cached, records.slice(index, index + 256));
+        // Keep IPC/input dispatch possible even on the genuinely cold path.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      await _codexJsonlInflight.get(result.filePath)?.catch(() => {});
+      const stat = await fs.promises.stat(result.filePath);
+      if (stat.size !== result.written.size || stat.mtimeMs !== result.written.mtimeMs
+        || stat.ctimeMs !== result.written.ctimeMs || stat.dev !== result.written.dev
+        || stat.ino !== result.written.ino) throw new Error('prepared_child_changed');
+      cached.fileMtimeMs = stat.mtimeMs;
+      cached.fileIdentity = stat.dev + ':' + stat.ino;
+      cached.fileCtimeMs = stat.ctimeMs;
+      cached.sourceGeneration = rememberCodexSourceGeneration(result.filePath, stat, ticket, sessionId);
+      cached.rewriteReceipt = codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs,
+        sourcePrefixCount, stat, filePath: result.filePath, sourceGeneration: cached.sourceGeneration,
+        sourceProof: result.written.sourceProof, reusedRecords });
+      rememberCodexProjection(sessionId, cached);
+      stagedCanonical = null;
+      // Continue/settings/export use the independent raw-record reader. Its
+      // prepared cursor is exact too; otherwise Continue immediately re-reads
+      // the same 400MB that History just stopped re-reading. Use ITS existing
+      // LRU bound, never pin an ancestor or add another budget.
+      setCodexJsonlCacheEntry(result.filePath, {
+        size: stat.size, mtimeMs: stat.mtimeMs, lineCount: records.length,
+        fileIdentity: cached.fileIdentity, ctimeMs: stat.ctimeMs,
+        sourceGeneration: cached.sourceGeneration,
+        leftover: '', leftoverBuffer: Buffer.alloc(0), records,
+      });
+      await codexResumeSourceReader().seedPrepared(sessionId, records[0]?.payload?.cwd || '', {
+        filePath: result.filePath, stat, records,
+      }).catch(error => console.warn('[CodexResumeSource] prepared cache skipped: ' + error.message));
+      console.log('[CodexRewriteProjection] source=' + sourceSessionId.slice(0, 8)
+        + ' child=' + sessionId.slice(0, 8) + ' prefix=' + pairs.length
+        + ' reused=' + reusedRecords + ' reuseReason=' + reuseReason
+        + ' fed=' + (records.length - reusedRecords) + ' readKB=0'
+        + ' feedMs=' + cached.readMetrics.feedMs.toFixed(1)
+        + ' checkpointMs=' + cached.readMetrics.checkpointMs.toFixed(1)
+        + ' checkpoints=' + cached.readMetrics.checkpoints
+        + ' yieldMs=' + cached.readMetrics.yieldMs.toFixed(1));
+    } catch (error) {
+      stagedCanonical?.historyProjector.close?.();
+      for (const item of stagedCanonical?.checkpoints || []) item.state?.history?.release?.();
+      invalidateCodexHistoryProjectors(result.filePath);
+      console.warn('[CodexRewriteProjection] cold fallback child=' + sessionId.slice(0, 8) + ': ' + error.message);
+    } finally { _codexReadFence.finish(ticket); }
+  });
+}
+
+function getCodexRewriteReceipt(sessionId, sourceSessionId) {
+  const prepared = _codexRewriteReceipts.get(sessionId)?.receipt;
+  if (prepared && prepared.sourceSessionId === sourceSessionId) {
+    const known = _codexSourceGenerations.get(prepared.targetSnapshot.filePath);
+    if (known && !known.rewritePending && known.generation === prepared.targetSnapshot.sourceGeneration
+      && codexSourceSnapshotMatchesStat(prepared.targetSnapshot, { ...known.stat,
+        dev: known.stat.fileIdentity.split(':')[0], ino: known.stat.fileIdentity.split(':')[1] })) return prepared;
+  }
+  const cached = _codexHistoryProjectors.get(sessionId);
+  const receipt = cached?.rewriteReceipt;
+  return receipt && typeof sourceSessionId === 'string' && receipt.sourceSessionId === sourceSessionId
+    && sameCodexSourceSnapshot(cached, receipt.targetSnapshot) ? receipt : null;
+}
+
+function createCodexReplacementRecords(compactText, timestamp = new Date().toISOString()) {
+  const text = String(compactText || '').trim();
+  return [
+    {
+      timestamp,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+      },
+    },
+    {
+      timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: text,
+        images: [],
+        local_images: [],
+        text_elements: [],
+      },
+    },
+  ];
+}
+
+function codexTimelineSemanticEntry(entry) {
+  return {
+    type: entry?.type || 'unknown',
+    content: normalizeCodexText(entry?.content || ''),
+    compactSummary: normalizeCodexText(entry?.compactSummary || ''),
+    hasImage: entry?.hasImage === true,
+  };
+}
+
+function validateCodexRangeRewriteProjection({
+  sourceTimeline,
+  outputRecords,
+  minIndex,
+  maxIndex,
+  replacementText,
+}) {
+  const expected = sourceTimeline
+    .filter((_entry, index) => index < minIndex || index > maxIndex)
+    .map(codexTimelineSemanticEntry);
+  if (replacementText) {
+    expected.splice(minIndex, 0, {
+      type: 'user',
+      content: normalizeCodexText(replacementText),
+      compactSummary: '',
+      hasImage: false,
+    });
+  }
+  const projectedRecords = outputRecords.map((record, index) => ({
+    ...record,
+    __line: index,
+  }));
+  const actual = buildCodexMutationTimeline(projectedRecords, 'codex-range-validation')
+    .map(codexTimelineSemanticEntry);
+  if (actual.length !== expected.length) {
+    return {
+      success: false,
+      error: 'Codex range rewrite projection count mismatch',
+      expectedCount: expected.length,
+      actualCount: actual.length,
+    };
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    if (JSON.stringify(actual[index]) === JSON.stringify(expected[index])) continue;
+    return {
+      success: false,
+      error: 'Codex range rewrite projection content mismatch',
+      mismatchIndex: index,
+      expected: expected[index],
+      actual: actual[index],
+    };
+  }
+  return { success: true, expectedCount: expected.length, actualCount: actual.length };
+}
+
+function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replacementText = null, { toPhysicalEnd = false } = {}) {
+  if (typeof toPhysicalEnd !== 'boolean' || toPhysicalEnd && replacementText != null) {
+    return { success: false, error: 'Physical suffix mode is only valid for Rewind deletion' };
+  }
+  const timeline = buildCodexMutationTimeline(records, sessionId);
+  const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
+  const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
+  if (startIndex < 0 || endIndex < 0) {
+    if (!replacementText) {
+      const orphanRepair = planCodexTrailingServiceCarrierRemoval(
+        records,
+        sessionId,
+        startUuid,
+        endUuid,
+      );
+      if (orphanRepair) return orphanRepair;
+    }
+    return { success: false, error: 'Timeline range not found' };
+  }
+
+  const minIndex = toPhysicalEnd ? startIndex : Math.min(startIndex, endIndex);
+  let maxIndex = toPhysicalEnd ? timeline.length - 1 : Math.max(startIndex, endIndex);
+  // A rewrite from the first visible entry is a new root. Any compact snapshot
+  // immediately following the selected prefix still describes that deleted
+  // root and cannot lead the first retained user turn. Middle-range deletes do
+  // not use this expansion: their following compact remains valid and must stay.
+  if (minIndex === 0) {
+    while (timeline[maxIndex + 1]?.type === 'compact') maxIndex += 1;
+  }
+  const selected = timeline.slice(minIndex, maxIndex + 1);
+
+  const selectedTurns = new Set();
+  const selectedTurnKeys = new Set();
+  const selectedCompacts = new Set();
+  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
+  const canonicalByUuid = new Map(
+    wrappers
+      .filter((wrapper) => wrapper.sourceUuid)
+      .map((wrapper) => [wrapper.sourceUuid, wrapper]),
+  );
+  const selectedUserUuids = new Set();
+  for (const entry of selected) {
+    if (entry.type === 'compact') {
+      selectedCompacts.add(entry.uuid);
+      continue;
+    }
+    if (entry.type !== 'user') continue;
+    const canonical = canonicalByUuid.get(entry.uuid);
+    if (!canonical || canonical.kind !== 'user' || !Number.isFinite(canonical.turnKey)) {
+      const reason = !canonical ? 'canonical-carrier-missing'
+        : canonical.kind !== 'user' ? 'canonical-carrier-not-user' : 'canonical-turn-key-missing';
+      // Preserve the address that the renderer used to discard when it threw
+      // only plan.error. No prompt, tool body or opaque compact enters logs.
+      console.warn('[CodexRangeRewrite:IdentityRejected] ' + JSON.stringify({
+        sessionId, startUuid, endUuid, entryUuid: entry.uuid, reason,
+        sourceLine: entry.sourceLine ?? null, physicalSessionId: entry.sessionId || sessionId,
+        canonicalLine: canonical?.line ?? null, canonicalKind: canonical?.kind ?? null,
+        canonicalTurnKey: canonical?.turnKey ?? null,
+        timelineCount: timeline.length, selectedCount: selected.length,
+      }));
+      return {
+        success: false,
+        error: 'Selected Codex user turn has no exact rollout identity',
+        code: 'codex_history_target_identity_unresolved',
+        reason,
+        entryUuid: entry.uuid,
+      };
+    }
+    selectedUserUuids.add(entry.uuid);
+    selectedTurnKeys.add(Number(canonical.turnKey));
+    if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
+  }
+  if (selectedTurnKeys.size !== selectedUserUuids.size) {
+    return {
+      success: false,
+      error: 'Selected Codex turns have ambiguous rollout identities',
+      selectedUsers: selectedUserUuids.size,
+      selectedTurnKeys: selectedTurnKeys.size,
+    };
+  }
+  if (selectedTurnKeys.size === 0 && selectedCompacts.size === 0) {
+    return { success: false, error: 'Selected range has no editable Codex turns' };
+  }
+
+  const selectedCompactRecords = new Set(
+    wrappers
+      .filter((wrapper) => wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid))
+      .map((wrapper) => wrapper.record)
+  );
+  if (selectedCompactRecords.size !== selectedCompacts.size) {
+    return {
+      success: false,
+      error: 'Selected Codex compact has no exact rollout identity',
+      selectedCompacts: selectedCompacts.size,
+      selectedCompactLines: selectedCompactRecords.size,
+    };
+  }
+  const compactCompanionPairs = codexCompactCompanionPairs(records, { recordIdentity: true });
+  const selectedCompactCompanionRecords = new Set(
+    [...selectedCompactRecords]
+      .map((record) => compactCompanionPairs.get(record))
+      .filter(Boolean),
+  );
+  const isSelectedCompactCompanion = (wrapper) => {
+    if (!isCodexCompactRecord(wrapper.record)) return false;
+    return selectedCompactCompanionRecords.has(wrapper.record);
+  };
+  // A compact clears turn ownership until the next canonical user. Only
+  // orphan preambles anchored to a removed compact belong to its cleanup;
+  // another retained compact starts an independent context/settings tail.
+  // A new root also discards its initial unowned preamble before the first
+  // selected compact, rather than carrying instructions from the old root.
+  const selectedOrphanPreambles = new Set();
+  let orphanCompactSelected = minIndex === 0 && selectedCompacts.size > 0;
+  let orphanPhysicalSessionId = wrappers[0]?.record?.__physicalSessionId || sessionId;
+  for (const wrapper of wrappers) {
+    const physicalSessionId = wrapper.record?.__physicalSessionId || sessionId;
+    if (physicalSessionId !== orphanPhysicalSessionId) {
+      orphanCompactSelected = false;
+      orphanPhysicalSessionId = physicalSessionId;
+    }
+    if (isCodexCompactRecord(wrapper.record)) {
+      orphanCompactSelected = selectedCompactRecords.has(wrapper.record)
+        || selectedCompactCompanionRecords.has(wrapper.record);
+    } else if (wrapper.kind === 'user') {
+      orphanCompactSelected = false;
+    } else if (orphanCompactSelected && !Number.isFinite(wrapper.turnKey)
+      && isCodexTurnPreambleRecord(wrapper.record)) {
+      selectedOrphanPreambles.add(wrapper);
+    }
+  }
+  const startCarrier = canonicalByUuid.get(startUuid);
+  const suffixStart = toPhysicalEnd && startCarrier?.kind === 'user' && Number.isFinite(startCarrier.turnKey)
+    ? wrappers.findIndex(wrapper => wrapper.turnKey === startCarrier.turnKey) : -1;
+  if (toPhysicalEnd && suffixStart < 0) return { success: false, error: 'Rewind suffix has no exact user-iteration boundary' };
+  const shouldRemoveWrapper = (wrapper) => {
+    if (Number.isFinite(wrapper.turnKey) && selectedTurnKeys.has(Number(wrapper.turnKey))) return true;
+    if (wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid)) return true;
+    return isSelectedCompactCompanion(wrapper) || selectedOrphanPreambles.has(wrapper);
+  };
+  const firstRemovalIndex = toPhysicalEnd ? suffixStart : wrappers.findIndex(shouldRemoveWrapper);
+  if (firstRemovalIndex < 0) {
+    return { success: false, error: 'Selected Codex turns were not found in visible rollout records' };
+  }
+  let replacementTimestamp = new Date().toISOString();
+  if (replacementText) {
+    for (let i = firstRemovalIndex + 1; i < wrappers.length; i++) {
+      const wrapper = wrappers[i];
+      if (shouldRemoveWrapper(wrapper)) continue;
+      const nextMs = Date.parse(wrapper.record?.timestamp || '');
+      if (Number.isFinite(nextMs)) {
+        replacementTimestamp = new Date(nextMs - 1).toISOString();
+        break;
+      }
+    }
+  }
+  const replacementRecords = replacementText
+    ? createCodexReplacementRecords(replacementText, replacementTimestamp)
+    : [];
+  const outputRecords = [];
+  let inserted = false;
+  let removedRecords = 0;
+  let removedUsers = 0;
+  const removedUserUuids = new Set();
+
+  for (const [index, wrapper] of wrappers.entries()) {
+    const shouldRemove = toPhysicalEnd ? index >= suffixStart : shouldRemoveWrapper(wrapper);
+    if (shouldRemove) {
+      if (replacementRecords.length > 0 && !inserted) {
+        for (const replacement of replacementRecords) outputRecords.push(replacement);
+        inserted = true;
+      }
+      removedRecords += 1;
+      if (wrapper.kind === 'user') {
+        removedUsers += 1;
+        if (wrapper.sourceUuid) removedUserUuids.add(wrapper.sourceUuid);
+      }
+      continue;
+    }
+    outputRecords.push(cloneCodexRecordForWrite(wrapper.record));
+  }
+
+  if (replacementRecords.length > 0 && !inserted) {
+    for (const replacement of replacementRecords) outputRecords.push(replacement);
+  }
+
+  if (removedUsers !== selectedUserUuids.size
+    || removedUserUuids.size !== selectedUserUuids.size
+    || [...selectedUserUuids].some((uuid) => !removedUserUuids.has(uuid))) {
+    return {
+      success: false,
+      error: 'Codex range rewrite user identity validation failed',
+      selectedUsers: selectedUserUuids.size,
+      removedUsers,
+      removedUserUuids: [...removedUserUuids],
+    };
+  }
+  const projection = validateCodexRangeRewriteProjection({
+    sourceTimeline: timeline,
+    outputRecords,
+    minIndex,
+    maxIndex,
+    replacementText,
+  });
+  if (!projection.success) return projection;
+
+  return {
+    success: true,
+    outputRecords,
+    replacementRecords,
+    removedCount: removedRecords,
+    removedUsers,
+    selectedCount: selected.length,
+    selectedTurns: Array.from(selectedTurns),
+    selectedTurnKeys: Array.from(selectedTurnKeys),
+    selectedCompacts: Array.from(selectedCompacts),
+    expectedRemainingCount: projection.expectedCount,
+    ...(toPhysicalEnd ? { suffixProof: { kind: 'physical-suffix', startRecordIndex: suffixStart,
+      sourceRecordCount: wrappers.length, retainedRecordCount: outputRecords.length,
+      removedRecordCount: removedRecords } } : {}),
+  };
+}
+
+function planCodexForkFromLatestCompact(records, sessionId) {
+  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
+  let compactIndex = -1;
+  for (let index = wrappers.length - 1; index >= 0; index -= 1) {
+    if (wrappers[index]?.record?.type === 'compacted') {
+      compactIndex = index;
+      break;
+    }
+  }
+  if (compactIndex < 0) {
+    return {
+      success: false,
+      reason: 'no-compact',
+      error: 'В этой Codex-сессии ещё нет сжатия контекста',
+    };
+  }
+
+  const outputRecords = [];
+  const sessionMeta = wrappers.find((wrapper) => wrapper?.record?.type === 'session_meta');
+  if (sessionMeta) outputRecords.push(cloneCodexRecordForWrite(sessionMeta.record));
+  for (let index = compactIndex; index < wrappers.length; index += 1) {
+    const record = wrappers[index]?.record;
+    if (!record || record.type === 'session_meta') continue;
+    outputRecords.push(cloneCodexRecordForWrite(record));
+  }
+
+  return {
+    success: true,
+    outputRecords,
+    compactLine: wrappers[compactIndex]?.line ?? null,
+    removedRecordCount: wrappers
+      .slice(0, compactIndex)
+      .filter((wrapper) => wrapper?.record?.type !== 'session_meta')
+      .length,
+    retainedRecordCount: outputRecords.filter((record) => record?.type !== 'session_meta').length,
+  };
+}
+
+async function forkCodexFromLatestCompact({ sessionId, cwd }) {
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  const loaded = await loadCodexOperationSource(sessionId, cwd);
+  if (!loaded.success) return loaded;
+  const plan = planCodexForkFromLatestCompact(loaded.records, sessionId);
+  if (!plan.success) return plan;
+
+  const result = await writeCodexEditedFork(
+    loaded.records,
+    sessionId,
+    cwd,
+    plan.outputRecords,
+    { forkMode: 'latest_compact' },
+  );
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = await commitPreparedFork({ ...result, store: codexUsageStateStore, commit: () => persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords: plan.outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'latest_compact',
+    }) });
+  } catch (historyEventError) {
+    console.warn('[CodexData] compact fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+    return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
+  }
+  return {
+    success: true,
+    newSessionId: result.newSessionId,
+    filePath: result.filePath,
+    sourceFilePath: loaded.filePath,
+    fromLatestCompact: true,
+    compactLine: plan.compactLine,
+    removedRecordCount: plan.removedRecordCount,
+    retainedRecordCount: plan.retainedRecordCount,
+    historyEventPersisted,
+  };
+}
+
+async function editCodexRange({
+  sessionId,
+  cwd,
+  startUuid,
+  endUuid,
+  compactText,
+  codexSettingsProof = null,
+  validateOnly = false,
+}) {
+  const replacementText = String(compactText || '').trim();
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
+  if (!replacementText) return { success: false, error: 'Replacement text required' };
+
+  const loaded = await loadCodexOperationSource(sessionId, cwd);
+  if (!loaded.success) return loaded;
+
+  const plan = planCodexRangeRewrite(
+    loaded.records,
+    sessionId,
+    startUuid,
+    endUuid,
+    replacementText
+  );
+  if (!plan.success) return plan;
+  const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
+    loaded.records,
+    sessionId,
+    codexSettingsProof,
+  );
+  if (effectiveSettingsProof.status !== 'found') {
+    return {
+      success: false,
+      error: 'Codex history mutation settings proof is unavailable',
+      code: 'codex_history_mutation_settings_unproven',
+      reason: effectiveSettingsProof.reason || 'settings-pair-absent',
+    };
+  }
+
+  console.log('[CodexRangeRewrite] operation=edit source=' + String(sessionId).slice(0, 8)
+    + ' selected=' + plan.selectedCount
+    + ' users=' + plan.removedUsers
+    + ' rawRecords=' + plan.removedCount
+    + ' expectedRemaining=' + plan.expectedRemainingCount);
+  if (validateOnly === true) {
+    return {
+      success: true,
+      validationOnly: true,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      expectedRemainingCount: plan.expectedRemainingCount,
+      codexSettingsProof: effectiveSettingsProof,
+    };
+  }
+
+  const replacementEventRecord = plan.replacementRecords.find(
+    (record) => record.type === 'event_msg' && record.payload?.type === 'user_message'
+  );
+  let result;
+  try {
+    result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords, {
+      codexSettingsProof: effectiveSettingsProof,
+      requireSettingsProof: true,
+      forkMode: 'history_edit',
+    });
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || null,
+      reason: error?.reason || null,
+    };
+  }
+  const outputRecords = plan.outputRecords;
+  const rewrittenRecords = outputRecords.map((record, index) => ({ ...record, __line: index }));
+  const remainingTimeline = buildCodexMutationTimeline(rewrittenRecords, result.newSessionId);
+  if (remainingTimeline.length !== plan.expectedRemainingCount) {
+    await fs.promises.unlink(result.filePath).catch(() => {});
+    invalidateCodexJsonlCache(result.filePath);
+    return {
+      success: false,
+      error: 'Codex edited child failed post-write Timeline validation',
+      code: 'codex_history_mutation_postwrite_validation_failed',
+      expectedRemainingCount: plan.expectedRemainingCount,
+      actualRemainingCount: remainingTimeline.length,
+    };
+  }
+  const finalLine = outputRecords.findIndex((record) => record === replacementEventRecord);
+  const replacementUuid = finalLine >= 0 ? stableUuid(result.newSessionId, finalLine, 'codex-user') : null;
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = await commitPreparedFork({ ...result, store: codexUsageStateStore, commit: () => persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'history_edit',
+    }) });
+  } catch (historyEventError) {
+    console.warn('[CodexData] edited fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+    return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
+  }
+
+  await publishCodexRewriteProjection({ sourceSessionId: sessionId, loaded, result, outputRecords });
+
+  return {
+    success: true,
+    newSessionId: result.newSessionId,
+    filePath: result.filePath,
+    sourceFilePath: loaded.filePath,
+    replacementUuid,
+    compactUuid: replacementUuid,
+    removedCount: plan.removedCount,
+    removedUsers: plan.removedUsers,
+    selectedCount: plan.selectedCount,
+    selectedTurns: plan.selectedTurns,
+    selectedCompacts: plan.selectedCompacts,
+    codexSettingsProof: result.codexSettingsProof,
+    settingsProofInjected: result.settingsProofInjected,
+    expectedRemainingCount: plan.expectedRemainingCount,
+    remainingCount: remainingTimeline.length,
+    historyEventPersisted,
+  };
+}
+
+function codexRepairRecordsHash(records) {
+  const digest = crypto.createHash('sha256');
+  for (const record of records) digest.update(JSON.stringify(cloneCodexRecordForWrite(record)) + '\n');
+  return digest.digest('hex');
+}
+
+function isCodexSavedRepairResumeSettings(record, { previous, currentSessionId, cwd, createdAt, baseline }) {
+  if (record?.type !== 'event_msg' || record.payload?.type !== 'thread_settings_applied'
+    || previous?.resume?.launchWritten !== true || typeof previous.resume.launchId !== 'string'
+    || !previous.resume.launchId.trim()) return false;
+  const candidate = extractCodexSettingsCandidate(record, 0);
+  if (!candidate?.complete || candidate.model !== baseline.model || candidate.effort !== baseline.effort) return false;
+  const timestamp = Date.parse(record.timestamp || '');
+  if (!Number.isFinite(timestamp) || !Number.isFinite(createdAt) || timestamp < createdAt) return false;
+  // This is an appended provider fact in the exact already-verified child,
+  // not an arbitrary event of the same type or a cold authoring transaction.
+  const payload = record.payload;
+  if (Object.hasOwn(payload, 'source') && !['cli', 'codex'].includes(payload.source)) return false;
+  if (record.__physicalSessionId && record.__physicalSessionId !== currentSessionId) return false;
+  for (const object of [record, payload, payload.thread_settings]) {
+    for (const key of ['session_id', 'sessionId', 'thread_id', 'threadId', 'source_session_id']) {
+      if (Object.hasOwn(object, key) && object[key] !== currentSessionId) return false;
+    }
+    if (Object.hasOwn(object, 'cwd') && (typeof object.cwd !== 'string'
+      || !path.isAbsolute(object.cwd) || path.resolve(object.cwd) !== path.resolve(cwd))) return false;
+    // A settings envelope must not smuggle an authored/tool action.
+    if (['message', 'prompt', 'input', 'call_id', 'arguments', 'error'].some(key => Object.hasOwn(object, key))) return false;
+  }
+  return true;
+}
+
+async function inspectCodexSavedRewindRepair({ previous, currentSessionId, cwd }) {
+  const request = previous?.request;
+  const sourceSessionId = request?.expectedSessionId;
+  const reject = code => ({ success: false, code, error: code });
+  if (previous?.state !== 'completed' || previous.toolType !== 'codex' || previous.kind !== 'rewind'
+    || previous.historyMutated !== true || previous.bindingCommitted !== true
+    || previous.newSessionId !== currentSessionId || !sourceSessionId || !previous.endUuid) {
+    return reject('history_repair_previous_operation_unproven');
+  }
+  const source = await loadCodexOperationSource(sourceSessionId, cwd, { forceFresh: true });
+  const child = await loadCodexOperationSource(currentSessionId, cwd, { forceFresh: true });
+  if (!source.success || !child.success) return reject('history_repair_source_unavailable');
+  const childMeta = getSessionMeta(child.records);
+  const childHeader = child.records.find(record => record.type === 'session_meta');
+  if (childMeta.id !== currentSessionId || childMeta.forked_from_id !== sourceSessionId
+    || childMeta.history_mode !== 'legacy' || path.resolve(childMeta.cwd || '') !== path.resolve(cwd || '')) {
+    return reject('history_repair_child_identity_changed');
+  }
+  const legacy = planCodexRangeRewrite(source.records, sourceSessionId, request.targetUuid, previous.endUuid);
+  if (!legacy.success) return reject('history_repair_original_target_changed');
+  const proof = resolveCodexHistoryMutationSettingsProof(source.records, sourceSessionId, null, source);
+  if (proof.status !== 'found') return reject('history_repair_source_settings_unproven');
+  const expected = legacy.outputRecords;
+  const timestamp = childHeader?.timestamp || childMeta.timestamp;
+  if (!timestamp) return reject('history_repair_child_identity_changed');
+  rewriteCodexEditedForkMetadata(source.records, sourceSessionId, cwd, expected, currentSessionId, timestamp);
+  const mutationSettings = child.records.find(record => record.type === 'event_msg'
+    && record.payload?.type === 'thread_settings_applied'
+    && record.payload?.source === 'noted-terminal-history-mutation' && record.timestamp === timestamp);
+  if (mutationSettings) {
+    if (mutationSettings.payload.source_session_id !== sourceSessionId
+      || !Number.isFinite(Number(mutationSettings.payload.proof_at))) return reject('history_repair_child_changed');
+    proof.proofAt = Number(mutationSettings.payload.proof_at);
+  }
+  const settings = ensureCodexEditedForkSettingsProof(expected, currentSessionId, proof, timestamp);
+  if (!settings.success || child.records.length < expected.length) return reject('history_repair_child_changed');
+  for (let index = 0; index < expected.length; index++) {
+    if (JSON.stringify(cloneCodexRecordForWrite(child.records[index])) !== JSON.stringify(expected[index])) {
+      return reject('history_repair_source_or_child_changed');
+    }
+  }
+  const baseline = resolveCodexSourceSettingsProof(expected, currentSessionId);
+  const childSettingsProof = resolveCodexHistoryMutationSettingsProof(child.records, currentSessionId, null, child);
+  if (baseline.status !== 'found' || childSettingsProof.status !== 'found'
+    || childSettingsProof.model !== baseline.model || childSettingsProof.effort !== baseline.effort) {
+    return reject('history_repair_child_has_new_work');
+  }
+  const classifySuffix = record => {
+    const payload = record?.payload || {};
+    const bootstrap = record?.type === 'session_meta' && payload.id === currentSessionId
+      && (payload.session_id === undefined || payload.session_id === currentSessionId)
+      && path.resolve(payload.cwd || '') === path.resolve(cwd || '');
+    const context = isCodexPreUserRecord(record)
+      && !isCodexResponseUserRecord(record)
+      && record?.type !== 'event_msg';
+    const count = record?.type === 'event_msg' && payload.type === 'token_count';
+    const resumeSettings = isCodexSavedRepairResumeSettings(record, {
+      previous, currentSessionId, cwd, createdAt: Date.parse(timestamp), baseline,
+    });
+    return resumeSettings ? 'resume-settings' : bootstrap || context || count ? 'context' : null;
+  };
+  // A parsed array can omit malformed rows or an unfinished next user. Prove
+  // completeness of just the physical suffix with the SAME canonical reader,
+  // on its exact inode/stat lease, rather than claiming absence from that array.
+  const lastPrefix = child.records[expected.length - 1];
+  const startByte = Number(lastPrefix?.__byteOffset);
+  if (!child.sourceSnapshot || !Number.isSafeInteger(startByte) || startByte < 0) return reject('history_repair_child_changed');
+  const sourceStat = await fs.promises.stat(child.filePath);
+  if (!codexSourceSnapshotMatchesStat(child.sourceSnapshot, sourceStat)) return reject('history_repair_child_changed');
+  let prefixSeen = false, suffixCount = 0, resumeSettingsRecords = 0, suffixUnproven = false;
+  const suffix = await readJsonlRange(child.filePath, startByte, sourceStat.size - 1, {
+    sourceStat, collectRecords: false,
+    onRecord: record => {
+      if (!prefixSeen) {
+        prefixSeen = true;
+        if (JSON.stringify(cloneCodexRecordForWrite(record)) !== JSON.stringify(cloneCodexRecordForWrite(lastPrefix))) suffixUnproven = true;
+        return;
+      }
+      suffixCount += 1;
+      const kind = classifySuffix(record);
+      if (!kind) suffixUnproven = true;
+      if (kind === 'resume-settings') resumeSettingsRecords += 1;
+    },
+  });
+  if (!prefixSeen || suffixUnproven || suffix.errors || suffix.leftoverBuffer?.length
+    || suffixCount !== child.records.length - expected.length) return reject('history_repair_child_has_new_work');
+  return { success: true, sourceSessionId, sourceRecords: source.records,
+    childSettingsProof,
+    sourceHash: codexRepairRecordsHash(source.records), childHash: codexRepairRecordsHash(child.records),
+    validateChild: () => {
+      if (!child.sourceSnapshot || !codexSourceSnapshotMatchesStat(child.sourceSnapshot, fs.statSync(child.filePath))) {
+        throw Object.assign(new Error('history_repair_child_changed'), { code: 'history_repair_child_changed' });
+      }
+    },
+    proof: { kind: 'exact-previous-cow-output', repairOfOperationId: previous.operationId,
+      previousChildSessionId: currentSessionId, sourceSessionId, retainedRecords: expected.length,
+      resumeSettingsRecords } };
+}
+
+async function deleteCodexRange({
+  sessionId,
+  cwd,
+  startUuid,
+  endUuid,
+  codexSettingsProof = null,
+  validateOnly = false,
+  validateSource = null,
+  beforeWrite = null,
+  toPhysicalEnd = false,
+  diagnosticOperationId = null,
+}) {
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
+  const stageStarted = performance.now();
+  let stageAt = stageStarted;
+  const stage = phase => {
+    const now = performance.now();
+    console.log('[CodexRangeRewrite:Stage] operation=' + String(diagnosticOperationId || '-').slice(0, 160)
+      + ' source=' + sessionId.slice(0, 8) + ' validateOnly=' + (validateOnly === true)
+      + ' phase=' + phase + ' elapsedMs=' + (now - stageAt).toFixed(1)
+      + ' totalMs=' + (now - stageStarted).toFixed(1));
+    stageAt = now;
+  };
+
+  const loaded = await loadCodexOperationSource(sessionId, cwd);
+  stage('load');
+  if (!loaded.success) return loaded;
+  if (typeof validateSource === 'function') validateSource(loaded);
+
+  const plan = planCodexRangeRewrite(
+    loaded.records,
+    sessionId,
+    startUuid,
+    endUuid,
+    null,
+    { toPhysicalEnd },
+  );
+  stage('plan');
+  if (!plan.success) return plan;
+  const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
+    loaded.records,
+    sessionId,
+    codexSettingsProof,
+    loaded,
+  );
+  if (effectiveSettingsProof.status !== 'found') {
+    return {
+      success: false,
+      error: 'Codex history mutation settings proof is unavailable',
+      code: 'codex_history_mutation_settings_unproven',
+      reason: effectiveSettingsProof.reason || 'settings-pair-absent',
+    };
+  }
+
+  console.log('[CodexRangeRewrite] operation=delete source=' + String(sessionId).slice(0, 8)
+    + ' selected=' + plan.selectedCount
+    + ' users=' + plan.removedUsers
+    + ' rawRecords=' + plan.removedCount
+    + ' turnKeys=' + plan.selectedTurnKeys.join(',')
+    + ' expectedRemaining=' + plan.expectedRemainingCount);
+  if (validateOnly === true) {
+    return {
+      success: true,
+      validationOnly: true,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      selectedTurnKeys: plan.selectedTurnKeys,
+      selectedCompacts: plan.selectedCompacts,
+      expectedRemainingCount: plan.expectedRemainingCount,
+      codexSettingsProof: effectiveSettingsProof,
+      suffixProof: plan.suffixProof || null,
+    };
+  }
+
+  let result;
+  try {
+    if (typeof beforeWrite === 'function') beforeWrite();
+    result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords, {
+      codexSettingsProof: effectiveSettingsProof,
+      requireSettingsProof: true,
+      forkMode: 'history_delete',
+      beforeWrite,
+      operationSource: loaded,
+    });
+    stage('write');
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || null,
+      reason: error?.reason || null,
+    };
+  }
+  const rewrittenRecords = plan.outputRecords.map((record, index) => ({ ...record, __line: index }));
+  const remainingTimeline = buildCodexMutationTimeline(rewrittenRecords, result.newSessionId);
+  stage('postwrite-proof');
+  if (remainingTimeline.length !== plan.expectedRemainingCount) {
+    await fs.promises.unlink(result.filePath).catch(() => {});
+    invalidateCodexJsonlCache(result.filePath);
+    return {
+      success: false,
+      error: 'Codex deleted child failed post-write Timeline validation',
+      code: 'codex_history_mutation_postwrite_validation_failed',
+      expectedRemainingCount: plan.expectedRemainingCount,
+      actualRemainingCount: remainingTimeline.length,
+    };
+  }
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = await commitPreparedFork({ ...result, store: codexUsageStateStore, commit: () => persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords: plan.outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'history_delete',
+    }) });
+  } catch (historyEventError) {
+    console.warn('[CodexData] deleted fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+    return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
+  }
+  stage('lineage-commit');
+
+  await publishCodexRewriteProjection({ sourceSessionId: sessionId, loaded, result, outputRecords: plan.outputRecords });
+  stage('projection');
+
+  return {
+    success: true,
+    newSessionId: result.newSessionId,
+    filePath: result.filePath,
+    sourceFilePath: loaded.filePath,
+    removedCount: plan.removedCount,
+    removedUsers: plan.removedUsers,
+    selectedCount: plan.selectedCount,
+    selectedTurns: plan.selectedTurns,
+    selectedCompacts: plan.selectedCompacts,
+    selectedTurnKeys: plan.selectedTurnKeys,
+    remainingCount: remainingTimeline.length,
+    remainingUsers: remainingTimeline.filter((entry) => entry.type === 'user').length,
+    fileDeleted: false,
+    codexSettingsProof: result.codexSettingsProof,
+    settingsProofInjected: result.settingsProofInjected,
+    expectedRemainingCount: plan.expectedRemainingCount,
+    historyEventPersisted,
+    suffixProof: plan.suffixProof || null,
+  };
+}
+
+async function deleteCodexRangeInPlace({
+  sessionId,
+  cwd,
+  startUuid,
+  endUuid,
+  codexSettingsProof = null,
+  validateOnly = false,
+}) {
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
+
+  // In-place repair is intentionally physical-only. A composite/materialized
+  // view may span several files and cannot be replaced under one provider id.
+  const loaded = await loadSessionRecords(sessionId, cwd);
+  if (!loaded.success) return loaded;
+  const plan = planCodexRangeRewrite(loaded.records, sessionId, startUuid, endUuid);
+  if (!plan.success) return plan;
+
+  const settingsProof = resolveCodexHistoryMutationSettingsProof(
+    loaded.records,
+    sessionId,
+    codexSettingsProof,
+  );
+  if (settingsProof.status !== 'found') {
+    return {
+      success: false,
+      error: 'Codex history mutation settings proof is unavailable',
+      code: 'codex_history_mutation_settings_unproven',
+      reason: settingsProof.reason || 'settings-pair-absent',
+    };
+  }
+  const outputRecords = plan.outputRecords.map(cloneCodexRecordForWrite);
+  const settingsReady = ensureCodexEditedForkSettingsProof(
+    outputRecords,
+    sessionId,
+    settingsProof,
+    new Date().toISOString(),
+  );
+  if (!settingsReady.success) {
+    return {
+      success: false,
+      error: settingsReady.error,
+      code: 'codex_history_mutation_settings_unproven',
+    };
+  }
+  const outputMeta = getSessionMeta(outputRecords);
+  if (!outputMeta?.id || outputMeta.id !== sessionId) {
+    return {
+      success: false,
+      error: 'Codex in-place rewrite changed the source session identity',
+      code: 'codex_in_place_rewrite_session_identity_mismatch',
+    };
+  }
+  const remainingTimeline = buildCodexTimeline(
+    outputRecords.map((record, index) => ({ ...record, __line: index })),
+    sessionId,
+  );
+  if (remainingTimeline.length !== plan.expectedRemainingCount) {
+    return {
+      success: false,
+      error: 'Codex in-place rewrite failed pre-write Timeline validation',
+      code: 'codex_history_mutation_postwrite_validation_failed',
+      expectedRemainingCount: plan.expectedRemainingCount,
+      actualRemainingCount: remainingTimeline.length,
+    };
+  }
+  if (validateOnly === true) {
+    return {
+      success: true,
+      validationOnly: true,
+      sessionId,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      selectedTurnKeys: plan.selectedTurnKeys,
+      selectedCompacts: plan.selectedCompacts,
+      expectedRemainingCount: plan.expectedRemainingCount,
+    };
+  }
+
+  try {
+    const committed = await replaceCodexSessionFileInPlace({
+      filePath: loaded.filePath,
+      records: outputRecords,
+      sourceSnapshot: loaded.sourceSnapshot,
+      sessionId,
+    });
+    return {
+      ...committed,
+      inPlace: true,
+      newSessionId: sessionId,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      selectedTurns: plan.selectedTurns,
+      selectedCompacts: plan.selectedCompacts,
+      selectedTurnKeys: plan.selectedTurnKeys,
+      remainingCount: remainingTimeline.length,
+      expectedRemainingCount: plan.expectedRemainingCount,
+      codexSettingsProof: {
+        model: settingsProof.model,
+        effort: settingsProof.effort,
+        proofAt: settingsProof.proofAt,
+        sessionId,
+        ...(typeof settingsProof.fast === 'boolean' ? { fast: settingsProof.fast } : {}),
+      },
+      settingsProofInjected: settingsReady.injected === true,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || 'codex_in_place_rewrite_failed',
+    };
+  }
+}
+
+function codexCopyOptions(params = {}) {
+  const includeTools = params.includeTools ?? false;
+  const includeBash = params.includeBash ?? false;
+  return {
+    includeEditing: params.includeEditing ?? false,
+    includeReading: params.includeReading ?? false,
+    includeSearch: params.includeSearch ?? includeBash,
+    includeRun: params.includeRun ?? includeBash,
+    includeGit: params.includeGit ?? includeBash,
+    includeMcp: params.includeMcp ?? includeTools,
+    includeWeb: params.includeWeb ?? params.includeWebSearch ?? false,
+    includePlan: params.includePlan ?? params.includeToolSearch ?? params.includeOtherTools ?? false,
+    includeOther: params.includeOther ?? params.includeOtherTools ?? params.includeToolSearch ?? includeTools,
+    includeActions: params.includeActions ?? true,
+    fromStart: params.fromStart ?? true,
+    includeSubagentResult: params.includeSubagentResult ?? false,
+    includeSubagentHistory: params.includeSubagentHistory ?? false,
+    includeUser: params.includeUser ?? true,
+    includeClaude: params.includeClaude ?? true,
+    includeText: params.includeText ?? true,
+    includeThinking: params.includeThinking ?? true,
+    includeBash,
+    includeTools,
+    includeWebSearch: params.includeWebSearch ?? false,
+    includeToolSearch: params.includeToolSearch ?? false,
+    includeOtherTools: params.includeOtherTools ?? includeTools,
+  };
+}
+
+function compactCopyTokenCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return '';
+  if (count < 1000) return String(Math.floor(count));
+  const rounded = count >= 10_000
+    ? Math.round(count / 1000)
+    : Math.round(count / 100) / 10;
+  return String(rounded).replace(/\.0$/, '') + 'k';
+}
+
+function codexCompactCopyLine(preTokens, postTokens) {
+  const pre = Number(preTokens);
+  const post = Number(postTokens);
+  const preText = compactCopyTokenCount(pre);
+  const postText = compactCopyTokenCount(post);
+  if (preText && postText) {
+    const reduced = pre > post ? compactCopyTokenCount(pre - post) : '';
+    return `Context compacted · ${preText} → ${postText} tokens${reduced ? `, −${reduced}` : ''} (encrypted)`;
+  }
+  if (postText) return `Context compacted · ${postText} tokens (encrypted)`;
+  return 'Context compacted (encrypted)';
+}
+
+function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
+  const entries = [];
+  const pendingResponseUsers = [];
+  const pendingProjectInstructions = [];
+  const compactCompanionLines = codexCompactCompanionLines(records);
+  const pendingCalls = new Map();
+  let currentTurnIndex = -1;
+  let pendingThinking = '';
+  let currentTurnCanonicalUserText = null;
+  let latestTokenCountInfo = null;
+
+  const push = (entry) => {
+    const stored = { ...entry, turnIndex: currentTurnIndex };
+    entries.push(stored);
+    return stored;
+  };
+  const compactText = (payload) => {
+    const last = latestTokenCountInfo?.last_token_usage
+      || latestTokenCountInfo?.total_token_usage
+      || {};
+    const preTokens = Number(last.total_tokens || last.input_tokens || 0) || undefined;
+    return codexCompactCopyLine(preTokens, compactPostTokenCount(payload));
+  };
+
+  for (const record of records) {
+    const payload = record.payload || {};
+
+    if (record.type === 'compacted') {
+      // For clean export, a Codex compacted record is a snapshot of model
+      // context, not a new user-visible turn. Expanding replacement_history
+      // recursively re-exports old/rolled-back prompts on every compaction.
+      const sourceUuid = stableUuidForRecord(sessionId, record, 'codex-compact');
+      push({
+        kind: 'compact',
+        text: compactText(payload),
+        sourceUuid,
+      });
+      continue;
+    }
+
+    if (record.type === 'event_msg') {
+      if (payload.type === 'task_started') currentTurnCanonicalUserText = null;
+      if (payload.type === 'patch_apply_end') {
+        attachCodexPatchApplyEvent(pendingCalls, payload);
+      } else if (payload.type === 'user_message') {
+        // Codex persists a built-in subagent completion as an event_msg with a
+        // user role, but it is a service carrier inside the current external
+        // turn. Timeline already ignores it; the clean result projection must
+        // keep the same boundary or it drops the final assistant tail.
+        if (isCodexSubagentNotification(payload)) continue;
+        const presentedUserText = codexUserMessagePresentationText(record);
+        const userText = presentedUserText;
+        const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
+        if (isCodexTurnAbortedUserText(userText)
+          || isCodexEnvironmentContextUserText(userText)) continue;
+        if (isCodexProjectInstructionsUserText(userText)) {
+          // Project instructions are a service preamble of the following
+          // real user turn. Timeline does not mint an editable dot for them,
+          // so clean copy must not consume a turn coordinate either.
+          const pendingIndex = pendingProjectInstructions.findIndex((candidate) => (
+            codexUserCarrierTextsMatch(candidate, userText)
+          ));
+          if (pendingIndex >= 0) {
+            pendingProjectInstructions.splice(pendingIndex, 1);
+          }
+          currentTurnCanonicalUserText = userText;
+          continue;
+        }
+        pendingProjectInstructions.length = 0;
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          codexUserCarrierTextsMatch(candidate.text, userText)
+        ));
+        const pending = pendingIndex >= 0
+          ? pendingResponseUsers.splice(pendingIndex, 1)[0]
+          : null;
+        if (!pending) currentTurnIndex += 1;
+        if (goalContinuation) {
+          if (pending?.entry) {
+            pending.entry.kind = 'goal';
+            pending.entry.text = CODEX_GOAL_CONTINUATION_HISTORY_TEXT;
+            pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
+          } else {
+            push({
+              kind: 'goal',
+              text: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+              sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+            });
+          }
+        } else {
+          if (pending?.entry) {
+            pending.entry.text = presentedUserText;
+            pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
+          } else {
+            const entry = {
+              kind: 'user',
+              text: presentedUserText,
+              sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+            };
+            push(entry);
+          }
+        }
+        currentTurnCanonicalUserText = userText;
+      } else if (payload.type === 'thread_rolled_back') {
+        removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
+        currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
+        pendingProjectInstructions.length = 0;
+        pendingThinking = '';
+      } else if (payload.type === 'turn_aborted') {
+        pendingThinking = '';
+      } else if (isCompactPayload(payload)) {
+        if (!compactCompanionLines.has(record.__line)) {
+          const sourceUuid = stableUuidForRecord(sessionId, record, 'codex-compact');
+          push({
+            kind: 'compact',
+            text: compactText(payload),
+            sourceUuid,
+          });
+        }
+      } else if (payload.type === 'token_count') {
+        latestTokenCountInfo = payload.info || latestTokenCountInfo;
+      } else if (payload.type === 'task_complete') {
+        pendingResponseUsers.length = 0;
+        pendingProjectInstructions.length = 0;
+      }
+      continue;
+    }
+
+    if (record.type !== 'response_item') continue;
+
+    if (payload.type === 'message' && payload.role === 'user') {
+      const presentedUserText = codexUserMessagePresentationText(record);
+      const userText = presentedUserText;
+      const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
+      if (!userText
+        || userText.includes('<subagent_notification>')
+        || isCodexTurnAbortedUserText(userText)
+        || isCodexEnvironmentContextUserText(userText)) continue;
+      if (isCodexProjectInstructionsUserText(userText)) {
+        pendingProjectInstructions.push(userText);
+        currentTurnCanonicalUserText = userText;
+        continue;
+      }
+      pendingProjectInstructions.length = 0;
+      if (currentTurnCanonicalUserText
+        && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
+        continue;
+      }
+      currentTurnIndex += 1;
+      let entry = null;
+      if (goalContinuation) {
+        entry = {
+          kind: 'goal',
+          text: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+          sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+        };
+        entry = push(entry);
+      } else {
+        entry = {
+          kind: 'user',
+          text: presentedUserText,
+          sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+        };
+        entry = push(entry);
+      }
+      pendingResponseUsers.push({ entry, text: userText });
+      continue;
+    }
+
+    if (payload.type === 'reasoning') {
+      const text = extractReasoning(payload.summary || payload.content);
+      if (text) pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
+      continue;
+    }
+
+    if (payload.type === 'message' && payload.role === 'assistant') {
+      if (!opts.includeClaude) {
+        pendingThinking = '';
+        continue;
+      }
+      const text = opts.includeText ? extractTextContent(payload.content) : '';
+      const thinking = opts.includeThinking && pendingThinking ? `<thinking>\n${pendingThinking}\n</thinking>` : '';
+      const content = [thinking, text].filter(Boolean).join('\n\n').trim();
+      if (content) push({ kind: 'assistant', text: content });
+      pendingThinking = '';
+      continue;
+    }
+
+    if (payload.type === 'web_search_call') {
+      const formatted = formatCodexToolForExport(payload, null, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      continue;
+    }
+
+    if (payload.type === 'tool_search_call') {
+      const callId = payload.call_id || stableUuidForRecord(sessionId, record, 'codex-tool-search');
+      pendingCalls.set(callId, payload);
+      continue;
+    }
+
+    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+      const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
+      pendingCalls.set(callId, {
+        ...payload,
+        callId,
+        toolName: codexToolName(payload),
+        args: parseCodexCallArgs(payload),
+        namespace: payload.namespace || '',
+        turnId: payload.turn_id || '',
+        patchApplyEvents: [],
+      });
+      continue;
+    }
+
+    if (payload.type === 'tool_search_output') {
+      const callId = payload.call_id || payload.id;
+      const call = pendingCalls.get(callId) || { type: 'tool_search_call', arguments: {} };
+      const formatted = formatCodexToolForExport(call, payload, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      pendingCalls.delete(callId);
+      continue;
+    }
+
+    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+      const callId = payload.call_id || payload.id;
+      const call = pendingCalls.get(callId) || { type: payload.type, name: payload.name || 'tool' };
+      const formatted = formatCodexToolForExport(call, payload, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      pendingCalls.delete(callId);
+    }
+  }
+
+  // Filtering text must not remove structural user owners before rollback or
+  // carrier adoption. A user-only rollback still owns a turn with User OFF.
+  return opts.includeUser ? entries : entries.filter(entry => entry.kind !== 'user');
+}
+
+function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex Session Export') {
+  const out = [];
+  out.push(title);
+  out.push(`Session: ${sessionId}`);
+  out.push(`CWD: ${cwd || meta.cwd || 'unknown'}`);
+  if (meta.forked_from_id) out.push(`Forked from: ${meta.forked_from_id}`);
+  out.push('');
+
+  for (const entry of entries) {
+    const text = String(entry.text || '').trim();
+    if (!text) continue;
+    if (entry.kind === 'user') {
+      out.push('---', '', '👤 USER:', text, '');
+    } else if (entry.kind === 'assistant') {
+      out.push('🤖 CODEX:', text, '');
+    } else if (entry.kind === 'tool') {
+      out.push(text);
+    } else if (entry.kind === 'compact') {
+      out.push(text, '');
+    } else if (entry.kind === 'goal') {
+      out.push(text, '');
+    }
+  }
+  return out.join('\n');
+}
+
+function buildCodexCleanExport(records, sessionId, cwd, opts) {
+  const meta = opts?.virtualSessionMeta || getSessionMeta(records);
+  const entries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
+  return formatCodexCleanExport(entries, sessionId, cwd, meta);
+}
+
+function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid) {
+  if (!startUuid || !endUuid) {
+    return { success: false, error: 'startUuid/endUuid required' };
+  }
+
+  const timeline = buildCodexTimeline(records, sessionId);
+  const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
+  const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
+  if (startIndex < 0 || endIndex < 0) {
+    return { success: false, error: 'Timeline range not found' };
+  }
+
+  const minIndex = Math.min(startIndex, endIndex);
+  const maxIndex = Math.max(startIndex, endIndex);
+  const selected = timeline.slice(minIndex, maxIndex + 1);
+  const selectedUserUuids = new Set();
+  const selectedCompacts = new Set();
+  for (const entry of selected) {
+    if (entry.type === 'compact') {
+      selectedCompacts.add(entry.uuid);
+    } else if (entry.type === 'user') {
+      selectedUserUuids.add(entry.uuid);
+    }
+  }
+
+  // Compact is a structural, selectable Timeline point. Its encrypted body is
+  // never expanded into replacement_history; the clean projection carries
+  // exactly one metadata line for both single-point and range copy.
+  const copyOptions = codexCopyOptions(opts);
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, { ...copyOptions, includeUser: true });
+  // Timeline and clean export are distinct projections. Their ordinal counters
+  // are not an identity: one ignored provider carrier used to shift every later
+  // Copy to an older turn. Join the selected canonical UUIDs first, then use
+  // only the matched clean projection's own turn coordinates.
+  const selectedTurns = new Set();
+  const matchedUserUuids = new Set();
+  for (const entry of cleanEntries) {
+    if ((entry.kind !== 'user' && entry.kind !== 'goal')
+      || !selectedUserUuids.has(entry.sourceUuid)) continue;
+    if (matchedUserUuids.has(entry.sourceUuid) || typeof entry.turnIndex !== 'number'
+      || selectedTurns.has(entry.turnIndex)) {
+      return { success: false, error: 'Selected Codex user identity is ambiguous in copy projection' };
+    }
+    matchedUserUuids.add(entry.sourceUuid);
+    selectedTurns.add(entry.turnIndex);
+  }
+  if (matchedUserUuids.size !== selectedUserUuids.size) {
+    console.warn('[CodexCopyRange] user identity mismatch'
+      + ' session=' + String(sessionId || '').slice(0, 8)
+      + ' selected=' + selectedUserUuids.size + ' matched=' + matchedUserUuids.size);
+    return { success: false, error: 'Selected Codex user identity not found in copy projection' };
+  }
+  const filtered = cleanEntries.filter((entry) => {
+    if (entry.kind === 'compact') return selectedCompacts.has(entry.sourceUuid);
+    if (entry.kind === 'user' && !copyOptions.includeUser) return false;
+    return typeof entry.turnIndex === 'number' && selectedTurns.has(entry.turnIndex);
+  });
+
+  if (filtered.length === 0) {
+    const cleanTurnIndexes = cleanEntries
+      .map((entry) => entry.turnIndex)
+      .filter((turnIndex) => typeof turnIndex === 'number');
+    const cleanTurnRange = cleanTurnIndexes.length > 0
+      ? `${Math.min(...cleanTurnIndexes)}..${Math.max(...cleanTurnIndexes)}`
+      : 'none';
+    console.warn('[CodexCopyRange] empty projection'
+      + ' session=' + String(sessionId || '').slice(0, 8)
+      + ' start=' + String(startUuid || '').slice(0, 16)
+      + ' end=' + String(endUuid || '').slice(0, 16)
+      + ' selected=' + selected.map((entry) => `${entry.type}@${entry.turnIndex ?? '-'}:${String(entry.uuid || '').slice(0, 8)}`).join(',')
+      + ' selectedTurns=' + [...selectedTurns].join(',')
+      + ' selectedCompacts=' + selectedCompacts.size
+      + ' cleanTurnRange=' + cleanTurnRange);
+    return { success: false, error: 'Selected range has no copyable content' };
+  }
+
+  const meta = opts?.virtualSessionMeta || getSessionMeta(records);
+  return {
+    success: true,
+    content: formatCodexCleanExport(filtered, sessionId, cwd, meta, '# Codex Range Export'),
+    selectedCount: selected.length,
+  };
+}
+
+function projectCodexAssistantContext(blocks, maxChars = 8000, maxLimit = 16000) {
+  return projectResultText((Array.isArray(blocks) ? blocks : []).map(summarizeResultText), maxChars, maxLimit);
+}
+
+function boundCodexAssistantContext(blocks, maxChars = 8000) {
+  return projectCodexAssistantContext(blocks, maxChars, 16000).assistantText;
+}
+
+function collectCodexTurnAssistantBlocks(records, sessionId, entryUuid) {
+  const timeline = buildCodexTimeline(records, sessionId);
+  const target = timeline.find((entry) => entry.uuid === entryUuid && typeof entry.turnIndex === 'number');
+  if (!target) return { success: false, error: 'Timeline turn not found' };
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions({
+    // Keep user rows in the structural projection so rollback indexing stays
+    // identical to Timeline. Assistant filtering happens only after the exact
+    // real user turn has been identified.
+    includeUser: true,
+    includeClaude: true,
+    includeText: true,
+    includeThinking: false,
+    includeBash: false,
+    includeTools: false,
+    includeWebSearch: false,
+    includeToolSearch: false,
+    includeOtherTools: false,
+  }));
+  const cleanTarget = cleanEntries.find((entry) => (
+    (entry.kind === 'user' || entry.kind === 'goal') && entry.sourceUuid === target.uuid
+  ));
+  if (typeof cleanTarget?.turnIndex !== 'number') {
+    return { success: false, error: 'Selected Codex user identity not found in copy projection' };
+  }
+  const assistantBlocks = cleanEntries
+    .filter((entry) => entry.kind === 'assistant' && entry.turnIndex === cleanTarget.turnIndex)
+    .map((entry) => entry.text);
+  return { success: true, target, assistantBlocks };
+}
+
+function codexProviderTurnId(record) {
+  const value = record?.payload?.turn_id ?? record?.turn_id;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function findCodexPromptExecutionContext(records, sessionId, entryUuid) {
+  if (!sessionId || !entryUuid) return null;
+  const rows = Array.isArray(records) ? records : [];
+  // The UUID identifies one physical carrier. Resolve that row before looking
+  // for its enclosing provider turn; globally pairing same-text aliases can
+  // otherwise connect a response_item from turn A to an event_msg from turn B.
+  const promptIndex = rows.findIndex((record) => (
+    codexUserMessageAuditText(record) !== null
+    && stableUuidForRecord(sessionId, record, 'codex-user') === entryUuid
+  ));
+  if (promptIndex < 0) return null;
+
+  const contextFromStart = (record) => {
+    const turnId = codexProviderTurnId(record);
+    if (!turnId) return null;
+    const startedAtSeconds = Number(record?.payload?.started_at);
+    const startedAt = Number.isFinite(startedAtSeconds)
+      ? Math.round(startedAtSeconds * 1000)
+      : (Date.parse(String(record?.timestamp || '')) || null);
+    return {
+      provider: 'codex',
+      sessionId,
+      turnId,
+      processId: null,
+      generation: null,
+      startedAt,
+    };
+  };
+
+  // An already-open previous turn wins. Only when no task_started exists since
+  // the previous terminal boundary may this be Codex's legal pre-start carrier.
+  for (let index = promptIndex - 1; index >= 0; index -= 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') break;
+    if (payload.type !== 'task_started') continue;
+    return contextFromStart(record);
+  }
+  for (let index = promptIndex + 1; index < rows.length; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') break;
+    if (payload.type === 'task_started') return contextFromStart(record);
+  }
+  return null;
+}
+
+function buildCodexProviderTurnAssistantResult(
+  records,
+  sessionId,
+  proof = {},
+  maxChars = 100000,
+  options = {},
+) {
+  // Private observation selection is independent of send/prompt proof.
+  const executionOnly = options.executionOnly === true;
+  const historicalExecutionOnly = executionOnly && options.historicalExecutionOnly === true;
+  const executionContext = proof?.targetExecutionContext;
+  const expectedTurnId = typeof executionContext?.turnId === 'string'
+    ? executionContext.turnId.trim()
+    : '';
+  const expectedSessionId = typeof executionContext?.sessionId === 'string'
+    ? executionContext.sessionId.trim()
+    : '';
+  const hasExpectedGeneration = executionContext?.generation != null
+    && Number.isFinite(Number(executionContext.generation));
+  const expectedGeneration = hasExpectedGeneration ? Number(executionContext.generation) : null;
+  if (executionContext?.provider !== 'codex') {
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.PROVIDER_MISMATCH,
+      error: 'Codex provider turn proof has a provider mismatch',
+      proofDefinitive: true,
+    };
+  }
+  if (!expectedSessionId || expectedSessionId !== sessionId) {
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.SESSION_MISMATCH,
+      error: 'Codex provider turn proof has a session mismatch',
+      proofDefinitive: true,
+    };
+  }
+  // Historical bootstrap can recover the physical turn from a durable prompt
+  // after restart without inventing a live execution generation. This private
+  // mode never binds runtime ownership; known-execution callers stay strict.
+  const historicalGenerationUnknown = options.allowHistoricalGenerationUnknown === true
+    && !hasExpectedGeneration
+    && (typeof proof.promptUserUuid === 'string' && proof.promptUserUuid.trim()
+      || typeof proof.promptSourceIdentity === 'string' && proof.promptSourceIdentity.trim());
+  if (!expectedTurnId || (!hasExpectedGeneration && !historicalGenerationUnknown && !historicalExecutionOnly)
+    || (executionOnly && (historicalExecutionOnly
+      ? executionContext.generation != null || executionContext.processId != null
+      : !Number.isSafeInteger(executionContext.generation) || executionContext.generation <= 0))) {
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.EXECUTION_IDENTITY_INCOMPLETE,
+      error: 'Codex provider turn identity is incomplete',
+      proofDefinitive: true,
+    };
+  }
+
+  const rows = Array.isArray(records) ? records : [];
+  const starts = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const record = rows[index];
+    if (record?.type === 'event_msg'
+      && record?.payload?.type === 'task_started'
+      && codexProviderTurnId(record) === expectedTurnId) {
+      starts.push(index);
+    }
+  }
+  if (starts.length !== 1) {
+    return {
+      success: false,
+      errorCode: starts.length === 0
+        ? RESULT_PROOF_CODES.TASK_STARTED_NOT_FOUND
+        : RESULT_PROOF_CODES.TASK_STARTED_AMBIGUOUS,
+      error: starts.length === 0
+        ? 'matching Codex task_started not found'
+        : 'matching Codex task_started is ambiguous',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      proofDefinitive: starts.length > 1,
+    };
+  }
+
+  const startIndex = starts[0];
+  if (executionOnly && codexRecordPhysicalSessionId(rows[startIndex], sessionId) !== expectedSessionId) {
+    return { success: false, errorCode: RESULT_PROOF_CODES.SESSION_MISMATCH,
+      error: 'Codex provider turn belongs to a different physical session', proofDefinitive: true };
+  }
+  let boundaryIndex = rows.length;
+  let boundaryReason = 'transcript-end';
+  let terminalIndex = -1;
+  let terminalEvent = null;
+  for (let index = startIndex + 1; index < rows.length; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (executionOnly && codexRecordPhysicalSessionId(record, sessionId) !== expectedSessionId) {
+      boundaryIndex = index;
+      boundaryReason = 'physical-session-boundary';
+      break;
+    }
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_started') {
+      boundaryIndex = index;
+      boundaryReason = codexProviderTurnId(record) === expectedTurnId
+        ? 'duplicate-task-started'
+        : 'next-task-started';
+      break;
+    }
+    if (payload.type !== 'task_complete' && payload.type !== 'turn_aborted') continue;
+    const terminalTurnId = codexProviderTurnId(record);
+    if (terminalTurnId === expectedTurnId) {
+      terminalIndex = index;
+      terminalEvent = payload.type;
+      boundaryIndex = index;
+      boundaryReason = payload.type;
+      break;
+    }
+    boundaryIndex = index;
+    boundaryReason = terminalTurnId ? 'mismatched-terminal-turn' : 'terminal-turn-id-missing';
+    break;
+  }
+
+  const terminalTracker = {};
+  let terminalOutcome = null;
+  if (terminalIndex >= 0) {
+    for (let index = startIndex; index <= terminalIndex; index += 1) {
+      const outcome = classifyCodexTurnRecord(terminalTracker, rows[index]);
+      if (outcome && outcome.busy === false) terminalOutcome = outcome;
+    }
+  }
+
+  const lowerBound = Number(proof?.resultAfterAt) > 0
+    ? Number(proof.resultAfterAt)
+    : (Number(proof?.requestedAt) > 0 ? Number(proof.requestedAt) - 5 * 60 * 1000 : 0);
+  const upperBound = Number(proof?.resultBeforeAt) > 0 ? Number(proof.resultBeforeAt) : 0;
+  const exactUuid = typeof proof?.promptUserUuid === 'string' && proof.promptUserUuid.trim()
+    ? proof.promptUserUuid.trim()
+    : null;
+  const exactSourceIdentity = typeof proof?.promptSourceIdentity === 'string'
+    && proof.promptSourceIdentity.trim()
+    ? proof.promptSourceIdentity.trim()
+    : null;
+  const expectedPromptHash = typeof proof?.promptHash === 'string' && proof.promptHash.trim()
+    ? proof.promptHash.trim()
+    : null;
+  const timeOnly = options.allowTimeOnly === true && !exactUuid && !exactSourceIdentity
+    && !expectedPromptHash && Number(proof?.resultAfterAt) > 0;
+  if (!executionOnly && !exactUuid && !exactSourceIdentity && !expectedPromptHash && !timeOnly) {
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.PROMPT_IDENTITY_REQUIRED,
+      error: 'Codex provider turn proof requires an exact prompt UUID, source identity, or hash',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      proofDefinitive: true,
+    };
+  }
+
+  let carrierStartIndex = startIndex + 1;
+  if (exactUuid || exactSourceIdentity || executionOnly) {
+    // Exact physical identity may precede task_started in a valid Codex turn.
+    // Admit only the immediately preceding structural segment; hash-only legacy
+    // proof remains post-start so copied history cannot become causal.
+    let cursor = startIndex - 1;
+    let previousBoundaryType = null;
+    while (cursor >= 0) {
+      const previous = rows[cursor];
+      const previousType = previous?.type === 'event_msg' ? previous?.payload?.type : null;
+      if (previousType === 'task_started'
+        || previousType === 'task_complete'
+        || previousType === 'turn_aborted') {
+        previousBoundaryType = previousType;
+        break;
+      }
+      cursor -= 1;
+    }
+    if (previousBoundaryType === null
+      || previousBoundaryType === 'task_complete'
+      || previousBoundaryType === 'turn_aborted') {
+      carrierStartIndex = cursor + 1;
+    }
+  }
+  const carrierCandidates = [];
+  for (let index = carrierStartIndex; index < boundaryIndex; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type === 'event_msg' && isCodexSubagentNotification(payload)) continue;
+    if (codexUserMessageAuditText(record) === null) continue;
+    if (executionOnly) {
+      if (codexRecordPhysicalSessionId(record, sessionId) !== expectedSessionId) continue;
+      const text = codexUserMessagePresentationText(record);
+      if (!text.trim() || text.includes('<subagent_notification>')
+        || isCodexEnvironmentContextUserText(text) || isCodexProjectInstructionsUserText(text)
+        || isCodexTurnAbortedUserText(text) || isCodexGoalContinuationUserText(text)) continue;
+      if (index < startIndex) {
+        if (!Number.isSafeInteger(record.__line) || record.__line < 0) continue;
+        const attached = findCodexPromptExecutionContext(rows, sessionId, stableUuidForRecord(sessionId, record, 'codex-user'));
+        if (attached?.turnId !== expectedTurnId || attached.sessionId !== expectedSessionId) continue;
+      }
+    }
+    carrierCandidates.push({
+      record,
+      index,
+      byteOffset: record.__byteOffset,
+      ...(executionOnly ? { turnSegment: expectedTurnId, taskStartedSeen: index > startIndex } : {}),
+    });
+  }
+  const promptCandidates = [];
+  const carrierGroups = groupCodexPreferredUserMessageAuditRecords(carrierCandidates);
+  for (const group of carrierGroups) {
+    const recordsWithAliases = [group.candidate, ...(group.aliases || [])];
+    const userUuids = recordsWithAliases.map((candidate) => (
+      executionOnly && (!Number.isSafeInteger(candidate.record.__line) || candidate.record.__line < 0)
+        ? null : stableUuidForRecord(sessionId, candidate.record, 'codex-user')
+    ));
+    const sourceIdentities = recordsWithAliases.map(({ record }) => {
+      if (!executionOnly) return stableSourceIdentity(sessionId, record, 'codex-user');
+      const hasOffset = Number.isSafeInteger(record.__byteOffset) && record.__byteOffset >= 0;
+      const hasLine = Number.isSafeInteger(record.__line) && record.__line >= 0;
+      return hasOffset || hasLine
+        ? stableSourceIdentity(sessionId, { ...record, __byteOffset: hasOffset ? record.__byteOffset : undefined }, 'codex-user')
+        : null;
+    });
+    if (executionOnly) {
+      // The shared grouping is ordered by first physical carrier, not text or
+      // timestamp. Clarifications remain inside this same provider execution.
+      promptCandidates.push({
+        index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+        record: group.candidate.record,
+        userUuid: userUuids[0], sourceIdentity: sourceIdentities[0],
+        sourceIdentityAliases: sourceIdentities.slice(1).filter(Boolean),
+        carrierKind: group.candidate.record.type === 'event_msg' ? 'event' : 'response',
+      });
+      break;
+    }
+    const hasExactIdentity = Boolean(exactUuid || exactSourceIdentity);
+    if (hasExactIdentity) {
+      const uuidMatches = !exactUuid || userUuids.includes(exactUuid);
+      const sourceMatches = !exactSourceIdentity || sourceIdentities.includes(exactSourceIdentity);
+      if (uuidMatches && sourceMatches) {
+        promptCandidates.push({
+          index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+          record: group.candidate.record,
+          userUuid: userUuids[0],
+          sourceIdentity: sourceIdentities[0],
+          sourceIdentityAliases: sourceIdentities.slice(1),
+          carrierKind: group.candidate.record.type === 'event_msg' ? 'event' : 'response',
+        });
+      }
+      continue;
+    }
+    const record = group.candidate.record;
+    const timestampMs = Date.parse(recordTimestamp(record) || '');
+    if ((lowerBound || upperBound) && !Number.isFinite(timestampMs)) continue;
+    if (lowerBound && timestampMs < lowerBound) continue;
+    if (upperBound && timestampMs > upperBound) continue;
+    const text = codexUserMessageAuditText(record) || '';
+    if (timeOnly && (isCodexEnvironmentContextUserText(text)
+      || isCodexProjectInstructionsUserText(text) || isCodexTurnAbortedUserText(text)
+      || isCodexGoalContinuationUserText(text))) continue;
+    if (timeOnly || promptFingerprint(text) === expectedPromptHash) {
+      promptCandidates.push({
+        index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+        record,
+        userUuid: userUuids[0],
+        sourceIdentity: sourceIdentities[0],
+        sourceIdentityAliases: sourceIdentities.slice(1),
+        carrierKind: record.type === 'event_msg' ? 'event' : 'response',
+      });
+    }
+  }
+  // Recovery still names one exact provider execution. Within it preserve
+  // the legacy latest-real-prompt selection after the accepted resume bound.
+  if (timeOnly && promptCandidates.length > 1) promptCandidates.splice(0, promptCandidates.length - 1);
+  if (!executionOnly && promptCandidates.length !== 1) {
+    return {
+      success: false,
+      errorCode: promptCandidates.length === 0
+        ? RESULT_PROOF_CODES.PROMPT_OUTSIDE_TURN
+        : RESULT_PROOF_CODES.PROMPT_AMBIGUOUS,
+      error: promptCandidates.length === 0
+        ? 'matching prompt is outside the exact Codex provider turn'
+        : 'matching prompt is ambiguous inside the exact Codex provider turn',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      boundaryReason,
+      terminalEvent,
+      proofDefinitive: promptCandidates.length > 1 || boundaryReason !== 'transcript-end',
+    };
+  }
+
+  const prompt = promptCandidates[0] || null;
+  // An observation owns the exact provider bracket even before its user row
+  // is durable. Prompt metadata never widens that bracket into a prior turn.
+  const promptIndex = executionOnly ? startIndex : prompt.index;
+  const assistantBlocks = [];
+  for (let index = promptIndex + 1; index < boundaryIndex; index += 1) {
+    const payload = rows[index]?.payload || {};
+    if (rows[index]?.type !== 'response_item'
+      || payload.type !== 'message'
+      || payload.role !== 'assistant') continue;
+    const text = extractTextContent(payload.content).trim();
+    if (text) assistantBlocks.push(text);
+  }
+  let projected = typeof options.projectAssistant === 'function'
+    ? options.projectAssistant({ rows, promptIndex, boundaryIndex, terminalIndex, maxChars })
+    : projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
+  if (!projected.assistantText && terminalOutcome?.hasFinalResult === true) {
+    const terminalText = String(rows[terminalIndex]?.payload?.last_agent_message || '').trim();
+    if (terminalText) projected = projectCodexAssistantContext([terminalText], maxChars, 250000);
+  }
+  if (!executionOnly && !projected.assistantText && !terminalOutcome) {
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.ASSISTANT_NOT_MATERIALIZED,
+      error: 'No assistant response found inside the exact Codex provider turn',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      userUuid: prompt.userUuid,
+      boundaryReason,
+      terminalEvent,
+      proofDefinitive: boundaryReason !== 'transcript-end',
+    };
+  }
+  const turnIndex = !prompt?.userUuid ? null : typeof options.getTurnIndex === 'function'
+    ? options.getTurnIndex(prompt.userUuid)
+    : buildCodexTimeline(rows, sessionId)
+      .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number')?.turnIndex;
+  const executionFailure = executionOnly && terminalOutcome && terminalOutcome.reason !== 'task_complete'
+    ? terminalEvent === 'turn_aborted' ? RESULT_PROOF_CODES.TURN_ABORTED
+      : terminalOutcome.reason === 'codex-no-final-result' ? RESULT_PROOF_CODES.NO_FINAL_RESULT
+        : terminalOutcome.reason
+    : null;
+  const proofDefinitive = !!executionFailure || (terminalIndex < 0 && boundaryReason !== 'transcript-end');
+  return {
+    success: true,
+    ...(executionOnly ? { executionContext: { ...executionContext }, anchorFound: true } : {}),
+    // A terminal envelope is not necessarily a successful answer. Codex
+    // writes `turn_aborted` after Stop/close and can leave assistant text
+    // before that record. Treating any terminal event as `complete` lets that
+    // partial text fabricate a successful orchestration result.
+    complete: terminalOutcome?.reason === 'task_complete'
+      && terminalOutcome?.hasFinalResult === true,
+    assistantText: projected.assistantText,
+    assistantChars: projected.assistantChars,
+    truncated: projected.truncated,
+    assistantMessageCount: assistantBlocks.length,
+    assistantBlockCount: assistantBlocks.length,
+    turnIndex: turnIndex ?? null,
+    userUuid: prompt?.userUuid || null,
+    sourceIdentity: prompt?.sourceIdentity || null,
+    sourceIdentityAliases: prompt?.sourceIdentityAliases || [],
+    promptCarrierKind: prompt?.carrierKind || null,
+    proofMode: historicalExecutionOnly ? 'historical-observed-execution'
+      : executionOnly ? 'observed-provider-execution' : historicalGenerationUnknown ? 'historical-provider-turn' : 'provider-turn-id',
+    providerTurnId: expectedTurnId,
+    providerGeneration: expectedGeneration,
+    terminalEvent,
+    terminalOutcomeReason: terminalOutcome?.reason || null,
+    hasFinalResult: terminalOutcome?.hasFinalResult === true,
+    boundaryReason,
+    proofDefinitive,
+    errorCode: executionFailure || (proofDefinitive ? RESULT_PROOF_CODES.TURN_BOUNDARY_CLOSED : null),
+    error: executionFailure ? 'Codex provider execution ended without a successful final result: ' + executionFailure : proofDefinitive
+      ? 'Codex provider turn closed before an exact terminal result'
+      : null,
+  };
+}
+
+// Orchestration completion is one provider turn, even when Codex compacts its
+// context in the middle of that turn. The normal History projection exposes
+// the post-compact continuation as a synthetic row for navigation, while the
+// clean projection deliberately keeps it under the original real user turn.
+// Reuse that projection here so get_delegation_result includes the final answer
+// and still stops before the next real user message.
+function buildCodexTurnAssistantResult(records, sessionId, entryUuid, maxChars = 100000) {
+  const collected = collectCodexTurnAssistantBlocks(records, sessionId, entryUuid);
+  if (!collected.success) return collected;
+  const projected = projectCodexAssistantContext(collected.assistantBlocks, maxChars, 250000);
+  return projected.assistantText
+    ? {
+      success: true,
+      complete: collected.target.responseComplete === true,
+      assistantText: projected.assistantText,
+      assistantChars: projected.assistantChars,
+      truncated: projected.truncated,
+      assistantMessageCount: collected.assistantBlocks.length,
+      assistantBlockCount: collected.assistantBlocks.length,
+      turnIndex: collected.target.turnIndex,
+    }
+    : { success: false, error: 'No completed assistant response found' };
+}
+
+function buildCodexTurnAssistantContext(records, sessionId, entryUuid, maxChars = 8000) {
+  const collected = collectCodexTurnAssistantBlocks(records, sessionId, entryUuid);
+  if (!collected.success) return collected;
+  const assistantText = boundCodexAssistantContext(collected.assistantBlocks, maxChars);
+  return assistantText
+    ? {
+      success: true,
+      assistantText,
+      assistantMessageCount: collected.assistantBlocks.length,
+      turnIndex: collected.target.turnIndex,
+    }
+    : { success: false, error: 'No completed assistant response found' };
+}
+
+function parseCodexNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeCodexReset(value) {
+  if (value == null) return null;
+  let timestampMs = null;
+  if (typeof value === 'number' && Number.isFinite(value)) timestampMs = value * 1000;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    timestampMs = /^\d+$/.test(trimmed) ? Number(trimmed) * 1000 : Date.parse(trimmed);
+  }
+  if (!Number.isFinite(timestampMs)) return null;
+  const date = new Date(timestampMs);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function normalizeCodexLimitBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+  const used = parseCodexNumber(bucket.used_percent ?? bucket.utilization ?? bucket.usedPercent);
+  const windowMinutes = parseCodexNumber(
+    bucket.window_minutes ?? bucket.windowMinutes ?? bucket.windowDurationMins
+  );
+  return {
+    utilization: used != null && used >= 0 && used <= 100 ? used : null,
+    resets_at: normalizeCodexReset(bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt),
+    window_minutes: windowMinutes,
+  };
+}
+
+function codexWindowMatchesMinutes(bucket, expectedMinutes) {
+  const minutes = Number(bucket?.window_minutes);
+  if (!Number.isFinite(minutes) || minutes <= 0) return false;
+  return Math.abs(minutes - expectedMinutes) <= expectedMinutes * 0.05;
+}
+
+function buildCodexUsageFromRateLimits(rateLimits, timestamp = null, filePath = null) {
+  if (!rateLimits || typeof rateLimits !== 'object') return null;
+  const primary = normalizeCodexLimitBucket(rateLimits.primary);
+  const secondary = normalizeCodexLimitBucket(rateLimits.secondary);
+  if (!primary && !secondary) return null;
+  const buckets = [primary, secondary].filter(Boolean);
+  const fiveHour = buckets.find((bucket) => codexWindowMatchesMinutes(bucket, 5 * 60)) || null;
+  const sevenDay = buckets.find((bucket) => codexWindowMatchesMinutes(bucket, 7 * 24 * 60)) || null;
+  return {
+    primary,
+    secondary,
+    five_hour: fiveHour,
+    seven_day: sevenDay,
+    limit_id: rateLimits.limit_id || null,
+    limit_name: rateLimits.limit_name || null,
+    plan_type: rateLimits.plan_type || null,
+    credits: rateLimits.credits || null,
+    individual_limit: rateLimits.individual_limit || null,
+    rate_limit_reached_type: rateLimits.rate_limit_reached_type || null,
+    timestamp,
+    filePath,
+  };
+}
+
+function normalizeCodexAppServerCredits(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return normalizeCodexCreditBalance({
+    has_credits: raw.hasCredits,
+    unlimited: raw.unlimited,
+    overage_limit_reached: raw.overageLimitReached ?? raw.spendControlReached,
+    balance: raw.balance,
+  });
+}
+
+function buildCodexResetCreditsFromAppServer(raw, receivedAtMs = Date.now()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const availableCount = parseCodexNumber(raw.availableCount);
+  const credits = (Array.isArray(raw.credits) ? raw.credits : [])
+    .map((credit) => {
+      if (!credit || typeof credit !== 'object') return null;
+      if (credit.status && credit.status !== 'available') return null;
+      const expiresAt = normalizeCodexReset(credit.expiresAt);
+      if (!expiresAt || Date.parse(expiresAt) <= receivedAtMs) return null;
+      return {
+        title: typeof credit.title === 'string' && credit.title.trim()
+          ? credit.title.trim().slice(0, 80)
+          : 'Full reset',
+        expires_at: expiresAt,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.expires_at) - Date.parse(right.expires_at));
+  if (availableCount == null && credits.length === 0) return null;
+  return {
+    available_count: availableCount != null ? Math.max(0, Math.floor(availableCount)) : credits.length,
+    credits,
+    timestamp: new Date(receivedAtMs).toISOString(),
+  };
+}
+
+function buildCodexUsageFromAppServerRateLimits(payload, receivedAtMs = Date.now()) {
+  if (!payload || typeof payload !== 'object') return null;
+  const rows = Object.values(payload.rateLimitsByLimitId || {})
+    .filter((row) => row && typeof row === 'object');
+  const core = payload.rateLimits
+    || rows.find((row) => row.limitId === 'codex')
+    || rows[0]
+    || null;
+  if (!core) return null;
+
+  const mapRow = (row) => buildCodexUsageFromRateLimits({
+    primary: row?.primary || null,
+    secondary: row?.secondary || null,
+    limit_id: row?.limitId || null,
+    limit_name: row?.limitName || null,
+    plan_type: row?.planType || null,
+    credits: normalizeCodexAppServerCredits(row?.credits),
+    individual_limit: row?.individualLimit || null,
+    rate_limit_reached_type: row?.rateLimitReachedType || null,
+  }, new Date(receivedAtMs).toISOString(), null);
+
+  const usage = mapRow(core);
+  if (!usage) return null;
+  const coreLimitId = core.limitId || null;
+  const additional = rows
+    .filter((row) => !coreLimitId || row.limitId !== coreLimitId)
+    .map((row) => {
+      const rowUsage = mapRow(row);
+      if (!rowUsage?.five_hour && !rowUsage?.seven_day) return null;
+      return {
+        key: String(row.limitId || row.limitName || '').slice(0, 120),
+        label: String(row.limitName || 'Additional Codex limit').slice(0, 120),
+        five_hour: rowUsage.five_hour,
+        seven_day: rowUsage.seven_day,
+      };
+    })
+    .filter((row) => row?.key);
+
+  return {
+    usage: {
+      ...usage,
+      authoritative_windows: true,
+      additional_rate_limits_observed: rows.length > 0,
+      additional_rate_limits: additional,
+    },
+    resetCredits: buildCodexResetCreditsFromAppServer(payload.rateLimitResetCredits, receivedAtMs),
+  };
+}
+
+function latestCodexUsageInRecords(records, filePath = null) {
+  let latest = null;
+  for (const record of records) {
+    const payload = record.payload || {};
+    if (record.type !== 'event_msg' || payload.type !== 'token_count') continue;
+    const usage = buildCodexUsageFromRateLimits(payload.rate_limits, recordTimestamp(record), filePath);
+    if (usage) latest = usage;
+  }
+  return latest;
+}
+
+async function findLatestCodexUsage() {
+  if (!fs.existsSync(CODEX_SESSIONS_DIR)) return null;
+  const files = await walkJsonlFiles(CODEX_SESSIONS_DIR);
+  const candidates = [];
+  for (const filePath of files) {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      candidates.push({ filePath, mtimeMs: stat.mtimeMs });
+    } catch {}
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const candidate of candidates.slice(0, CODEX_LATEST_USAGE_FILE_LIMIT)) {
+    try {
+      const usage = await findLatestCodexUsageInFile(candidate.filePath, {
+        maxBytes: CODEX_LATEST_USAGE_TAIL_BYTES,
+      });
+      if (usage) return usage;
+    } catch {}
+  }
+  return null;
+}
+
+function latestCodexUsageInJsonlBuffer(buffer, filePath) {
+  const lines = buffer.toString('utf8').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const record = JSON.parse(line);
+      const payload = record?.payload || {};
+      if (record?.type !== 'event_msg' || payload.type !== 'token_count') continue;
+      const usage = buildCodexUsageFromRateLimits(payload.rate_limits, recordTimestamp(record), filePath);
+      if (usage) return usage;
+    } catch {}
+  }
+  return null;
+}
+
+async function findLatestCodexUsageInFile(filePath, {
+  maxBytes = CODEX_USAGE_TAIL_MAX_BYTES,
+  chunkBytes = CODEX_USAGE_TAIL_CHUNK_BYTES,
+} = {}) {
+  const stat = await fs.promises.stat(filePath);
+  if (!stat.isFile() || stat.size <= 0) return null;
+
+  const byteBudget = Math.max(1, Math.min(stat.size, Number(maxBytes) || CODEX_USAGE_TAIL_MAX_BYTES));
+  const readChunkSize = Math.max(1, Math.min(byteBudget, Number(chunkBytes) || CODEX_USAGE_TAIL_CHUNK_BYTES));
+  const fd = await fs.promises.open(filePath, 'r');
+  let position = stat.size;
+  let scanned = 0;
+  let carry = Buffer.alloc(0);
+  try {
+    while (position > 0 && scanned < byteBudget) {
+      const length = Math.min(readChunkSize, position, byteBudget - scanned);
+      const start = position - length;
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await fd.read(chunk, 0, length, start);
+      if (bytesRead <= 0) break;
+      const combined = Buffer.concat([chunk.subarray(0, bytesRead), carry]);
+      scanned += bytesRead;
+      position = start;
+
+      if (start === 0) {
+        return latestCodexUsageInJsonlBuffer(combined, filePath);
+      }
+      const firstNewline = combined.indexOf(0x0a);
+      if (firstNewline < 0) {
+        carry = combined;
+        continue;
+      }
+      const usage = latestCodexUsageInJsonlBuffer(combined.subarray(firstNewline + 1), filePath);
+      if (usage) return usage;
+      carry = combined.subarray(0, firstNewline);
+    }
+    return null;
+  } finally {
+    await fd.close();
+  }
+}
+
+async function loadLatestCodexUsageForSession(sessionId, cwd) {
+  const found = await findCodexSessionFile(sessionId, cwd, { allowContentScan: false });
+  if (!found) return { success: false, error: 'Session not found' };
+  const usage = await findLatestCodexUsageInFile(found.filePath);
+  return { success: true, usage, filePath: found.filePath };
+}
+
+function runSqliteJson(dbPath, sql) {
+  return new Promise((resolve, reject) => {
+    execFile('sqlite3', ['-json', dbPath, sql], {
+      timeout: 15_000,
+      maxBuffer: 16 * 1024 * 1024,
+      env: buildChildProcessEnv(),
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const message = stderr?.trim() || error.message;
+        reject(new Error(message));
+        return;
+      }
+      resolve(safeJsonParse(stdout || '[]', []));
+    });
+  });
+}
+
+function shortCodexId(value) {
+  if (!value) return null;
+  const s = String(value);
+  if (s.length <= 12) return s;
+  return `${s.slice(0, 8)}…${s.slice(-4)}`;
+}
+
+function maskCodexEmail(value) {
+  if (!value || typeof value !== 'string') return null;
+  const [local, domain] = value.split('@');
+  if (!domain) return shortCodexId(value);
+  const prefix = local.slice(0, Math.min(2, Math.max(1, local.length)));
+  return `${prefix}***@${domain}`;
+}
+
+function hashCodexAccountKey(raw) {
+  return crypto.createHash('sha256').update(String(raw || 'unknown')).digest('hex').slice(0, 16);
+}
+
+function codexAccountIdentityKey(identity) {
+  if (!identity || typeof identity !== 'object') return null;
+  return identity.accountId || identity.email || null;
+}
+
+function codexAccountKeyFromIdentity(identity) {
+  const key = codexAccountIdentityKey(identity);
+  return key ? hashCodexAccountKey(key) : null;
+}
+
+function sqlString(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
+function sqlStringList(values) {
+  return values.map((value) => `'${sqlString(value)}'`).join(',');
+}
+
+function arrayChunks(values, size) {
+  const chunks = [];
+  for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
+  return chunks;
+}
+
+function extractCodexThreadId(body) {
+  if (!body || typeof body !== 'string') return null;
+  return (body.match(/thread_id=([0-9a-f-]+)/) || [])[1]
+    || (body.match(/thread\.id=([0-9a-f-]+)/) || [])[1]
+    || (body.match(/conversation\.id=([0-9a-f-]+)/) || [])[1]
+    || null;
+}
+
+function parseCodexRateLimitLog(body) {
+  if (!body || typeof body !== 'string' || !body.includes('codex.rate_limits')) return null;
+  const plan = (body.match(/"plan_type":"([^"]+)"/) || [])[1] || null;
+  const primaryMatch = body.match(/"primary":\{"used_percent":([0-9.]+),"window_minutes":([0-9]+)(?:,"reset_after_seconds":[0-9.]+)?,"reset_at":([0-9]+)\}/);
+  const secondaryMatch = body.match(/"secondary":\{"used_percent":([0-9.]+),"window_minutes":([0-9]+)(?:,"reset_after_seconds":[0-9.]+)?,"reset_at":([0-9]+)\}/);
+  const primary = primaryMatch ? {
+    used_percent: Number(primaryMatch[1]),
+    window_minutes: Number(primaryMatch[2]),
+    reset_at: Number(primaryMatch[3]),
+  } : null;
+  const secondary = secondaryMatch ? {
+    used_percent: Number(secondaryMatch[1]),
+    window_minutes: Number(secondaryMatch[2]),
+    reset_at: Number(secondaryMatch[3]),
+  } : null;
+  if (!primary && !secondary) return null;
+  return {
+    limit_id: 'codex',
+    limit_name: null,
+    primary,
+    secondary,
+    credits: null,
+    individual_limit: null,
+    plan_type: plan,
+    rate_limit_reached_type: null,
+  };
+}
+
+function parseCodexAccountIdentityLog(body) {
+  if (!body || typeof body !== 'string') return { accountId: null, email: null };
+  if (!body.includes('terminal.type=')) return { accountId: null, email: null };
+  return {
+    accountId: (body.match(/user\.account_id="([^"]+)"/) || [])[1] || null,
+    email: (body.match(/user\.email="([^"]+)"/) || [])[1] || null,
+  };
+}
+
+function codexLogTimeMs(row) {
+  return (Number(row?.ts) || 0) * 1000 + (Number(row?.ts_nanos) || 0) / 1_000_000;
+}
+
+function codexRateBucketForWindow(rateLimits, semanticKey, expectedMinutes, legacyKey) {
+  const explicit = rateLimits?.[semanticKey];
+  if (explicit && typeof explicit === 'object') return explicit;
+  const candidates = [rateLimits?.primary, rateLimits?.secondary]
+    .filter((bucket) => bucket && typeof bucket === 'object');
+  const matched = candidates.find((bucket) => {
+    const directMinutes = parseCodexNumber(bucket.window_minutes ?? bucket.windowMinutes);
+    const seconds = parseCodexNumber(bucket.limit_window_seconds ?? bucket.window_seconds ?? bucket.limitWindowSeconds);
+    const minutes = directMinutes ?? (seconds != null ? seconds / 60 : null);
+    return minutes != null && Math.abs(minutes - expectedMinutes) <= expectedMinutes * 0.05;
+  });
+  return matched || rateLimits?.[legacyKey] || null;
+}
+
+function codexRateResetEpoch(bucket) {
+  if (!bucket || typeof bucket !== 'object') return 0;
+  const raw = bucket.reset_at ?? bucket.resets_at ?? bucket.resetAt ?? bucket.resetsAt;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d+$/.test(trimmed)) return Number(trimmed);
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  }
+  return 0;
+}
+
+function compareCodexResetGeneration(next, prev, semanticKey, expectedMinutes, legacyKey) {
+  const nextReset = codexRateResetEpoch(codexRateBucketForWindow(next.rateLimits, semanticKey, expectedMinutes, legacyKey));
+  const prevReset = codexRateResetEpoch(codexRateBucketForWindow(prev.rateLimits, semanticKey, expectedMinutes, legacyKey));
+  const diff = nextReset - prevReset;
+  if (Math.abs(diff) <= CODEX_RESET_DRIFT_TOLERANCE_SECONDS) return 0;
+  return diff;
+}
+
+function compareCodexRateSnapshotFreshness(next, prev) {
+  if (!prev) return 1;
+  if (!next) return -1;
+
+  const weeklyGeneration = compareCodexResetGeneration(next, prev, 'seven_day', 7 * 24 * 60, 'secondary');
+  if (weeklyGeneration !== 0) return weeklyGeneration;
+
+  const fiveHourGeneration = compareCodexResetGeneration(next, prev, 'five_hour', 5 * 60, 'primary');
+  if (fiveHourGeneration !== 0) return fiveHourGeneration;
+
+  const nextTs = Number(next.ts) || 0;
+  const prevTs = Number(prev.ts) || 0;
+  if (nextTs !== prevTs) return nextTs - prevTs;
+  return (Number(next.tsNanos) || 0) - (Number(prev.tsNanos) || 0);
+}
+
+function codexUsageTimestampParts(usage) {
+  const ms = parseTimestampMs(usage?.timestamp);
+  if (!Number.isFinite(ms)) return { ts: 0, tsNanos: 0 };
+  return {
+    ts: Math.floor(ms / 1000),
+    tsNanos: Math.floor((ms % 1000) * 1_000_000),
+  };
+}
+
+function codexUsageFreshnessCandidate(usage) {
+  if (!usage) return null;
+  const { ts, tsNanos } = codexUsageTimestampParts(usage);
+  return {
+    rateLimits: {
+      primary: usage.primary || null,
+      secondary: usage.secondary || null,
+      five_hour: usage.five_hour || null,
+      seven_day: usage.seven_day || null,
+    },
+    ts,
+    tsNanos,
+  };
+}
+
+function compareCodexUsageFreshness(nextUsage, prevUsage) {
+  return compareCodexRateSnapshotFreshness(
+    codexUsageFreshnessCandidate(nextUsage),
+    codexUsageFreshnessCandidate(prevUsage)
+  );
+}
+
+function readCodexAuthSession(codexHome = CODEX_HOME) {
+  const authPath = path.join(codexHome, 'auth.json');
+  if (!fs.existsSync(authPath)) return null;
+  const raw = safeJsonParse(fs.readFileSync(authPath, 'utf8'), null);
+  const tokens = raw?.tokens || {};
+  const accessToken = typeof tokens.access_token === 'string' ? tokens.access_token.trim() : '';
+  const accessPayload = decodeBase64UrlJson(accessToken.split('.')[1]);
+  const idPayload = decodeBase64UrlJson(String(tokens.id_token || '').split('.')[1]);
+  const authClaims = accessPayload?.['https://api.openai.com/auth']
+    || idPayload?.['https://api.openai.com/auth']
+    || {};
+  const profileClaims = accessPayload?.['https://api.openai.com/profile']
+    || idPayload?.['https://api.openai.com/profile']
+    || {};
+  const accountId = tokens.account_id || authClaims.chatgpt_account_id || null;
+  const userId = authClaims.user_id || null;
+  const email = profileClaims.email || idPayload?.email || accessPayload?.email || null;
+  if (!accountId && !email && !accessToken) return null;
+  return {
+    accountId,
+    userId,
+    email,
+    accessToken,
+    authMode: raw?.auth_mode || null,
+    tokenFingerprint: accessToken ? hashCodexAccountKey(accessToken) : null,
+    accountKey: codexAccountKeyFromIdentity({ accountId, email }),
+    accessExpiresAtMs: Number.isFinite(Number(accessPayload?.exp))
+      ? Number(accessPayload.exp) * 1000
+      : null,
+    refreshedAtMs: parseTimestampMs(raw?.last_refresh),
+  };
+}
+
+function readCurrentCodexAuthSession() {
+  return readCodexAuthSession(CODEX_HOME);
+}
+
+function closestCodexIdentity(rate, identities) {
+  if (!rate || !Array.isArray(identities) || identities.length === 0) return null;
+  let closest = null;
+  for (const identity of identities) {
+    const distance = Math.abs(identity.timeMs - rate.timeMs);
+    if (!closest || distance < closest.distance) {
+      closest = { identity, distance };
+    }
+  }
+  return closest?.identity || null;
+}
+
+function codexAccountLabel({ email, accountId }, index) {
+  const maskedEmail = maskCodexEmail(email);
+  if (maskedEmail) return maskedEmail;
+  const short = shortCodexId(accountId);
+  return short ? `Account ${short}` : `Account ${index + 1}`;
+}
+
+function buildCodexUsageAccount(raw, index) {
+  const identity = codexAccountIdentityKey(raw) || `unknown-${index}`;
+  const accountKey = hashCodexAccountKey(identity);
+  const label = codexAccountLabel(raw, index);
+  const usage = buildCodexUsageFromRateLimits(raw.rateLimits, raw.timestamp, raw.filePath);
+  if (!usage) return null;
+  return {
+    accountKey,
+    label,
+    accountHint: raw.email ? maskCodexEmail(raw.email) : shortCodexId(raw.accountId),
+    accountIdHint: shortCodexId(raw.accountId),
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    sourceThreadId: raw.threadId || null,
+    source: 'codex-log',
+    usage,
+  };
+}
+
+function buildCodexActiveUsageAccount(identity, usage, threadId) {
+  if (!usage) return null;
+  const accountKey = codexAccountKeyFromIdentity(identity);
+  if (!accountKey) return null;
+  return {
+    accountKey,
+    label: codexAccountLabel(identity, 0),
+    accountHint: identity.email ? maskCodexEmail(identity.email) : shortCodexId(identity.accountId),
+    accountIdHint: shortCodexId(identity.accountId),
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    sourceThreadId: threadId || null,
+    source: 'active-session-rollout',
+    usage,
+  };
+}
+
+class CodexUsageFetchError extends Error {
+  constructor(code, message, status = null) {
+    super(message);
+    this.name = 'CodexUsageFetchError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function normalizeCodexWhamWindow(raw, receivedAtMs) {
+  if (!raw || typeof raw !== 'object') return null;
+  const usedPercent = parseCodexNumber(raw.used_percent ?? raw.utilization ?? raw.usedPercent);
+  if (usedPercent == null || usedPercent < 0 || usedPercent > 100) return null;
+
+  let resetAt = parseCodexNumber(raw.reset_at ?? raw.resets_at ?? raw.resetAt ?? raw.resetsAt);
+  if (resetAt == null || resetAt <= 0) {
+    const resetAfter = parseCodexNumber(raw.reset_after_seconds ?? raw.resetAfterSeconds);
+    resetAt = resetAfter != null && resetAfter >= 0
+      ? Math.floor(receivedAtMs / 1000 + resetAfter)
+      : null;
+  }
+
+  const windowSeconds = parseCodexNumber(raw.limit_window_seconds ?? raw.window_seconds ?? raw.limitWindowSeconds);
+  const directWindowMinutes = parseCodexNumber(raw.window_minutes ?? raw.windowMinutes);
+  const windowMinutes = windowSeconds != null && windowSeconds > 0
+    ? windowSeconds / 60
+    : directWindowMinutes;
+
+  return {
+    used_percent: usedPercent,
+    window_minutes: windowMinutes != null && windowMinutes > 0 ? windowMinutes : null,
+    reset_at: resetAt,
+  };
+}
+
+function normalizeCodexCreditBalance(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const balance = parseCodexNumber(raw.balance);
+  const hasCredits = typeof raw.has_credits === 'boolean' ? raw.has_credits : null;
+  const unlimited = typeof raw.unlimited === 'boolean' ? raw.unlimited : null;
+  const overageLimitReached = typeof raw.overage_limit_reached === 'boolean'
+    ? raw.overage_limit_reached
+    : null;
+  if (balance == null && hasCredits == null && unlimited == null && overageLimitReached == null) return null;
+  return {
+    has_credits: hasCredits,
+    unlimited,
+    overage_limit_reached: overageLimitReached,
+    balance: balance != null && balance >= 0 ? balance : null,
+  };
+}
+
+function normalizeCodexAdditionalRateLimits(rawLimits, receivedAtMs) {
+  if (!Array.isArray(rawLimits)) return null;
+  const normalized = [];
+  const seen = new Set();
+  for (const raw of rawLimits.slice(0, 16)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rateLimit = raw.rate_limit;
+    if (!rateLimit || typeof rateLimit !== 'object') continue;
+    const primary = normalizeCodexWhamWindow(rateLimit.primary_window ?? rateLimit.primary, receivedAtMs);
+    const secondary = normalizeCodexWhamWindow(rateLimit.secondary_window ?? rateLimit.secondary, receivedAtMs);
+    const usage = buildCodexUsageFromRateLimits({ primary, secondary }, null, null);
+    if (!usage?.five_hour && !usage?.seven_day) continue;
+
+    const rawKey = typeof raw.metered_feature === 'string' ? raw.metered_feature.trim() : '';
+    const rawLabel = typeof raw.limit_name === 'string' ? raw.limit_name.trim() : '';
+    const key = (rawKey || rawLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')).slice(0, 120);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      key,
+      label: (rawLabel || 'Additional Codex limit').slice(0, 120),
+      five_hour: usage.five_hour,
+      seven_day: usage.seven_day,
+    });
+  }
+  return normalized;
+}
+
+function sanitizeCodexAdditionalRateLimits(rawLimits) {
+  if (!Array.isArray(rawLimits)) return [];
+  const normalized = [];
+  const seen = new Set();
+  for (const raw of rawLimits.slice(0, 16)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const key = typeof raw.key === 'string' ? raw.key.trim().slice(0, 120) : '';
+    const label = typeof raw.label === 'string' ? raw.label.trim().slice(0, 120) : '';
+    if (!key || !label || seen.has(key)) continue;
+    const fiveHour = normalizeCodexLimitBucket(raw.five_hour);
+    const sevenDay = normalizeCodexLimitBucket(raw.seven_day);
+    if (!fiveHour && !sevenDay) continue;
+    seen.add(key);
+    normalized.push({ key, label, five_hour: fiveHour, seven_day: sevenDay });
+  }
+  return normalized;
+}
+
+function codexWhamWindowsAreAuthoritative(rateLimit, usage) {
+  const hasBothSlots = Object.prototype.hasOwnProperty.call(rateLimit, 'primary_window')
+    && Object.prototype.hasOwnProperty.call(rateLimit, 'secondary_window');
+  return hasBothSlots && !!(usage?.five_hour || usage?.seven_day);
+}
+
+function buildCodexUsageFromWhamResponse(payload, receivedAtMs = Date.now()) {
+  const rateLimit = payload?.rate_limit;
+  if (!rateLimit || typeof rateLimit !== 'object') {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response has no rate limit');
+  }
+
+  const primary = normalizeCodexWhamWindow(rateLimit.primary_window ?? rateLimit.primary, receivedAtMs);
+  const secondary = normalizeCodexWhamWindow(rateLimit.secondary_window ?? rateLimit.secondary, receivedAtMs);
+  if (!primary && !secondary) {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response has no valid windows');
+  }
+
+  const usage = buildCodexUsageFromRateLimits({
+    limit_id: 'codex',
+    limit_name: null,
+    primary,
+    secondary,
+    credits: normalizeCodexCreditBalance(payload?.credits || rateLimit.credits || null),
+    individual_limit: rateLimit.individual_limit || payload?.spend_control?.individual_limit || null,
+    plan_type: payload?.plan_type || rateLimit.plan_type || null,
+    rate_limit_reached_type: payload?.rate_limit_reached_type || rateLimit.rate_limit_reached_type || null,
+  }, new Date(receivedAtMs).toISOString(), null);
+  return {
+    ...usage,
+    authoritative_windows: codexWhamWindowsAreAuthoritative(rateLimit, usage),
+    additional_rate_limits_observed: Array.isArray(payload?.additional_rate_limits),
+    additional_rate_limits: normalizeCodexAdditionalRateLimits(payload?.additional_rate_limits, receivedAtMs),
+  };
+}
+
+function buildCodexResetCreditsFromResponse(payload, receivedAtMs = Date.now()) {
+  const availableCount = parseCodexNumber(payload?.available_count);
+  if (!Number.isInteger(availableCount) || availableCount < 0 || !Array.isArray(payload?.credits)) {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI reset credits response is invalid');
+  }
+  const credits = payload.credits
+    .slice(0, 32)
+    .filter((credit) => credit && typeof credit === 'object')
+    .filter((credit) => credit.status === 'available')
+    .filter((credit) => credit.reset_type === 'codex_rate_limits')
+    .filter((credit) => credit.is_supported_by_plan !== false)
+    .map((credit) => {
+      const expiresAt = normalizeCodexReset(credit.expires_at);
+      if (!expiresAt || Date.parse(expiresAt) <= receivedAtMs) return null;
+      const title = typeof credit.title === 'string' && credit.title.trim()
+        ? credit.title.trim().slice(0, 80)
+        : 'Full reset';
+      return { title, expires_at: expiresAt };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.expires_at) - Date.parse(right.expires_at));
+  return {
+    available_count: credits.length,
+    credits,
+    timestamp: new Date(receivedAtMs).toISOString(),
+  };
+}
+
+function codexUsageErrorMessage(error) {
+  const code = error?.code;
+  if (code === 'auth_missing') return 'Codex is not signed in with a ChatGPT account.';
+  if (code === 'unauthorized') return 'Codex login expired. Sign in to Codex again.';
+  if (code === 'account_mismatch') return 'OpenAI returned usage for a different Codex account.';
+  if (code === 'account_changed') return 'Codex account changed while usage was updating.';
+  if (code === 'timeout') return 'OpenAI usage request timed out.';
+  if (code === 'rate_limited') return 'OpenAI usage is temporarily rate limited.';
+  if (code === 'invalid_response') return 'OpenAI returned an invalid usage response.';
+  if (code === 'inconsistent_response') return 'OpenAI returned inconsistent usage. Try refreshing again.';
+  if (code === 'server_error') return `OpenAI usage request failed (${error?.status || 'server error'}).`;
+  return 'Could not refresh OpenAI usage.';
+}
+
+function canonicalizeCodexUsage(usage, previousUsage = null) {
+  if (!usage || typeof usage !== 'object') return null;
+  const authoritativeWindows = usage.authoritative_windows === true;
+  const fiveHour = usage.five_hour
+    || (!authoritativeWindows ? previousUsage?.five_hour : null)
+    || null;
+  const sevenDay = usage.seven_day
+    || (!authoritativeWindows ? previousUsage?.seven_day : null)
+    || null;
+  if (!fiveHour && !sevenDay) return null;
+  const ownAdditionalLimits = sanitizeCodexAdditionalRateLimits(usage.additional_rate_limits);
+  const additionalLimitsObserved = usage.additional_rate_limits_observed === true;
+  const additionalRateLimits = additionalLimitsObserved || ownAdditionalLimits.length > 0
+    ? ownAdditionalLimits
+    : sanitizeCodexAdditionalRateLimits(previousUsage?.additional_rate_limits);
+  const credits = normalizeCodexCreditBalance(usage.credits)
+    || normalizeCodexCreditBalance(previousUsage?.credits);
+  return {
+    ...usage,
+    primary: fiveHour ? { ...fiveHour, window_minutes: 5 * 60 } : null,
+    secondary: sevenDay ? { ...sevenDay, window_minutes: 7 * 24 * 60 } : null,
+    five_hour: fiveHour,
+    seven_day: sevenDay,
+    authoritative_windows: authoritativeWindows || previousUsage?.authoritative_windows === true,
+    additional_rate_limits_observed: additionalLimitsObserved
+      || previousUsage?.additional_rate_limits_observed === true,
+    additional_rate_limits: additionalRateLimits,
+    credits,
+  };
+}
+
+function codexUsageBucketSnapshot(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+  const utilization = parseCodexNumber(bucket.utilization);
+  if (utilization == null || utilization < 0 || utilization > 100) return null;
+  const resetMs = parseTimestampMs(bucket.resets_at);
+  return {
+    utilization,
+    resetMs: Number.isFinite(resetMs) ? resetMs : null,
+  };
+}
+
+function codexUsageWindowSnapshot(usage, key) {
+  return codexUsageBucketSnapshot(usage?.[key]);
+}
+
+function codexUsageWindowSnapshots(usage) {
+  const snapshots = new Map();
+  for (const key of ['five_hour', 'seven_day']) {
+    const snapshot = codexUsageWindowSnapshot(usage, key);
+    if (snapshot) snapshots.set(`main:${key}`, snapshot);
+  }
+  for (const limit of sanitizeCodexAdditionalRateLimits(usage?.additional_rate_limits)) {
+    for (const key of ['five_hour', 'seven_day']) {
+      const snapshot = codexUsageBucketSnapshot(limit[key]);
+      if (snapshot) snapshots.set(`${limit.key}:${key}`, snapshot);
+    }
+  }
+  return snapshots;
+}
+
+function codexUsageSnapshotsMatch(leftUsage, rightUsage) {
+  const leftSnapshots = codexUsageWindowSnapshots(leftUsage);
+  const rightSnapshots = codexUsageWindowSnapshots(rightUsage);
+  const keys = new Set([...leftSnapshots.keys(), ...rightSnapshots.keys()]);
+  for (const key of keys) {
+    const left = leftSnapshots.get(key) || null;
+    const right = rightSnapshots.get(key) || null;
+    if (!left && !right) continue;
+    if (!left || !right) return false;
+    if (Math.abs(left.utilization - right.utilization) > 12) return false;
+    if (left.resetMs == null || right.resetMs == null) {
+      if (left.resetMs !== right.resetMs) return false;
+    } else if (Math.abs(left.resetMs - right.resetMs) > CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function classifyCodexUsageSnapshot(previousUsage, candidateUsage, nowMs = Date.now()) {
+  let suspicious = false;
+  let olderWindows = 0;
+
+  const previousSnapshots = codexUsageWindowSnapshots(previousUsage);
+  const candidateSnapshots = codexUsageWindowSnapshots(candidateUsage);
+  const keys = new Set([...previousSnapshots.keys(), ...candidateSnapshots.keys()]);
+  for (const key of keys) {
+    const previous = previousSnapshots.get(key) || null;
+    const candidate = candidateSnapshots.get(key) || null;
+    if (!previous || !candidate) continue;
+
+    const previousResetElapsed = previous.resetMs != null && previous.resetMs <= nowMs;
+    if (previous.resetMs != null && candidate.resetMs != null) {
+      const resetDeltaMs = candidate.resetMs - previous.resetMs;
+      if (resetDeltaMs < -CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) olderWindows += 1;
+      // OpenAI's rolling windows legitimately move their next reset forward as
+      // older usage ages out. Forward reset drift is therefore not a branch
+      // change by itself. The dangerous shape is budget suddenly coming back
+      // before the old reset (handled by the utilization regression below);
+      // an older reset generation remains obsolete above.
+    }
+
+    if (!previousResetElapsed
+      && previous.utilization - candidate.utilization >= CODEX_USAGE_REGRESSION_POINTS) {
+      suspicious = true;
+    }
+  }
+
+  if (olderWindows > 0) return 'obsolete';
+  return suspicious ? 'suspicious' : 'accept';
+}
+
+function reconcileCodexUsageSnapshot(previousEntry, candidateResult, nowMs = Date.now()) {
+  const previousAccount = previousEntry?.account || null;
+  const candidateAccount = candidateResult?.account || null;
+  const candidateUsage = canonicalizeCodexUsage(candidateAccount?.usage, previousAccount?.usage);
+  if (!candidateAccount || !candidateUsage) {
+    return { entry: previousEntry || null, status: 'invalid', accepted: false };
+  }
+
+  const normalizedCandidate = {
+    ...candidateResult,
+    account: { ...candidateAccount, usage: candidateUsage, timestamp: candidateUsage.timestamp || candidateAccount.timestamp || null },
+  };
+  if (!previousAccount?.usage) {
+    return {
+      entry: {
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'accepted',
+      accepted: true,
+    };
+  }
+
+  const classification = classifyCodexUsageSnapshot(previousAccount.usage, candidateUsage, nowMs);
+  if (classification === 'accept') {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'accepted',
+      accepted: true,
+    };
+  }
+
+  if (classification === 'obsolete') {
+    return {
+      entry: {
+        ...previousEntry,
+        pending: null,
+        warning: CODEX_USAGE_INCONSISTENT_WARNING,
+      },
+      status: 'obsolete',
+      accepted: false,
+    };
+  }
+
+  if (candidateResult?.usageConsensusVerified === true) {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'verified',
+      accepted: true,
+    };
+  }
+
+  const pending = previousEntry?.pending || null;
+  const pendingMatches = pending?.account?.usage
+    && codexUsageSnapshotsMatch(pending.account.usage, candidateUsage);
+  if (pendingMatches && nowMs - Number(pending.firstSeenAt || nowMs) >= CODEX_USAGE_PENDING_CONFIRM_MS) {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'confirmed',
+      accepted: true,
+    };
+  }
+
+  return {
+    entry: {
+      ...previousEntry,
+      pending: {
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        firstSeenAt: pendingMatches ? pending.firstSeenAt : nowMs,
+        lastSeenAt: nowMs,
+      },
+      warning: CODEX_USAGE_INCONSISTENT_WARNING,
+    },
+    status: 'pending',
+    accepted: false,
+  };
+}
+
+function selectCodexInitialUsageConsensus(results) {
+  const candidates = (Array.isArray(results) ? results : [])
+    .filter((result) => result?.account?.usage);
+  let bestGroup = [];
+  for (const candidate of candidates) {
+    const group = candidates.filter((other) => (
+      candidate.account.accountKey === other.account.accountKey
+      && codexUsageSnapshotsMatch(candidate.account.usage, other.account.usage)
+    ));
+    if (group.length > bestGroup.length) bestGroup = group;
+  }
+  if (bestGroup.length < 2) return null;
+  return bestGroup.reduce((latest, candidate) => (
+    Number(candidate.fetchedAt || 0) >= Number(latest.fetchedAt || 0) ? candidate : latest
+  ));
+}
+
+function sanitizeCodexPersistedAccount(raw) {
+  const accountKey = typeof raw?.accountKey === 'string' ? raw.accountKey.trim().slice(0, 160) : '';
+  if (!accountKey) return null;
+  const rawLabel = typeof raw?.label === 'string' ? raw.label.trim().slice(0, 80) : '';
+  const rawHint = typeof raw?.accountHint === 'string' ? raw.accountHint.trim().slice(0, 80) : '';
+  const label = rawLabel.includes('@') ? maskCodexEmail(rawLabel) : rawLabel;
+  const accountHint = rawHint.includes('@') ? maskCodexEmail(rawHint) : rawHint;
+  const rebuiltUsage = buildCodexUsageFromRateLimits({
+    primary: raw?.usage?.five_hour || raw?.usage?.primary || null,
+    secondary: raw?.usage?.seven_day || raw?.usage?.secondary || null,
+    limit_id: 'codex',
+    plan_type: typeof raw?.usage?.plan_type === 'string' ? raw.usage.plan_type.slice(0, 80) : null,
+    credits: normalizeCodexCreditBalance(raw?.usage?.credits),
+  }, normalizeCodexReset(raw?.usage?.timestamp || raw?.timestamp), null);
+  const usage = canonicalizeCodexUsage(rebuiltUsage ? {
+    ...rebuiltUsage,
+    authoritative_windows: raw?.usage?.authoritative_windows === true,
+    additional_rate_limits_observed: raw?.usage?.additional_rate_limits_observed === true,
+    additional_rate_limits: sanitizeCodexAdditionalRateLimits(raw?.usage?.additional_rate_limits),
+  } : null);
+  if (!usage || !['five_hour', 'seven_day'].some((key) => codexUsageWindowSnapshot(usage, key))) return null;
+  return {
+    accountKey,
+    label: label || 'Codex account',
+    accountHint: accountHint || null,
+    accountIdHint: null,
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    sourceThreadId: null,
+    source: 'openai-usage-api',
+    usage,
+  };
+}
+
+function serializeCodexUsageState(entries = codexRemoteUsageByAccount) {
+  const accounts = [...entries.entries()]
+    .map(([accountKey, entry]) => {
+      const account = sanitizeCodexPersistedAccount({ ...entry?.account, accountKey });
+      if (!account) return null;
+      return {
+        account,
+        fetchedAt: Number(entry?.fetchedAt || 0) || 0,
+        lastAttemptAt: Number(entry?.lastAttemptAt || 0) || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.fetchedAt - a.fetchedAt)
+    .slice(0, 8);
+  return { version: 1, accounts };
+}
+
+function parseCodexUsageState(raw) {
+  const parsed = typeof raw === 'string' ? safeJsonParse(raw, null) : raw;
+  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.accounts)) return [];
+  return parsed.accounts.slice(0, 8).map((item) => {
+    const account = sanitizeCodexPersistedAccount(item?.account);
+    if (!account) return null;
+    return {
+      account,
+      tokenFingerprint: null,
+      fetchedAt: Number(item?.fetchedAt || 0) || 0,
+      lastAttemptAt: Number(item?.lastAttemptAt || 0) || null,
+      error: null,
+      errorAt: 0,
+      pending: null,
+      warning: null,
+    };
+  }).filter(Boolean);
+}
+
+function hydrateCodexUsageState() {
+  if (codexUsageStateHydrated) return;
+  codexUsageStateHydrated = true;
+  if (!codexUsageStateStore?.getAppState) return;
+  try {
+    for (const entry of parseCodexUsageState(codexUsageStateStore.getAppState(CODEX_USAGE_PERSISTENCE_KEY))) {
+      codexRemoteUsageByAccount.set(entry.account.accountKey, entry);
+    }
+    pruneCodexRemoteUsageAccounts(null);
+  } catch (error) {
+    console.warn('[CodexData] could not restore usage accounts:', error?.message || String(error));
+  }
+}
+
+function persistCodexUsageState() {
+  if (!codexUsageStateStore?.setAppState) return;
+  try {
+    codexUsageStateStore.setAppState(CODEX_USAGE_PERSISTENCE_KEY, serializeCodexUsageState());
+  } catch (error) {
+    console.warn('[CodexData] could not persist usage accounts:', error?.message || String(error));
+  }
+}
+
+async function fetchCodexUsageFromOpenAI(auth, {
+  fetchImpl = global.fetch,
+  timeoutMs = CODEX_REMOTE_USAGE_TIMEOUT_MS,
+  now = Date.now,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    throw new CodexUsageFetchError('auth_missing', 'Missing Codex ChatGPT OAuth credentials');
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw new CodexUsageFetchError('network_error', 'Fetch is unavailable');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimer(() => controller.abort(), timeoutMs);
+  const startedAt = now();
+  let phase = 'waiting-headers';
+  let headersAt = null;
+  let responseStatus = null;
+  try {
+    const response = await fetchImpl(CODEX_USAGE_API_URL, {
+      method: 'GET',
+      cache: 'no-store',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${auth.accessToken}`,
+        'ChatGPT-Account-Id': auth.accountId,
+        Accept: 'application/json',
+        'User-Agent': 'Noted Terminal',
+      },
+    });
+    headersAt = now();
+    responseStatus = response.status;
+    phase = 'checking-status';
+
+    if (response.status === 401 || response.status === 403) {
+      throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
+    }
+    if (response.status === 429) {
+      const error = new CodexUsageFetchError('rate_limited', 'OpenAI usage endpoint is rate limited', response.status);
+      const retryAfter = response.headers?.get?.('retry-after');
+      const seconds = retryAfter == null || retryAfter.trim() === '' ? NaN : Number(retryAfter);
+      error.retryAt = Number.isFinite(seconds)
+        ? now() + Math.max(0, seconds) * 1000
+        : Date.parse(retryAfter || '');
+      throw error;
+    }
+    if (!response.ok) {
+      throw new CodexUsageFetchError('server_error', 'OpenAI usage endpoint failed', response.status);
+    }
+
+    phase = 'reading-body';
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response is not JSON');
+    }
+
+    phase = 'validating-response';
+    const expectedEmail = String(auth.email || '').trim().toLowerCase();
+    const responseEmail = String(payload?.email || '').trim().toLowerCase();
+    if (expectedEmail && responseEmail && expectedEmail !== responseEmail) {
+      throw new CodexUsageFetchError('account_mismatch', 'OpenAI usage email does not match Codex auth');
+    }
+    const expectedUserId = String(auth.userId || '').trim();
+    const responseUserId = String(payload?.user_id || payload?.account_id || '').trim();
+    if (expectedUserId && responseUserId && expectedUserId !== responseUserId) {
+      throw new CodexUsageFetchError('account_mismatch', 'OpenAI usage user does not match Codex auth');
+    }
+    const responseDateMs = Date.parse(response.headers?.get?.('date') || '');
+    const receivedAtMs = Number.isFinite(responseDateMs) ? responseDateMs : now();
+    const usage = buildCodexUsageFromWhamResponse(payload, receivedAtMs);
+    const account = buildCodexActiveUsageAccount(auth, usage, null);
+    if (!account) {
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI usage account is invalid');
+    }
+    return {
+      account: {
+        ...account,
+        accountKey: auth.accountKey,
+        source: 'openai-usage-api',
+        isCurrent: true,
+      },
+      fetchedAt: now(),
+      durationMs: Math.max(0, now() - startedAt),
+    };
+  } catch (error) {
+    const failure = error?.name === 'AbortError'
+      ? new CodexUsageFetchError('timeout', 'OpenAI usage request timed out')
+      : error instanceof CodexUsageFetchError
+        ? error
+        : new CodexUsageFetchError('network_error', error?.message || String(error));
+    failure.status ??= responseStatus;
+    failure.requestPhase = phase;
+    failure.requestDurationMs = Math.max(0, now() - startedAt);
+    failure.responseHeadersMs = headersAt == null ? null : Math.max(0, headersAt - startedAt);
+    failure.requestTimeoutMs = timeoutMs;
+    throw failure;
+  } finally {
+    clearTimer(timeout);
+  }
+}
+
+async function fetchCodexResetCreditsFromOpenAI(auth, {
+  fetchImpl = global.fetch,
+  timeoutMs = CODEX_RESET_CREDITS_TIMEOUT_MS,
+  now = Date.now,
+} = {}) {
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    throw new CodexUsageFetchError('auth_missing', 'Missing Codex ChatGPT OAuth credentials');
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw new CodexUsageFetchError('network_error', 'Fetch is unavailable');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(CODEX_RESET_CREDITS_API_URL, {
+      method: 'GET',
+      cache: 'no-store',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${auth.accessToken}`,
+        'ChatGPT-Account-Id': auth.accountId,
+        Accept: 'application/json',
+        'User-Agent': 'Noted Terminal',
+      },
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
+    }
+    if (response.status === 429) {
+      throw new CodexUsageFetchError('rate_limited', 'OpenAI reset credits are temporarily rate limited', response.status);
+    }
+    if (!response.ok) {
+      throw new CodexUsageFetchError('server_error', 'OpenAI reset credits request failed', response.status);
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI reset credits response is not JSON');
+    }
+    const responseDateMs = Date.parse(response.headers?.get?.('date') || '');
+    const receivedAtMs = Number.isFinite(responseDateMs) ? responseDateMs : now();
+    return buildCodexResetCreditsFromResponse(payload, receivedAtMs);
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new CodexUsageFetchError('timeout', 'OpenAI reset credits request timed out');
+    }
+    if (error instanceof CodexUsageFetchError) throw error;
+    throw new CodexUsageFetchError('network_error', error?.message || String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function pruneCodexRemoteUsageAccounts(currentAccountKey = null) {
+  if (codexRemoteUsageByAccount.size <= 8) return;
+  const removable = [...codexRemoteUsageByAccount.entries()]
+    .filter(([accountKey]) => accountKey !== currentAccountKey)
+    .sort((a, b) => Number(a[1]?.fetchedAt || 0) - Number(b[1]?.fetchedAt || 0));
+  while (codexRemoteUsageByAccount.size > 8 && removable.length > 0) {
+    codexRemoteUsageByAccount.delete(removable.shift()[0]);
+  }
+}
+
+function listCodexRemoteUsageAccounts(currentAccountKey = null, profiles = codexAccountProfileManager?.listPublicProfiles() || []) {
+  const now = Date.now();
+  const connected = new Set(profiles.filter(profile => profile.status === 'connected').map(profile => profile.accountKey));
+  return [...codexRemoteUsageByAccount.entries()]
+    .map(([accountKey, entry]) => {
+      if (!entry?.account) return null;
+      const isCurrent = accountKey === currentAccountKey;
+      return {
+        ...entry.account,
+        isCurrent,
+        stale: (!isCurrent && !connected.has(accountKey)) || !entry.tokenFingerprint || !!entry.error || !!entry.warning
+          || now - Number(entry.fetchedAt || 0) > CODEX_REMOTE_USAGE_STALE_MS,
+        lastError: entry.error || null,
+        warning: entry.warning || null,
+        lastAttemptAt: entry.lastAttemptAt || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (!!a.isCurrent !== !!b.isCurrent) return a.isCurrent ? -1 : 1;
+      return codexAccountTimestampMs(b) - codexAccountTimestampMs(a);
+    });
+}
+
+function getCodexRemoteUsageSnapshot(auth = readCurrentCodexAuthSession()) {
+  hydrateCodexUsageState();
+  const currentAccountKey = auth?.accountKey || null;
+  const currentEntry = currentAccountKey
+    ? codexRemoteUsageByAccount.get(currentAccountKey) || null
+    : null;
+  return {
+    accounts: listCodexRemoteUsageAccounts(currentAccountKey),
+    currentAccountKey,
+    error: currentAccountKey
+      ? currentEntry?.error || null
+      : codexUsageErrorMessage(new CodexUsageFetchError('auth_missing', 'Missing Codex auth')),
+    warning: currentEntry?.warning || null,
+    lastAttemptAt: currentEntry?.lastAttemptAt || null,
+  };
+}
+
+function resolveCodexUsageRefreshScope({ requestedAccountKey = null, currentAccountKey = null } = {}) {
+  if (!requestedAccountKey) {
+    return {
+      refreshDefault: true,
+      managedAccountKey: null,
+      refreshAllManaged: !currentAccountKey,
+      label: currentAccountKey ? 'current-default' : 'all-connected-fallback',
+    };
+  }
+  if (requestedAccountKey === currentAccountKey) {
+    return {
+      refreshDefault: true,
+      managedAccountKey: null,
+      refreshAllManaged: false,
+      label: 'current-default',
+    };
+  }
+  return {
+    refreshDefault: false,
+    managedAccountKey: requestedAccountKey,
+    refreshAllManaged: false,
+    label: 'selected-profile',
+  };
+}
+
+async function getCodexRemoteUsage({
+  force = false,
+  verifyInitial = false,
+  fetchImpl = global.fetch,
+  resetCreditsFetchImpl = null,
+  creditExpirationFetchImpl = null,
+  authReader = readCurrentCodexAuthSession,
+  authRetryCount = 0,
+} = {}) {
+  hydrateCodexUsageState();
+  let auth = authReader();
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(null),
+      currentAccountKey: null,
+      error: codexUsageErrorMessage(new CodexUsageFetchError('auth_missing', 'Missing Codex auth')),
+      warning: null,
+      lastAttemptAt: null,
+    };
+  }
+
+  const now = Date.now();
+  const cached = codexRemoteUsageByAccount.get(auth.accountKey) || null;
+  if (cached?.retryAt > now && cached.tokenFingerprint === auth.tokenFingerprint) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.errorAt,
+    };
+  }
+  if (auth.accessExpiresAtMs && auth.accessExpiresAtMs <= now + 30_000) {
+    const message = codexUsageErrorMessage(new CodexUsageFetchError('unauthorized', 'Codex access token expired'));
+    codexRemoteUsageByAccount.set(auth.accountKey, {
+      ...cached,
+      tokenFingerprint: auth.tokenFingerprint,
+      lastAttemptAt: now,
+      error: message,
+      errorAt: now,
+    });
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: message,
+      warning: cached?.warning || null,
+      lastAttemptAt: now,
+    };
+  }
+  if (!force && cached?.account
+    && now - cached.fetchedAt < CODEX_REMOTE_USAGE_CACHE_TTL_MS
+    && cached.tokenFingerprint === auth.tokenFingerprint) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.fetchedAt,
+    };
+  }
+  if (!force && cached?.errorAt
+    && cached.tokenFingerprint === auth.tokenFingerprint
+    && now - cached.errorAt < CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.errorAt,
+    };
+  }
+
+  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'token'}`;
+  let request = codexRemoteUsageInflight.get(inflightKey);
+  if (!request) {
+    request = (async () => {
+      const attemptAuth = auth;
+      const creditExpirationRequest = typeof creditExpirationFetchImpl === 'function'
+        ? fetchCodexCreditExpiration(attemptAuth, { fetchImpl: creditExpirationFetchImpl }).catch(() => null)
+        : fetchImpl === global.fetch ? readCodexCreditExpiration(attemptAuth, force).catch(() => null) : Promise.resolve(null);
+      const shouldFetchResetCredits = typeof resetCreditsFetchImpl === 'function'
+        || fetchImpl === global.fetch;
+      const resetCreditsRequest = shouldFetchResetCredits
+        ? fetchCodexResetCreditsFromOpenAI(attemptAuth, {
+          fetchImpl: resetCreditsFetchImpl || global.fetch,
+        }).then(
+          (value) => ({ value, error: null }),
+          (error) => ({ value: null, error })
+        )
+        : Promise.resolve({ value: null, error: null });
+      let result;
+      try {
+        result = await fetchCodexUsageFromOpenAI(attemptAuth, { fetchImpl });
+        const acceptedEntry = codexRemoteUsageByAccount.get(attemptAuth.accountKey);
+        const acceptedUsage = acceptedEntry?.account?.usage || null;
+        const needsInitialVerification = verifyInitial && !acceptedUsage;
+        const needsManualBranchVerification = verifyInitial
+          && force
+          && acceptedUsage
+          && classifyCodexUsageSnapshot(acceptedUsage, result.account?.usage, Date.now()) === 'suspicious';
+        if (needsInitialVerification || needsManualBranchVerification) {
+          const confirmations = await Promise.allSettled([
+            fetchCodexUsageFromOpenAI(attemptAuth, {
+              fetchImpl,
+              timeoutMs: CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS,
+            }),
+            fetchCodexUsageFromOpenAI(attemptAuth, {
+              fetchImpl,
+              timeoutMs: CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS,
+            }),
+          ]);
+          const consensus = selectCodexInitialUsageConsensus([
+            result,
+            ...confirmations
+              .filter((confirmation) => confirmation.status === 'fulfilled')
+              .map((confirmation) => confirmation.value),
+          ]);
+          if (!consensus) {
+            throw new CodexUsageFetchError(
+              'inconsistent_response',
+              needsInitialVerification
+                ? 'Initial OpenAI usage responses did not agree'
+                : 'Manual OpenAI usage verification did not agree'
+            );
+          }
+          result = {
+            ...consensus,
+            usageConsensusVerified: needsManualBranchVerification,
+          };
+        }
+        const resetCreditsResult = await resetCreditsRequest;
+        const creditExpiration = await creditExpirationRequest;
+        result = {
+          ...result,
+          account: {
+            ...result.account,
+            reset_credits: resetCreditsResult.value,
+            credit_expiration: creditExpiration,
+          },
+        };
+        if (resetCreditsResult.error) {
+          console.warn('[CodexData] reset credits unavailable account=' + result.account.label +
+            ' error=' + compactPreview(resetCreditsResult.error?.message || String(resetCreditsResult.error), 120));
+        }
+      } catch (error) {
+        error.authSnapshot = attemptAuth;
+        throw error;
+      }
+      const currentAuth = authReader();
+      const authStayedCurrent = currentAuth?.accountKey === attemptAuth.accountKey
+        && currentAuth?.tokenFingerprint === attemptAuth.tokenFingerprint;
+      if (authStayedCurrent) return { ...result, auth: currentAuth };
+      const error = new CodexUsageFetchError('account_changed', 'Codex auth changed during usage request');
+      error.authSnapshot = attemptAuth;
+      throw error;
+    })();
+    codexRemoteUsageInflight.set(inflightKey, request);
+    request.finally(() => {
+      if (codexRemoteUsageInflight.get(inflightKey) === request) {
+        codexRemoteUsageInflight.delete(inflightKey);
+      }
+    }).catch(() => {});
+  }
+
+  const lastAttemptAt = Date.now();
+  try {
+    const result = await request;
+    auth = result.auth || authReader() || auth;
+    const previous = codexRemoteUsageByAccount.get(result.account.accountKey) || null;
+    const reconciled = reconcileCodexUsageSnapshot(previous, result, lastAttemptAt);
+    const nextEntry = {
+      ...(reconciled.entry || previous || {}),
+      tokenFingerprint: auth.tokenFingerprint,
+      lastAttemptAt,
+      error: null,
+      errorAt: 0,
+      retryAt: 0,
+    };
+    if (nextEntry.account) {
+      nextEntry.account = {
+        ...nextEntry.account,
+        reset_credits: result.account.reset_credits || null,
+        credit_expiration: result.account.credit_expiration || null,
+      };
+    }
+    codexRemoteUsageByAccount.set(result.account.accountKey, nextEntry);
+    pruneCodexRemoteUsageAccounts(auth.accountKey);
+    if (reconciled.accepted) persistCodexUsageState();
+    console.log('[CodexData] remote usage ' + reconciled.status + ' account=' + result.account.label +
+      ' candidate=' + codexUsagePercentSummary(result.account.usage) +
+      ' shown=' + codexUsagePercentSummary(nextEntry.account?.usage) +
+      ' durMs=' + result.durationMs);
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: null,
+      warning: nextEntry.warning || null,
+      lastAttemptAt,
+    };
+  } catch (error) {
+    const latestAuth = authReader();
+    const failedAuth = error?.authSnapshot || auth;
+    const latestAuthIsUsable = !!(latestAuth?.accessToken && latestAuth?.accountId && latestAuth?.accountKey);
+    const authChanged = !latestAuthIsUsable
+      || latestAuth.accountKey !== failedAuth.accountKey
+      || latestAuth.tokenFingerprint !== failedAuth.tokenFingerprint;
+    if (authChanged) {
+      if (latestAuthIsUsable && authRetryCount < 1) {
+        return getCodexRemoteUsage({
+          force: false,
+          verifyInitial,
+          fetchImpl,
+          resetCreditsFetchImpl,
+          creditExpirationFetchImpl,
+          authReader,
+          authRetryCount: authRetryCount + 1,
+        });
+      }
+      const changedError = latestAuthIsUsable
+        ? new CodexUsageFetchError('account_changed', 'Codex auth changed during usage request')
+        : new CodexUsageFetchError('auth_missing', 'Missing Codex auth');
+      return {
+        accounts: listCodexRemoteUsageAccounts(latestAuthIsUsable ? latestAuth.accountKey : null),
+        currentAccountKey: latestAuthIsUsable ? latestAuth.accountKey : null,
+        error: codexUsageErrorMessage(changedError),
+        warning: null,
+        lastAttemptAt,
+      };
+    }
+    const message = codexUsageErrorMessage(error);
+    const errorAccountKey = latestAuth?.accountKey || failedAuth.accountKey;
+    const previous = codexRemoteUsageByAccount.get(errorAccountKey)
+      || (cached?.account?.accountKey === errorAccountKey ? cached : null);
+    codexRemoteUsageByAccount.set(errorAccountKey, {
+      ...previous,
+      tokenFingerprint: latestAuth?.tokenFingerprint || failedAuth.tokenFingerprint,
+      lastAttemptAt,
+      error: message,
+      errorAt: Date.now(),
+      retryAt: Number.isFinite(error.retryAt) ? error.retryAt : 0,
+    });
+    pruneCodexRemoteUsageAccounts(errorAccountKey);
+    console.warn('[CodexData] remote usage failed account=' +
+      (maskCodexEmail(latestAuth?.email || failedAuth.email) || shortCodexId(latestAuth?.accountId || failedAuth.accountId) || 'unknown') +
+      ' code=' + (error?.code || 'network_error') +
+      ' status=' + (error?.status || 'none') +
+      ' phase=' + (error?.requestPhase || 'unknown') +
+      ' durationMs=' + (error?.requestDurationMs ?? 'unknown') +
+      ' headersMs=' + (error?.responseHeadersMs ?? 'none') +
+      ' timeoutMs=' + (error?.requestTimeoutMs ?? 'unknown'));
+    return {
+      accounts: listCodexRemoteUsageAccounts(errorAccountKey),
+      currentAccountKey: errorAccountKey,
+      error: message,
+      warning: previous?.warning || null,
+      lastAttemptAt,
+    };
+  }
+}
+
+function mergeCodexPreferredAccounts(accounts, preferredAccounts) {
+  const byKey = new Map();
+  for (const account of Array.isArray(accounts) ? accounts : []) {
+    if (account?.accountKey) byKey.set(account.accountKey, account);
+  }
+  for (const account of Array.isArray(preferredAccounts) ? preferredAccounts : []) {
+    if (account?.accountKey) byKey.set(account.accountKey, account);
+  }
+  return [...byKey.values()].sort((a, b) => {
+    if (!!a.isCurrent !== !!b.isCurrent) return a.isCurrent ? -1 : 1;
+    return codexAccountTimestampMs(b) - codexAccountTimestampMs(a);
+  });
+}
+
+function decorateCodexProfileAccount(account, profile, overrides = {}) {
+  if (!account?.accountKey || !account?.usage || !profile) return null;
+  return {
+    ...account,
+    profileId: profile.profileId,
+    connected: profile.status === 'connected',
+    authStatus: profile.status,
+    isDefaultProfile: !!profile.isDefault,
+    ...overrides,
+  };
+}
+
+function codexProfileFallbackAccount(result, receivedAtMs = Date.now()) {
+  const profile = result?.profile;
+  if (!profile?.accountKey || profile.status !== 'connected') return null;
+  const mapped = buildCodexUsageFromAppServerRateLimits(result.rateLimits, receivedAtMs);
+  if (!mapped?.usage) return null;
+  return decorateCodexProfileAccount({
+    accountKey: profile.accountKey,
+    label: profile.label,
+    accountHint: profile.accountHint,
+    accountIdHint: null,
+    plan_type: mapped.usage.plan_type || profile.planType || null,
+    timestamp: mapped.usage.timestamp,
+    sourceThreadId: null,
+    source: 'codex-app-server',
+    usage: mapped.usage,
+    reset_credits: mapped.resetCredits,
+    stale: false,
+    lastError: null,
+  }, profile, { stale: false });
+}
+
+async function refreshCodexManagedProfileAccounts(options = {}) {
+  const key = options.accountKey || 'all';
+  if (codexManagedUsageInflight.has(key)) return codexManagedUsageInflight.get(key);
+  const request = refreshCodexManagedProfileAccountsInner(options);
+  codexManagedUsageInflight.set(key, request);
+  try { return await request; }
+  finally { if (codexManagedUsageInflight.get(key) === request) codexManagedUsageInflight.delete(key); }
+}
+
+async function refreshCodexManagedProfileAccountsInner({ force = false, accountKey = null } = {}) {
+  if (!codexAccountProfileManager) return { accounts: [], results: [] };
+  const selectedProfile = accountKey && codexAccountProfileManager.listPublicProfiles()
+    .find(profile => !profile.isDefault && profile.accountKey === accountKey);
+  const profile = selectedProfile && codexAccountProfileManager.getProfile(selectedProfile.profileId);
+  const auth = profile && readCodexAuthSession(profile.homePath);
+  const cached = auth && codexRemoteUsageByAccount.get(auth.accountKey);
+  if (auth && cached?.tokenFingerprint === auth.tokenFingerprint
+    && (cached.retryAt > Date.now() || (!force && cached.errorAt
+      && Date.now() - cached.errorAt < CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS))) {
+    // A native app-server probe also reads quotas: do not bypass the account's
+    // known server pause by changing the transport while its HTTP reader waits.
+    const snapshot = getCodexRemoteUsageSnapshot(auth);
+    const account = snapshot.accounts.find(item => item.accountKey === auth.accountKey);
+    return {
+      accounts: account ? [decorateCodexProfileAccount(account, selectedProfile, { isCurrent: false })] : [],
+      results: [], error: snapshot.error,
+    };
+  }
+  const initialResults = await codexAccountProfileManager.refreshManagedProfiles({ force, accountKey });
+  const accounts = [];
+  const results = [];
+
+  for (let result of initialResults) {
+    let profile = result?.profile;
+    if (!profile || profile.isDefault) {
+      results.push(result);
+      continue;
+    }
+
+    let auth = readCodexAuthSession(profile.homePath);
+    if (profile.status !== 'connected' && !(auth?.accessToken && auth?.accountId && auth?.accountKey)) {
+      results.push(result);
+      continue;
+    }
+    let refreshedToken = false;
+    if (auth?.accessExpiresAtMs && auth.accessExpiresAtMs <= Date.now() + 30_000) {
+      result = await codexAccountProfileManager.probeProfile(profile, {
+        refreshToken: true,
+        includeRateLimits: true,
+      });
+      profile = result.profile;
+      auth = readCodexAuthSession(profile.homePath);
+      refreshedToken = true;
+    }
+
+    let remoteResult = null;
+    if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+      remoteResult = await getCodexRemoteUsage({
+        force,
+        verifyInitial: true,
+        authReader: () => readCodexAuthSession(profile.homePath),
+      });
+      if (!refreshedToken && remoteResult.error === 'Codex login expired. Sign in to Codex again.') {
+        result = await codexAccountProfileManager.probeProfile(profile, {
+          refreshToken: true,
+          includeRateLimits: true,
+        });
+        profile = result.profile;
+        auth = readCodexAuthSession(profile.homePath);
+        if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+          remoteResult = await getCodexRemoteUsage({
+            force: true,
+            verifyInitial: true,
+            authReader: () => readCodexAuthSession(profile.homePath),
+          });
+        }
+      }
+    }
+
+    const remoteAccount = auth?.accountKey
+      ? remoteResult?.accounts?.find((account) => account.accountKey === auth.accountKey)
+      : null;
+    const decorated = remoteAccount?.usage
+      ? decorateCodexProfileAccount(remoteAccount, profile, {
+        isCurrent: false,
+        stale: !!remoteResult?.error || !!remoteAccount.warning || remoteAccount.stale,
+        lastError: remoteResult?.error || remoteAccount.lastError || null,
+      })
+      : codexProfileFallbackAccount(result, profile.lastCheckedAt || Date.now());
+    if (decorated) {
+      if (profile.status !== 'connected') {
+        profile = codexAccountProfileManager.markProfileConnected(profile.profileId, {
+          accountKey: decorated.accountKey,
+          label: decorated.label,
+          accountHint: decorated.accountHint,
+          planType: decorated.plan_type,
+        }) || profile;
+      }
+      accounts.push(decorateCodexProfileAccount(decorated, profile, { isCurrent: false }));
+      codexManagedUsageAccounts.set(profile.profileId, accounts[accounts.length - 1]);
+    }
+    results.push(result);
+  }
+
+  return { accounts, results, error: results.find(result => result?.error)?.error
+    || accounts.find(account => account?.lastError)?.lastError || null };
+}
+
+function getCodexManagedUsageSnapshot() {
+  const profiles = codexAccountProfileManager?.listPublicProfiles() || [];
+  const byId = new Map(profiles.map(profile => [profile.profileId, profile]));
+  const accounts = [];
+  for (const [id, account] of codexManagedUsageAccounts) {
+    const profile = byId.get(id);
+    if (!profile || profile.status !== 'connected') {
+      codexManagedUsageAccounts.delete(id);
+      continue;
+    }
+    // Prefer the remote cache, which also owns account-specific errors/cooldown.
+    if (codexRemoteUsageByAccount.has(account.accountKey)) continue;
+    accounts.push(decorateCodexProfileAccount(account, profile, {
+      stale: codexUsageAccountIsStale({ ...account, stale: undefined }),
+    }));
+  }
+  return { accounts, results: [] };
+}
+
+function listCodexUsagePollingTargets() {
+  const auth = readCurrentCodexAuthSession();
+  const targets = [];
+  if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+    targets.push({ key: auth.accountKey, identity: auth.tokenFingerprint, isDefault: true });
+  }
+  for (const profile of codexAccountProfileManager?.listPublicProfiles() || []) {
+    if (profile.isDefault || !profile.accountKey || !['connected', 'error'].includes(profile.status)
+      || targets.some(target => target.key === profile.accountKey)) continue;
+    targets.push({ key: profile.accountKey, identity: profile.profileId, isDefault: false });
+  }
+  return targets;
+}
+
+function broadcastCodexUsageUpdated(target) {
+  try {
+    const { BrowserWindow } = require('electron');
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('codex:usage-updated', { accountKey: target.key });
+    }
+  } catch {}
+}
+
+function resetCodexUsageStateForTests() {
+  codexCreditExpirationReader = null;
+  codexUsagePolling?.stop();
+  codexRemoteUsageByAccount.clear();
+  codexRemoteUsageInflight.clear();
+  codexManagedUsageAccounts.clear();
+  codexUsageStateStore = null;
+  codexUsageStateHydrated = false;
+}
+
+function setCodexUsageStateStoreForTests(store) {
+  codexUsageStateStore = store || null;
+  codexUsageStateHydrated = false;
+  hydrateCodexUsageState();
+}
+
+function mergeCodexActiveUsageIntoAccounts(accounts, selectedAccountKey, activeUsage, sessionId) {
+  if (!Array.isArray(accounts) || !selectedAccountKey || !activeUsage) return accounts;
+  let changed = false;
+  const merged = accounts.map((account) => {
+    if (account?.accountKey !== selectedAccountKey) return account;
+    changed = true;
+    return {
+      ...account,
+      usage: activeUsage,
+      timestamp: activeUsage.timestamp,
+      plan_type: activeUsage.plan_type || account.plan_type,
+      source: 'active-session-rollout',
+      sourceThreadId: sessionId || account.sourceThreadId || null,
+      stale: codexUsageAccountIsStale({ usage: activeUsage, timestamp: activeUsage.timestamp }),
+      lastError: null,
+    };
+  });
+  return changed ? merged : accounts;
+}
+
+function codexUsagePercentSummary(usage) {
+  const weekly = usage?.seven_day || null;
+  const fiveHour = usage?.five_hour || null;
+  return 'weekly=' + (weekly?.utilization ?? 'null') +
+    '@' + (weekly?.resets_at || 'none') +
+    ' fiveHour=' + (fiveHour?.utilization ?? 'null') +
+    '@' + (fiveHour?.resets_at || 'none');
+}
+
+function codexAccountTimestampMs(account) {
+  const ms = parseTimestampMs(account?.timestamp);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function codexUsageAccountIsStale(account, now = Date.now()) {
+  if (!account?.usage) return true;
+  if (typeof account.stale === 'boolean') return account.stale;
+  const timestampMs = codexAccountTimestampMs(account);
+  if (!timestampMs) return true;
+  return now - timestampMs > 6 * 60 * 1000;
+}
+
+function codexActiveUsageMatchesSelected({
+  activeUsage,
+  activeAccountKey,
+  selectedAccountKey,
+  sessionId,
+  selectedSourceThreadId,
+}) {
+  if (!activeUsage) return false;
+  if (!selectedAccountKey) return !!activeAccountKey;
+  if (activeAccountKey) return activeAccountKey === selectedAccountKey;
+  return !!sessionId && selectedSourceThreadId === sessionId;
+}
+
+function pruneCodexActiveUsageOverrides(now = Date.now()) {
+  for (const [accountKey, entry] of codexActiveUsageOverrides) {
+    if (!entry?.account?.usage || now - (entry.updatedAt || 0) > CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS) {
+      codexActiveUsageOverrides.delete(accountKey);
+    }
+  }
+}
+
+function rememberCodexActiveUsageOverride(identity, usage, sessionId) {
+  const account = buildCodexActiveUsageAccount(identity, usage, sessionId);
+  if (!account) return null;
+  const now = Date.now();
+  pruneCodexActiveUsageOverrides(now);
+
+  const existing = codexActiveUsageOverrides.get(account.accountKey);
+  if (existing?.account?.usage && compareCodexUsageFreshness(existing.account.usage, account.usage) >= 0) {
+    return existing.account;
+  }
+
+  codexActiveUsageOverrides.set(account.accountKey, { account, updatedAt: now });
+  console.log('[CodexData] usage active override remember account=' + account.label +
+    ' session=' + (shortCodexId(sessionId) || 'none') +
+    ' ' + codexUsagePercentSummary(usage));
+  return account;
+}
+
+function mergeCodexActiveOverridesIntoAccounts(accounts, { includeMissing = true, reason = 'merge' } = {}) {
+  pruneCodexActiveUsageOverrides();
+  if (codexActiveUsageOverrides.size === 0) return Array.isArray(accounts) ? accounts : [];
+
+  const next = Array.isArray(accounts) ? [...accounts] : [];
+  let changed = false;
+  for (const entry of codexActiveUsageOverrides.values()) {
+    const activeAccount = entry?.account;
+    if (!activeAccount?.accountKey || !activeAccount?.usage) continue;
+
+    const idx = next.findIndex((account) => account?.accountKey === activeAccount.accountKey);
+    if (idx >= 0) {
+      const prev = next[idx];
+      if (compareCodexUsageFreshness(activeAccount.usage, prev?.usage) > 0) {
+        next[idx] = {
+          ...prev,
+          usage: activeAccount.usage,
+          timestamp: activeAccount.timestamp,
+          plan_type: activeAccount.plan_type || prev.plan_type,
+          source: 'active-session-rollout',
+          sourceThreadId: activeAccount.sourceThreadId || prev.sourceThreadId || null,
+          stale: codexUsageAccountIsStale(activeAccount),
+          lastError: null,
+        };
+        changed = true;
+        console.log('[CodexData] usage active override apply reason=' + reason +
+          ' account=' + (prev.label || activeAccount.label || 'unknown') +
+          ' session=' + (shortCodexId(activeAccount.sourceThreadId) || 'none') +
+          ' ' + codexUsagePercentSummary(activeAccount.usage));
+      }
+      continue;
+    }
+
+    if (includeMissing) {
+      next.push(activeAccount);
+      changed = true;
+      console.log('[CodexData] usage active override add reason=' + reason +
+        ' account=' + (activeAccount.label || 'unknown') +
+        ' session=' + (shortCodexId(activeAccount.sourceThreadId) || 'none') +
+        ' ' + codexUsagePercentSummary(activeAccount.usage));
+    }
+  }
+
+  if (!changed) return Array.isArray(accounts) ? accounts : [];
+  return next.sort((a, b) => codexAccountTimestampMs(b) - codexAccountTimestampMs(a));
+}
+
+async function scanLatestCodexUsageAccounts() {
+  if (!fs.existsSync(CODEX_LOGS_DB)) {
+    return [];
+  }
+
+  // Extract only the useful slices from the large Codex log rows. Do not mix
+  // identity rows and rate rows under one global LIMIT: a busy account can
+  // otherwise push a quieter account out of the scan window completely.
+  const rateSql = `
+    SELECT
+      ts,
+      ts_nanos,
+      thread_id,
+      substr(feedback_log_body, 1, 260) || ' ' ||
+      substr(feedback_log_body, instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"'), 5000) AS body
+    FROM logs
+    WHERE ts > strftime('%s','now','-${CODEX_USAGE_SCAN_DAYS} days')
+      AND target = 'codex_api::endpoint::responses_websocket'
+      AND feedback_log_body LIKE '%websocket event: {"type":"codex.rate_limits"%'
+    ORDER BY ts DESC, ts_nanos DESC
+    LIMIT ${CODEX_USAGE_RATE_ROWS_LIMIT};
+  `;
+
+  const rateRows = await runSqliteJson(CODEX_LOGS_DB, rateSql);
+
+  const byThread = new Map();
+  for (const row of Array.isArray(rateRows) ? rateRows : []) {
+    const body = row?.body || '';
+    const threadId = row?.thread_id || extractCodexThreadId(body);
+    if (!threadId) continue;
+    const ctx = byThread.get(threadId) || { threadId, identities: [], rates: [] };
+    const rateLimits = parseCodexRateLimitLog(body);
+    if (rateLimits) {
+      ctx.rates.push({
+        ts: Number(row.ts) || 0,
+        tsNanos: Number(row.ts_nanos) || 0,
+        timeMs: codexLogTimeMs(row),
+        rateLimits,
+        timestamp: row.ts ? new Date(Number(row.ts) * 1000).toISOString() : null,
+      });
+    }
+    byThread.set(threadId, ctx);
+  }
+
+  const threadIds = [...byThread.keys()];
+  for (const chunk of arrayChunks(threadIds, 400)) {
+    if (chunk.length === 0) continue;
+    const identitySql = `
+      SELECT
+        ts,
+        ts_nanos,
+        thread_id,
+        CASE
+          WHEN instr(feedback_log_body, 'user.account_id=') > 0
+            THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
+          WHEN instr(feedback_log_body, 'user.email=') > 0
+            THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
+          ELSE ''
+        END AS body
+      FROM logs
+      WHERE ts > strftime('%s','now','-${CODEX_USAGE_SCAN_DAYS} days')
+        AND target = 'codex_otel.log_only'
+        AND thread_id IN (${sqlStringList(chunk)})
+        AND (
+          feedback_log_body LIKE '%user.account_id=%'
+          OR feedback_log_body LIKE '%user.email=%'
+        );
+    `;
+    const identityRows = await runSqliteJson(CODEX_LOGS_DB, identitySql);
+    for (const row of Array.isArray(identityRows) ? identityRows : []) {
+      const body = row?.body || '';
+      const threadId = row?.thread_id || extractCodexThreadId(body);
+      if (!threadId) continue;
+      const ctx = byThread.get(threadId);
+      if (!ctx) continue;
+      const { accountId, email } = parseCodexAccountIdentityLog(body);
+      if (!accountId && !email) continue;
+      ctx.identities.push({
+        ts: Number(row.ts) || 0,
+        tsNanos: Number(row.ts_nanos) || 0,
+        timeMs: codexLogTimeMs(row),
+        accountId,
+        email,
+      });
+    }
+  }
+
+  const latestByIdentity = new Map();
+  for (const ctx of byThread.values()) {
+    if (!ctx.rates?.length) continue;
+    for (const rate of ctx.rates) {
+      const accountIdentity = closestCodexIdentity(rate, ctx.identities);
+      const accountId = accountIdentity?.accountId || null;
+      const email = accountIdentity?.email || null;
+      const identity = accountId || email || `thread:${ctx.threadId}`;
+      const prev = latestByIdentity.get(identity);
+      const candidate = {
+        accountId,
+        email,
+        rateLimits: rate.rateLimits,
+        timestamp: rate.timestamp,
+        threadId: ctx.threadId,
+        ts: rate.ts,
+        tsNanos: rate.tsNanos,
+      };
+      if (compareCodexRateSnapshotFreshness(candidate, prev) > 0) {
+        latestByIdentity.set(identity, candidate);
+      }
+    }
+  }
+
+  const accounts = [...latestByIdentity.values()]
+    .sort((a, b) => (b.ts - a.ts) || (b.tsNanos - a.tsNanos))
+    .map(buildCodexUsageAccount)
+    .filter(Boolean);
+
+  console.log('[CodexData] usage accounts scanned count=' + accounts.length +
+    ' labels=' + accounts.map((a) => {
+      const weekly = a.usage?.seven_day || null;
+      const fiveHour = a.usage?.five_hour || null;
+      return a.label + ':' + (a.plan_type || 'unknown') +
+        ':w=' + (weekly?.utilization ?? 'null') +
+        ':5h=' + (fiveHour?.utilization ?? 'null') +
+        ':wReset=' + (weekly?.resets_at || 'null') +
+        ':5hReset=' + (fiveHour?.resets_at || 'null') +
+        ':sample=' + (a.timestamp || 'null') +
+        ':thread=' + (shortCodexId(a.sourceThreadId) || 'none');
+    }).join(','));
+  return accounts;
+}
+
+async function findCodexAccountIdentityForThread(threadId) {
+  if (!threadId || !fs.existsSync(CODEX_LOGS_DB)) return null;
+  const sql = `
+    SELECT
+      ts,
+      ts_nanos,
+      thread_id,
+      CASE
+        WHEN instr(feedback_log_body, 'user.account_id=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
+        WHEN instr(feedback_log_body, 'user.email=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
+        ELSE ''
+      END AS body
+    FROM logs
+    WHERE ts > strftime('%s','now','-10 days')
+      AND target = 'codex_otel.log_only'
+      AND thread_id = '${sqlString(threadId)}'
+      AND (
+        feedback_log_body LIKE '%user.account_id=%'
+        OR feedback_log_body LIKE '%user.email=%'
+      )
+    ORDER BY ts DESC, ts_nanos DESC
+    LIMIT 20;
+  `;
+
+  const rows = await runSqliteJson(CODEX_LOGS_DB, sql);
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const identity = parseCodexAccountIdentityLog(row?.body || '');
+    if (identity.accountId || identity.email) return identity;
+  }
+  return null;
+}
+
+function resolveAfterBudget(promise, budgetMs, timeoutValue) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(timeoutValue);
+    }, budgetMs);
+
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(timeoutValue);
+      }
+    );
+  });
+}
+
+function startCodexUsageAccountsRefresh({ force = false, reason = 'refresh' } = {}) {
+  if (usageAccountsRefreshInFlight) {
+    console.log('[CodexData] usage accounts refresh join reason=' + reason);
+    return usageAccountsRefreshInFlight;
+  }
+
+  const startedAt = Date.now();
+  usageAccountsLastAttemptAt = startedAt;
+  console.log('[CodexData] usage accounts refresh start reason=' + reason +
+    ' force=' + (force ? '1' : '0') +
+    ' cache=' + (usageAccountsCache ? 'hit' : 'empty'));
+
+  usageAccountsRefreshInFlight = scanLatestCodexUsageAccounts()
+    .then((accounts) => {
+      const mergedAccounts = mergeCodexActiveOverridesIntoAccounts(accounts, { reason });
+      usageAccountsCache = { ts: Date.now(), accounts: mergedAccounts };
+      usageAccountsLastError = null;
+      usageAccountsLastErrorAt = 0;
+      console.log('[CodexData] usage accounts refresh done count=' + mergedAccounts.length +
+        ' durMs=' + (Date.now() - startedAt));
+      return mergedAccounts;
+    })
+    .catch((error) => {
+      const rawError = error?.message || String(error);
+      const durationMs = Date.now() - startedAt;
+      usageAccountsLastError = durationMs >= 14_500
+        ? 'Local Codex usage cache refresh timed out.'
+        : 'Local Codex usage cache could not be refreshed.';
+      usageAccountsLastErrorAt = Date.now();
+      usageAccountsCache = {
+        ts: Date.now(),
+        accounts: usageAccountsCache?.accounts || [],
+      };
+      console.warn('[CodexData] usage accounts refresh failed durMs=' + (Date.now() - startedAt) +
+        ' error=' + compactPreview(rawError, 240));
+      return usageAccountsCache.accounts;
+    })
+    .finally(() => {
+      usageAccountsRefreshInFlight = null;
+    });
+
+  return usageAccountsRefreshInFlight;
+}
+
+async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {}) {
+  const now = Date.now();
+  const cache = usageAccountsCache;
+  const cacheAgeMs = cache ? now - cache.ts : null;
+
+  if (!force && cache && cacheAgeMs < USAGE_ACCOUNTS_CACHE_TTL_MS) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache.accounts, { reason: 'cache-hit' });
+    if (accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
+    return {
+      accounts,
+      stale: !!usageAccountsLastError,
+      refreshing: !!usageAccountsRefreshInFlight,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  if (!force && usageAccountsLastErrorAt && now - usageAccountsLastErrorAt < USAGE_ACCOUNTS_ERROR_COOLDOWN_MS) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache?.accounts || [], { reason: 'error-cooldown' });
+    return {
+      accounts,
+      stale: true,
+      refreshing: false,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  const refreshPromise = startCodexUsageAccountsRefresh({ force, reason });
+  if (cache) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache.accounts, { reason: force ? 'force-stale-cache' : 'stale-cache' });
+    if (accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
+    return {
+      accounts,
+      stale: true,
+      refreshing: true,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  const quickAccounts = await resolveAfterBudget(
+    refreshPromise,
+    USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS,
+    null
+  );
+  if (quickAccounts) {
+    return {
+      accounts: quickAccounts,
+      stale: false,
+      refreshing: false,
+      cacheAgeMs: 0,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  return {
+    accounts: [],
+    stale: false,
+    refreshing: true,
+    cacheAgeMs: null,
+    lastAttemptAt: usageAccountsLastAttemptAt,
+    error: usageAccountsLastError,
+  };
+}
+
+function getCodexUsageAccountsSnapshot(reason = 'snapshot') {
+  const now = Date.now();
+  const cache = usageAccountsCache;
+  const accounts = mergeCodexActiveOverridesIntoAccounts(cache?.accounts || [], { reason });
+  if (cache && accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
+  return {
+    accounts,
+    stale: !!usageAccountsLastError || !cache,
+    refreshing: !!usageAccountsRefreshInFlight,
+    cacheAgeMs: cache ? now - cache.ts : null,
+    lastAttemptAt: usageAccountsLastAttemptAt,
+    error: usageAccountsLastError,
+  };
+}
+
+function shouldLoadCodexFallbackUsage(remoteResult, requestedAccountKey = null) {
+  const remoteAccounts = Array.isArray(remoteResult?.accounts) ? remoteResult.accounts : [];
+  if (requestedAccountKey) {
+    const requested = remoteAccounts.find((account) => account?.accountKey === requestedAccountKey);
+    if (requested?.source === 'openai-usage-api' && requested?.usage) return false;
+    if (!requested) return true;
+    return !requested.isCurrent || !!requested.stale;
+  }
+  if (remoteAccounts.some((account) => account?.isCurrent && account?.usage)) return false;
+  return !!remoteResult?.error || remoteAccounts.length === 0;
+}
+
+async function findLatestCodexUsageAccounts({ force = false } = {}) {
+  const result = await getCodexUsageAccountsFast({ force, reason: 'direct' });
+  if (result.refreshing && usageAccountsRefreshInFlight) {
+    return usageAccountsRefreshInFlight;
+  }
+  return result.accounts;
+}
+
+function normalizeCodexModel(raw) {
+  const id = raw.slug || raw.id || raw.name;
+  if (!id) return null;
+  const levels = raw.supported_reasoning_efforts || raw.supported_reasoning_levels || raw.reasoning_efforts || raw.reasoning_levels || ['low', 'medium', 'high', 'xhigh'];
+  const efforts = (Array.isArray(levels) ? levels : [])
+    .map((level) => typeof level === 'string' ? level : level?.effort || level?.name || level?.id)
+    .filter(Boolean);
+  return {
+    id,
+    label: raw.display_name || raw.name || id,
+    defaultEffort: raw.default_reasoning_effort || raw.default_reasoning_level || 'medium',
+    efforts: efforts.length > 0 ? efforts : ['low', 'medium', 'high', 'xhigh'],
+  };
+}
+
+function parseCodexModelsCatalog(stdout) {
+  const parsed = safeJsonParse(stdout, []);
+  const rawModels = Array.isArray(parsed) ? parsed : (parsed.models || parsed.available_models || []);
+  return rawModels
+    .filter((m) => {
+      const visibility = m.visibility || m.display || m.state;
+      return !visibility || visibility === 'list' || visibility === 'visible';
+    })
+    .map(normalizeCodexModel)
+    .filter(Boolean);
+}
+
+function listCodexModels() {
+  if (modelCache && Date.now() - modelCache.ts < MODEL_CACHE_TTL_MS) return Promise.resolve(modelCache.value);
+  // Dozens of persistent Codex controls mount together after workspace
+  // restore. Before the first catalog request completed, every control spawned
+  // its own `codex debug models` child; production 24.08 recorded 32 copies
+  // taking 11-12s each and starving the process-tree proof used by AutoResume.
+  // The TTL cache only helps AFTER completion, so the pending request itself
+  // must also be shared.
+  if (modelCacheInflight) {
+    console.log('[CodexModels] join in-flight catalog request');
+    return modelCacheInflight;
+  }
+  modelCacheInflight = new Promise((resolve) => {
+    const fallback = [
+      { id: 'gpt-5.5', label: 'GPT-5.5', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+      { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+      { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+      { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+      { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+      { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'] },
+    ];
+    const finish = (models, source) => {
+      const value = models.length > 0 ? models : fallback;
+      console.log('[CodexModels] catalog resolved source=' + (models.length > 0 ? source : 'builtin-fallback')
+        + ' count=' + value.length);
+      modelCache = { ts: Date.now(), value };
+      modelCacheInflight = null;
+      resolve(value);
+    };
+
+    // Live catalog matches the current account/config and the interactive
+    // `/model` picker. Bundled catalog contains hidden/internal/upgrade-only
+    // rows that the TUI will not accept.
+    // A Dock-launched main has only system PATH. Use the same user-install
+    // lookup as account probes, including its priority over an older Homebrew CLI.
+    const catalogEnv = buildChildProcessEnv({ PATH: buildCodexProcessPath() });
+    execFile('codex', ['debug', 'models'], {
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 15_000,
+      env: catalogEnv,
+    }, (err, stdout) => {
+      if (!err) {
+        const models = parseCodexModelsCatalog(stdout);
+        if (models.length > 0) {
+          finish(models, 'live');
+          return;
+        }
+      }
+      console.warn('[CodexModels] live catalog unavailable code=' + (err?.code || 'empty-catalog')
+        + ' fallback=bundled');
+
+      execFile('codex', ['debug', 'models', '--bundled'], {
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 5_000,
+        env: catalogEnv,
+      }, (bundledErr, bundledStdout) => {
+        if (bundledErr) {
+          console.warn('[CodexModels] bundled catalog unavailable code=' + (bundledErr.code || 'unknown')
+            + ' fallback=builtin');
+          finish(fallback, 'builtin-fallback');
+          return;
+        }
+        finish(parseCodexModelsCatalog(bundledStdout), 'bundled');
+      });
+    });
+  });
+  return modelCacheInflight;
+}
+
+async function loadSessionRecords(sessionId, cwd, options = {}) {
+  return perfCausal.run('codex.loadSessionRecords', { sessionId,
+    caller: perfCausal.current()?.name || _describeJsonlReadCaller() }, async () => {
+  const found = await findCodexSessionFile(sessionId, cwd,
+    options.sessionsDir ? { sessionsDir: options.sessionsDir } : {});
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const records = await parseJsonlFile(found.filePath, options);
+  const sourceSnapshot = getCodexJsonlSourceSnapshot(found.filePath, sessionId, records);
+  // parseJsonlFile already copied membership and its matching cursor together.
+  return { success: true, records, filePath: found.filePath, sourceSnapshot };
+  });
+}
+
+let _codexResumeSourceReader = null;
+function codexResumeSourceReader() {
+  _codexResumeSourceReader ||= createCodexResumeSourceReader({
+    findSessionFile: findCodexSessionFile,
+    readJsonlRange,
+    createTimelineProjector: createCodexTimelineProjector,
+    activity: historyPreparationActivity,
+  });
+  return _codexResumeSourceReader;
+}
+function loadResumeSource(sessionId, cwd, options = {}) {
+  return codexResumeSourceReader().load(sessionId, cwd, options);
+}
+
+function register({ projectManager, transcriptService, historyMutationInput } = {}) {
+  codexUsageStateStore = projectManager?.db || null;
+  codexUsageStateHydrated = false;
+  hydrateCodexUsageState();
+  codexUsagePolling?.stop();
+  codexAccountProfileManager?.shutdown?.();
+  codexManagedUsageAccounts.clear();
+  codexAccountProfileManager = new CodexAccountProfileManager({
+    store: codexUsageStateStore,
+    defaultCodexHome: CODEX_HOME,
+    onChange: (payload) => {
+      try {
+        const { BrowserWindow } = require('electron');
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed()) {
+            window.webContents.send('codex:account-profiles-updated', payload);
+          }
+        }
+      } catch {}
+    },
+  });
+  if (!codexAccountProfileCleanupBound) {
+    codexAccountProfileCleanupBound = true;
+    try {
+      const { app } = require('electron');
+      app.once('before-quit', () => {
+        codexUsagePolling?.stop();
+        codexAccountProfileManager?.shutdown?.();
+      });
+    } catch {}
+  }
+
+  module.exports._api.materializeEmptySession = materializeEmptyCodexSession;
+  module.exports._api.inspectConversationMaterialization = inspectCodexConversationMaterialization;
+  module.exports._api.inspectConversationMaterializationFromFile = inspectCodexConversationMaterializationFromFile;
+
+  module.exports._api.injectHistoryContext = async function ({
+    sessionId = null,
+    cwd,
+    prompt,
+    imagePaths = [],
+    model = null,
+    effort = null,
+    itemId = null,
+    onBeforeCommit = null,
+  } = {}) {
+    const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd)
+      ? cwd
+      : null;
+    const exactPrompt = typeof prompt === 'string' ? prompt : '';
+    if (!exactCwd) return { success: false, committed: false, error: 'history_context_cwd_required' };
+    if (!exactPrompt.trim()) return { success: false, committed: false, error: 'history_context_prompt_required' };
+    const exactModel = typeof model === 'string' ? model.trim() : '';
+    const exactEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    if (!exactModel || !exactEffort) {
+      return {
+        success: false,
+        committed: false,
+        error: 'codex_history_context_settings_required',
+      };
+    }
+    const exactItemId = typeof itemId === 'string' && itemId.trim()
+      ? itemId.trim()
+      : 'msg_' + crypto.randomUUID();
+    const item = await buildCodexHistoryContextItem(exactPrompt, exactItemId, { imagePaths });
+    const requestedSessionId = typeof sessionId === 'string' && sessionId.trim()
+      ? sessionId.trim()
+      : null;
+    const lockKey = requestedSessionId || ('fresh:' + exactItemId);
+    const previous = _codexHistoryContextInflight.get(lockKey) || Promise.resolve();
+    let committed = false;
+    let appendStarted = false;
+    const work = previous.catch(() => {}).then(async () => {
+      let exactSessionId = requestedSessionId;
+      let filePath = null;
+      let fresh = false;
+      try {
+        if (!exactSessionId) {
+          const materialized = await materializeEmptyCodexSession({ cwd: exactCwd });
+          exactSessionId = materialized.sessionId;
+          filePath = materialized.filePath;
+          fresh = true;
+        } else {
+          const found = await findCodexSessionFile(exactSessionId, exactCwd);
+          filePath = found?.filePath || null;
+        }
+        if (!exactSessionId || !filePath) {
+          throw new Error('codex_history_context_session_not_found');
+        }
+
+        const loadedBefore = await loadSessionRecords(exactSessionId, exactCwd);
+        if (!loadedBefore.success || loadedBefore.filePath !== filePath) {
+          throw new Error(loadedBefore.error || 'codex_history_context_source_unavailable');
+        }
+        const expectedSource = loadedBefore.sourceSnapshot;
+        if (!expectedSource) throw new Error('codex_history_context_source_snapshot_missing');
+
+        const timestamp = new Date().toISOString();
+        const responseTimestamp = new Date(Date.parse(timestamp) + 1).toISOString();
+        const eventTimestamp = new Date(Date.parse(timestamp) + 2).toISOString();
+        const settingsRecord = {
+          timestamp,
+          type: 'event_msg',
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: {
+              model: exactModel,
+              reasoning_effort: exactEffort,
+            },
+            source: 'noted-terminal-history-context',
+            source_session_id: exactSessionId,
+            proof_at: Date.parse(timestamp),
+          },
+        };
+        const responseRecord = {
+          timestamp: responseTimestamp,
+          type: 'response_item',
+          payload: item,
+        };
+        const presentationText = codexUserMessagePresentationText(responseRecord) || exactPrompt;
+        const eventRecord = {
+          timestamp: eventTimestamp,
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: presentationText,
+            kind: 'plain',
+          },
+        };
+        const serialized = JSON.stringify(settingsRecord) + '\n'
+          + JSON.stringify(responseRecord) + '\n'
+          + JSON.stringify(eventRecord) + '\n';
+
+        if (typeof onBeforeCommit === 'function') await onBeforeCommit({
+          provider: 'codex',
+          sessionId: exactSessionId,
+          itemId: exactItemId,
+          fresh,
+        });
+
+        const handle = await fs.promises.open(filePath, 'a+');
+        try {
+          const sourceNow = await handle.stat();
+          if (!codexSourceSnapshotMatchesStat(expectedSource, sourceNow)) {
+            const error = new Error('codex_history_context_source_changed');
+            error.code = 'codex_history_context_source_changed';
+            throw error;
+          }
+          if (sourceNow.size > 0) {
+            const tail = Buffer.alloc(1);
+            await handle.read(tail, 0, 1, sourceNow.size - 1);
+            if (tail[0] !== 0x0a) {
+              const error = new Error('codex_history_context_partial_tail');
+              error.code = 'codex_history_context_partial_tail';
+              throw error;
+            }
+          }
+          appendStarted = true;
+          await handle.appendFile(serialized, 'utf8');
+          committed = true;
+        } finally {
+          await handle.close();
+        }
+
+        invalidateCodexJsonlCache(filePath, { sourceAppend: true });
+        const loaded = await loadSessionRecords(exactSessionId, exactCwd);
+        if (!loaded.success) {
+          const error = new Error(loaded.error || 'codex_history_context_record_unavailable');
+          error.historyContextCommitted = committed;
+          throw error;
+        }
+        const record = loaded.records.find((candidate) => (
+          candidate?.type === 'response_item'
+          && candidate?.payload?.type === 'message'
+          && candidate?.payload?.role === 'user'
+          && String(candidate?.payload?.id || '') === exactItemId
+        ));
+        if (!record) {
+          const error = new Error('codex_history_context_record_identity_missing');
+          error.historyContextCommitted = committed;
+          error.historyContextOutcomeUnknown = appendStarted && !committed;
+          throw error;
+        }
+        committed = true;
+        const auditTimestamp = recordTimestamp(record);
+        return {
+          success: true,
+          committed: true,
+          provider: 'codex',
+          sessionId: exactSessionId,
+          itemId: exactItemId,
+          entryUuid: stableUuid(exactSessionId, record.__line, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(exactSessionId, record, 'codex-user'),
+          recordByteOffset: Number.isFinite(record.__byteOffset)
+            ? Number(record.__byteOffset)
+            : null,
+          auditTimestamp,
+          fresh,
+          filePath: loaded.filePath,
+          presentationText: codexUserMessagePresentationText(record),
+        };
+      } catch (error) {
+        if (fresh && filePath && appendStarted !== true) {
+          await fs.promises.unlink(filePath).catch(() => null);
+          invalidateCodexJsonlCache(filePath);
+        }
+        throw error;
+      }
+    });
+    _codexHistoryContextInflight.set(lockKey, work);
+    try {
+      return await work;
+    } catch (error) {
+      if (error.historyContextCommitted === undefined) {
+        error.historyContextCommitted = committed;
+      }
+      if (error.historyContextOutcomeUnknown === undefined) {
+        error.historyContextOutcomeUnknown = appendStarted && !committed;
+      }
+      throw error;
+    } finally {
+      if (_codexHistoryContextInflight.get(lockKey) === work) {
+        _codexHistoryContextInflight.delete(lockKey);
+      }
+    }
+  };
+
+  ipcMain.handle('codex:get-account-profiles', async () => ({
+    success: true,
+    profiles: codexAccountProfileManager?.listPublicProfiles() || [],
+  }));
+
+  ipcMain.handle('codex:start-account-login', async (_event, payload = {}) => {
+    try {
+      const result = await codexAccountProfileManager.startLogin(payload.profileId || null);
+      return {
+        success: true,
+        ...result,
+        profiles: codexAccountProfileManager.listPublicProfiles(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        profiles: codexAccountProfileManager?.listPublicProfiles() || [],
+      };
+    }
+  });
+
+  ipcMain.handle('codex:cancel-account-login', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.cancelLogin(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('codex:logout-account-profile', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.logout(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('codex:remove-account-profile', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.removeProfile(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('codex:get-timeline', (event, request = {}) => require('../history-ipc-demand').historyIpcDemands.run(event, request, async payload => {
+    // Legacy callers (including launch finalization) must see the same frozen
+    // prefix + child tail as History. A physical-only empty answer can cause
+    // the caller to discard a perfectly valid thin native fork after Stop.
+    if (transcriptService?.getTimeline) {
+      return transcriptService.getTimeline({ ...payload, toolType: 'codex' });
+    }
+    const { sessionId, cwd } = payload;
+    try {
+      // Same file-cursor projector as the panel's Timeline: this channel is
+      // also called on ordinary flows (tab-title generation, AI-launch
+      // finalize), and a full re-parse of a giant rollout there is exactly
+      // the storm that evicted the active session from the records cache.
+      const projected = await projectCodexTimelineFromFile(sessionId, cwd);
+      if (!projected.success) return projected;
+      let historyEventPersisted = false;
+      try {
+        const snapshot = deriveCodexForkSnapshot(projected.entries, projected.sessionMeta);
+        if (snapshot && codexUsageStateStore?.saveSessionForkEvent) {
+          codexUsageStateStore.saveSessionForkEvent({
+            provider: 'codex',
+            sourceSessionId: snapshot.sourceSessionId,
+            childSessionId: sessionId,
+            entryUuids: snapshot.entryUuids,
+            boundaryEntryUuid: snapshot.boundaryEntryUuid,
+            snapshotComplete: snapshot.snapshotComplete,
+            occurredAt: snapshot.occurredAt,
+            forkMode: 'unknown',
+            origin: 'transcript',
+            isDirect: true,
+          });
+          historyEventPersisted = true;
+        }
+      } catch (historyEventError) {
+        console.warn('[CodexData] timeline fork event reconcile failed session=' + String(sessionId).slice(0, 8) + ': ' + historyEventError.message);
+      }
+      return {
+        success: true,
+        entries: projected.entries,
+        sessionMeta: projected.sessionMeta,
+        historyEventPersisted,
+        sessionBoundaries: [],
+        claudeMemoryBoundaryUuid: null,
+        filePath: projected.filePath,
+      };
+    } catch (error) {
+      console.error('[CodexData] get-timeline error:', error);
+      return { success: false, error: error.message };
+    }
+  }));
+
+  ipcMain.handle('codex:get-full-history', (event, request = {}) => require('../history-ipc-demand').historyIpcDemands.run(event, request, async payload => {
+    if (transcriptService?.getHistory) {
+      return transcriptService.getHistory({
+        ...payload,
+        toolType: 'codex',
+      });
+    }
+    const { sessionId, cwd, ifRevision } = payload;
+    try {
+      if (ifRevision) {
+        const validation = await validateHistoryRevision(
+          ifRevision,
+          { toolType: 'codex', sessionId, cwd },
+          {
+            resolvePrimaryFile: async () => {
+              const found = await findCodexSessionFile(sessionId, cwd);
+              return found?.filePath || null;
+            },
+          }
+        );
+        if (validation.unchanged) {
+          return { success: true, unchanged: true, revision: ifRevision };
+        }
+      }
+      const loaded = await loadSessionRecords(sessionId, cwd);
+      if (!loaded.success) return loaded;
+      const revision = buildHistoryRevision(
+        { toolType: 'codex', sessionId, cwd },
+        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : []
+      );
+      return {
+        success: true,
+        unchanged: false,
+        entries: buildCodexFullHistory(loaded.records, sessionId),
+        claudeMemoryBoundaryUuid: null,
+        filePath: loaded.filePath,
+        revision,
+      };
+    } catch (error) {
+      console.error('[CodexData] get-full-history error:', error);
+      return { success: false, error: error.message };
+    }
+  }));
+
+  ipcMain.handle('codex:export-clean-session', async (_event, params = {}) => {
+    try {
+      const { sessionId, cwd } = params;
+      const loaded = await loadSessionRecords(sessionId, cwd);
+      if (!loaded.success) return loaded;
+      const content = buildCodexCleanExport(loaded.records, sessionId, cwd, codexCopyOptions(params));
+      return { success: true, content, filePath: loaded.filePath };
+    } catch (error) {
+      console.error('[CodexData] export-clean-session error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('codex:copy-range', async (_event, params = {}) => {
+    try {
+      const { sessionId, cwd, startUuid, endUuid } = params;
+      const loaded = await loadSessionRecords(sessionId, cwd);
+      if (!loaded.success) return loaded;
+      if (params.assistantOnly) {
+        const context = buildCodexTurnAssistantContext(
+          loaded.records,
+          sessionId,
+          startUuid,
+          params.maxChars
+        );
+        return context.success ? { ...context, filePath: loaded.filePath } : context;
+      }
+      const result = buildCodexRangeExport(
+        loaded.records,
+        sessionId,
+        cwd,
+        codexCopyOptions(params),
+        startUuid,
+        endUuid
+      );
+      return result.success ? { ...result, filePath: loaded.filePath } : result;
+    } catch (error) {
+      console.error('[CodexData] copy-range error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('codex:edit-range', async (_event, params = {}) => {
+    try {
+      return await editCodexRange(params);
+    } catch (error) {
+      console.error('[CodexData] edit-range error:', error);
+      return {
+        success: false,
+        error: error.message,
+        code: error.code || null,
+        reason: error.reason || null,
+      };
+    }
+  });
+
+  ipcMain.handle('codex:delete-range', async (_event, params = {}) => {
+    try {
+      const perform = () => {
+        if (params.tabId) historyMutationInput?.assert(params.tabId, params.historyInput, { action: 'mutation' });
+        return deleteCodexRange({ ...params, diagnosticOperationId: params.historyInput?.operationId || null, beforeWrite: () => {
+          if (params.tabId) historyMutationInput?.assert(params.tabId, params.historyInput, { action: 'mutation' });
+          params.beforeWrite?.();
+        } });
+      };
+      return historyMutationInput ? await historyMutationInput.run(params.historyInput, perform) : await perform();
+    } catch (error) {
+      console.error('[CodexData] delete-range error:', error);
+      return {
+        success: false,
+        error: error.message,
+        code: error.code || null,
+        reason: error.reason || null,
+      };
+    }
+  });
+
+  ipcMain.handle('codex:fork-from-latest-compact', async (_event, params = {}) => {
+    try {
+      const result = await forkCodexFromLatestCompact(params);
+      console.log(
+        '[CodexData] fork-from-latest-compact' +
+        ' session=' + String(params?.sessionId || '').slice(0, 8) +
+        ' success=' + (result?.success === true ? '1' : '0') +
+        ' reason=' + String(result?.reason || (result?.success === true ? 'created' : 'error'))
+      );
+      return result;
+    } catch (error) {
+      console.error('[CodexData] fork-from-latest-compact error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('codex:list-models', async () => {
+    try {
+      const models = await listCodexModels();
+      return { success: true, models };
+    } catch (error) {
+      return { success: false, error: error.message, models: [] };
+    }
+  });
+
+  module.exports._api.getUsage = async (opts = {}) => {
+    // Stage probes. This handler has shown 620ms-7.7s wall times and once
+    // coincided with a 5002ms main-loop stall at near-zero CPU — i.e. the
+    // process was WAITING synchronously, not computing. The stage log names
+    // which phase ate the time so the blocker is identified by evidence, not
+    // by guess. (5002ms at zero CPU smells like a lock-acquisition timeout;
+    // the probe will say.)
+    const usageStages = [];
+    const usageStartedAt = Date.now();
+    let usageStageStartedAt = usageStartedAt;
+    const markUsageStage = (name) => {
+      const now = Date.now();
+      usageStages.push(name + '=' + (now - usageStageStartedAt));
+      usageStageStartedAt = now;
+    };
+    const logUsageStages = () => {
+      const totalMs = Date.now() - usageStartedAt;
+      if (totalMs > 250) {
+        console.log('[CodexUsage:Stages] totalMs=' + totalMs
+          + ' ' + usageStages.join(' ')
+          + ' force=' + (!!opts?.force)
+          + ' reason=' + compactPreview(opts?.reason || 'unspecified', 48));
+      }
+    };
+    try {
+      const requestedAccountKey = typeof opts?.accountKey === 'string' && opts.accountKey
+        ? opts.accountKey
+        : null;
+      const defaultAuthSnapshot = readCurrentCodexAuthSession();
+      const refreshScope = resolveCodexUsageRefreshScope({
+        requestedAccountKey,
+        currentAccountKey: defaultAuthSnapshot?.accountKey || null,
+      });
+      let remoteMs = 0;
+      let profilesMs = 0;
+      const remoteStartedAt = Date.now();
+      const remotePromise = (!opts.snapshotOnly && refreshScope.refreshDefault
+        ? getCodexRemoteUsage({
+          force: !!opts?.force,
+          verifyInitial: true,
+        })
+        : Promise.resolve(getCodexRemoteUsageSnapshot(defaultAuthSnapshot)))
+        .finally(() => { remoteMs = Date.now() - remoteStartedAt; });
+      const profilesStartedAt = Date.now();
+      const profilesPromise = (!opts.snapshotOnly && (refreshScope.managedAccountKey || refreshScope.refreshAllManaged)
+        ? refreshCodexManagedProfileAccounts({
+          force: !!opts?.force,
+          accountKey: refreshScope.managedAccountKey,
+        })
+        : Promise.resolve(getCodexManagedUsageSnapshot()))
+        .finally(() => { profilesMs = Date.now() - profilesStartedAt; });
+      const [remoteResult, managedProfileResult] = await Promise.all([
+        remotePromise,
+        profilesPromise,
+      ]);
+      usageStages.push('target=' + refreshScope.label, 'remoteMs=' + remoteMs, 'profilesMs=' + profilesMs);
+      markUsageStage('remoteAndProfiles');
+      const currentRemoteAccount = remoteResult.currentAccountKey
+        ? remoteResult.accounts?.find((account) => account.accountKey === remoteResult.currentAccountKey)
+        : null;
+      codexAccountProfileManager?.syncDefaultProfile({
+        accountKey: remoteResult.currentAccountKey || null,
+        label: currentRemoteAccount?.label || null,
+        accountHint: currentRemoteAccount?.accountHint || null,
+        planType: currentRemoteAccount?.plan_type || null,
+        connected: !!remoteResult.currentAccountKey,
+        error: remoteResult.currentAccountKey ? remoteResult.error : null,
+      });
+      // The local log is discovery/fallback only. A healthy OpenAI response
+      // must not start or wait for a multi-gigabyte log scan.
+      const needsFallback = !opts.snapshotOnly && shouldLoadCodexFallbackUsage(remoteResult, opts?.accountKey);
+      const accountResult = needsFallback
+        ? await getCodexUsageAccountsFast({ force: false, reason: 'ipc-fallback' })
+        : getCodexUsageAccountsSnapshot('ipc-server-primary');
+      markUsageStage(needsFallback ? 'accountsFallback' : 'accountsSnapshot');
+      let accountUsages = mergeCodexPreferredAccounts(
+        accountResult.accounts || [],
+        [
+          ...(remoteResult.accounts || []),
+          ...(managedProfileResult.accounts || []),
+        ]
+      );
+
+      let activeUsage = null;
+      let activeIdentity = null;
+      let activeAccountKey = null;
+      if (needsFallback && opts?.sessionId) {
+        try {
+          const [identity, loaded] = await Promise.all([
+            resolveAfterBudget(
+              findCodexAccountIdentityForThread(opts.sessionId).catch(() => null),
+              1000,
+              null
+            ),
+            loadLatestCodexUsageForSession(opts.sessionId, opts.cwd)
+              .catch((error) => ({ success: false, error: error?.message || String(error) })),
+          ]);
+          activeIdentity = identity;
+          if (loaded?.success) {
+            activeUsage = loaded.usage || null;
+          }
+          activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
+        } catch {}
+        markUsageStage('sessionIdentity');
+      }
+      if (activeUsage && activeIdentity) {
+        rememberCodexActiveUsageOverride(activeIdentity, activeUsage, opts.sessionId);
+        accountUsages = mergeCodexActiveOverridesIntoAccounts(accountUsages, { reason: 'ipc-active' });
+        if (usageAccountsCache) {
+          const cachedAccounts = mergeCodexActiveOverridesIntoAccounts(usageAccountsCache.accounts, { reason: 'ipc-cache' });
+          if (cachedAccounts !== usageAccountsCache.accounts) {
+            usageAccountsCache = { ...usageAccountsCache, accounts: cachedAccounts };
+          }
+        }
+      }
+      accountUsages = mergeCodexPreferredAccounts(
+        accountUsages,
+        [
+          ...(remoteResult.accounts || []).filter((account) => account.isCurrent && !account.stale),
+          ...(managedProfileResult.accounts || []),
+        ]
+      );
+      const accountProfiles = codexAccountProfileManager?.listPublicProfiles() || [];
+      const profileByAccountKey = new Map(
+        accountProfiles
+          .filter((profile) => profile.accountKey)
+          .map((profile) => [profile.accountKey, profile])
+      );
+      accountUsages = accountUsages.map((account) => ({
+        ...account,
+        profileId: account.profileId || profileByAccountKey.get(account.accountKey)?.profileId || null,
+        connected: account.connected === true
+          || profileByAccountKey.get(account.accountKey)?.status === 'connected',
+        authStatus: account.authStatus
+          || profileByAccountKey.get(account.accountKey)?.status
+          || 'historical',
+        isDefaultProfile: account.isDefaultProfile === true
+          || profileByAccountKey.get(account.accountKey)?.isDefault === true,
+        isCurrent: account.accountKey === remoteResult.currentAccountKey,
+        stale: codexUsageAccountIsStale(account),
+      }));
+
+      let selectedAccount = opts?.accountKey
+        ? accountUsages.find((account) => account.accountKey === opts.accountKey)
+        : null;
+      if (!selectedAccount && activeAccountKey) {
+        selectedAccount = accountUsages.find((account) => account.accountKey === activeAccountKey) || null;
+      }
+      if (!selectedAccount) selectedAccount = accountUsages[0] || null;
+
+      let usage = selectedAccount?.usage || null;
+      let selectedAccountKey = selectedAccount?.accountKey || null;
+      let source = selectedAccount?.source === 'active-session-rollout'
+        ? 'active-session-rollout'
+        : (usage ? 'account-log' : 'none');
+
+      const activeMatchesSelected = codexActiveUsageMatchesSelected({
+        activeUsage,
+        activeAccountKey,
+        selectedAccountKey,
+        sessionId: opts?.sessionId,
+        selectedSourceThreadId: selectedAccount?.sourceThreadId,
+      });
+      if (activeMatchesSelected && (!usage || compareCodexUsageFreshness(activeUsage, usage) > 0)) {
+        if (!selectedAccountKey && activeAccountKey) {
+          const activeAccount = buildCodexActiveUsageAccount(activeIdentity, activeUsage, opts.sessionId);
+          if (activeAccount) {
+            accountUsages = [activeAccount];
+            selectedAccount = activeAccount;
+            selectedAccountKey = activeAccount.accountKey;
+          }
+        } else if (selectedAccountKey) {
+          accountUsages = mergeCodexActiveUsageIntoAccounts(accountUsages, selectedAccountKey, activeUsage, opts.sessionId);
+          selectedAccount = accountUsages.find((account) => account.accountKey === selectedAccountKey) || selectedAccount;
+        }
+        usage = activeUsage;
+        source = 'active-session-rollout';
+      }
+      if (!opts.snapshotOnly && !usage && !accountResult.refreshing && !opts?.accountKey && accountUsages.length === 0) {
+        usage = await findLatestCodexUsage();
+        source = usage ? 'latest-rollout-unverified' : source;
+        markUsageStage('latestRolloutScan');
+      }
+
+      if (selectedAccount?.source) source = selectedAccount.source;
+      const selectedIsCurrent = !!selectedAccountKey
+        && selectedAccountKey === remoteResult.currentAccountKey;
+      const selectedIsConnected = selectedAccount?.connected === true;
+      const stale = selectedAccount
+        ? codexUsageAccountIsStale(selectedAccount)
+        : !!usage;
+      const warning = selectedAccount && !selectedIsConnected && stale
+        ? 'This Codex account is not connected. Showing its last known value.'
+        : (selectedIsCurrent ? (remoteResult.warning || selectedAccount?.warning || null) : selectedAccount?.warning || null);
+      const relevantError = selectedIsCurrent
+        ? remoteResult.error
+        : (selectedAccount?.lastError || (!usage ? (accountResult.error || remoteResult.error) : null));
+
+      const weekly = usage?.seven_day?.utilization ?? null;
+      const fiveHour = usage?.five_hour?.utilization ?? null;
+      const accountLabel = selectedAccount?.label || accountUsages[0]?.label || 'none';
+      console.log('[CodexData] get-usage source=' + source +
+        ' accounts=' + accountUsages.length +
+        ' selected=' + accountLabel +
+        ' weekly=' + (weekly ?? 'null') +
+        ' fiveHour=' + (fiveHour ?? 'null') +
+        ' refreshing=0' +
+        ' stale=' + (stale ? '1' : '0') +
+        ' cacheAgeMs=' + (accountResult.cacheAgeMs ?? 'none') +
+        ' session=' + (opts?.sessionId ? String(opts.sessionId).slice(0, 8) : 'none') +
+        ' error=' + (relevantError ? compactPreview(relevantError, 120) : 'none'));
+
+      return {
+        success: true,
+        data: usage,
+        accounts: accountUsages,
+        profiles: accountProfiles,
+        selectedAccountKey,
+        currentAccountKey: remoteResult.currentAccountKey,
+        source,
+        refreshing: false,
+        stale,
+        cacheAgeMs: accountResult.cacheAgeMs,
+        lastAttemptAt: selectedIsCurrent
+          ? remoteResult.lastAttemptAt
+          : selectedAccount?.lastAttemptAt || accountResult.lastAttemptAt,
+        lastSuccessAt: usage?.timestamp || null,
+        warning,
+        error: relevantError,
+      };
+    } catch (error) {
+      console.error('[CodexData] get-usage error:', error);
+      return { success: false, error: error.message };
+    } finally {
+      logUsageStages();
+    }
+  };
+  ipcMain.handle('codex:get-usage', (_event, opts = {}) => module.exports._api.getUsage(opts));
+  codexUsagePolling = createCodexUsagePolling({
+    listTargets: listCodexUsagePollingTargets,
+    refreshTarget: target => target.isDefault
+      ? getCodexRemoteUsage({ force: false, verifyInitial: true })
+      : refreshCodexManagedProfileAccounts({ force: false, accountKey: target.key }),
+    onUpdated: broadcastCodexUsageUpdated,
+  });
+  codexUsagePolling.start();
+}
+
+module.exports = {
+  register,
+  findCodexSessionFile,
+  findLatestCodexSession,
+  findCodexDescendantSessions,
+  inspectCodexDescendantSessions,
+  findCodexDirectChildSessions,
+  inspectCodexDirectChildSessions,
+  findCodexLinkedLiveBoundary,
+  buildCodexTimeline,
+  buildCodexFullHistory,
+  buildCodexTimelineCooperatively,
+  buildCodexFullHistoryCooperatively,
+  buildCodexTurnEvidence,
+  buildCodexCleanExport,
+  buildCodexRangeExport,
+  buildCodexTurnAssistantContext,
+  buildCodexTurnAssistantResult,
+  editCodexRange,
+  deleteCodexRange,
+  deleteCodexRangeInPlace,
+  forkCodexFromLatestCompact,
+  getTimelineSessionMeta,
+  listCodexModels,
+  invalidateCodexJsonlCache,
+  _api: {
+    setCodexExternalReadPrepare: prepare => { _codexExternalReadPrepare = prepare; },
+    // The coordinator partitions the user's one budget between read graphs,
+    // their lightweight index and main's existing mutation-proof accelerator.
+    setCodexProjectionRuntimeBudgetBytes: bytes => {
+      if (!Number.isSafeInteger(bytes) || bytes < CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES) throw new Error('codex_projection_budget');
+      _codexHistoryProjectorBudgetBytes = bytes;
+    },
+    setCodexExternalReadVersion: readVersion => { _codexReadFence.externalVersion = readVersion; },
+    refreshCodexSubagentCards,
+    getCodexPayloadGeneration,
+    buildCodexInterruptedHistoryEntry,
+    observeCodexReadInvalidation,
+    setCodexProjectionStorage,
+    setCodexRewriteProjectionPublisher,
+    restoreCodexSourceSnapshot,
+    isCodexSourceSnapshotCurrent,
+    beginCodexSourceRead,
+    assertCodexSourceRead,
+    assertCodexSourceReadCurrent,
+    finishCodexSourceRead: read => _codexReadFence.finish(read.ticket),
+    getCodexJsonlSourceSnapshot,
+    setCodexOperationSourceResolver,
+    loadCodexOperationSource,
+    listCodexModels,
+    findCodexSessionFile,
+    locateCodexSessionFile,
+    findLatestCodexSession,
+    findCodexDescendantSessions,
+    inspectCodexDescendantSessions,
+    findCodexDirectChildSessions,
+    inspectCodexDirectChildSessions,
+    selectSingleProvenCodexRewindRecoveryCandidate,
+    findCodexLinkedLiveBoundary,
+    readCodexSessionMetadata,
+    scanCodexStableSourceRewindProof,
+    isCodexUserTuiSession,
+    parseJsonlFile,
+    readJsonlRange,
+    readAuditRecordAddress,
+    getCodexJsonlCacheStats,
+    codexCompactCompanionLines,
+    codexHistoryCellId,
+    invalidateJsonlCache: invalidateCodexJsonlCache,
+    buildCodexCleanEntries,
+    extractTextContent,
+    buildCodexCleanExport,
+    buildCodexRangeExport,
+    buildCodexTurnAssistantContext,
+    buildCodexTurnAssistantResult,
+    collectCodexTurnAssistantBlocks,
+    buildCodexProviderTurnAssistantResult,
+    loadCodexProviderResult,
+    loadCodexObservedExecution,
+    loadLatestCodexObservedExecution,
+    loadCodexHistoricalObservedExecution,
+    readCachedCodexCompletedResponse,
+    readCachedCodexInputInterval,
+    getCodexResultReaderStats: () => codexResultReader().stats(),
+    getCodexUserRecordIdentity,
+    isCompactPayload,
+    extractReasoning,
+    findCodexPromptExecutionContext,
+    buildCodexVisibleRecordWrappers,
+    planCodexRangeRewrite,
+    inspectCodexSavedRewindRepair,
+    codexRepairRecordsHash,
+    validateCodexRangeRewriteProjection,
+    planCodexForkFromLatestCompact,
+    rewriteCodexEditedForkMetadata,
+    resolveCodexHistoryMutationSettingsProof,
+    ensureCodexEditedForkSettingsProof,
+    writeCodexJsonlExclusive,
+    replaceCodexSessionFileInPlace,
+    buildCodexEmptySessionMetaRecord,
+    materializeEmptySession: materializeEmptyCodexSession,
+    inspectConversationMaterialization: inspectCodexConversationMaterialization,
+    inspectConversationMaterializationFromFile: inspectCodexConversationMaterializationFromFile,
+    editCodexRange,
+    deleteCodexRange,
+    deleteCodexRangeInPlace,
+    forkCodexFromLatestCompact,
+    loadSessionRecords,
+    loadResumeSource,
+    injectHistoryContext: null,
+    buildCodexFullHistory,
+    buildCodexFullHistoryCooperatively,
+    buildCodexTurnEvidence,
+    createCodexHistoryProjector,
+    CodexRootProjectionOwner,
+    HistoryProjectionArena,
+    projectCodexFullHistoryFromFile,
+    projectCodexFullHistoryStream,
+    publishCodexRewriteProjection,
+    getCodexRewriteReceipt,
+    projectCodexTimelineFromFile,
+    projectCodexRootTimelineFromFile,
+    CODEX_ROOT_TIMELINE_NAMESPACE,
+    createCodexTimelineProjector,
+    invalidateCodexHistoryProjectors,
+    getCodexHistoryProjectorStats,
+    setCodexHistoryProjectorBudgetMb,
+    estimateProjectorBytes,
+    estimateCodexProjectorCacheEntryBytes,
+    buildCodexTimeline,
+    buildCodexTimelineCooperatively,
+    findCodexExecNestedCalls,
+    codexHistoryLogicalCalls,
+    resolveSimpleJsCallValue,
+    parseApplyPatchHistoryActions,
+    parseHistoryUnifiedDiffHunks,
+    parseCodexPatchApplyChanges,
+    codexHistoryActionsForCall,
+    codexHistoryOutputParts,
+    codexHistoryCellId,
+    codexHistorySettledOutputParts,
+    getTimelineSessionMeta,
+    latestCodexUsageInRecords,
+    findLatestCodexUsage,
+    findLatestCodexUsageAccounts,
+    getCodexUsageAccountsFast,
+    compareCodexRateSnapshotFreshness,
+    compareCodexUsageFreshness,
+    normalizeCodexWhamWindow,
+    normalizeCodexAdditionalRateLimits,
+    buildCodexUsageFromWhamResponse,
+    buildCodexResetCreditsFromResponse,
+    buildCodexUsageFromRateLimits,
+    buildCodexUsageFromAppServerRateLimits,
+    canonicalizeCodexUsage,
+    codexUsageSnapshotsMatch,
+    classifyCodexUsageSnapshot,
+    reconcileCodexUsageSnapshot,
+    selectCodexInitialUsageConsensus,
+    serializeCodexUsageState,
+    parseCodexUsageState,
+    fetchCodexUsageFromOpenAI,
+    fetchCodexResetCreditsFromOpenAI,
+    getCodexRemoteUsage,
+    getCodexRemoteUsageSnapshot,
+    listCodexRemoteUsageAccounts,
+    resolveCodexUsageRefreshScope,
+    readCodexAuthSession,
+    readCurrentCodexAuthSession,
+    mergeCodexPreferredAccounts,
+    codexUsageAccountIsStale,
+    codexActiveUsageMatchesSelected,
+    shouldLoadCodexFallbackUsage,
+    findLatestCodexUsageInFile,
+    resetCodexUsageStateForTests,
+    setCodexUsageStateStoreForTests,
+    findCodexAccountIdentityForThread,
+    codexAccountKeyFromIdentity,
+    rememberCodexActiveUsageOverride,
+    mergeCodexActiveOverridesIntoAccounts,
+  },
+};

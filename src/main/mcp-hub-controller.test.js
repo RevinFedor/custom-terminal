@@ -44,6 +44,34 @@ function fixture(port) {
   } };
 }
 
+test('controller: status preserves live server identities when the maintenance reader rejects its storage', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-status-authority-'));
+  const ingressFile = path.join(dir, 'ingress.json');
+  fs.writeFileSync(ingressFile, JSON.stringify({ version: 1, storeEpoch: 'owned-epoch', fences: [{ barrierId: 'owned-invalid' }] }), { mode: 0o600 });
+  fs.writeFileSync(ingressFile + '.initialized', JSON.stringify({ version: 1, storeEpoch: 'owned-epoch' }), { mode: 0o600 });
+  const names = ['terminal', 'knowledge', 'browser', 'electron', 'ios', 'sc-desktop'];
+  const observed = { pid: 12345, port: 12346, capabilities: { browserMaintenance: 1 }, configurationMatches: true,
+    servers: names.map((name, i) => ({ name, pid: 20000 + i, up: true, initialized: true, pendingRequests: 0 })) };
+  const controller = createMcpHubController({ port: 12346, ingressFile,
+    readConfiguration: () => ({ serverDefs: Object.fromEntries(names.map(name => [name, {}])),
+      status: { entries: [], error: null, needsReview: false }, fingerprint: 'owned-status', canLaunch: true }),
+    fetchImpl: async (_url, options) => {
+      assert.notEqual(options.method, 'POST', 'a rejected authority does not authorize a restart');
+      return { ok: true, json: async () => structuredClone(observed) };
+    },
+    spawnImpl() { assert.fail('a live hub must not be replaced'); }, log() {} });
+  try {
+    const value = await controller.status();
+    assert.deepEqual(value.servers, observed.servers);
+    assert.equal(value.pid, observed.pid);
+    assert.equal(value.browserMaintenance.held, true);
+    assert.equal(value.browserMaintenance.code, 'research_ingress_storage_invalid');
+    assert.equal(value.browserMaintenance.replayPermission, false);
+    assert.deepEqual((await controller.ensure()).servers, observed.servers);
+    assert.equal((await controller.restart('browser')).ok, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('controller: concurrent start and quick reopen reuse one detached hub; restart is ready', async () => {
   const f = fixture(await freePort());
   try {

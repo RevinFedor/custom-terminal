@@ -7,6 +7,7 @@ function noticeRef(notice) {
   return { version: 1, runId: notice.runId, noticeId: notice.id, jobId: notice.jobId,
     origin: notice.origin, runCreatedAt: notice.runCreatedAt,
     ...(notice.origin === 'sc' ? { scControlEpoch: notice.scControlEpoch } : { localEpisodeId: notice.localEpisodeId }),
+    ...(notice.recoveryDisposition ? { recoveryDisposition: structuredClone(notice.recoveryDisposition) } : {}),
     bodyHash: notice.bodyHash, preparedPromptHash: notice.preparedPromptHash, cancelRevision: notice.cancelRevision };
 }
 async function resolveOperationalRequest(store, request) {

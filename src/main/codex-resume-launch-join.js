@@ -22,7 +22,12 @@ function reusableCodexResumeLaunch({ request = {}, terminal, commandState,
   if (current(pendingLaunch) && pendingLaunch.command === 'codex-c'
     && pendingLaunch.materializedFresh !== true
     && pendingLaunch.sessionId === request.sessionId
-    && pendingLaunch.resumePausedGoal !== false
+    // A saved Leave-paused policy belongs to the already-written launch, not
+    // a new Goal mutation by this observer. A caller without an explicit
+    // override may join either saved policy (or manual choice) read-only.
+    // An explicit incompatible Resume choice still cannot be silently eaten.
+    && (typeof request.resumePausedGoal !== 'boolean'
+      || request.resumePausedGoal === pendingLaunch.resumePausedGoal)
     && pendingAcceptanceId === pendingLaunch.launchId) {
     return { launchId: pendingLaunch.launchId, pending: true, writerSessionId: null };
   }

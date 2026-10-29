@@ -33,8 +33,7 @@ import {usePaneStripSelection} from './PaneStripSelection';
 import type {PaneStripGroupControl} from './PaneStripCollapsedGroup';
 import {CHIP_HOVER_STYLE} from '../../utils/chipHoverIntent.mjs';
 import {createPaneStripBadgeHover} from '../../utils/paneStripBadgeHover.mjs';
-import NavigationDwellStroke from './NavigationDwellStroke';
-import {currentUIActionId,uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
+import {captureUIHoverAction,currentUIActionId,uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -75,11 +74,12 @@ export default function PaneTabChip({
 
   const chipRef = useRef<HTMLSpanElement | null>(null);
   const controlRef=useRef(groupControl);controlRef.current=groupControl;
-  const [badgeProgress,setBadgeProgress]=useState(false);
+  const badgeAction=useRef<string|null>(null);
   const badgeHover=useRef<ReturnType<typeof createPaneStripBadgeHover>|null>(null);
   if(groupControl&&groupControl.count>0&&!badgeHover.current&&typeof window!=='undefined')badgeHover.current=createPaneStripBadgeHover({target:window,
-    getControl:()=>controlRef.current,isInstant:()=>useUIStore.getState().paneStripInstantHover===true,
-    publish:setBadgeProgress,phase:phase=>uiPerformancePhaseForAction(currentUIActionId(),`strip-group:dwell-${phase}`,{tabId})});
+    getControl:()=>{const control=controlRef.current;return control?{...control,hover:()=>controlRef.current?.hover(badgeAction.current)}:control;},
+    isInstant:()=>useUIStore.getState().paneStripInstantHover===true,
+    phase:phase=>uiPerformancePhaseForAction(badgeAction.current??currentUIActionId(),`strip-group:dwell-${phase}`,{tab:tabId})});
   useEffect(()=>()=>badgeHover.current?.cancel(),[projectId,tabId,groupControl?.groupId,groupControl?.revision,groupControl?.available,groupControl?.count,groupControl?.open]);
   // Immediate acknowledgement lives on the chip, independently of the heavy
   // surface switch. `shown` clears it only after the selected tab really owns
@@ -191,16 +191,14 @@ export default function PaneTabChip({
         data-pane-strip-group-count={groupControl.groupId} data-group-unread={groupControl.unread?'1':undefined}
         aria-label={`Ещё вкладок: ${groupControl.count}. ${groupControl.open?'Группа раскрыта':'Раскрыть группу'}`}
         aria-expanded={groupControl.open} aria-busy={groupControl.busy||undefined}
-        onMouseEnter={event=>{if(!event.buttons)badgeHover.current?.enter(event.currentTarget);}}
+        onMouseEnter={event=>{if(!event.buttons){badgeHover.current?.cancel();
+          badgeAction.current=captureUIHoverAction(event.nativeEvent||event)?.id||null;badgeHover.current?.enter(event.currentTarget);}}}
         onMouseLeave={()=>badgeHover.current?.cancel()}
+        onAnimationEnd={event=>badgeHover.current?.finish(event)}
         style={{...CHIP_HOVER_STYLE,color:groupControl.color}} onPointerDown={event=>{event.stopPropagation();}}
         onMouseDown={event=>event.stopPropagation()} onDoubleClick={event=>event.stopPropagation()}
-        onClick={event=>{event.preventDefault();event.stopPropagation();groupControl.toggle();}}>
+        onClick={event=>{event.preventDefault();event.stopPropagation();badgeHover.current?.cancel();groupControl.toggle();}}>
         {groupControl.busy?'…':`+${groupControl.count}`}
-        {badgeProgress&&<svg data-pane-strip-badge-progress aria-hidden="true"
-          style={{position:'absolute',inset:-1,width:'calc(100% + 2px)',height:'calc(100% + 2px)',overflow:'visible',pointerEvents:'none'}}>
-          <NavigationDwellStroke shape="rect" attributes={{x:1,y:1,width:'calc(100% - 2px)',height:'calc(100% - 2px)',rx:4,pathLength:100}}/>
-        </svg>}
       </button>:undefined}
       interactiveStatus sharedActivity={sharedActivity}
       onLinkedFileOpen={previewOnly ? undefined : file => {
@@ -342,7 +340,13 @@ export default function PaneTabChip({
         // happened out of sight, on another surface than the one clicked.
         const selection=stripSelection?.menu(tabId) || null;
         openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY, { renameHost: renameHostId,
-          singleTarget:!selection||selection.entries.length===1,paneSelection:selection || undefined,isCurrent:selection?.isCurrent });
+          singleTarget:!selection||selection.entries.length===1,paneSelection:selection || undefined,
+          // Multi-selection settings may follow an exact released B5 pair.
+          // This is only the outer menu's presentation gate; its original
+          // captured execution lease/targets stay canonical. Single-tab legacy
+          // commands keep their existing gate.
+          isCurrent:selection&&selection.entries.length>1
+            ?selection.isGroupCurrent||selection.isCurrent:selection?.isCurrent });
       }}
       onAuxClick={(e) => {
         // Middle-click takes this tab OUT OF THE WINDOW: its chip goes and the

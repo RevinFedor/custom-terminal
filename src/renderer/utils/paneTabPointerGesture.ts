@@ -4,7 +4,7 @@ import { acquireInteractionCursor } from './interactionCursor';
 import { createHorizontalRowDragPreview } from './horizontalRowDragPreview';
 import { historyForegroundPriority } from './historyForegroundPriority.mjs';
 import { beginPaneTabDrag, endPaneTabDrag, getPaneTabDragSnapshot,
-  paneTabDropTargetContainsPoint, resolvePaneTabDropTarget, setPaneTabDragTarget,
+  paneTabDropReleaseDecision, resolvePaneTabDropTarget, setPaneTabDragTarget,
   claimPaneTabDragDrop,
   paneTabGroupDragIsCurrent,
   type PaneTabDragSource } from './paneTabDragBridge';
@@ -18,6 +18,7 @@ type Gesture = {
   source: PaneTabDragSource; point: Point; frame: number;
   preview: ReturnType<typeof createHorizontalRowDragPreview>;
   releaseCursor: () => void; cleanup: () => void; owner: string;
+  inputRevision:number; paintedInputRevision:number;
 };
 let gesture: Gesture | null = null;
 let suppressClick = false;
@@ -47,23 +48,50 @@ function finish(cancelled: boolean, reason: string) {
   const target = snapshot.target;
   uiDragDiagnostic('release-request',{gestureId:drag.source.gestureId,reason,revision:snapshot.revision,
     workflowId:target?.spaceId,paneKey:target?.paneKey,zone:target?.zone,at:target?.at});
-  const inside = !cancelled && target && paneTabDropTargetContainsPoint(target, drag.point.clientX, drag.point.clientY);
+  let decision:any={accepted:false,authority:'none',reason:cancelled?'cancel:'+reason:'target-missing'};
+  let result:any=null,claimed=false,compiled=false,dispatched=false,adopted=false;
+  let stage='containment',releaseReason=decision.reason;
   try {
-    const adopted = !cancelled && finishPaneTabPointer(drag.point);
-    let result:any=null;
-    if(inside && !adopted) {
+    if(!cancelled&&target)decision=paneTabDropReleaseDecision(target,drag.point.clientX,drag.point.clientY,
+      {unpaintedInput:drag.inputRevision!==drag.paintedInputRevision});
+    releaseReason=decision.reason;
+    stage='adoption';adopted=!cancelled&&finishPaneTabPointer(drag.point);
+    if(decision.accepted && target && !adopted) {
       if(drag.source.workflowDrag) {
-        const claimed=claimPaneTabDragDrop(drag.source.rootTabId);
-        const request=claimed && workflowDragRequest(drag.source.workflowDrag,{workflowId:target.spaceId || useWorkspaceStore.getState().activeSpaceId,target});
-        if(request && claimed)void useWorkspaceStore.getState().commitWorkflowDrag(request,{isSourceCurrent:()=>paneTabGroupDragIsCurrent(drag.source,request),
-          isRevealCurrent:claimed.isRevealCurrent}).then(accepted=>
-          console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed='+Number(accepted)));
-      } else result=commitPaintedPaneTabDrop(drag.source.rootTabId);
+        stage='claim';
+        const claim=claimPaneTabDragDrop(drag.source.rootTabId);claimed=!!claim;
+        stage='compile';
+        const request=claim && workflowDragRequest(drag.source.workflowDrag,{workflowId:target.spaceId || useWorkspaceStore.getState().activeSpaceId,target});
+        compiled=!!request;
+        if(request && claim) {
+          stage='dispatch';
+          const saving=useWorkspaceStore.getState().commitWorkflowDrag(request,{isSourceCurrent:()=>paneTabGroupDragIsCurrent(drag.source,request),
+            isRevealCurrent:claim.isRevealCurrent});
+          dispatched=true;
+          void saving.then(accepted=>
+            console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed='+Number(accepted)),error=>
+            console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed=0 error='
+              +(typeof error?.code==='string'?error.code.replace(/[^a-zA-Z0-9_-]/g,'').slice(0,80):'rejected')));
+        } else releaseReason=claim?'compile-rejected':'claim-rejected';
+      } else {
+        stage='legacy-commit';
+        result=commitPaintedPaneTabDrop(drag.source.rootTabId);claimed=!!result.claimed;
+        if(!result.committed)releaseReason=result.claimed?'legacy-write-rejected':'claim-rejected';
+      }
     }
     if (cancelled) cancelPaneTabPointer();
-    console.log('[PaneTabDnd:pointer-release] reason=' + reason + ' source=' + drag.source.rootTabId.slice(-12)
-      + ' committed=' + Number(result?.committed || false) + ' at=' + (result?.target?.at ?? '-'));
+  } catch(error) {
+    releaseReason=stage+'-threw';throw error;
   } finally {
+    uiDragDiagnostic('release-decision',{gestureId:drag.source.gestureId,reason:releaseReason,
+      authority:decision.authority,hit:decision.hit||decision.reason,claimed,compiled,dispatched,adopted});
+    // One bounded existing release line, including in summary mode. Dispatch
+    // is not an ACK; `committed` here remains the synchronous legacy result.
+    console.log('[PaneTabDnd:pointer-release] reason=' + reason + ' source=' + drag.source.rootTabId.slice(-12)
+      + ' committed=' + Number(result?.committed || false) + ' at=' + (result?.target?.at ?? (claimed?target?.at:'-'))
+      + ' gesture='+drag.source.gestureId+' decision='+releaseReason+' authority='+decision.authority
+      + ' hit='+(decision.hit||decision.reason)
+      + ' claimed='+Number(claimed)+' compiled='+Number(compiled)+' dispatched='+Number(dispatched)+' adopted='+Number(adopted));
     endPaneTabDrag(drag.source.rootTabId,drag.source.gestureId);
     clearTabDragNavigationTarget('pane');
     drag.preview.remove();
@@ -88,6 +116,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   if(state.organizationReady && !workflowDrag){uiDragDiagnostic('physical-end',{reason:'source-admission-rejected'});return;}
   const drag: Gesture = {
     source: { ...source, input: 'pointer', pointerId: point.pointerId,gestureId,workflowDrag }, point, frame: 0, owner,
+    inputRevision:0,paintedInputRevision:-1,
     preview: createHorizontalRowDragPreview(sourceElement,
       sample=>uiDragDiagnostic('authored',{gestureId,presentation:'existing-centred-pane-feedback',...sample}),
       sample=>uiDragDiagnostic('pickup-rect',{gestureId,...sample})),
@@ -130,6 +159,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
       setPaneTabDragTarget(resolvePaneTabDropTarget(pointed, p.clientX,
         drag.source.entries.map(entry => entry.tabId), p.clientY));
     }
+    drag.paintedInputRevision=drag.inputRevision;
   };
   const schedule = () => { if (!drag.frame) drag.frame = requestAnimationFrame(paint); };
   const move = (event: PointerEvent) => {
@@ -137,6 +167,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
     if (!(event.buttons & 1)) { finish(true, 'buttons-zero'); return; }
     event.preventDefault();
     drag.point = { clientX: event.clientX, clientY: event.clientY, metaKey: event.metaKey || metaHeld, pointerId: event.pointerId };
+    drag.inputRevision++;
     updatePaneTabPointer(drag.source, drag.point);
     schedule();
   };
@@ -151,6 +182,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
     if (event.key !== 'Meta') return;
     metaHeld=event.type==='keydown';
     drag.point = { ...drag.point, metaKey: metaHeld };
+    drag.inputRevision++;
     updatePaneTabPointer(drag.source, drag.point);
     schedule();
   };

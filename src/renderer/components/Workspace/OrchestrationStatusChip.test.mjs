@@ -20,7 +20,16 @@ test('manual recovery shows a static yellow timer and warning together', () => {
 
   assert.match(presentation, /run\.status === 'waiting_recovery'/);
   assert.match(presentation, /icon: 'recovery'/);
-  assert.match(presentation, /run\.outcome === 'interrupted' \? 'Остановлено вручную'/);
+  const pausedStart = source.indexOf('function isPaused('), pausedEnd = source.indexOf('\nfunction canPause(', pausedStart);
+  const readPresentation = vm.runInNewContext(transformSync(source.slice(pausedStart, pausedEnd) + '\n' + presentation,
+    { loader: 'ts' }).code + '\nrunPresentation', {
+    isOrchestrationResultProofPending: () => false, hasSourceNotificationError: () => false,
+    hasPendingSourceHandoff: () => false, STATUS_LABEL: {},
+  });
+  assert.equal(readPresentation({ status: 'waiting_recovery', outcome: 'interrupted' }, 'source').label, 'Работа прервана');
+  assert.equal(readPresentation({ status: 'waiting_recovery', outcome: 'paused' }, 'source').label, 'На паузе');
+  assert.equal(readPresentation({ status: 'waiting_recovery', outcome: 'interrupted', continuation: { state: 'unconfirmed' } }, 'source').label,
+    'Проверка продолжения');
   assert.match(statusIcon, /presentation\.icon === 'recovery'/);
   assert.match(statusIcon, /presentation\.icon === 'recovery'[\s\S]*?<Timer size=\{13\}/);
   assert.match(statusIcon, /<CircleAlert size=\{10\}/);
@@ -156,6 +165,8 @@ test('detaching an observer never asks the target to cancel Send; exact source h
   const action = vm.runInNewContext(transformSync(source.slice(start, end), { loader: 'ts' }).code + '\nrunAction', {
     useCallback: fn => fn, tabId: 'source', isOrchestrationResultProofPending: () => false,
     canCancelPendingSourceHandoff: run => run.sourceFollowupPending === true,
+    actionInflight: { current: new Set() }, cancellationInflight: { current: new Set() },
+    setActionPending: () => {}, setNewRequestAvailable: () => {},
     setRuns: () => {}, setActionError: () => {},
     ipcRenderer: { invoke: async (channel, args) => { calls.push({ channel, args }); return { ok: true, cancelled: true }; } },
   });
@@ -190,7 +201,8 @@ test('SC tracker navigation uses exact run identity, waits for commit and coales
   let release;
   const pending = new Promise(resolve => { release = resolve; });
   const callback = vm.runInNewContext(transformSync(source.slice(start, end), { loader: 'ts' }).code + '\nopenLinkedTab', {
-    useCallback: fn => fn, tabId: 'source', openingLinkedRuns: { current: new Set() },
+    useCallback: fn => fn, useRef: value => ({ current: value }), useState: initial => [initial, () => {}],
+    tabId: 'source', openingLinkedRuns: { current: new Set() },
     setOpeningLinkedRunIds: () => {}, setActionError: fn => errors.push(fn({})),
     setHistoryOpen: value => calls.push(['history', value]), closeMessage: () => calls.push(['close']),
     useWorkspaceStore: { getState: () => ({ openTabById: () => { throw Error('No terminal target for external research'); } }) },

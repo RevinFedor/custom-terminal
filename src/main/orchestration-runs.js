@@ -1224,6 +1224,19 @@ class OrchestrationRunStore {
     return publicRun(run);
   }
 
+  async ensureExternalResearchDelivery(runId) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId);
+    // Startup may restore a born modern terminal outcome whose previous
+    // process stopped before initializing local delivery. Never mint birth
+    // on load and never replace a frozen/attempted old notification.
+    if (!externalCompletion.hasBirth(run)) return null;
+    externalCompletion.initializeDelivery(run);
+    this._syncSourceFollowupState(run);
+    await this.persistStrict();
+    return publicRun(run);
+  }
+
   async updateExternalResearchDelivery(runId, deliveryId, patch) {
     await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId), d = run?.externalResearchDelivery;
@@ -1573,6 +1586,8 @@ class OrchestrationRunStore {
     run.externalResearchStage = snapshot.stage || run.externalResearchStage || null;
     const scExecution = snapshot.execution;
     const previousUi = run.externalResearchUiState;
+    const acceptsRecoveryEnvelope = scExecution?.version === 1 && Number.isInteger(scExecution.controlRevision)
+      && (!previousUi || previousUi.epoch === scExecution.controlEpoch && scExecution.controlRevision >= Number(previousUi.revision || 0));
     if (scExecution?.version === 1 && (!previousUi || previousUi.epoch !== scExecution.controlEpoch
       || Number(scExecution.controlRevision) >= Number(previousUi.revision || 0))) {
       run.externalResearchUiState = { epoch: scExecution.controlEpoch, revision: scExecution.controlRevision,
@@ -1610,6 +1625,7 @@ class OrchestrationRunStore {
       textKind: result.text_kind || null,
     } : null;
     const operational = externalOperational.ingestOperational(run, snapshot, now);
+    if (acceptsRecoveryEnvelope) run.externalResearchRecoveryEnvelope = require('./external-research-recovery-envelope').recoveryEnvelope(run, snapshot);
     const localOperationalCleared = (!run.externalResearchOperationalRearm || readCurrent)
       && ['queued', 'pending', 'running', 'done', 'error'].includes(externalStatus)
       && externalOperational.clearLocalOperationalEpisode(run, now);
@@ -1643,6 +1659,7 @@ class OrchestrationRunStore {
       run.completedAt = Number(snapshot.doneAt) || now;
       run.completionReason = 'external-research-error';
       run.notificationStatus = run.notificationSuppressed ? 'suppressed' : 'pending';
+      externalCompletion.initializeDelivery(run);
       this._pushChanged(changed, run);
       settled.push(publicRun(run));
       this._refreshAncestors(run.parentRunId, changed, settled, now);
@@ -1692,6 +1709,9 @@ class OrchestrationRunStore {
     run.completedAt = now;
     run.completionReason = 'external-research-start-failed';
     run.notificationStatus = run.notificationSuppressed ? 'suppressed' : 'pending';
+    run.externalResearchLocalOutcome = { version: 1, state: 'failed', phase: 'source_channel',
+      code: run.resultErrorCode, committedAt: now, remoteOutcome: 'unknown' };
+    externalCompletion.initializeDelivery(run);
     run.updatedAt = now;
     this._pushChanged(changed, run);
     settled.push(publicRun(run));
@@ -3314,6 +3334,7 @@ class OrchestrationRunStore {
         baseExecutionContext: normalizeExecutionContext(run.targetExecutionContext),
         baseLookup: buildOrchestrationResultLookup(run),
         promptHash: input.promptHash, auditHash: input.auditHash,
+        ...(typeof input.prompt === 'string' ? { prompt: input.prompt } : {}),
         previousError: run.error || null, previousDeadlineAt: run.recoveryDeadlineAt || null,
       };
       run.resumeAwaitingNewTurn = true;
@@ -3403,6 +3424,53 @@ class OrchestrationRunStore {
     this._adoptExactOrphanChildren(run, changed, run.updatedAt);
     await this.persistStrict();
     return { confirmed: true, run: publicRun(run), changed };
+  }
+
+  async adoptInstallCallbackContinuation(runId, { operationId, capturedAt, originalContext, proof, isCurrent }) {
+    const work = this.reservationChain.catch(() => {}).then(async () => {
+      await this.initialize({ requireAuthority: true });
+      let run = this.runs.get(runId);
+      const sameContext = (a, b) => a?.provider === b?.provider && a?.sessionId === b?.sessionId
+        && !!a?.turnId && a.turnId === b?.turnId && (a.generation ?? null) === (b.generation ?? null)
+        && (a.processId ?? null) === (b.processId ?? null);
+      if (!run || run.runKind && run.runKind !== 'agent' || isTerminalStatus(run.status)
+        || isPausedRun(run) || run.notificationSuppressed || !operationId || typeof isCurrent !== 'function') return { confirmed: false };
+      if (run.installCallbackContinuation?.operationId === operationId) {
+        const prior = run.installCallbackContinuation;
+        return { confirmed: prior.operationId === operationId && prior.proof.operationKey === proof.operationKey
+          && prior.proof.attemptId === proof.attemptId && await isCurrent() === true, idempotent: true, run: publicRun(run) };
+      }
+      if (run.status !== 'waiting_recovery' || !sameContext(run.targetExecutionContext, originalContext)) return { confirmed: false };
+      const context = normalizeExecutionContext(proof.executionContext), owner = continuationOwnerKey(run);
+      if (!context || context.provider !== run.targetToolType || context.sessionId !== proof.sessionId
+        || !context.turnId || context.turnId === originalContext.turnId || !(context.startedAt >= capturedAt)
+        || run.resumeAfterAt && context.startedAt < run.resumeAfterAt
+        || !proof.operationKey || !proof.handoffId?.startsWith('build-install-return:') || !proof.attemptId
+        || !proof.userUuid && !proof.sourceIdentity || !/^[a-f0-9]{64}$/.test(proof.resultPromptHash || '')
+        || await isCurrent() !== true) return { confirmed: false };
+      run = this.runs.get(runId);
+      if (!run || continuationOwnerKey(run) !== owner || isTerminalStatus(run.status) || isPausedRun(run)
+        || !sameContext(run.targetExecutionContext, originalContext)) return { confirmed: false };
+      if (run.installCallbackContinuation) {
+        run.installCallbackContinuations ||= [];
+        run.installCallbackContinuations.push(run.installCallbackContinuation);
+      }
+      run.installCallbackContinuation = { version: 1, operationId, capturedAt,
+        originalContext: normalizeExecutionContext(originalContext), originalLookup: buildOrchestrationResultLookup(run), proof };
+      run.resultPromptHash = proof.resultPromptHash;
+      run.resultPromptProofUserUuid = proof.userUuid || null; run.resultPromptProofSourceIdentity = proof.sourceIdentity || null;
+      run.resultPromptRequestedAt = capturedAt; run.resultAfterAt = null;
+      run.resultComplete = false; run.resultAvailable = false; run.resultProofStatus = 'awaiting-transcript';
+      run.outcome = null; run.ownCompletedAt = null; run.completedAt = null; run.completionReason = null;
+      run.targetExecutionContext = context; run.targetContinuationExecutionContext = null;
+      run.targetLifecycleGeneration = proof.lifecycleGeneration || null; run.sessionId = proof.sessionId;
+      run.resumeAwaitingNewTurn = false; run.waitingForPriorTurn = false; run.recoveryDeadlineAt = null;
+      run.error = null; run.status = 'running'; run.targetBusySeen = true; run.updatedAt = Date.now();
+      const changed = []; this._pushChanged(changed, run);
+      this._adoptExactOrphanChildren(run, changed, run.updatedAt);
+      await this.persistStrict(); return { confirmed: true, run: publicRun(run), changed };
+    });
+    this.reservationChain = work.catch(() => {}); return work;
   }
 
   async acceptContinuationReadyResult(runId, ownerKey, proof) {
@@ -3676,6 +3744,20 @@ class OrchestrationRunStore {
     }
     if (capture() !== snapshot) throw Object.assign(new Error('install_run_state_changed'), { statusCode: 503 });
     return JSON.parse(snapshot);
+  }
+
+  readRestartReturns(runIds) {
+    if (!this._hasStoreAuthority()) return { known: false, reason: 'orchestration-not-ready', runs: [] };
+    // A synchronous metadata view is used for the final FIFO reservation CAS;
+    // it neither initializes the registry nor materializes any provider result.
+    return { known: true, runs: runIds.map(id => this.runs.get(id)).filter(Boolean).map(run => ({
+      runId: run.runId, createdAt: run.createdAt, status: run.status, sourceTabId: run.sourceTabId,
+      externalResearchJobId: run.externalResearchJobId || null,
+      sourceSendTarget: run.sourceSendTarget || null, sourceSessionId: run.sourceSessionId || null,
+      resultComplete: run.resultComplete === true, notifySource: run.notifySource,
+      notificationSuppressed: run.notificationSuppressed === true, notificationCancelRequestedAt: run.notificationCancelRequestedAt || null,
+      notificationStatus: run.notificationStatus, notificationHandoffId: run.notificationHandoffId || null,
+    })) };
   }
 
   // Uses the initialized registry; a metadata GET never initializes/migrates it.

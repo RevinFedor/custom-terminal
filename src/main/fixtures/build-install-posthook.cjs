@@ -2,9 +2,17 @@
 // Source/private only. Node's SQLite replaces the incompatible better-sqlite3
 // binary; this fixture is not native ABI/Electron/provider acceptance.
 const { DatabaseSync } = require('node:sqlite');
-const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm'), Module = require('node:module');
+const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), vm = require('node:vm'), Module = require('node:module');
 class NodeSqlite {
-  constructor(file = ':memory:') { this.raw = new DatabaseSync(file); this.depth = 0; this.name = file; this.open = true; }
+  constructor(file = ':memory:') {
+    if (Buffer.isBuffer(file)) {
+      this.serializedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-adapter-restore-'));
+      const target = path.join(this.serializedRoot, 'restored.sqlite'); fs.writeFileSync(target, file); file = target;
+    }
+    try { this.raw = new DatabaseSync(file); }
+    catch (error) { if (this.serializedRoot) fs.rmSync(this.serializedRoot, { recursive: true, force: true }); throw error; }
+    this.depth = 0; this.name = file; this.open = true;
+  }
   get inTransaction() { return this.depth > 0; }
   exec(sql) { return this.raw.exec(sql); }
   prepare(sql) {
@@ -29,7 +37,15 @@ class NodeSqlite {
     };
     const run = mode('DEFERRED'); run.immediate = mode('IMMEDIATE'); run.deferred = run; run.exclusive = mode('EXCLUSIVE'); return run;
   }
-  close() { this.raw.close(); this.open = false; }
+  serialize() {
+    // Real private SQLite bytes for the existing reopen tests, not a native
+    // better-sqlite3 ABI claim. VACUUM cannot be issued inside a transaction.
+    if (this.depth) throw Error('private_sqlite_serialize_during_transaction');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-adapter-export-'));
+    try { const file = path.join(root, 'snapshot.sqlite'); this.raw.prepare('VACUUM INTO ?').run(file); return fs.readFileSync(file); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+  close() { this.raw.close(); this.open = false; if (this.serializedRoot) fs.rmSync(this.serializedRoot, { recursive: true, force: true }); }
 }
 function codexApi() {
   const original = Module._load;
@@ -125,13 +141,18 @@ async function installContextFixture(t, options = {}) {
   fs.writeFileSync(file, rows.map(row => JSON.stringify(row) + '\n').join(''));
   const auditIdentity = codexApi().getCodexUserRecordIdentity({ ...rows[1], __line: 1,
     __byteOffset: Buffer.byteLength(JSON.stringify(rows[0]) + '\n') }, 'S');
-  assertFixture(store.promoteFromAudit({ success: true, operationKey, attemptId: attempt.attemptId, provider: 'codex', sessionId: 'S',
-    promptHash: identity.promptHash, actualHash: identity.promptHash, entryUuid: auditIdentity.userUuid,
-    sourceIdentity: auditIdentity.sourceIdentity, auditTimestamp: rows[1].timestamp, transcriptBoundary: { byteOffset: 1 } }).promoted,
+  const promoteAudit = (patch = {}) => store.promoteFromAudit({ success: true, operationKey,
+    attemptId: attempt.attemptId, provider: 'codex', sessionId: 'S',
+    promptHash: identity.promptHash, actualHash: identity.promptHash, entryUuid: auditIdentity.uuid,
+    sourceIdentity: auditIdentity.sourceIdentity, auditTimestamp: rows[1].timestamp,
+    transcriptBoundary: { byteOffset: 1 }, ...patch });
+  assertFixture(promoteAudit({ ...(options.sourceOnlyAudit ? { entryUuid: null } : {}), ...options.initialAudit }).promoted,
   'private exact native audit promotion');
   t.after(async () => { queue.dispose(); await new Promise(resolve => setImmediate(resolve));
     for (const watcher of context.watchers.values()) watcher.close(); db.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  return { db, root, source, logical, transport, context, queue, store, state, changes, inputs, reads, resultReader: realRead, operationKey, attempt, auditAt, completedAt,
+  return { db, root, source, logical, transport, context, queue, store, state, changes, inputs, reads, resultReader: realRead, operationKey, attempt, auditAt, completedAt, promoteAudit,
+    callbackProof: () => service.readCallbackProof({ requestId: 'I', jobId: 'J', source }),
+    cancelRequest: () => service.cancelRequest({ requestId: 'I', id: 'J', tabId: '753' }),
     read: () => service.snapshot(), blocked: () => service.blocked('753'), reconcile: () => service.reconcile('753'),
     reconcileAll: () => service.reconcile(),
     restore: () => { service = make(); },

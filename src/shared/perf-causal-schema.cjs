@@ -47,7 +47,7 @@ function sanitizeWorkSummary(value, maxSites = 16) {
   }
   const overflow=own(value,'overflow');
   const context=Object.create(null), rawContext=own(value,'context');
-  for (const key of ['tabId','sessionId','actionId','readId','requestId','fileIdentity','caller']) {
+  for (const key of ['tabId','sessionId','actionId','readId','requestId','initAttemptId','cwdHash','fileIdentity','caller']) {
     const v=token(own(rawContext,key),100); if(v)context[key]=v;
   }
   const omittedSites=count(own(value,'omittedSites')) + Math.max(0,

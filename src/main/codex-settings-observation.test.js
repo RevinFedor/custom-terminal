@@ -8,6 +8,20 @@ const { createCodexSettingsSendRuntime } = require('./codex-settings-send');
 const { codexSettingsObservationCurrent } = require('./codex-settings-send');
 const { createCodexLiveSettingsObserver } = require('./codex-live-settings');
 
+function loadActualSendHarness() {
+  const filename = path.join(__dirname, 'codex-settings-send.integration.test.js');
+  const text = fs.readFileSync(filename, 'utf8'); const end = text.indexOf("test('actual picker measures");
+  assert.ok(end > 0);
+  const fixture = new Module(filename, module);
+  fixture.filename = filename; fixture.paths = Module._nodeModulePaths(path.dirname(filename));
+  const load = fixture.require.bind(fixture);
+  // The shared prefix contains later registered tests as well as the harness.
+  // Importing it into a running parent must not create unfinished nested tests.
+  fixture.require = name => name === 'node:test' ? () => {} : load(name);
+  fixture._compile(text.slice(0, end) + '\nmodule.exports=harness;', filename);
+  return fixture.exports();
+}
+
 test('changed observation resolves Settings display label to its canonical model id', () => {
   const configured = [{ id: 'gpt-6-astra', label: 'GPT-6-Astra' }];
   const resolveModelIdentity = (value) => {
@@ -67,13 +81,7 @@ test('remembered picker result cannot acquire a newer conflicting observation ke
 });
 
 test('actual main picker late return cannot poison subsequent actual settings+Send cache', async () => {
-  const filename = path.join(__dirname, 'codex-settings-send.integration.test.js');
-  const text = fs.readFileSync(filename, 'utf8'); const end = text.indexOf("test('actual picker measures");
-  assert.ok(end > 0);
-  const fixture = new Module(filename, module);
-  fixture.filename = filename; fixture.paths = Module._nodeModulePaths(path.dirname(filename));
-  fixture._compile(text.slice(0, end) + '\nmodule.exports=harness;', filename);
-  const h = await fixture.exports();
+  const h = await loadActualSendHarness();
   const observer = createCodexLiveSettingsObserver({
     capture: () => ({ terminal: h.terminals.get('tab'), runSeq: 2, lifecycleGeneration: 'generation',
       live: true, ownerId: 'writer', sessionId: 'writer' }), publish() {}, now: () => Date.now() + 100,
@@ -92,12 +100,7 @@ test('actual main picker late return cannot poison subsequent actual settings+Se
 });
 
 test('4410: own second picker waits for current chosen pair instead of failing on delayed first-picker footer', async () => {
-  const filename = path.join(__dirname, 'codex-settings-send.integration.test.js');
-  const text = fs.readFileSync(filename, 'utf8');
-  const fixture = new Module(filename, module);
-  fixture.filename = filename; fixture.paths = Module._nodeModulePaths(path.dirname(filename));
-  fixture._compile(text.slice(0, text.indexOf("test('actual picker measures")) + '\nmodule.exports=harness;', filename);
-  const h = await fixture.exports();
+  const h = await loadActualSendHarness();
   const observer = createCodexLiveSettingsObserver({
     capture: () => ({ terminal: h.terminals.get('tab'), runSeq: 2, lifecycleGeneration: 'generation',
       live: true, ownerId: 'writer', sessionId: 'writer' }), publish() {},

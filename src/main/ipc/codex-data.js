@@ -2,6 +2,9 @@ const { ipcMain } = require('node:worker_threads').isMainThread
   && process.env.NOTED_HISTORY_READER_PROCESS !== '1' ? require('electron') : {};
 const path = require('path');
 const fs = require('fs');
+const { isCodexRolloutFile, resolveExistingRollout } = require('../codex-rollout-format');
+const { prepareCodexRolloutReadFile, materializeCodexRolloutForMutation,
+  assertCodexRolloutReadViewCurrent, codexRolloutReadViewBacking } = require('../codex-rollout-read-views');
 const { causal: perfCausal } = require('../perf-causal-context');
 const { drainProjectionSteps, createProjectionControl } = require('../codex-turns-projection');
 const { currentReadControl, createDemandRegistry, isHistoryReadCancelled,
@@ -24,12 +27,19 @@ const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
 const { commitPreparedFork } = require('../fork-commit');
 const { cloneCodexPromptPresentationsForProvenChild } = require('../history-prompt-presentations');
 const { cloneProjectionGraphAsync, measureProjectionGraphBytes, createProjectionIdentityMap, retainCheckpoint } = require('../codex-projection-checkpoint');
+const { HistoryProjectionArena, projectionArenaOf } = require('../history-projection-arena');
+const { readRootedJsonlRange, matchesRootedSessionHead } = require('../codex-root-jsonl');
+const rootText = require('../history-paged-text');
+const rootMachineText = require('../codex-root-machine-text');
+const { createRootPromptText } = require('../codex-root-prompt-text');
+const { CodexRootProjectionOwner, appendRootSourceProof, trimRootSourceProof, verifyRootSourcePrefix, checkpointRootAt } = require('../codex-root-projection-owner');
 const { dehydrateHistoryEntries, historyPayloadStash } = require('../history-payload-dehydrate');
 const {
   buildHistoryRevision,
   validateHistoryRevision,
 } = require('../history-revision');
 const { buildChildProcessEnv } = require('../child-process-env');
+const { beginCatalogLaunchBinding } = require('../codex-model-catalog-binding');
 const {
   createCodexSubagentTracker,
   extractCodexSpawnIdentities,
@@ -315,9 +325,11 @@ function setCodexJsonlCacheEntry(filePath, cached) {
   deleteCodexJsonlCacheEntry(filePath);
   _codexJsonlCache.set(filePath, cached);
   _codexJsonlCacheRawBytes += Number(cached?.size) || 0;
+  cached.compressedBacking = codexRolloutReadViewBacking(filePath);
   _codexRecordSnapshots.set(cached.records, {
     filePath, size: cached.size, mtimeMs: cached.mtimeMs, ctimeMs: cached.ctimeMs,
     fileIdentity: cached.fileIdentity, sourceGeneration: cached.sourceGeneration || '',
+    ...(cached.compressedBacking ? { compressedBacking: cached.compressedBacking } : {}),
   });
   pruneCodexJsonlCache(filePath);
 }
@@ -345,6 +357,7 @@ function getCodexJsonlSourceSnapshot(filePath, sessionId, records = null) {
       fileIdentity: cached.fileIdentity,
       ctimeMs: cached.ctimeMs,
       sourceGeneration: cached.sourceGeneration || '',
+      ...(cached.compressedBacking ? { compressedBacking: cached.compressedBacking } : {}),
       sessionId: sessionId || path.basename(filePath, '.jsonl'),
       linkKind: 'end',
     };
@@ -355,7 +368,8 @@ function getCodexJsonlSourceSnapshot(filePath, sessionId, records = null) {
 }
 
 function compactPreview(value, max = 120) {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  return rootText.isPagedText(value) ? rootText.preview(value, max)
+    : String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
 function recordTimestamp(record) {
@@ -426,7 +440,7 @@ function promoteStableSourceIdentity(entry, nextIdentity) {
 
 function codexPromptPresentationAuditIdentity(record, text) {
   const auditTimestamp = String(recordTimestamp(record) || '').trim();
-  const transportHash = promptAuditFingerprint(text || '');
+  const transportHash = rootText.isPagedText(text) ? rootText.hash(text).slice(0, 16) : promptAuditFingerprint(text || '');
   return auditTimestamp && transportHash
     ? { auditTimestamp, transportHash }
     : null;
@@ -501,6 +515,7 @@ function pathsAreSameOrNested(a, b) {
 }
 
 function safeJsonParse(value, fallback = null) {
+  if (rootText.isPagedText(value)) return rootText.parseJson(value, fallback);
   if (typeof value !== 'string') return fallback;
   try {
     return JSON.parse(value);
@@ -1020,7 +1035,7 @@ function findCodexExecNestedCalls(source) {
 }
 
 function codexHistoryLogicalCalls(call) {
-  const source = call?.toolName === 'exec' && typeof call?.args?.input === 'string' ? call.args.input : '';
+  const source = call?.toolName === 'exec' && rootText.isText(call?.args?.input) ? rootText.materialize(call.args.input, 'exec-parse-source') : '';
   if (!source) return [normalizeCodexSubagentCall(call || {})];
   const resolveRawLiteral = createCodexRawLiteralResolver(source);
   return findCodexExecNestedCalls(source).map((nestedCall, index) => {
@@ -1033,35 +1048,42 @@ function codexHistoryLogicalCalls(call) {
 }
 
 function normalizeCodexHistoryTextPart(text) {
-  let current = String(text || '');
+  let current = rootText.coerce(text || '');
   for (let depth = 0; depth < 2; depth += 1) {
     const trimmed = current.trim();
-    if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) break;
-    let parsed;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      break;
-    }
+    if (!trimmed || (trimmed.charAt(0) !== '{' && trimmed.charAt(0) !== '[')) break;
+    const parsed = safeJsonParse(trimmed);
     if (!parsed || Array.isArray(parsed) || !Array.isArray(parsed.content)) break;
     const content = parsed.content.map((item) => {
       if (!item) return '';
       if (String(item.type || '').toLowerCase().includes('image') || item.image_url) return '[Image output]';
-      return typeof item.text === 'string' ? item.text : '';
+      return rootText.isText(item.text) ? item.text : '';
     }).filter(Boolean);
     if (content.length === 0) break;
-    current = content.join('\n');
+    current = joinCodexHistoryText(content, '\n');
   }
-  if (current.trim() === '{}' || current.trim() === '[]') return '';
+  if (rootText.equal(current.trim(), '{}') || rootText.equal(current.trim(), '[]')) return '';
   return stripBase64Images(current);
+}
+
+function joinCodexHistoryText(values, separator = '\n') {
+  return rootText.concat(values, separator, projectionArenaOf(values));
+}
+
+// These header regexes have observable legacy grammar. The cheap prefix
+// exclusion handles an arbitrary ordinary output without coercing its leaf.
+function codexOutputHeaderMatches(text, pattern, kind) {
+  if (!text) return false;
+  return rootText.isPagedText(text) ? rootMachineText.outputHeader(text, kind) : pattern.test(text);
 }
 
 function codexHistoryOutputParts(rawOutput) {
   if (rawOutput == null) return [];
   if (!Array.isArray(rawOutput)) {
-    return [normalizeCodexHistoryTextPart(typeof rawOutput === 'string' ? rawOutput : stringifyCompact(rawOutput))];
+    return [normalizeCodexHistoryTextPart(rootText.isText(rawOutput) ? rawOutput : stringifyCompact(rawOutput))];
   }
-  const parts = [];
+  const arena = projectionArenaOf(rawOutput);
+  const parts = arena ? arena.make('array') : [];
   for (const item of rawOutput) {
     if (!item) continue;
     const type = String(item.type || '').toLowerCase();
@@ -1069,14 +1091,14 @@ function codexHistoryOutputParts(rawOutput) {
       parts.push('[Image output]');
       continue;
     }
-    const text = typeof item.text === 'string'
+    const text = rootText.isText(item.text)
       ? item.text
-      : (typeof item.output_text === 'string' ? item.output_text : '');
+      : (rootText.isText(item.output_text) ? item.output_text : '');
     if (text) parts.push(normalizeCodexHistoryTextPart(text));
   }
-  if (/^Script completed\b[\s\S]*\nOutput:\n?$/.test(parts[0] || '')) {
+  if (codexOutputHeaderMatches(parts[0], /^Script completed\b[\s\S]*\nOutput:\n?$/, 'completed')) {
     parts.shift();
-  } else if (parts.length > 1 && /^Script running\b[\s\S]*\nOutput:\n?$/.test(parts[0])) {
+  } else if (parts.length > 1 && codexOutputHeaderMatches(parts[0], /^Script running\b[\s\S]*\nOutput:\n?$/, 'running')) {
     parts.shift();
   }
   return parts;
@@ -1105,14 +1127,18 @@ function codexHistoryOutputParts(rawOutput) {
 function codexHistoryCellId(rawOutput) {
   // When a streaming cell already emitted output, the presentation splitter
   // removes its machine header. Read that first block before splitting too.
-  const header = Array.isArray(rawOutput) && typeof rawOutput[0]?.text === 'string' ? rawOutput[0].text : '';
-  const text = [header, ...codexHistoryOutputParts(rawOutput)].join('\n');
-  return /^\s*Script running with cell ID\s+(\d+)\s*$/m.exec(text)?.[1] || null;
+  const header = Array.isArray(rawOutput) && rootText.isText(rawOutput[0]?.text) ? rawOutput[0].text : '';
+  const parts = codexHistoryOutputParts(rawOutput);
+  const text = rootText.concat((function* () { yield header; yield* parts; })(), '\n',
+    projectionArenaOf(parts) || rootText.info(header)?.arena || rootText.info(parts[0])?.arena);
+  if (!text.includes('Script running with cell ID')) return null;
+  return rootText.isPagedText(text) ? rootMachineText.cellId(text)
+    : /^\s*Script running with cell ID\s+(\d+)\s*$/m.exec(text)?.[1] || null;
 }
 
 function codexHistorySettledOutputParts(rawOutput) {
   return codexHistoryOutputParts(rawOutput).filter(part =>
-    !/^Script running with cell ID\s+\d+\b[\s\S]*\nOutput:\n?$/.test(part));
+    !codexOutputHeaderMatches(part, /^Script running with cell ID\s+\d+\b[\s\S]*\nOutput:\n?$/, 'settled'));
 }
 
 function parseApplyPatchHunks(body) {
@@ -1353,8 +1379,8 @@ function sameHistoryPatchPaths(left, right) {
 }
 
 function codexNestedApplyPatchTexts(call) {
-  if (call?.toolName !== 'exec' || typeof call?.args?.input !== 'string') return [];
-  const source = call.args.input;
+  if (call?.toolName !== 'exec' || !rootText.isText(call?.args?.input)) return [];
+  const source = rootText.materialize(call.args.input, 'exec-patch-source');
   const values = [];
   for (const nestedCall of findCodexExecNestedCalls(source)) {
     if (nestedCall.toolName !== 'apply_patch') continue;
@@ -1376,7 +1402,7 @@ function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
   // resolve `const patch = header + files.map(...)`), so the same-call_id
   // exec that visibly invokes tools.apply_patch is the authoritative owner.
   if (direct?.toolName === 'exec'
-      && typeof direct?.args?.input === 'string'
+      && rootText.isText(direct?.args?.input)
       && direct.args.input.includes('apply_patch')) {
     direct.patchApplyEvents.push(payload);
     return true;
@@ -1384,21 +1410,21 @@ function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
 
   const eventPaths = codexPatchEventPathSet(payload, cwd);
   if (!eventPaths) return false;
-  const eventTurnId = String(payload?.turn_id || '');
-  const candidates = [];
+  const eventTurnId = rootText.coerce(payload?.turn_id || '');
+  let candidate = null, candidates = 0;
   for (const call of pendingCalls.values()) {
     if (call.toolName !== 'exec') continue;
-    if (eventTurnId && call.turnId && eventTurnId !== call.turnId) continue;
+    if (eventTurnId && call.turnId && !rootText.equal(eventTurnId,call.turnId)) continue;
     const matches = codexNestedApplyPatchTexts(call).some((patchText) => (
       sameHistoryPatchPaths(expectedHistoryPatchPaths(patchText, cwd), eventPaths)
     ));
-    if (matches) candidates.push(call);
+    if (matches) { candidate = call; candidates++; }
   }
-  if (candidates.length === 1) {
-    candidates[0].patchApplyEvents.push(payload);
+  if (candidates === 1) {
+    candidate.patchApplyEvents.push(payload);
     return true;
   }
-  if (candidates.length > 1) return false;
+  if (candidates > 1) return false;
 
   // Last resort — ORDER, because identity is not available at all.
   //
@@ -1418,18 +1444,18 @@ function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
   // apply_patch, it is the owner. Two open candidates is ambiguous and the
   // event is dropped rather than guessed: a wrong attachment would print
   // someone else's files.
-  const open = [];
+  let open = null, openCount = 0;
   for (const call of pendingCalls.values()) {
-    if (eventTurnId && call.turnId && eventTurnId !== call.turnId) continue;
-    if (call.toolName === 'apply_patch') { open.push(call); continue; }
+    if (eventTurnId && call.turnId && !rootText.equal(eventTurnId,call.turnId)) continue;
+    if (call.toolName === 'apply_patch') { open = call; openCount++; continue; }
     if (call.toolName === 'exec'
-        && typeof call?.args?.input === 'string'
+        && rootText.isText(call?.args?.input)
         && call.args.input.includes('apply_patch')) {
-      open.push(call);
+      open = call; openCount++;
     }
   }
-  if (open.length !== 1) return false;
-  open[0].patchApplyEvents.push(payload);
+  if (openCount !== 1) return false;
+  open.patchApplyEvents.push(payload);
   return true;
 }
 
@@ -1465,9 +1491,9 @@ function humanizeCodexToolName(toolName) {
 function firstCodexToolDetail(args) {
   if (!args || typeof args !== 'object') return '';
   const direct = args.query || args.q || args.path || args.file_path || args.location || args.uri || args.pattern || args.prompt;
-  if (typeof direct === 'string') return direct;
+  if (rootText.isText(direct)) return direct;
   const query = Array.isArray(args.search_query) ? args.search_query[0]?.q : null;
-  if (typeof query === 'string') return query;
+  if (rootText.isText(query)) return query;
   return '';
 }
 
@@ -1484,9 +1510,9 @@ function firstCodexMcpDetail(args) {
   if (!args || typeof args !== 'object') return '';
   const direct = args.label || args.query || args.q || args.path || args.file_path
     || args.location || args.uri || args.pattern;
-  if (typeof direct === 'string') return direct;
+  if (rootText.isText(direct)) return direct;
   const query = Array.isArray(args.search_query) ? args.search_query[0]?.q : null;
-  return typeof query === 'string' ? query : '';
+  return rootText.isText(query) ? query : '';
 }
 
 function normalizeCodexHistoryCall(toolName, args, namespace = '') {
@@ -1499,7 +1525,7 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
     : name;
 
   if (qualifiedName === 'apply_patch') {
-    const patchText = typeof input.input === 'string' ? input.input : '';
+    const patchText = rootText.isText(input.input) ? rootText.materialize(input.input, 'patch-parser') : '';
     const actions = parseApplyPatchHistoryActions(patchText);
     if (actions.length > 0) return actions;
     // No readable patch and no authoritative apply event (the caller tries
@@ -1514,7 +1540,7 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
     // Unparsed nested arguments arrive as the RAW `{cmd,workdir:"…"}` source
     // (shorthand/variable args defeat the literal parser). That junk must
     // never become the command: recover the cmd string by regex, else drop.
-    if (typeof command === 'string' && command.trim().startsWith('{')) {
+    if (rootText.isText(command) && command.trim().startsWith('{')) {
       const recovered = command.match(/cmd\s*:\s*"((?:[^"\\]|\\.)+)"/)
         || command.match(/cmd\s*:\s*'((?:[^'\\]|\\.)+)'/)
         || command.match(/cmd\s*:\s*`((?:[^`\\]|\\.)+)`/);
@@ -1525,8 +1551,8 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
       args: {
         command: command || humanizeCodexToolName(qualifiedName),
         description: input.justification || '',
-        ...(typeof input.workdir === 'string' ? { workdir: input.workdir } : {}),
-        ...(typeof input.cwd === 'string' ? { cwd: input.cwd } : {}),
+        ...(rootText.isText(input.workdir) ? { workdir: input.workdir } : {}),
+        ...(rootText.isText(input.cwd) ? { cwd: input.cwd } : {}),
       },
     }];
   }
@@ -1561,7 +1587,9 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
       toolName: 'MCP',
       mcpServer,
       mcpMethod,
-      args: { summary: detail ? `${action} — ${detail}` : action, ...input },
+      args: projectionArenaOf(input)
+        ? projectionArenaOf(input).assign({ summary: detail ? rootText.concat([action,' — ',detail], '', projectionArenaOf(input)) : action },input)
+        : { summary: detail ? `${action} — ${detail}` : action, ...input },
     }];
   }
   if (qualifiedName === 'update_plan') {
@@ -1625,7 +1653,7 @@ function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan
       const result = matched?.get(index);
       for (const action of callGroups[index]) {
         if (result) {
-          action.result = result.value === undefined ? '' : codexHistoryOutputParts(result.value).join('\n');
+          action.result = result.value === undefined ? '' : joinCodexHistoryText(codexHistoryOutputParts(result.value));
           action.isError = !!isError || result.isError;
         } else if (!pending) {
           action.result = '';
@@ -1638,7 +1666,7 @@ function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan
       // child; keep the actual script/output available as a separate card.
       callGroups.push([{
         toolName: 'Script', args: { command: source },
-        result: output.join('\n'), isError: !!isError,
+        result: joinCodexHistoryText(output), isError: !!isError,
       }]);
     }
     return;
@@ -1646,8 +1674,8 @@ function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan
   const perCall = callGroups.length === parts.length
     ? parts
     : callGroups.length === 1
-      ? [parts.join('\n')]
-      : callGroups.map((_, index) => index === callGroups.length - 1 ? parts.join('\n') : '');
+      ? [joinCodexHistoryText(parts)]
+      : callGroups.map((_, index) => index === callGroups.length - 1 ? joinCodexHistoryText(parts) : '');
   for (let index = 0; index < callGroups.length; index += 1) {
     for (const action of callGroups[index]) {
       action.result = perCall[index] ?? '';
@@ -1657,10 +1685,10 @@ function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan
 }
 
 function codexHistoryActionsForCall(call, rawOutput, isError) {
-  const source = call?.toolName === 'exec' && typeof call?.args?.input === 'string'
-    ? call.args.input
+  const source = call?.toolName === 'exec' && rootText.isText(call?.args?.input)
+    ? rootText.materialize(call.args.input, 'exec-parse-source')
     : '';
-  const callId = call?.callId == null ? '' : String(call.callId);
+  const callId = call?.callId == null ? '' : rootText.coerce(call.callId);
   const nested = source ? findCodexExecNestedCalls(source) : [];
   const settledPlan = nested.length ? inspectCodexSettledEmission(source, nested) : null;
   const resolveRawLiteral = createCodexRawLiteralResolver(source);
@@ -1716,7 +1744,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       args: lookup ? { summary: 'Inspect available tools' } : { command: source },
     }]);
   } else {
-    const patchText = call?.toolName === 'apply_patch' && typeof call?.args?.input === 'string'
+    const patchText = call?.toolName === 'apply_patch' && rootText.isText(call?.args?.input)
       ? call.args.input
       : null;
     const canonicalPatchActions = patchText
@@ -1745,7 +1773,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     if (!spawn) continue;
     const scope = settledPlan ? group.map(action => action.result || '').join('\n')
       : outputParts.length === callGroups.length ? outputParts[groupIndex]
-      : spawnGroups.length === 1 ? outputParts.join('\n') : '';
+      : spawnGroups.length === 1 ? joinCodexHistoryText(outputParts) : '';
     const identities = extractCodexSpawnIdentities(scope, spawn.subagentSpawn.namespace);
     if (identities.length) {
       callGroups[groupIndex] = identities.map(identity => {
@@ -1753,7 +1781,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
         const base = spawn.description === 'Subagent' ? identity.nickname || identity.task_name || 'Subagent'
           : spawn.description + (identity.nickname ? ' — ' + identity.nickname : '');
         return { ...spawn, description: base, baseDescription: base,
-          toolUseId: source ? `${callId}:subagent:${nativeKey}` : callId, agentSessionId: identity.agent_id || undefined,
+          toolUseId: source ? rootText.concat([callId,':subagent:',nativeKey]) : callId, agentSessionId: identity.agent_id || undefined,
           startedAt: Date.parse(call?.timestamp || '') || undefined,
           subagentStatus: 'running',
           subagentSpawn: { ...spawn.subagentSpawn, accepted: true, identity, parentCallId: callId },
@@ -1762,7 +1790,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     } else {
       spawn.subagentSpawn = { ...spawn.subagentSpawn, accepted: rawOutput === undefined || cellId ? null : false,
         parentCallId: callId };
-      spawn.toolUseId = `${callId}:spawn:${groupIndex}`;
+      spawn.toolUseId = rootText.concat([callId,':spawn:',String(groupIndex)]);
       if (isError) { spawn.spawnRejected = true; spawn.subagentStatus = 'interrupted'; }
     }
   }
@@ -1776,7 +1804,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       return {
         ...action,
         ...(recordTime ? { recordTime } : {}),
-        ...(callId && !action.toolUseId ? { toolUseId: String(callId) } : {}),
+        ...(callId && !action.toolUseId ? { toolUseId: callId } : {}),
         ...(action.result === undefined ? {} : { result: action.result }),
       };
     }
@@ -1785,7 +1813,10 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     // row-window stubs can carry the same fields without content.
     const classified = classifyHistoryAction({
       toolName: action.toolName,
-      args: action.args,
+      // Shell classification still uses the established full-string grammar.
+      // Its exact conversion is measured as a remaining legacy operation.
+      args: action.toolName === 'Bash' && rootText.isPagedText(action.args?.command)
+        ? { ...action.args, command: rootText.materialize(action.args.command, 'shell-classification') } : action.args,
       mcpServer: action.mcpServer,
       mcpMethod: action.mcpMethod,
     });
@@ -1793,7 +1824,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       tool: '__raw__',
       rawTool: {
         ...(recordTime ? { recordTime } : {}),
-        ...(callId ? { toolUseId: `${callId}:canonical:${action.__canonicalIndex ?? index}` } : {}),
+        ...(callId ? { toolUseId: rootText.concat([callId,':canonical:',String(action.__canonicalIndex ?? index)]) } : {}),
         toolName: action.toolName,
         args: action.args || {},
         family: classified.family,
@@ -1823,11 +1854,11 @@ function fillPendingCodexHistoryActions(actions, rawOutput, isError, sourceRecor
 
 function parseToolArguments(payload) {
   if (payload?.arguments != null) {
-    return typeof payload.arguments === 'string'
+    return rootText.isText(payload.arguments)
       ? safeJsonParse(payload.arguments, { raw: payload.arguments })
       : payload.arguments;
   }
-  if (payload?.input != null && typeof payload.input !== 'string') return payload.input;
+  if (payload?.input != null && !rootText.isText(payload.input)) return payload.input;
   return {};
 }
 
@@ -1894,28 +1925,22 @@ function collectCodexDocsAttributes(currentUser, payload, cwd) {
 
 function extractTextContent(content) {
   if (!content) return '';
-  if (typeof content === 'string') return content;
+  if (rootText.isText(content)) return content;
   if (!Array.isArray(content)) {
-    if (typeof content.text === 'string') return content.text;
-    if (typeof content.value === 'string') return content.value;
+    if (rootText.isText(content.text)) return content.text;
+    if (rootText.isText(content.value)) return content.value;
     return '';
   }
-  const parts = [];
-  for (const part of content) {
-    if (!part) continue;
-    if (typeof part === 'string') {
-      parts.push(part);
-    } else if (typeof part.text === 'string') {
-      parts.push(part.text);
-    } else if (typeof part.value === 'string') {
-      parts.push(part.value);
-    } else if (part.type === 'input_text' && typeof part.text === 'string') {
-      parts.push(part.text);
-    } else if (part.type === 'output_text' && typeof part.text === 'string') {
-      parts.push(part.text);
+  const arena = projectionArenaOf(content);
+  const parts = (function* () {
+    for (const part of content) {
+      if (!part) continue;
+      if (rootText.isText(part)) yield part;
+      else if (rootText.isText(part.text)) yield part.text;
+      else if (rootText.isText(part.value)) yield part.value;
     }
-  }
-  return parts.join('\n');
+  })();
+  return rootText.concat(parts, '\n', arena);
 }
 
 function formatReplacementHistory(replacementHistory) {
@@ -1943,11 +1968,11 @@ function formatReplacementHistory(replacementHistory) {
 
 function extractReasoning(summary) {
   if (!summary) return '';
-  if (typeof summary === 'string') return summary;
+  if (rootText.isText(summary)) return summary;
   if (!Array.isArray(summary)) return '';
   return summary.map((item) => {
     if (!item) return '';
-    if (typeof item === 'string') return item;
+    if (rootText.isText(item)) return item;
     return item.text || item.summary || item.content || '';
   }).filter(Boolean).join('\n');
 }
@@ -2017,7 +2042,7 @@ function codexCompactCompanionLines(records) {
   return new Set(codexCompactCompanionPairs(records).values());
 }
 
-async function walkJsonlFiles(rootDir, maxFiles = 4000) {
+async function walkJsonlFiles(rootDir, maxFiles = 4000, { includeCompressed = false } = {}) {
   const out = [];
   async function walk(dir) {
     let entries;
@@ -2030,7 +2055,7 @@ async function walkJsonlFiles(rootDir, maxFiles = 4000) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         await walk(full);
-      } else if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.includes('.with-rollbacks-backup')) {
+      } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || includeCompressed && isCodexRolloutFile(entry.name)) && !entry.name.includes('.with-rollbacks-backup')) {
         out.push(full);
         if (out.length >= maxFiles) return;
       }
@@ -2136,6 +2161,7 @@ function codexRecordTypeFromPrefix(buffer) {
 }
 
 async function readCodexSessionMetadata(filePath, options = {}) {
+  if (typeof filePath === 'string' && filePath.endsWith('.jsonl.zst')) filePath = (await prepareCodexRolloutReadFile(filePath)).filePath;
   const maxBytes = Math.max(1, Number(options.maxBytes) || CODEX_SESSION_META_HEAD_MAX_BYTES);
   const chunkBytes = Math.max(1, Math.min(
     maxBytes,
@@ -3180,33 +3206,61 @@ function logCodexSessionCandidateSkip(meta, filePath, reason, { sourceSessionId 
 // the normal walk.
 const codexSessionFilePathMemo = new Map();
 
-async function findCodexSessionFile(sessionId, cwd, {
+async function locateCodexSessionFile(sessionId, cwd, {
+  rootedIdentity = null,
   allowContentScan = true,
   sessionsDir = CODEX_SESSIONS_DIR,
 } = {}) {
-  if (!sessionId || !fs.existsSync(sessionsDir)) return null;
+  if (!sessionId) return null;
+  const roots = sessionsDir === CODEX_SESSIONS_DIR
+    ? [sessionsDir, path.join(CODEX_HOME, 'archived_sessions')] : [sessionsDir];
+  if (!roots.some(root => fs.existsSync(root))) return null;
 
   const memoKey = sessionId + ':' + (sessionsDir || '');
   const memoized = codexSessionFilePathMemo.get(memoKey);
   if (memoized) {
     try {
-      await fs.promises.access(memoized);
-      return { filePath: memoized };
+      const resolved = await resolveExistingRollout(memoized);
+      if (resolved.state !== 'present') throw Object.assign(Error('Source unavailable'), { code: resolved.state === 'unknown' ? 'CODEX_SOURCE_UNAVAILABLE' : 'ENOENT' });
+      codexSessionFilePathMemo.set(memoKey, resolved.filePath);
+      return { filePath: resolved.filePath, representation: resolved.representation };
     } catch {
       codexSessionFilePathMemo.delete(memoKey);
     }
   }
 
-  const files = await walkJsonlFiles(sessionsDir);
-  const suffixHit = files.find((file) => path.basename(file).includes(sessionId) && path.basename(file).endsWith('.jsonl'));
+  const files = [];
+  let suffixHit = null;
+  for (const root of roots) {
+    const discovered = await walkJsonlFiles(root, 4000, { includeCompressed: true });
+    files.push(...discovered);
+    const matching = discovered.filter(file => path.basename(file).includes(sessionId) && isCodexRolloutFile(file));
+    suffixHit = matching.find(file => file.endsWith('.jsonl')) || matching[0];
+    if (suffixHit) break;
+  }
   if (suffixHit) {
-    codexSessionFilePathMemo.set(memoKey, suffixHit);
-    return { filePath: suffixHit };
+    const physical = await resolveExistingRollout(suffixHit);
+    if (physical.state === 'unknown') throw Object.assign(Error('Codex source unavailable'), { code: 'CODEX_SOURCE_UNAVAILABLE' });
+    if (physical.state === 'present') {
+      codexSessionFilePathMemo.set(memoKey, physical.filePath);
+      return { filePath: physical.filePath, representation: physical.representation };
+    }
   }
   if (!allowContentScan) return null;
 
   const normalizedCwd = cwd ? path.resolve(cwd) : null;
   for (const filePath of files) {
+    // Native compressed names contain their exact UUID. Do not transcode an
+    // entire archive merely because an unrelated/missing UUID was requested.
+    if (filePath.endsWith('.jsonl.zst')) continue;
+    if (rootedIdentity) {
+      let matched;
+      try { matched = await rootedIdentity(filePath); }
+      catch (error) { if (['ENOENT','ENOTDIR'].includes(error.code)) continue; throw error; }
+      if (!matched) continue;
+      codexSessionFilePathMemo.set(memoKey,filePath);
+      return { filePath };
+    }
     let metadata;
     try {
       metadata = await readCodexSessionMetadata(filePath);
@@ -3225,6 +3279,31 @@ async function findCodexSessionFile(sessionId, cwd, {
     return { filePath };
   }
   return null;
+}
+
+async function findCodexSessionFile(sessionId, cwd, options = {}) {
+  const found = await locateCodexSessionFile(sessionId, cwd, options);
+  if (!found) return null;
+  // History may borrow a disposable decoded inode. Live append/turn observers
+  // need the native physical source instead and must never borrow that view.
+  // A zstd-only result is still readable history, not an appendable writer.
+  if (options.purpose === 'live') {
+    if (found.filePath.endsWith('.jsonl.zst')) return found;
+    const before = await fs.promises.stat(found.filePath);
+    const metadata = await readCodexSessionMetadata(found.filePath);
+    const after = await fs.promises.stat(found.filePath);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw Object.assign(new Error('Native Codex source changed during discovery'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+    }
+    if (metadata.meta?.id !== sessionId || !isCodexUserTuiSession(metadata.meta)) {
+      throw Object.assign(new Error('Native Codex source identity mismatch'), { code: 'CODEX_LIVE_SOURCE_IDENTITY_MISMATCH' });
+    }
+    return found;
+  }
+  const readable = await prepareCodexRolloutReadFile(found.filePath);
+  await assertCodexRolloutReadViewCurrent(readable.filePath);
+  return { ...found, ...readable };
 }
 
 async function findLatestCodexSession({
@@ -3762,13 +3841,13 @@ function pushAssistantEntry(
   });
 }
 
-function applyRollback(list, numTurns) {
+function applyRollback(list, numTurns, rooted = null) {
   const requestedTurns = Number(numTurns || 0);
   const beforeCount = list.length;
   if (!requestedTurns || requestedTurns <= 0) {
     return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
   }
-  const turnIds = [];
+  const turnIds = rooted ? rooted.make('array') : [];
   for (let i = list.length - 1; i >= 0; i--) {
     const tid = list[i].turnIndex;
     if (typeof tid !== 'number') continue;
@@ -3778,7 +3857,8 @@ function applyRollback(list, numTurns) {
   if (turnIds.length === 0) {
     return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
   }
-  const remove = new Set(turnIds);
+  const remove = rooted ? rooted.make('set') : new Set();
+  for (const id of turnIds) remove.add(id);
   let removedEntries = 0;
   const removedPreview = [];
   for (let i = list.length - 1; i >= 0; i--) {
@@ -3867,16 +3947,32 @@ function rememberCodexNativeQuestion(definitions, record, sessionId, turnIndex) 
   if (record?.type !== 'response_item' || payload.type !== 'function_call'
     || !['request_user_input_async', 'functions.request_user_input_async'].includes(payload.name)
     || !['', 'functions'].includes(payload.namespace || '')) return;
+  let args = parseToolArguments(payload), callId = payload.call_id;
+  const arena = projectionArenaOf(args);
+  if (arena && Array.isArray(args?.questions)) {
+    // This shared legacy proof reader requires primitive titles. Preserve its
+    // exact hashes/validation while explicitly accounting the still-unported
+    // question-list boundary instead of treating paged titles as missing.
+    arena.metrics.maxNativeQuestionArray = Math.max(arena.metrics.maxNativeQuestionArray || 0, args.questions.length);
+    args = { questions: Array.from(args.questions, question => ({
+      title: rootText.isPagedText(question?.title) ? rootText.materialize(question.title, 'native-question-title') : question?.title,
+    })) };
+    if (rootText.isPagedText(callId)) callId = rootText.materialize(callId, 'native-question-call-id');
+  }
   registerNativeQuestionDefinition(definitions, codexNativeQuestionDefinition({
-    toolName: payload.name, namespace: payload.namespace || '', callId: payload.call_id,
-    args: parseToolArguments(payload), turnIndex,
+    toolName: payload.name, namespace: payload.namespace || '', callId,
+    args, turnIndex,
     physicalSessionId: codexRecordPhysicalSessionId(record, sessionId),
     sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-assistant'),
   }, questionReplyFingerprint));
 }
 
 function attachCodexQuestionReplyProof(entry, definitions, physicalSessionId) {
-  const proof = proveCodexNativeQuestionReply(entry.content, definitions, physicalSessionId, questionReplyFingerprint);
+  const content = entry.content;
+  const candidate = rootText.isPagedText(content)
+    ? (content.trim().startsWith('<send_user_message_question_reply>')
+      ? rootText.materialize(content, 'native-question-reply') : '') : content;
+  const proof = proveCodexNativeQuestionReply(candidate, definitions, physicalSessionId, questionReplyFingerprint);
   if (proof) entry.questionReplyProof = proof;
   else delete entry.questionReplyProof;
 }
@@ -4397,28 +4493,25 @@ function refreshCodexSubagentCards(cards, sessionId) {
   return drainProjectionSteps(refreshCodexSubagentCardSteps(cards, sessionId));
 }
 
-function* refreshCodexSubagentCardSteps(cards, sessionId) {
+function* refreshCodexSubagentCardSteps(cards, sessionId, sourceOptions = {}) {
   for (const card of cards) {
     yield;
     const generation = card.processOwnerSource && getCodexProcessActionGeneration(card.processOwnerSource);
     if (generation) card.processGeneration = generation;
     else delete card.processGeneration;
   }
-  const tracked = [];
+  let tracked = 0, resolved = 0;
   for (const card of cards) {
     yield;
-    if (card.subagentStatus === 'running'
+    if (!(card.subagentStatus === 'running'
       || (card.subagentStatus === 'completed' && (!Number(card.completedAt)
-        || card.completionTimingSource === 'parent'))) tracked.push(card);
-  }
-  let resolved = 0;
-  for (const card of tracked) {
-    yield;
+        || card.completionTimingSource === 'parent')))) continue;
+    tracked++;
     if (!card.agentSessionId) continue;
     const timingKey = String(card.startedAt || 0) + ':' + String(card.completedAt || 0);
     if (card.subagentStatus === 'completed' && card.completionTimingAttemptKey === timingKey) continue;
     card.completionTimingAttemptKey = timingKey;
-    const filePath = findCodexAgentFile({ agentSessionId: card.agentSessionId });
+    const filePath = findCodexAgentFile({ agentSessionId: card.agentSessionId, sessionsDir: sourceOptions.sessionsDir });
     if (!filePath) continue;
     const completion = readAgentCompletionProof({ toolType: 'codex', filePath, notBefore: card.startedAt });
     if (!completion.finished) continue;
@@ -4433,16 +4526,43 @@ function* refreshCodexSubagentCardSteps(cards, sessionId) {
     }
   }
   if (resolved) console.log('[CodexSubagents] closed by own transcript: ' + resolved
-    + '/' + tracked.length + ' session=' + String(sessionId).slice(0, 8));
+    + '/' + tracked + ' session=' + String(sessionId).slice(0, 8));
 }
 
-function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {}) {
+function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink, rooted, sourceOptions = {} } = {}) {
+  if (rooted && !(rooted instanceof HistoryProjectionArena)) throw new TypeError('HistoryProjectionArena required');
+  if (rooted && catalogSink) throw new TypeError('rooted canonical and catalog projection are distinct owners');
+  if (rooted && !rooted.inStep) return rooted.step(() => createCodexHistoryProjector(sessionId, seed, { rooted, sourceOptions }));
+  if (rooted) seed = rooted.state();
+  const own = value => rooted ? rooted.own(value) : value;
+  const sameOwner = (left, right) => rooted ? rooted.same(left, right) : left === right;
+  const list = () => rooted ? rooted.make('array') : [];
+  const map = () => rooted ? rooted.make('map') : new Map();
+  const promptText = rooted ? createRootPromptText(rooted) : null;
+  const presentUserText = promptText?.presentation || codexUserMessagePresentationText;
+  const userImageRefs = promptText?.imageRefs || codexUserMessageImageRefs;
+  const compareUserText = promptText?.matches || codexUserCarrierTextsMatch;
+  const environmentUserText = promptText?.environment || isCodexEnvironmentContextUserText;
+  const goalUserText = promptText?.goal || isCodexGoalContinuationUserText;
+  const instructionsUserText = promptText?.instructions || isCodexProjectInstructionsUserText;
+  const abortedUserText = promptText?.aborted || isCodexTurnAbortedUserText;
+  const auditUserText = promptText?.fingerprint || promptAuditFingerprint;
   // Opt-in catalog projection: ownership, row placement and rollback still
   // belong to this reducer. The sink detaches payloads, never reduces turns.
   const retainUserText = (text, record) => catalogSink?.retainUserText?.(text, record) ?? text;
   const userTextsMatch = (left, right) => catalogSink?.userTextsMatch
-    ? catalogSink.userTextsMatch(left, right) : codexUserCarrierTextsMatch(left, right);
-  const retainUserEntry = (entry, record) => catalogSink?.onUserEntry?.(entry, record);
+    ? catalogSink.userTextsMatch(left, right) : compareUserText(left, right);
+  const bindUserRecordByteOffset = (entry, record) => {
+    // The selected physical carrier owns the byte boundary. Missing/invalid
+    // coordinates remain unavailable, never line-number or identity parsing.
+    const offset = record?.__byteOffset;
+    if (Number.isSafeInteger(offset) && offset >= 0) entry.recordByteOffset = offset;
+    else delete entry.recordByteOffset;
+  };
+  const retainUserEntry = (entry, record) => {
+    bindUserRecordByteOffset(entry, record);
+    return catalogSink?.onUserEntry?.(entry, record);
+  };
   const pushProjectedAssistantEntry = (...args) => {
     const target = args[0], before = target.length;
     pushAssistantEntry(...args);
@@ -4450,13 +4570,14 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       catalogSink?.onAssistantEntry?.(target[index], args[2]);
     }
   };
-  const entries = seed.entries ?? [];
-  const questionDefinitions = seed.questionDefinitions ?? new Map();
-  const pendingResponseUsers = seed.pendingResponseUsers ?? [];
-  const pendingProjectInstructions = seed.pendingProjectInstructions ?? [];
-  const pendingCalls = seed.pendingCalls ?? new Map();
-  const pendingExecCells = seed.pendingExecCells ?? new Map();
-  const subagents = createCodexSubagentTracker(seed.subagents);
+  const entries = seed.entries ?? (rooted ? (seed.entries = list()) : []);
+  const questionDefinitions = seed.questionDefinitions ?? (rooted ? (seed.questionDefinitions = map()) : new Map());
+  const pendingResponseUsers = seed.pendingResponseUsers ?? (rooted ? (seed.pendingResponseUsers = list()) : []);
+  const pendingProjectInstructions = seed.pendingProjectInstructions ?? (rooted ? (seed.pendingProjectInstructions = list()) : []);
+  const pendingCalls = seed.pendingCalls ?? (rooted ? (seed.pendingCalls = map()) : new Map());
+  const pendingExecCells = seed.pendingExecCells ?? (rooted ? (seed.pendingExecCells = map()) : new Map());
+  if (rooted && !seed.subagents) seed.subagents = own({ cardByCallId: map(), cardByAgentKey: map() });
+  const subagents = createCodexSubagentTracker(seed.subagents, { own });
   const registerSubagentSpawn = (call) => {
     const card = subagents.registerSpawn(call);
     card.processOwnerSource = {
@@ -4491,7 +4612,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     const controls = logical.filter(isCodexSubagentControlCall);
     for (const control of controls) {
       const scoped = parts.length === logical.length ? parts[control.index]
-        : controls.length === 1 && logical.length === 1 ? parts.join('\n') : null;
+        : controls.length === 1 && logical.length === 1 ? joinCodexHistoryText(parts) : null;
       if (scoped !== null) subagents.absorbControlOutput({ ...control, timestamp: call.timestamp }, scoped, observedAt);
     }
   };
@@ -4499,17 +4620,20 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
   let currentTurnIndex = seed.currentTurnIndex ?? -1;
   let pendingThinking = seed.pendingThinking ?? '';
   let pendingThinkingOwner = seed.pendingThinkingOwner ?? null;
-  const unrenderedThinkingByUser = seed.unrenderedThinkingByUser ?? new Map();
-  const discardedUserOwners = new WeakSet();
-  const sourceUuidAliasesByUser = new WeakMap();
-  for (const { owner, discarded, aliases } of seed.userMetadata || []) {
+  const unrenderedThinkingByUser = seed.unrenderedThinkingByUser ?? (rooted ? (seed.unrenderedThinkingByUser = map()) : new Map());
+  const discardedUserOwners = rooted ? (seed.discardedUserOwners ||= rooted.make('set')) : new WeakSet();
+  const sourceUuidAliasesByUser = rooted ? (seed.sourceUuidAliasesByUser ||= map()) : new WeakMap();
+  for (const { owner, discarded, aliases } of (rooted ? [] : seed.userMetadata || [])) {
     if (discarded) discardedUserOwners.add(owner);
     if (aliases.length) sourceUuidAliasesByUser.set(owner, aliases);
   }
   const rememberUserUuidAlias = (entry, uuid) => {
     if (!entry || !uuid) return;
-    const aliases = sourceUuidAliasesByUser.get(entry) || [];
-    if (!aliases.includes(uuid)) sourceUuidAliasesByUser.set(entry, [...aliases, uuid]);
+    const aliases = sourceUuidAliasesByUser.get(entry) || list();
+    if (!aliases.includes(uuid)) {
+      if (rooted) { aliases.push(uuid); sourceUuidAliasesByUser.set(entry, aliases); }
+      else sourceUuidAliasesByUser.set(entry, [...aliases, uuid]);
+    }
   };
   let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
   let lastDisplayedModel = seed.lastDisplayedModel ?? null;
@@ -4551,13 +4675,13 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       addStableSourceIdentityAlias(currentInterruptedNotice.entry, sourceIdentity);
       return;
     }
-    const entry = buildCodexInterruptedHistoryEntry(record, sessionId, currentTurnIndex);
+    const entry = own(buildCodexInterruptedHistoryEntry(record, sessionId, currentTurnIndex));
     entries.push(entry);
     currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
   };
 
   const pushProviderErrorNotice = (record) => {
-    const entry = codexProviderErrorEntry(record, sessionId, currentTurnIndex);
+    const entry = own(codexProviderErrorEntry(record, sessionId, currentTurnIndex));
     if (entry) entries.push(entry);
   };
 
@@ -4566,9 +4690,9 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
   // request the corresponding old texts from the sink.
   const userCarrierKind = (record, text) => {
     if (text.includes('<subagent_notification>')) return 'subagent';
-    if (isCodexTurnAbortedUserText(text)) return 'interrupted';
-    if ((record.type === 'response_item' && !text) || isCodexEnvironmentContextUserText(text)) return 'ignored';
-    if (isCodexProjectInstructionsUserText(text)) return 'instructions';
+    if (abortedUserText(text)) return 'interrupted';
+    if ((record.type === 'response_item' && !text) || environmentUserText(text)) return 'ignored';
+    if (instructionsUserText(text)) return 'instructions';
     return 'user';
   };
   const userMatchCandidates = (record, text) => {
@@ -4599,10 +4723,11 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         pending.entry.timestamp = recordTimestamp(record);
         pending.entry.recordTime = historyRecordTimeFromRecord(record);
         pending.entry.sessionId = physicalSessionId;
+        bindUserRecordByteOffset(pending.entry, record);
       }
       return;
     }
-    const entry = {
+    const entry = own({
       uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
       sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
       role: 'user',
@@ -4612,7 +4737,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       sessionId: physicalSessionId,
       turnIndex: currentTurnIndex + 1,
       serviceCarrier: 'project-instructions',
-    };
+    });
     entries.push(entry);
     retainUserEntry(entry, record);
     pendingProjectInstructions.push({ record: catalogSink ? null : record, text: retainUserText(text, record), entry });
@@ -4641,7 +4766,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       const { model, effort } = codexSettingsHistoryValues(record) || {};
       const nextTurnIndex = currentTurnIndex + 1;
       if (model && model !== lastDisplayedModel) {
-        lastModelEntry = { ...codexSettingsHistoryEntry(record, sessionId, 'model', model), turnIndex: nextTurnIndex };
+        lastModelEntry = own({ ...codexSettingsHistoryEntry(record, sessionId, 'model', model), turnIndex: nextTurnIndex });
         entries.push(lastModelEntry);
         lastDisplayedModel = model;
       } else if (model && lastModelEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
@@ -4650,7 +4775,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         if (alias !== lastModelEntry.sourceIdentity && aliases[aliases.length - 1] !== alias) aliases.push(alias);
       }
       if (effort && effort !== lastDisplayedEffort) {
-        lastEffortEntry = { ...codexSettingsHistoryEntry(record, sessionId, 'effort', effort), turnIndex: nextTurnIndex };
+        lastEffortEntry = own({ ...codexSettingsHistoryEntry(record, sessionId, 'effort', effort), turnIndex: nextTurnIndex });
         entries.push(lastEffortEntry);
         lastDisplayedEffort = effort;
       } else if (effort && lastEffortEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
@@ -4704,8 +4829,8 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
-        const userText = codexUserMessagePresentationText(record);
-        const goalContinuation = isCodexGoalContinuationUserText(userText);
+        const userText = presentUserText(record);
+        const goalContinuation = goalUserText(userText);
         const carrierKind = userCarrierKind(record, userText);
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
@@ -4752,18 +4877,18 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
             ? 'goal-continuation'
             : undefined;
           pending.entry.sessionId = physicalSessionId;
-          const imageRefs = mergeCodexUserMessageImageRefs(codexUserMessageImageRefs(record), pending.entry.imagePaths);
+          const imageRefs = mergeCodexUserMessageImageRefs(userImageRefs(record), pending.entry.imagePaths);
           if (imageRefs.length > 0) pending.entry.imagePaths = imageRefs;
           pending.entry.imageCount = Math.max(pending.entry.imageCount || 0, historyImageCountFromProviderRecord(record));
           currentTurnCanonicalUserEntry = pending.entry;
         } else {
           currentTurnIndex += 1;
           flushProjectInstructions(currentTurnIndex);
-          const entry = {
+          const entry = own({
             uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
             promptPresentationAuditTimestamp: recordTimestamp(record),
-            promptPresentationTransportHash: promptAuditFingerprint(userText),
+            promptPresentationTransportHash: auditUserText(userText),
             role: goalContinuation ? 'goal' : 'user',
             imageCount: historyImageCountFromProviderRecord(record),
             timestamp: recordTimestamp(record),
@@ -4774,8 +4899,8 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
             serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
             sessionId: physicalSessionId,
             turnIndex: currentTurnIndex,
-            ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
-          };
+            ...(userImageRefs(record).length > 0 ? { imagePaths: userImageRefs(record) } : {}),
+          });
           entries.push(entry);
           currentTurnCanonicalUserEntry = entry;
         }
@@ -4785,19 +4910,22 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       } else if (payload.type === 'thread_rolled_back') {
         currentInterruptedNotice = null;
         pendingProjectInstructions.length = 0;
-        const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
+        const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1), rooted);
         // Invalidate references once at rollback, not an O(history) membership
         // scan on every tool output. A later user can reuse the numeric index.
-        const removedTurns = new Set(rollback.removedTurnIds);
+        const removedTurns = rooted ? rooted.make('set') : new Set();
+        for (const id of rollback.removedTurnIds) removedTurns.add(id);
         for (const [id, definition] of questionDefinitions) {
           if (removedTurns.has(definition.turnIndex)) questionDefinitions.delete(id);
         }
-        for (const owner of [...pendingCalls.values()].map((call) => call.userOwner)
-          .concat([...unrenderedThinkingByUser.keys()], [pendingThinkingOwner])) {
+        for (const owner of (function* () {
+          for (const call of pendingCalls.values()) yield call.userOwner;
+          yield* unrenderedThinkingByUser.keys(); yield pendingThinkingOwner;
+        })()) {
           if (owner && removedTurns.has(owner.turnIndex)) discardedUserOwners.add(owner);
         }
         cachedUserOwner = null;
-        if (!catalogSink) logCodexRollback('full-history', sessionId, record, rollback);
+        if (!catalogSink && !rooted) logCodexRollback('full-history', sessionId, record, rollback);
         // The last rendered setting may have belonged to the removed turn.
         // Do not attach a later provider observation to that detached row.
         lastModelEntry = null;
@@ -4808,10 +4936,13 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         }
         lastDisplayedModel = lastModelEntry?.settingsFact.value || null;
         lastDisplayedEffort = lastEffortEntry?.settingsFact.value || null;
-        currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
-        currentTurnCanonicalUserEntry = [...entries].reverse().find((entry) => (
-          entry?.role === 'user' || entry?.role === 'goal'
-        )) || null;
+        currentTurnIndex = -1;
+        currentTurnCanonicalUserEntry = null;
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          currentTurnIndex = Math.max(currentTurnIndex, typeof entry.turnIndex === 'number' ? entry.turnIndex : -1);
+          if (!currentTurnCanonicalUserEntry && (entry.role === 'user' || entry.role === 'goal')) currentTurnCanonicalUserEntry = entry;
+        }
         currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.role === 'goal'
           ? null
           : (catalogSink?.userTextForEntry?.(currentTurnCanonicalUserEntry) ?? currentTurnCanonicalUserEntry?.content) || null;
@@ -4858,8 +4989,8 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     if (record.type !== 'response_item') return;
 
     if (payload.type === 'message' && payload.role === 'user') {
-      const userText = codexUserMessagePresentationText(record);
-      const goalContinuation = isCodexGoalContinuationUserText(userText);
+      const userText = presentUserText(record);
+      const goalContinuation = goalUserText(userText);
       const carrierKind = userCarrierKind(record, userText);
       // Codex currently persists fire-and-forget subagent completion in two
       // legitimate carrier shapes. Older rollouts used event_msg
@@ -4886,7 +5017,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       if (currentTurnCanonicalUserText
         && userTextsMatch(currentTurnCanonicalUserText, userText)) {
         const imageRefs = mergeCodexUserMessageImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
-          codexUserMessageImageRefs(record));
+          userImageRefs(record));
         if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
         currentTurnCanonicalUserEntry.imageCount = Math.max(currentTurnCanonicalUserEntry.imageCount || 0, historyImageCountFromProviderRecord(record));
         rememberUserUuidAlias(currentTurnCanonicalUserEntry, stableUuidForRecord(sessionId, record, 'codex-user'));
@@ -4903,11 +5034,11 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       pendingCompactCompanions = 0;
       currentTurnIndex += 1;
       flushProjectInstructions(currentTurnIndex);
-      const entry = {
+      const entry = own({
         uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
         promptPresentationAuditTimestamp: recordTimestamp(record),
-        promptPresentationTransportHash: promptAuditFingerprint(userText),
+        promptPresentationTransportHash: auditUserText(userText),
         role: goalContinuation ? 'goal' : 'user',
         timestamp: recordTimestamp(record),
         recordTime: historyRecordTimeFromRecord(record),
@@ -4917,12 +5048,12 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
         sessionId: physicalSessionId,
         turnIndex: currentTurnIndex,
-      };
+      });
       entries.push(entry);
       retainUserEntry(entry, record);
       pendingResponseUsers.push({ entry, text: retainUserText(userText, record) });
       if (catalogSink?.questionMetadata !== false) attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
-      const imageRefs = codexUserMessageImageRefs(record);
+      const imageRefs = userImageRefs(record);
       if (imageRefs.length > 0) entry.imagePaths = imageRefs;
       entry.imageCount = historyImageCountFromProviderRecord(record);
       return;
@@ -4931,7 +5062,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     if (payload.type === 'reasoning') {
       const text = extractReasoning(payload.summary);
       if (text) {
-        pendingThinking = catalogSink ? 'x' : pendingThinking ? `${pendingThinking}\n${text}` : text;
+        pendingThinking = catalogSink ? 'x' : pendingThinking ? rootText.concat([pendingThinking, text], '\n', rooted) : text;
         pendingThinkingOwner = currentUserOwner();
       }
       return;
@@ -4961,16 +5092,16 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
       const args = payload.arguments
         ? (safeJsonParse(payload.arguments, { raw: payload.arguments }) || {})
-        : (payload.input && typeof payload.input === 'string'
+        : (payload.input && rootText.isText(payload.input)
           ? { input: payload.input }
           : (payload.input || {}));
-      const pendingCall = {
+      const pendingCall = own({
         callId,
         toolName: payload.name || payload.tool_name || payload.type,
         namespace: payload.namespace || '',
         args: args && typeof args === 'object' ? args : { value: args },
         cwd: sessionCwd,
-        turnId: String(
+        turnId: rootText.coerce(
           payload.turn_id
           || payload.internal_chat_message_metadata_passthrough?.turn_id
           || '',
@@ -4989,7 +5120,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         // rendered below answer 13737 although its byte offset was 35MB older).
         entryIndexAtCall: entries.length,
         record,
-      };
+      });
       // Register spawn cards at CALL time: the v2 sub_agent_activity(started)
       // event that binds the child thread id arrives BETWEEN the call and its
       // output, so output-time registration would drop that linkage.
@@ -5021,7 +5152,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         return;
       }
       const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
-      const callOwnsThinking = pendingThinkingOwner === call.userOwner;
+      const callOwnsThinking = sameOwner(pendingThinkingOwner, call.userOwner);
       const callThinking = callOwnsThinking ? pendingThinking : '';
       // Subagent lifecycle: spawn becomes a Task card (SubAgentBlock UX like
       // the Claude SDK tab); v1 spawn output binds agent_id/nickname; control
@@ -5058,29 +5189,29 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
           return;
         }
       }
-      const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
+      const waitCellId = call.toolName === 'wait' ? rootText.coerce(call.args?.cell_id || '') : '';
       const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
       if (pendingCellActions) {
         if (pendingCellActions.call) {
           const continuation = codexHistoryCellId(payload.output);
           pendingCellActions.parts.push(...codexHistorySettledOutputParts(payload.output));
-          const combined = [
-            ...(continuation ? [{ type: 'input_text', text: `Script running with cell ID ${continuation}\nOutput:\n` }] : []),
-            ...pendingCellActions.parts.map(text => ({ type: 'input_text', text })),
-          ];
+          const combined = list();
+          if (continuation) combined.push({ type: 'input_text', text: rootText.concat(['Script running with cell ID ',continuation,'\nOutput:\n'], '', rooted) });
+          for (const text of pendingCellActions.parts) combined.push({ type: 'input_text', text });
           const decoded = codexHistoryActionsForCall(pendingCellActions.call, combined, !!payload.is_error);
           const actions = trackDecodedSubagents(decoded.actions, pendingCellActions.call, recordTimestamp(record));
-          const previous = new Map(pendingCellActions.actions.filter(action => action.rawTool)
-            .map(action => [action.rawTool.toolUseId, action.rawTool]));
+          const previous = map();
+          for (const action of pendingCellActions.actions) if (action.rawTool)
+            previous.set(action.rawTool.toolUseId, action.rawTool);
           for (const action of actions) if (action.rawTool) {
             const old = previous.get(action.rawTool.toolUseId);
-            action.rawTool.resultSourceLine = old && old.result === action.rawTool.result
+            action.rawTool.resultSourceLine = old && sameOwner(old.result, action.rawTool.result)
               ? old.resultSourceLine : record.__line;
           }
           pendingCellActions.actions.splice(0, pendingCellActions.actions.length, ...actions);
           if (!continuation) {
             pendingExecCells.delete(waitCellId);
-          } else if (continuation !== waitCellId) {
+          } else if (!sameOwner(continuation, waitCellId)) {
             pendingExecCells.delete(waitCellId);
             pendingExecCells.set(continuation, pendingCellActions);
           }
@@ -5127,7 +5258,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
   function* pendingCallFinalizations() {
     for (const call of pendingCalls.values()) {
       if (call.userOwner && discardedUserOwners.has(call.userOwner)) continue;
-      const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
+      const waitCellId = call.toolName === 'wait' ? rootText.coerce(call.args?.cell_id || '') : '';
       if (waitCellId && pendingExecCells.has(waitCellId)) continue;
       if (isCodexSubagentSpawnCall(call)) {
         if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
@@ -5138,7 +5269,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     }
   }
 
-  function* finalizeSteps(options = {}) {
+  function* finalizeSteps(options = {}, preparedPlan = null) {
     // A transcript-changed notification is emitted as soon as Codex appends
     // the call, before its output exists. Keep that in-flight call in the
     // canonical history snapshot so a live semantic tool card is not briefly
@@ -5150,8 +5281,8 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     // Built on a COPY: pending calls stay pending and the thinking buffer is
     // not consumed, so later `feed` calls attach them to their real records
     // exactly as a fresh one-shot pass at that future moment would.
-    const tail = [];
-    const tailPlacements = [];
+    const tail = list();
+    const tailPlacements = list();
     const rememberTailPlacement = (call, beforeLength) => {
       const anchor = Number.isInteger(call?.entryIndexAtCall)
         ? Math.max(0, Math.min(entries.length, call.entryIndexAtCall))
@@ -5161,10 +5292,10 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       }
     };
     let tailThinking = pendingThinking;
-    for (const { call, kind } of catalogPendingPlan || pendingCallFinalizations()) {
+    for (const { call, kind } of preparedPlan || catalogPendingPlan || pendingCallFinalizations()) {
       yield;
       const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
-      const callOwnsThinking = pendingThinkingOwner === call.userOwner;
+      const callOwnsThinking = sameOwner(pendingThinkingOwner, call.userOwner);
       const callThinking = callOwnsThinking ? tailThinking : '';
       // In-flight spawn (no output yet): show a running Task card, not raw
       // JSON. The card is cached on the call so repeated finalizes reuse ONE
@@ -5210,21 +5341,21 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     // agent is checked against its OWN transcript, which is authoritative
     // about itself. Card mutation here is monotone — an explicit resume
     // record arriving later through `feed` reopens it, same as a fresh pass.
-    if (!catalogSink) yield* refreshCodexSubagentCardSteps(subagents.allCards(), sessionId);
+    if (!catalogSink && !preparedPlan) yield* refreshCodexSubagentCardSteps(rooted ? { [Symbol.iterator]: () => subagents.iterateCards() } : subagents.allCards(), sessionId, sourceOptions);
 
     // Pending calls are presentation rows, but not necessarily TAIL rows. A
     // current in-flight call naturally anchors at entries.length; an old call
     // whose output was lost anchors at the number of rows that existed when
     // its call record arrived. Buckets preserve provider arrival order when
     // several concurrent calls share one slot.
-    const pendingByAnchor = new Map();
+    const pendingByAnchor = map();
     for (const placement of tailPlacements) {
       yield;
-      const bucket = pendingByAnchor.get(placement.anchor) || [];
+      const bucket = pendingByAnchor.get(placement.anchor) || list();
       bucket.push(placement.entry);
       pendingByAnchor.set(placement.anchor, bucket);
     }
-    const presented = [];
+    const presented = list();
     const appendPresented = (source) => {
       const { turnIndex, ...entry } = source;
       const sourceUuidAliases = options?.includeTurnCoordinates === true
@@ -5239,7 +5370,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       if (index < entries.length) appendPresented(entries[index]);
     }
     if (options?.includeTurnCoordinates === true) {
-      const projectedThinking = new Map();
+      const projectedThinking = map();
       for (const [owner, thinking] of unrenderedThinkingByUser) {
         yield;
         projectedThinking.set(owner, { thinking, pending: false });
@@ -5259,6 +5390,102 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     return presented;
   }
   const finalize = (options = {}) => drainProjectionSteps(finalizeSteps(options));
+
+  if (rooted) {
+    const syncRoot = () => Object.assign(seed, {
+      entries, questionDefinitions, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
+      pendingExecCells, sessionCwd, currentTurnIndex, pendingThinking, pendingThinkingOwner,
+      unrenderedThinkingByUser, latestTokenCountInfo, lastDisplayedModel, lastDisplayedEffort,
+      lastModelEntry, lastEffortEntry, pendingCompactCompanions, consumedRecords,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, currentInterruptedNotice, cachedUserOwner,
+    });
+    const loadRegisters = () => {
+      ({ sessionCwd, currentTurnIndex, pendingThinking, pendingThinkingOwner, latestTokenCountInfo,
+        lastDisplayedModel, lastDisplayedEffort, lastModelEntry, lastEffortEntry, pendingCompactCompanions,
+        consumedRecords, currentTurnCanonicalUserText, currentTurnCanonicalUserEntry,
+        currentInterruptedNotice, cachedUserOwner } = seed);
+    };
+    syncRoot();
+    function* finalizeRootViewSteps(options = {}) {
+      const plan = seed.rootFinalizationPlan;
+      const prepared = { *[Symbol.iterator]() {
+        for (let index = 0; index < plan.count; index++) yield plan.calls[index];
+      } };
+      const iterator = finalizeSteps(options, prepared);
+      try {
+        for (;;) {
+          const next = rooted.step(() => {
+            const next = iterator.next();
+            syncRoot();
+            rooted.metrics.finalizerSteps++;
+            return next.done ? { done: true, value: rooted.publish(next.value) } : { done: false };
+          });
+          try { options.onRootStep?.({ ...rooted.stats(),rootPublished: next.done }); }
+          catch (error) { if (next.done) next.value.release(); throw error; }
+          if (next.done) return next.value;
+          yield;
+        }
+      } finally { iterator.return?.(); }
+    }
+    function* finalizeRootSteps(options = {}) {
+      // Keep semantic mutations (spawn identity and own-child status) in the
+      // continuation. Reuse a paged plan; warm reads do not retain a new copy
+      // of every presentation row in the canonical owner index.
+      const plan = rooted.step(() => seed.rootFinalizationPlan ||= own({ calls: list(), count: 0 }));
+      const decisions = pendingCallFinalizations();
+      let count = 0;
+      try {
+        for (;;) {
+          const done = rooted.step(() => {
+            const next = decisions.next();
+            if (next.done) { plan.count = count; syncRoot(); return true; }
+            if (count < plan.calls.length) {
+              plan.calls[count].call = next.value.call; plan.calls[count].kind = next.value.kind;
+            } else plan.calls.push(next.value);
+            count++; syncRoot(); return false;
+          });
+          if (done) break;
+          options.onRootStep?.(rooted.stats()); yield;
+        }
+      } finally { decisions.return?.(); }
+      const refresh = refreshCodexSubagentCardSteps({ [Symbol.iterator]: () => subagents.iterateCards() }, sessionId, sourceOptions);
+      try {
+        for (;;) {
+          const next = rooted.step(() => { const next = refresh.next(); syncRoot(); return next; });
+          if (next.done) break;
+          options.onRootStep?.(rooted.stats()); yield;
+        }
+      } finally { refresh.return?.(); }
+      const viewArena = rooted.fork();
+      try {
+        // Same reducer and same finalizer on a CoW branch. No DTO or SQL clone.
+        const view = createCodexHistoryProjector(sessionId, {}, { rooted: viewArena, sourceOptions });
+        return yield* view._finalizeRootViewSteps(options);
+      } finally {
+        const measured = viewArena.stats();
+        for (const name of ['peakInputObjects','peakHandleCache','peakImportedStringChars',
+          'maxDecodedTextChars','maxUnboundedTextChars','maxOwnKeyArray','maxLegacyPromptArray'])
+          rooted.metrics[name] = Math.max(rooted.metrics[name] || 0, measured[name] || 0);
+        rooted.metrics.unboundedTextMaterializations = (rooted.metrics.unboundedTextMaterializations || 0) + (measured.unboundedTextMaterializations || 0);
+        if (measured.lastUnboundedTextOperation) rooted.metrics.lastUnboundedTextOperation = measured.lastUnboundedTextOperation;
+        rooted.metrics.finalizerSteps += measured.finalizerSteps;
+        viewArena.close();
+      }
+    }
+    return {
+      feed(record) {
+        try { return rooted.step(() => { feed(own(record)); syncRoot(); }); }
+        catch (error) { loadRegisters(); throw error; }
+      },
+      finalizeRootSteps,
+      _finalizeRootViewSteps: finalizeRootViewSteps,
+      finalizeRoot: options => drainProjectionSteps(finalizeRootSteps(options)),
+      exportRoot: () => rooted.checkpoint(),
+      getConsumedRecords: () => consumedRecords,
+      rootStats: () => rooted.stats(),
+      close: () => rooted.close(),
+    };
+  }
 
   return {
     feed: catalogSink ? record => {
@@ -5794,6 +6021,7 @@ async function feedCodexProjection(cached, records, options = {}) {
 // pending-call payloads and individual JSON strings remain full;
 // this removes the raw-array duplicate, not the outstanding M2 graph bound.
 async function projectCodexFullHistoryStream(sessionId, cwd, options = {}) {
+  if (options.rootedOwner) return projectCodexFullHistoryFromFile(sessionId, cwd, options);
   const controlOptions = codexProjectionControl(options);
   controlOptions.assertCurrent();
   const found = await findCodexSessionFile(sessionId, cwd,
@@ -5840,8 +6068,170 @@ async function projectCodexFullHistoryStream(sessionId, cwd, options = {}) {
   } finally { finishPreparation(); _codexReadFence.finish(ticket); }
 }
 
+// Explicit rooted producer on the same file discovery/fence/framing/feed path.
+// Legacy callers keep their DTO contract until the service/postprocessors are
+// migrated. The backing owner is mandatory and comes from the reader/cache.
+async function projectCodexRootHistoryFromFile(sessionId, cwd, options) {
+  const owner = options.rootedOwner;
+  if (!(owner instanceof CodexRootProjectionOwner)) throw new TypeError('CodexRootProjectionOwner required');
+  owner.assertOpen();
+  const demand = codexProjectionControl(options);
+  demand.assertCurrent();
+  const found = await findCodexSessionFile(sessionId,cwd,{
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+    rootedIdentity: filePath => matchesRootedSessionHead(filePath,sessionId,owner.store, {
+      control: options._readControl || options.control, assertCurrent: demand.assertCurrent,
+      highWaterMark: options.highWaterMark, observe: stats => options.observeIngest?.(stats) }),
+  });
+  demand.assertCurrent();
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  await _codexExternalReadPrepare?.(filePath);
+  demand.assertCurrent();
+  const ticket = _codexReadFence.begin(filePath,'projection-root');
+  const assertCurrent = () => { demand.assertCurrent(); _codexReadFence.assertCurrent(ticket); };
+  const control = { ...demand, assertCurrent };
+  let arena, history, output, metadata, continuation, committed, supplied;
+  const checkpoints = [];
+  let finishPreparation = () => {};
+  let transferred = false;
+  try {
+    const stat = await fs.promises.stat(filePath); assertCurrent();
+    const identity = stat.dev + ':' + stat.ino;
+    committed = owner.read(sessionId,cwd);
+    const expectedPage = committed?.descriptor.page || 0;
+    supplied = options.rootCheckpoint ? owner.store.open(options.rootCheckpoint.descriptor || options.rootCheckpoint) : null;
+    const previous = supplied || committed;
+    let mode = 'rebuild', verificationBytes = 0;
+    if (previous) {
+      arena = new HistoryProjectionArena(owner.store,previous);
+      const file = arena.state().file;
+      if (file && rootText.equal(file.sessionId,sessionId) && rootText.equal(file.cwd,cwd || '')
+        && rootText.equal(file.filePath,filePath) && file.fileIdentity === identity && stat.size >= file.fileSize) {
+        // Even after restart, growth is not proof of an unchanged prefix.
+        // Compare exact retained bytes with bounded buffers, never re-project
+        // old records merely to discover whether their payload exists.
+        const verified = await verifyRootSourcePrefix(arena,filePath,file.fileSize,stat,control);
+        verificationBytes = verified.bytes;
+        if (verified.valid) mode = stat.size === file.fileSize ? 'unchanged' : 'append';
+      }
+    }
+    if (options.cacheOnly === true && mode !== 'unchanged') return { success: false, error: 'cached_projection_unavailable' };
+    if (mode === 'rebuild') { arena?.close(); arena = new HistoryProjectionArena(owner.store); }
+    else for (let i = 0; i < 4; i++) { const lease = owner.read(sessionId,cwd,i); if (lease) checkpoints.push(lease); }
+    const oldFile = mode === 'rebuild' ? null : arena.state().file;
+    const start = oldFile?.fileSize || 0;
+    trimRootSourceProof(arena,start);
+    const timeline = createCodexTimelineProjector(sessionId,oldFile?.timeline || {},{ metadataOnly: true });
+    history = createCodexHistoryProjector(sessionId,{}, { rooted: arena, sourceOptions: { sessionsDir: options.sessionsDir } });
+    const cached = { sessionId, historyProjector: history, timelineProjector: timeline };
+    const snapshot = { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+      fileIdentity: identity, linkKind: 'end' };
+    const file = { sessionId, cwd: cwd || '', filePath, fileIdentity: identity,
+      fileSize: stat.size, fileMtimeMs: stat.mtimeMs, fileCtimeMs: stat.ctimeMs };
+    const observe = phase => options.observeRoot?.({ phase, consumedRecords: history.getConsumedRecords(), ...arena.stats() });
+    finishPreparation = historyPreparationActivity.begin({ kind: 'history',sessionId,tabId: options.tabId,
+      bytes: stat.size-start,source: { toolType: 'codex',cwd } });
+    const metrics = {};
+    const read = await readRootedJsonlRange(filePath,start,stat.size-1,{
+      arena,oldFile,
+      sourceStat: stat,collectRecords: false,metrics,assertCurrent,
+      _readControl: options._readControl || options.control,
+      highWaterMark: options.highWaterMark,
+      onChunk: chunk => appendRootSourceProof(arena,chunk),
+      observe: stats => options.observeIngest?.(stats),
+      onRecord: async (cursor,coordinate) => {
+        const record=arena.step(()=>{
+          // Non-object JSON roots have no provider fields; raw bytes remain
+          // in the frozen source proof, exactly as unknown provider records.
+          const value=cursor.kind==='object'?arena.own(cursor):arena.make('object');
+          value.__line=coordinate.startLine;value.__byteOffset=coordinate.fromByte;
+          return value;
+        });
+        await feedCodexProjection(cached,[record],{ ...options,assertCurrent,checkpoints: false });
+        // Page writes cost more than the old in-memory feed. Return to the
+        // reader's demand loop after each owned record, including when the
+        // filesystem supplied many records in one chunk.
+        await control.schedule(); assertCurrent();
+        observe('feed');
+        if (history.getConsumedRecords() % owner.checkpointEvery === 0) {
+          assertCurrent();
+          const lease = checkpointRootAt(arena,file,timeline.exportState(),coordinate.toByte,coordinate.startLine+1);
+          checkpoints.push(lease);
+          if (checkpoints.length > 4) checkpoints.shift().release();
+          observe('checkpoint');
+        }
+      },
+      onProgress: bytes => finishPreparation.update?.({ completedBytes: bytes }),
+    });
+    assertCurrent();
+    if (mode !== 'unchanged') arena.step(() => { arena.state().file = { ...file,lineCount: read.lineCount,
+      ingest:'paged-jsonl-v1',partial:read.partial,timeline: timeline.exportState() }; });
+    const iterator = history.finalizeRootSteps({ includeTurnCoordinates: options.includeTurnCoordinates === true,
+      onRootStep: stats => options.observeRoot?.({ phase: 'view-step',consumedRecords: history.getConsumedRecords(),...stats }) });
+    try {
+      for (let steps = 0;; steps++) {
+        assertCurrent();
+        const next = iterator.next();
+        if (next.done) output = next.value;
+        observe('finalization');
+        if (next.done) break;
+        if (steps % 64 === 63) { await control.schedule(); assertCurrent(); }
+      }
+    } finally { iterator.return?.(); }
+    assertCurrent();
+    // Resolve the fixed metadata fields before forking: a lazy child first
+    // adopted on the parent after fork would have no identity in that fork.
+    const sessionMetadata = arena.step(() => timeline.getSessionMeta());
+    continuation = history.exportRoot();
+    const metadataArena = arena.fork();
+    try { metadata = metadataArena.step(() => metadataArena.publish(sessionMetadata)); }
+    finally { metadataArena.close(); }
+    observe('publication');
+    // Same-size replacement, truncate and cancellation cannot publish a
+    // newer cursor over bytes that no longer match this read's source.
+    const after = await fs.promises.stat(filePath);
+    assertCurrent();
+    if (after.dev !== stat.dev || after.ino !== stat.ino || after.size < stat.size
+      || after.size === stat.size && (after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs)) {
+      throw Object.assign(new Error('Codex source changed before root publication'),{ code:'CODEX_SOURCE_READ_INVALIDATED' });
+    }
+    if (after.size > stat.size) {
+      // Growth alone does not prove append: an external writer may rewrite
+      // the old prefix and append in the same interval. Retain the frozen
+      // prefix only after another exact, bounded comparison.
+      const publicationProof = await verifyRootSourcePrefix(arena,filePath,stat.size,after,control);
+      if (!publicationProof.valid) throw Object.assign(new Error('Codex source prefix changed before root publication'),
+        { code:'CODEX_SOURCE_READ_INVALIDATED' });
+      assertCurrent();
+    }
+    snapshot.sourceGeneration = rememberCodexSourceGeneration(filePath,stat,ticket,sessionId);
+    owner.commit(sessionId,cwd,continuation,expectedPage,checkpoints,assertCurrent);
+    const entries = output.cursor(), sessionMeta = metadata.cursor();
+    const rootStats = arena.stats();
+    let released = false;
+    const result = { success: true,representation: 'codex-canonical-root-v1',mode,
+      entries,sessionMeta,checkpoint: continuation,root: output,filePath,
+      sourceSnapshot: Object.freeze(snapshot),fedRecords: read.parsed,
+      reusedRecords: history.getConsumedRecords()-read.parsed,
+      readMetrics: { ...metrics,verificationBytes,canonicalRows: entries.length,timelineRows: 0 },
+      rootStats, release() {
+        if (released) return; released = true;
+        output.release(); metadata.release(); continuation.release();
+      } };
+    transferred = true;
+    return result;
+  } finally {
+    if (!transferred) { output?.release(); metadata?.release(); continuation?.release(); }
+    for (const lease of checkpoints) lease.release();
+    supplied?.release(); committed?.release(); arena?.close();
+    finishPreparation(); _codexReadFence.finish(ticket);
+  }
+}
+
 function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
   return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
+    if (options.rootedOwner) return projectCodexRootHistoryFromFile(sessionId, cwd, options);
     if (options.payloadPolicy === 'full') {
       // A small/full hot graph can serve a runtime-only ownership refresh
       // without replay. Completeness is affirmative and monotone: neither an
@@ -6235,6 +6625,7 @@ function stringifyCompact(value, max = CODEX_OUTPUT_LIMIT) {
 }
 
 function stripBase64Images(text) {
+  if (rootText.isPagedText(text)) return rootText.stripDataImages(text);
   return String(text || '').replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+/g, '[image: base64 omitted]');
 }
 
@@ -6934,11 +7325,20 @@ async function replaceCodexSessionFileInPlace({
       code: 'codex_in_place_rewrite_session_identity_mismatch',
     });
   }
-  const before = await fs.promises.stat(filePath);
+  let before = await fs.promises.stat(filePath);
   if (!codexSourceSnapshotMatchesStat(sourceSnapshot, before)) {
     throw Object.assign(new Error('codex_in_place_rewrite_source_changed'), {
       code: 'codex_in_place_rewrite_source_changed',
     });
+  }
+
+  const nativeSource = await materializeCodexRolloutForMutation(filePath);
+  if (nativeSource.representationMaterialized) {
+    filePath = nativeSource.filePath;
+    before = nativeSource.stat;
+    sourceSnapshot = { ...sourceSnapshot, filePath, size: nativeSource.stat.size,
+      mtimeMs: nativeSource.stat.mtimeMs, ctimeMs: nativeSource.stat.ctimeMs,
+      fileIdentity: nativeSource.stat.dev + ':' + nativeSource.stat.ino };
   }
 
   const nonce = process.pid + '-' + crypto.randomBytes(6).toString('hex');
@@ -11796,7 +12196,277 @@ function parseCodexModelsCatalog(stdout) {
     .filter(Boolean);
 }
 
+// Only the service-owned catalog child is enrolled here. ChildProcess keeps
+// spawn/PID ownership through exit; neither cwd nor a later process census can
+// enroll an unrelated process. The npm CLI wrapper forwards SIGTERM to its
+// native child and waits for it; keep its stdio/close lifetime joined as well.
+function createCodexModelCatalogLifecycle(run = execFile, config = {}) {
+  const children = new Set();
+  const retained = [];
+  const cycleOwner = Symbol('catalog-cycle');
+  const wallNow = config.nowWall || Date.now;
+  const monoNow = config.nowMono || (() => performance.now());
+  const observeBinding = config.observeBinding || (typeof beginCatalogLaunchBinding === 'function' ? beginCatalogLaunchBinding : null);
+  let closing = false, disposal = null, runtime = null, publisher = null;
+  let sequence = 0, revision = 0, factSequence = 0, maxActive = 0;
+  let evictedThrough = 0, lostReceipts = 0, diagnosticErrors = 0, disposalFacts = null;
+  const cancelled = () => Object.assign(new Error('Codex model catalog is closing'), { code: 'CODEX_MODEL_CATALOG_CLOSED' });
+  const safeCode = value => typeof value === 'string' && value.length <= 64
+    && /^(?:E[A-Z0-9_]+|ERR_[A-Z0-9_]+|SIG[A-Z0-9]+)$/.test(value) ? value : null;
+  const time = () => { let wallMs = null, monoMs = null;
+    try { const value = wallNow(); if (Number.isFinite(value)) wallMs = value; } catch {}
+    try { const value = monoNow(); if (Number.isFinite(value)) monoMs = value; } catch {}
+    return { wallMs, monoMs }; };
+  const stamp = () => { const value = time();
+    if (value.wallMs === null || value.monoMs === null) diagnosticErrors++;
+    return { sequence: ++factSequence, ...value }; };
+  const signalFact = value => value === null ? null : typeof value === 'string' && /^SIG[A-Z0-9]{1,24}$/.test(value) ? value : 'UNKNOWN';
+  const recipe = args => Array.isArray(args) && args.length === 2 && args[0] === 'debug' && args[1] === 'models'
+    ? 'live' : Array.isArray(args) && args.length === 3 && args[0] === 'debug' && args[1] === 'models' && args[2] === '--bundled' ? 'bundled' : null;
+  function wake() {
+    revision++;
+    try { publisher?.({ schemaVersion: 1, mainInstanceId: runtime?.instanceId ?? null, mainPid: runtime?.pid ?? null, snapshotRevision: revision }); }
+    catch { diagnosticErrors++; }
+  }
+  function outcome(record) {
+    const f = record.facts;
+    if (f.inconsistent) return 'inconsistent';
+    if (f.cancelled || f.termination.attempted) return 'cancelled';
+    if (f.launchThrew) return 'launch-threw';
+    if (!f.close) return f.callback?.ok ? 'close-unconfirmed' : 'pending';
+    if (f.close.signal !== null) return 'closed-signal';
+    if (f.close.code !== 0 || f.error || f.callback && !f.callback.ok) return 'closed-error';
+    if (!f.callback) return 'callback-unconfirmed';
+    if (!f.ownerBound || !f.handleReturned || !f.handlePid || !f.spawn
+      || f.commandTag !== 'codex-debug-models' || !['live', 'bundled'].includes(f.phase)) return 'launch-unqualified';
+    if (f.launchBinding.before?.status !== 'qualified' || f.launchBinding.after?.status !== 'qualified'
+      || f.launchBinding.after?.matched !== true
+      || typeof f.launchBinding.before.factsDigest !== 'string' || !/^[a-f0-9]{64}$/.test(f.launchBinding.before.factsDigest)
+      || f.launchBinding.after.factsDigest !== f.launchBinding.before.factsDigest) return 'binding-unqualified';
+    if (f.dataLost) return 'diagnostic-incomplete';
+    return 'completed-normal';
+  }
+  function publish(record) {
+    try {
+      const f = record.facts;
+      f.outcome = outcome(record);
+      if (record.closed) f.lastUpdated = stamp();
+      let body = JSON.parse(JSON.stringify(f));
+      if (Buffer.byteLength(JSON.stringify(body)) > 4096) {
+        if (!f.dataLost) { f.dataLost = true; lostReceipts++; }
+        body = { attemptSequence: f.attemptSequence, attemptId: f.attemptId, cycleId: f.cycleId,
+          phase: f.phase, handlePid: f.handlePid, outcome: 'diagnostic-incomplete', dataLost: true };
+      }
+      const at = retained.findIndex(value => value.attemptSequence === f.attemptSequence);
+      if (at >= 0) retained[at] = body;
+      else if (f.attemptSequence > evictedThrough) {
+        retained.push(body);
+        retained.sort((a, b) => a.attemptSequence - b.attemptSequence);
+        while (retained.length > 2) evictedThrough = Math.max(evictedThrough, retained.shift().attemptSequence);
+      }
+    } catch {
+      if (!record.facts.dataLost) { record.facts.dataLost = true; lostReceipts++; }
+      diagnosticErrors++;
+    }
+    wake();
+  }
+  function event(record, name, value) {
+    if (record.facts[name] !== null) record.facts.inconsistent = true;
+    else record.facts[name] = { ...value, stamp: stamp() };
+    publish(record);
+  }
+  function bindRuntime(identity, onChange) {
+    if (!identity || typeof identity.instanceId !== 'string' || identity.instanceId.length < 1 || identity.instanceId.length > 128
+      || !Number.isSafeInteger(identity.pid) || identity.pid < 2 || !Number.isFinite(identity.startedAt) || identity.startedAt <= 0) return false;
+    if (runtime) return runtime.instanceId === identity.instanceId && runtime.pid === identity.pid && runtime.startedAt === identity.startedAt;
+    if (sequence !== 0 || closing) return false;
+    runtime = Object.freeze({ instanceId: identity.instanceId, pid: identity.pid, startedAt: identity.startedAt });
+    publisher = typeof onChange === 'function' ? onChange : null;
+    wake(); return true;
+  }
+  const newCycle = () => ({ owner: cycleOwner, id: null, lastAttemptId: null, lastRecord: null });
+  function reportPublication(cycle, source, count) {
+    try {
+      if (cycle?.owner !== cycleOwner || !cycle.lastRecord) return;
+      const record = cycle.lastRecord;
+      record.facts.publication = { source: source === 'builtin-fallback' ? 'builtin' : source,
+        count: Number.isSafeInteger(count) && count >= 0 ? count : null, stamp: stamp() };
+      publish(record); cycle.lastRecord = null;
+    } catch { diagnosticErrors++; }
+  }
+  function snapshot() {
+    const now = time();
+    const value = { schemaVersion: 1, mainInstanceId: runtime?.instanceId ?? null,
+      mainPid: runtime?.pid ?? null, mainStartedAt: runtime?.startedAt ?? null,
+      snapshotRevision: revision, takenAtMonoMs: now.monoMs, takenAtWallMs: now.wallMs, closing,
+      attemptsStartedTotal: sequence, highestAttemptSequence: sequence,
+      activeHandleCount: children.size, maxActiveHandleCount: maxActive,
+      firstRetainedSequence: retained[0]?.attemptSequence ?? null, evictedThrough, lostReceipts, diagnosticErrors,
+      attempts: retained, disposal: disposalFacts,
+      activeRecordsOmitted: Math.max(0, children.size - retained.filter(value => !value.close && !value.launchThrew).length) };
+    const json = JSON.stringify(value);
+    if (Buffer.byteLength(json) > 12288) return { ...value, attempts: [], wireOverflow: true, omittedAttempts: retained.length };
+    return JSON.parse(json);
+  }
+  function request(args, options, metadata = {}) {
+    if (closing) return Promise.reject(cancelled());
+    return new Promise((resolve, reject) => {
+      let resolveClose;
+      const n = ++sequence, phase = recipe(args), cycle = metadata.cycle?.owner === cycleOwner ? metadata.cycle : newCycle();
+      if (cycle.id === null) cycle.id = n;
+      const attemptId = runtime ? runtime.instanceId + ':' + n : null;
+      const record = { child: null, pid: null, birth: n, closed: false, binding: null,
+        cancelRequest: () => reject(cancelled()), done: new Promise(done => { resolveClose = done; }),
+        facts: { attemptSequence: n, attemptId, cycleId: cycle.id, phase: metadata.phase || phase,
+          previousAttemptId: cycle.lastAttemptId, commandTag: phase ? 'codex-debug-models' : 'unsupported',
+          args: phase ? [...args] : null, shell: false, ownerBound: !!runtime, handleReturned: false, handlePid: null,
+          created: stamp(), spawn: null, callback: null, error: null, exit: null, close: null, launchThrew: null,
+          cancelled: false, inconsistent: !!metadata.phase && metadata.phase !== phase
+            || phase === 'live' && cycle.lastAttemptId !== null || phase === 'bundled' && cycle.lastAttemptId === null,
+          termination: { attempted: false, disposeRequested: false, count: 0, last: null },
+          launchBinding: { before: null, after: null }, publication: null, dataLost: false } };
+      cycle.lastAttemptId = attemptId; cycle.lastRecord = record;
+      try { record.binding = observeBinding?.('codex', args, { ...options, shell: false }) || null;
+        record.facts.launchBinding.before = record.binding?.before || { status: 'unqualified', reason: 'binding-observer-unavailable' }; }
+      catch { record.facts.launchBinding.before = { status: 'unqualified', reason: 'binding-observer-failed' }; diagnosticErrors++; }
+      publish(record);
+      let child;
+      try {
+        child = run('codex', args, { ...options, shell: false }, (error, stdout) => {
+          if (closing) record.facts.cancelled = true;
+          event(record, 'callback', { ok: !error, errorCode: safeCode(error?.code),
+            killed: error?.killed === true, signal: safeCode(error?.signal) });
+          if (closing) reject(cancelled());
+          else if (error) reject(error);
+          else resolve(stdout);
+        });
+      } catch (error) {
+        record.facts.launchThrew = { code: safeCode(error?.code), stamp: stamp() };
+        record.binding = null; publish(record); reject(error); return;
+      }
+      record.child = child; record.pid = child.pid;
+      record.facts.handleReturned = true;
+      record.facts.handlePid = Number.isSafeInteger(child.pid) && child.pid > 1 ? child.pid : null;
+      children.add(record); maxActive = Math.max(maxActive, children.size);
+      let originalKill, tappedKill;
+      try {
+        originalKill = child.kill;
+        if (typeof originalKill !== 'function') throw Error('kill unavailable');
+        tappedKill = function (...killArgs) {
+          if (record.closed) return originalKill.apply(this, killArgs);
+          const f = record.facts;
+          f.termination.attempted = true; f.termination.count++;
+          f.termination.last = { source: record.disposing ? 'owner-dispose' : 'handle-kill',
+            signal: killArgs.length === 0 ? 'SIGTERM' : typeof killArgs[0] === 'number' ? killArgs[0] : safeCode(killArgs[0]),
+            sent: null, threw: false, stamp: stamp() };
+          if (this !== child || child.pid !== record.pid) f.inconsistent = true;
+          publish(record);
+          try { const result = originalKill.apply(this, killArgs); f.termination.last.sent = result === true; publish(record); return result; }
+          catch (error) { f.termination.last.threw = true; publish(record); throw error; }
+        };
+        child.kill = tappedKill;
+        if (child.kill !== tappedKill) throw Error('kill tap unavailable');
+      } catch { record.facts.inconsistent = true; diagnosticErrors++; }
+      const checkHandle = () => {
+        if (child.pid !== record.pid || child.kill !== tappedKill) record.facts.inconsistent = true;
+        if (child.killed === true) record.facts.termination.attempted = true;
+      };
+      child.on('spawn', () => { checkHandle(); event(record, 'spawn', {}); });
+      child.on('error', error => { checkHandle(); event(record, 'error', { code: safeCode(error?.code) }); });
+      child.on('exit', (code, signal) => { checkHandle(); event(record, 'exit', { code: Number.isInteger(code) ? code : null, signal: signalFact(signal) }); });
+      child.on('close', (code, signal) => {
+        checkHandle();
+        const close = { code: Number.isInteger(code) ? code : null, signal: signalFact(signal) };
+        if (record.facts.exit && (record.facts.exit.code !== close.code || record.facts.exit.signal !== close.signal)) record.facts.inconsistent = true;
+        event(record, 'close', close);
+        if (record.closed) return;
+        record.closed = true;
+        try { const after = record.binding?.finish?.();
+          record.facts.launchBinding.after = after ? { status: after.status, reason: after.reason || null,
+            factsDigest: after.factsDigest || null, matched: after.matched === true, stamp: stamp() }
+            : { status: 'unqualified', reason: 'binding-observer-unavailable', matched: false, stamp: stamp() }; }
+        catch { record.facts.launchBinding.after = { status: 'unqualified', reason: 'binding-observer-failed', matched: false, stamp: stamp() }; diagnosticErrors++; }
+        record.binding = null; record.child = null; record.cancelRequest = null;
+        // The exact handle lifetime has ended. A stale caller's later kill is
+        // neither termination of this attempt nor authority over a reused PID.
+        if (child.kill === tappedKill) child.kill = originalKill;
+        children.delete(record); publish(record);
+        console.log('[CodexModels] child-close pid=' + (record.pid || '-') + ' birth=' + record.birth
+          + ' code=' + code + ' signal=' + (signal || '-'));
+        resolveClose(); resolveClose = null;
+        if (disposalFacts) { disposalFacts = { ...disposalFacts, currentPendingCount: children.size, lastClose: stamp() }; wake(); }
+      });
+      console.log('[CodexModels] child-start pid=' + (record.pid || '-') + ' birth=' + record.birth);
+      publish(record);
+    });
+  }
+  function dispose({ deadlineMs = 2000 } = {}) {
+    if (disposal) return disposal;
+    let resolveDisposal;
+    disposal = new Promise(resolve => { resolveDisposal = resolve; });
+    closing = true;
+    const owned = [...children];
+    disposalFacts = { started: stamp(), deadlineOutcome: null, currentPendingCount: owned.length };
+    for (const record of owned) {
+      record.facts.cancelled = true; record.facts.termination.disposeRequested = true;
+      record.disposing = true; publish(record);
+      record.cancelRequest();
+      const child = record.child;
+      if (!record.closed && child.pid === record.pid && Number.isSafeInteger(record.pid)
+          && child.exitCode === null && child.signalCode === null && !child.killed) {
+        try { const sent = child.kill('SIGTERM');
+          console.log('[CodexModels] child-cancel pid=' + record.pid + ' birth=' + record.birth + ' sent=' + sent); }
+        catch (error) { console.warn('[CodexModels] child-cancel failed pid=' + record.pid + ' code=' + (error?.code || 'unknown')); }
+      }
+    }
+    wake();
+    {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true; clearTimeout(timer);
+        const pending = owned.filter(record => !record.closed).map(record => ({ pid: record.pid, birth: record.birth }));
+        const result = { settled: pending.length === 0, pending };
+        disposalFacts = { ...disposalFacts, deadlineOutcome: { settled: result.settled,
+          pendingCount: pending.length, pending: pending.slice(0, 2).map(value => ({
+            pid: Number.isSafeInteger(value.pid) ? value.pid : null, attemptSequence: value.birth })),
+          omittedPending: Math.max(0, pending.length - 2), stamp: stamp() }, currentPendingCount: children.size };
+        wake();
+        console.log('[CodexModels] disposal settled=' + result.settled + ' pending=' + pending.length);
+        resolveDisposal(result);
+      };
+      const timer = setTimeout(finish, Math.min(2000, Math.max(1, deadlineMs)));
+      Promise.all(owned.map(record => record.done)).then(finish);
+    }
+    return disposal;
+  }
+  return { request, dispose, bindRuntime, snapshot, newCycle, reportPublication, get closing() { return closing; }, cancelled };
+}
+
+const codexModelCatalogLifecycle = createCodexModelCatalogLifecycle();
+
+function disposeCodexModelCatalog() {
+  return codexModelCatalogLifecycle.dispose();
+}
+
+function bindCodexModelCatalogRuntime(identity, onChange) {
+  return codexModelCatalogLifecycle.bindRuntime(identity, onChange);
+}
+
+function getCodexModelCatalogLifecycle() {
+  return codexModelCatalogLifecycle.snapshot();
+}
+
+// This is a passive snapshot of the SAME fresh live catalog used by the
+// control-bar, not a new CLI invocation or a source of input authority.
+function getCachedCodexPickerCatalog() {
+  if (!modelCache || modelCache.source !== 'live'
+    || Date.now() - modelCache.ts >= MODEL_CACHE_TTL_MS) return [];
+  return modelCache.value.map(model => ({ id: model.id, label: model.label }));
+}
+
 function listCodexModels() {
+  if (codexModelCatalogLifecycle.closing) return Promise.reject(codexModelCatalogLifecycle.cancelled());
   if (modelCache && Date.now() - modelCache.ts < MODEL_CACHE_TTL_MS) return Promise.resolve(modelCache.value);
   // Dozens of persistent Codex controls mount together after workspace
   // restore. Before the first catalog request completed, every control spawned
@@ -11808,7 +12478,8 @@ function listCodexModels() {
     console.log('[CodexModels] join in-flight catalog request');
     return modelCacheInflight;
   }
-  modelCacheInflight = new Promise((resolve) => {
+  modelCacheInflight = (async () => {
+    const catalogCycle = codexModelCatalogLifecycle.newCycle();
     const fallback = [
       { id: 'gpt-5.5', label: 'GPT-5.5', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
       { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
@@ -11822,9 +12493,9 @@ function listCodexModels() {
       const value = models.length > 0 ? models : fallback;
       console.log('[CodexModels] catalog resolved source=' + (models.length > 0 ? source : 'builtin-fallback')
         + ' count=' + value.length);
-      modelCache = { ts: Date.now(), value };
-      modelCacheInflight = null;
-      resolve(value);
+      codexModelCatalogLifecycle.reportPublication(catalogCycle, models.length > 0 ? source : 'builtin-fallback', value.length);
+      modelCache = { ts: Date.now(), value, source: models.length > 0 ? source : 'builtin-fallback' };
+      return value;
     };
 
     // Live catalog matches the current account/config and the interactive
@@ -11833,36 +12504,37 @@ function listCodexModels() {
     // A Dock-launched main has only system PATH. Use the same user-install
     // lookup as account probes, including its priority over an older Homebrew CLI.
     const catalogEnv = buildChildProcessEnv({ PATH: buildCodexProcessPath() });
-    execFile('codex', ['debug', 'models'], {
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: 15_000,
-      env: catalogEnv,
-    }, (err, stdout) => {
-      if (!err) {
-        const models = parseCodexModelsCatalog(stdout);
-        if (models.length > 0) {
-          finish(models, 'live');
-          return;
-        }
-      }
+    try {
+      const stdout = await codexModelCatalogLifecycle.request(['debug', 'models'], {
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 15_000,
+        env: catalogEnv,
+      }, { cycle: catalogCycle, phase: 'live' });
+      if (codexModelCatalogLifecycle.closing) throw codexModelCatalogLifecycle.cancelled();
+      const models = parseCodexModelsCatalog(stdout);
+      if (models.length > 0) return finish(models, 'live');
+      throw Object.assign(new Error('empty catalog'), { code: 'empty-catalog' });
+    } catch (err) {
+      if (codexModelCatalogLifecycle.closing) throw codexModelCatalogLifecycle.cancelled();
       console.warn('[CodexModels] live catalog unavailable code=' + (err?.code || 'empty-catalog')
         + ' fallback=bundled');
-
-      execFile('codex', ['debug', 'models', '--bundled'], {
+    }
+    if (codexModelCatalogLifecycle.closing) throw codexModelCatalogLifecycle.cancelled();
+    try {
+      const bundledStdout = await codexModelCatalogLifecycle.request(['debug', 'models', '--bundled'], {
         maxBuffer: 20 * 1024 * 1024,
         timeout: 5_000,
         env: catalogEnv,
-      }, (bundledErr, bundledStdout) => {
-        if (bundledErr) {
-          console.warn('[CodexModels] bundled catalog unavailable code=' + (bundledErr.code || 'unknown')
-            + ' fallback=builtin');
-          finish(fallback, 'builtin-fallback');
-          return;
-        }
-        finish(parseCodexModelsCatalog(bundledStdout), 'bundled');
-      });
-    });
-  });
+      }, { cycle: catalogCycle, phase: 'bundled' });
+      if (codexModelCatalogLifecycle.closing) throw codexModelCatalogLifecycle.cancelled();
+      return finish(parseCodexModelsCatalog(bundledStdout), 'bundled');
+    } catch (bundledErr) {
+      if (codexModelCatalogLifecycle.closing) throw codexModelCatalogLifecycle.cancelled();
+      console.warn('[CodexModels] bundled catalog unavailable code=' + (bundledErr.code || 'unknown')
+        + ' fallback=builtin');
+      return finish(fallback, 'builtin-fallback');
+    }
+  })().finally(() => { modelCacheInflight = null; });
   return modelCacheInflight;
 }
 
@@ -12664,7 +13336,12 @@ module.exports = {
     setCodexOperationSourceResolver,
     loadCodexOperationSource,
     listCodexModels,
+    getCachedCodexPickerCatalog,
+    disposeCodexModelCatalog,
+    bindCodexModelCatalogRuntime,
+    getCodexModelCatalogLifecycle,
     findCodexSessionFile,
+    locateCodexSessionFile,
     findLatestCodexSession,
     findCodexDescendantSessions,
     inspectCodexDescendantSessions,
@@ -12727,7 +13404,10 @@ module.exports = {
     buildCodexFullHistoryCooperatively,
     buildCodexTurnEvidence,
     createCodexHistoryProjector,
+    CodexRootProjectionOwner,
+    HistoryProjectionArena,
     projectCodexFullHistoryFromFile,
+    projectCodexFullHistoryStream,
     publishCodexRewriteProjection,
     getCodexRewriteReceipt,
     projectCodexTimelineFromFile,

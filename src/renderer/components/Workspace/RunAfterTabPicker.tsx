@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject } from 'react';
-import { createPortal } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
+import { captureUIHoverAction, uiPerformancePhaseForAction, uiPerformanceCommitForAction } from '../../utils/uiPerformanceDiagnostics.mjs';
 import { ChevronDown, Folder, Hourglass, LoaderCircle, Pencil, Play, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -633,31 +634,33 @@ export function RunAfterTabPicker({
     };
   }, [open]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open || !openOnHover) return;
-    let frame = 0;
     const onMove = (e: MouseEvent) => {
-      if (frame) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        const triggerRect = triggerRef.current?.getBoundingClientRect();
-        const menuRect = menuRef.current?.getBoundingClientRect();
-        if (!triggerRect || !menuRect) return;
-        // Список и его кнопка плюс зазор между ними — одно целое. Сторона не
-        // задаётся: список раскрывается влево или вправо в зависимости от места
-        // у края экрана, а зазор всегда лежит там, где блоки разошлись.
-        if (pointInHoverCluster({
-          hub: menuRect,
-          satellites: [triggerRect],
-          x: e.clientX,
-          y: e.clientY,
-          pad: HOVER_CLOSE_TOLERANCE,
-        })) return;
-        setOpen(false);
-      });
+      // Exact descendants already establish the hover owner. Only the gap or
+      // outside path needs the two existing rectangles; no row inventory.
+      const target = e.target;
+      if (target instanceof Node && (triggerRef.current?.contains(target) || menuRef.current?.contains(target))) return;
+      const triggerRect = triggerRef.current?.getBoundingClientRect();
+      const menuRect = menuRef.current?.getBoundingClientRect();
+      if (!triggerRect || !menuRect) return;
+      // Список и его кнопка плюс зазор между ними — одно целое. Сторона не
+      // задаётся: список раскрывается влево или вправо в зависимости от места
+      // у края экрана, а зазор всегда лежит там, где блоки разошлись.
+      if (pointInHoverCluster({
+        hub: menuRect,
+        satellites: [triggerRect],
+        x: e.clientX,
+        y: e.clientY,
+        pad: HOVER_CLOSE_TOLERANCE,
+      })) return;
+      const action = captureUIHoverAction(e);
+      if (action) uiPerformancePhaseForAction(action.id, 'run-after-picker:leave-admitted');
+      flushSync(() => setOpen(false));
+      if (action) uiPerformanceCommitForAction(action.id, 'run-after-picker:hidden-commit');
     };
     window.addEventListener('mousemove', onMove, true);
     return () => {
-      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener('mousemove', onMove, true);
     };
   }, [open, openOnHover]);

@@ -22,7 +22,11 @@ const STATUS_CLASS: Record<ToolStatus, string> = {
 // amber triangle (NOT a spinner — nothing is executing yet).
 export function ColoredToolIcon({ icon, status }: { icon: React.ReactNode; status: ToolStatus }) {
   if (status === 'running') {
-    return <Loader2Icon size={14} strokeWidth={2.75} className={`cb-spin cb-tool-ic ${STATUS_CLASS.running}`} />;
+    // Rotating the SVG itself causes native layer work in Electron even when
+    // the glyph is tiny. Keep the vector static and rotate its HTML carrier.
+    return <span className={`cb-spin cb-tool-ic ${STATUS_CLASS.running}`} style={{ width: 14, height: 14, willChange: 'transform' }}>
+      <Loader2Icon size={14} strokeWidth={2.75} style={{ display: 'block' }} />
+    </span>;
   }
   if (status === 'waiting') {
     return <AlertTriangleIcon size={14} strokeWidth={2.5} className={`cb-tool-ic ${STATUS_CLASS.waiting}`} />;

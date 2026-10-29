@@ -6,6 +6,10 @@ export function classifyQueuedCodexSettingsIntent(
   const revision = Number(state.codexSettingsIntentRevision || 0);
   if (revision > expectedRevision) return { kind: 'replaced' };
   if (revision !== expectedRevision) return { kind: 'ignore' };
+  if (state.codexSettingsIntentCancelled?.revision === revision
+    && state.codexSettingsIntentCancelled?.actionSequence === Number(state.codexSettingsIntentActionSequence || 0)) {
+    return { kind: 'failed', error: 'отменено пользователем' };
+  }
 
   const intentModel = String(state.codexSettingsIntentModel || '').trim();
   const intentEffort = String(state.codexSettingsIntentEffort || '').trim().toLowerCase();

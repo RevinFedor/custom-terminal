@@ -31,7 +31,11 @@ function fixture(t) {
   let root = { ready: true }, runtime = { status: 'active', inputReady: true, busy: false,
     writerStatus: 'provisional-source', sessionId: null };
   const writes = [], logs = [];
-  const context = vm.createContext({ isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey, automaticSendAdmissionDiagnostics: new Map(),
+  const context = vm.createContext({ require, path, srcMainDir: __dirname,
+    getBuildContinueOperations: () => ({ capturing: () => false }),
+    buildInstallAutomationBlocked: () => false, historyMutationInput: null,
+    isPromptLoopAutomationSource: require('./prompt-queue-source').isPromptLoopAutomationSource,
+    isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey, automaticSendAdmissionDiagnostics: new Map(),
     console: { log: line => logs.push(line) }, bridgeRequest: async () => root,
     coherentPublicRuntimeSnapshot: async () => runtime, readAutomaticSendFrame: gate.read });
   const admit = vm.runInContext(admitSource + ';admitQueuedAgentSend;', context);

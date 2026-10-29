@@ -1,4 +1,4 @@
-const MENU='[data-tab-context-menu],[data-tab-status-marker-menu],[data-tab-linked-files-popup]';
+const MENU='[data-tab-context-menu],[data-tab-status-marker-menu],[data-tab-linked-files-popup],[data-linked-files-hover-bridge]';
 
 /** DOM ownership labels only. A menu about another tab cannot keep this group's
  * hover alive. This is presentation, not an execution/membership proof. */

@@ -78,7 +78,7 @@ function fixture({selectedFirst=false,clickOnly=false,anchor=200,viewport=900,id
   const win={addEventListener:(name,fn)=>{const set=listeners.get(name)||new Set();set.add(fn);listeners.set(name,set);},
     removeEventListener:(name,fn)=>listeners.get(name)?.delete(fn),
     dispatchEvent:event=>{for(const listener of [...listeners.get(event.type)||[]])listener(event);}};
-  const dom=new Element();Object.assign(dom,{isConnected:true,contains:target=>!!target?.inside,querySelector:()=>null});
+  const dom=new Element();Object.assign(dom,{isConnected:true,dataset:{},contains:target=>!!target?.inside,querySelector:()=>null});
   dom.querySelectorAll=()=>all(tree).filter(node=>node.props?.['data-strip-item']!==undefined).map(node=>{
     const id=node.props['data-strip-tab-id'];let item=nodes.get(id);if(!item){item={dataset:{stripTabId:id}};nodes.set(id,item);}
     item.getBoundingClientRect=()=>{
@@ -93,9 +93,11 @@ function fixture({selectedFirst=false,clickOnly=false,anchor=200,viewport=900,id
     require:name=>{
       if(name==='react')return React;if(name.endsWith('useWorkspaceStore'))return {useWorkspaceStore:store};
       if(name.endsWith('useUIStore'))return {useUIStore:uiStore};
+      if(name.endsWith('tabChrome'))return {TABBAR_PANEL_BG:'rgb(37, 37, 38)'};
       if(name.endsWith('paneStripGroupMetaHover.mjs'))return {ownPaneStripGroupMetaHover:(owner,toggle,_target,inside)=>ownPaneStripGroupMetaHover(owner,toggle,win,inside)};
-      if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {currentUIActionId:()=> 'controlled-action',uiDiagnosticAbsNow:()=>performance.now(),
-        uiPerformancePhaseForAction:(id,name,fields)=>diagnostics.push({id,name,fields})};
+      if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {captureUIHoverAction:()=>({id:'controlled-hover'}),currentUIActionId:()=> 'controlled-action',uiDiagnosticAbsNow:()=>performance.now(),
+        uiPerformancePhaseForAction:(id,name,fields)=>diagnostics.push({id,name,fields}),
+        uiPerformanceCommitForAction:(id,name,fields)=>diagnostics.push({id,name,fields})};
       if(dependencies.has(name))return dependencies.get(name);
       if(name.endsWith('PaneStripGroupOutline'))return {__esModule:true,default:'Outline'};
       if(name.endsWith('.css'))return {};throw Error('Uncontrolled dependency: '+name);

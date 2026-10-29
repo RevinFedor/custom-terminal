@@ -151,14 +151,33 @@ JSONL, БД, вложения или диагностические пакеты
 Проверяй caller: в SOURCE покрыты соответствующие Send refusals/unknown,
 preparation failures, ручная preview diagnostic и некоторые owned short-control
 ошибки. Часть incidents намеренно metadata-only и не захватывает текст.
-У native question `control-unconfirmed` сам console log не вызывает raw pin;
-для нового caller требуется отдельная проверка этой связи. Это описание покрытия,
-не поручение сейчас менять question flow.
+Сам console log native question `control-unconfirmed` не вызывает raw pin.
+SOURCE24.10 добавляет отдельный caller: до throw/release writer вызывается прежний
+`reportTerminalIncident` с exact tab/request/reason, без ожидания disk/renderer
+под PTY lock. Detached observed frame (до128rows/32768 UTF-16 units/6styles на
+строку, с потерями) сохраняется отдельно от current collector snapshot; смена
+owner запрещает pin нового чужого PTY. First/last existing input IDs и write
+attempt/return связывают отказ с вводом, не доказывают fd-call или приём CLI и
+не получают выдуманный Send H/O/A. Diagnostic failure не меняет исходный отказ
+и не разрешает повтор клавиши, новый flush или ответ на вопрос.
+
+Headless/controlled tests подтверждают этот caller, bounded detach и once-before-
+rejection. Настоящий packaged question happy path24.10 прошёл без такого отказа:
+он не подтверждает persistence failure packet/prune. Исторический frame3281
+этой проводкой не восстановлен; сохранность конкретного raw пакета проверяется
+по его manifest/payload/losses, а не по наличию hook или успешному question UI.
 
 Старые composer forensics/replay journal дополняют пакет, но не заменяют raw window:
 они ограничивают текст, coalesce одинаковые семантические кадры и зависят от
 checkpoint. Длинный незакрытый кадр может потерять prefix до нового checkpoint.
 Сумма двух частичных окон не является доказательством полного потока.
+
+У Codex startup timeout Main watchdog и ожидатель готовности могут оба захватить
+снимок одного запуска. Каждый собственный artifact сохраняется; пользовательское
+уведомление объединяется только при совпадении tab + launch + lifecycle и только
+после действительно доставленного успешного сообщения. Другая или неизвестная
+identity не группируется, ошибка сохранения не маскируется. Это не меняет сам
+таймаут, состояние запуска или допустимость Send.
 
 ## Порядок разбора инцидента
 

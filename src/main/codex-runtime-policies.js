@@ -18,12 +18,33 @@ const sameOwner = (a, b) => !!a?.terminal && !!b?.live && a.terminal === b.termi
   && a.lifecycleGeneration === b.lifecycleGeneration && a.runSeq === b.runSeq;
 
 function goalDialogKey(frame) {
-  const goal = inspectCodexResumeGoalPrompt(frame.text);
+  const projection = paintedGoalProjection(frame);
+  const text = projection ? projection.text : frame.text;
+  const goal = inspectCodexResumeGoalPrompt(text);
   if (!goal.visible) return null;
   // Committed main frames are plain text. Selection/wrapping may change, the
   // actual Goal must not change underneath an operation authorizing Enter.
-  return frame.text.slice(goal.titleIndex).replace(/^[\t ]*[›❯»>][\t ]*(?=(?:1\.[\t ]*Resume|2\.[\t ]*Leave)\b)/gm, '')
+  return text.slice(goal.titleIndex).replace(/^[\t ]*[›❯»>][\t ]*(?=(?:1\.[\t ]*Resume|2\.[\t ]*Leave)\b)/gm, '')
     .replace(/\s+/g, ' ').trim();
+}
+
+function paintedGoalProjection(frame) {
+  const projection = frame.goalDialogProjection;
+  return !!frame.mirror && !!frame.snapshot && projection?.projected === true && typeof projection.text === 'string'
+    && projection.seq === frame.seq && projection.mirrorToken === frame.mirror
+    && projection.snapshotToken === frame.snapshot && frame.snapshot.writeSeq === frame.seq
+    && Number.isSafeInteger(projection.bounds?.left) && Number.isSafeInteger(projection.bounds?.right)
+    && projection.bounds.left >= 0 && projection.bounds.right > projection.bounds.left
+    && projection.bounds.right <= frame.snapshot.cols ? projection : null;
+}
+
+function recordPolicyFrame(frame) {
+  const projection = paintedGoalProjection(frame);
+  // Retain only the same admitted frame's derived key, not mirror/snapshot
+  // objects. GET remains a pure read; the write path re-reads its current frame.
+  return { seq: frame.seq, text: frame.text, goalKey: goalDialogKey(frame),
+    goalTextSource: projection ? 'painted:' + projection.bounds.left + '..' + projection.bounds.right
+      : 'snapshot:' + (frame.goalDialogProjectionReason || 'legacy') };
 }
 
 function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock, sendKey,
@@ -65,7 +86,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       + ' policy=' + state.policy + ' phase=' + phase + ' reason=' + reason
       + ' actionWritten=' + state.actionWritten + ' frame=' + state.frameSeq
       + ' request=' + (state.goalRequest?.requestId || '-') + ' attempted=' + !!state.actionAttempted
-      + ' choiceConfirmed=' + !!state.choiceConfirmed);
+      + ' choiceConfirmed=' + !!state.choiceConfirmed + ' goalTextSource=' + state.lastFrame.goalTextSource);
   }
   function clear(tabId) {
     const old = states.get(tabId);
@@ -77,14 +98,20 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       old.goalRequest.state = null;
     }
   }
-  function armDeadline(tabId, state) {
+  function armDeadline(tabId, state, explicit = false) {
     if (state.deadlineTimer) clearTimer(state.deadlineTimer);
+    // Cold UI can paint the picker before its restore finishes. Use ONLY the
+    // remaining original launch lifetime supplied by Main, not a new short
+    // deadline and not a deadline renewed by each repaint. Explicit later
+    // choices keep their existing independent action budget (not Send time).
+    state.actionDeadlineAt = !explicit && Number.isFinite(state.launchActionDeadlineAt)
+      ? state.launchActionDeadlineAt : now() + actionMs;
     const token = state.actionToken;
     state.deadlineTimer = setTimer(() => {
       if (current(tabId, state) && state.actionToken === token && state.phase !== 'handled') {
         setPhase(tabId, state, 'manual', state.actionAttempted ? 'policy-key-outcome-unknown' : 'policy-action-deadline');
       }
-    }, actionMs);
+    }, Math.max(0, state.actionDeadlineAt - now()));
     state.deadlineTimer?.unref?.();
   }
   function confirmComposer(tabId, state, frame, reason) {
@@ -151,14 +178,23 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
           if (!dialog.interactive || !dialog.selectedIndex) { setPhase(tabId, state, 'manual', 'option-unproven'); return; }
           if (state.selectionFrameSeq != null && (frame.seq <= state.selectionFrameSeq
             || dialog.selectedIndex !== state.expectedSelectedIndex)) {
+            // A written navigation key is not a selection ACK. In particular,
+            // the existing 2s capture may return the SAME committed frame while
+            // Codex is replaying history. Wait on existing frame events; never
+            // repeat the arrow/Enter or manufacture a ready/result proof.
+            if (state.type === 'resume-goal') {
+              setPhase(tabId, state, 'awaiting-selection', 'waiting-committed-selection'); return;
+            }
             setPhase(tabId, state, 'manual', 'option-selection-not-confirmed'); return;
           }
           state.lastSeenSeq = frame.seq;
-          state.lastFrame = { seq: frame.seq, text: frame.text };
+          state.lastFrame = recordPolicyFrame(frame);
           const target = state.type === 'usage-exhaustion' ? dialog.targetIndex : state.policy === 'leave-paused' ? 2 : 1;
           const key = dialog.selectedIndex === target ? '\r' : dialog.selectedIndex < target ? '\x1b[B' : '\x1b[A';
           const allowed = () => current(tabId, state, true) && state.actionToken === token
-            && state.phase !== 'manual' && state.phase !== 'handled';
+            && state.phase !== 'manual' && state.phase !== 'handled'
+            && now() < state.actionDeadlineAt;
+          if (now() >= state.actionDeadlineAt) { setPhase(tabId, state, 'manual', 'policy-action-deadline'); return; }
           if (key === '\r') {
             state.actionAttempted = true; state.actionFrameSeq = frame.seq;
             state.writeAttemptAt = now(); state.writeReturnedAt = null;
@@ -221,7 +257,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
                   && latest.seq > state.lastSeenSeq && state.type === 'resume-goal'
                   && inspectCodexPolicyDialog(latest.text)?.type === state.type && goalDialogKey(latest) === state.goalKey) {
                   state.lastSeenSeq = latest.seq;
-                  state.lastFrame = { seq: latest.seq, text: latest.text };
+                  state.lastFrame = recordPolicyFrame(latest);
                 }
                 setPhase(tabId, state, 'manual', 'provider-choice-not-confirmed');
               }
@@ -255,7 +291,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     }
     if (state) {
       state.lastSeenSeq = frame.seq;
-      state.lastFrame = { seq: frame.seq, text: frame.text };
+      state.lastFrame = recordPolicyFrame(frame);
     }
     if (!dialog) {
       if (state && frame.seq > state.frameSeq && isComposer(frame)) {
@@ -269,6 +305,9 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
         setPhase(tabId, state, 'manual', 'provider-choice-not-confirmed');
       }
       if (state.phase === 'awaiting-frame' && !state.actionWritten && frame.seq > state.frameSeq) void act(tabId, state);
+      if (state.phase === 'awaiting-selection' && !state.actionWritten
+        && frame.seq > state.selectionFrameSeq && dialog.interactive
+        && dialog.selectedIndex === state.expectedSelectedIndex) void act(tabId, state);
       return;
     }
     if (state?.phase === 'handled' && state.operationalTurnId && !state.resultFrameSeq && state.actionWritten) {
@@ -285,9 +324,10 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       ? preferences.usage === 'stop-all' ? 'stop-all' : 'continue'
       : resume === null ? 'manual' : resume ? 'resume' : 'leave-paused';
     state = { id: 'codex-policy-' + operationNamespace + '-' + (++sequence), owner, type: dialog.type, policy,
+      launchActionDeadlineAt: dialog.type === 'resume-goal' ? preferences.actionDeadlineAt : null,
       detectedAt: now(), frameSeq: frame.seq, lastSeenSeq: frame.seq, phase: null, actionWritten: false,
       actionAttempted: false, actionToken: {}, timer: null,
-      lastFrame: { seq: frame.seq, text: frame.text }, goalKey: dialog.type === 'resume-goal' ? goalDialogKey(frame) : null };
+      lastFrame: recordPolicyFrame(frame), goalKey: dialog.type === 'resume-goal' ? goalDialogKey(frame) : null };
     states.set(tabId, state);
     setPhase(tabId, state, 'detected', 'committed-provider-dialog');
     if (manualReason) { setPhase(tabId, state, 'manual', manualReason); return; }
@@ -314,7 +354,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     const inputOwned = owned && state.owner.inputRevision === owner.inputRevision;
     const dialog = inspectCodexPolicyDialog(state.lastFrame.text);
     const provenDialog = inputOwned && dialog?.type === 'resume-goal' && dialog.interactive && !!dialog.selectedIndex
-      && goalDialogKey(state.lastFrame) === state.goalKey;
+      && state.lastFrame.goalKey === state.goalKey;
     const recoveryAvailable = !!(state.actionAttempted && state.phase === 'manual' && !state.inflightToken
       && provenDialog && state.lastSeenSeq > Math.max(state.actionFrameSeq || 0, state.selectionFrameSeq || 0));
     let status = 'unavailable';
@@ -415,7 +455,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     state.actionToken = {};
     state.failureReported = false;
     setPhase(tabId, state, 'detected', view.recoveryAvailable ? 'explicit-goal-recovery' : 'explicit-goal-action');
-    armDeadline(tabId, state);
+    armDeadline(tabId, state, true);
     void act(tabId, state);
     return goalRequestState(record);
   }

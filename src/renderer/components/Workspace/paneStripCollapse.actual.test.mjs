@@ -37,6 +37,7 @@ function fixture({anchor=200,width=600}={}){
     require:name=>{
       if(name==='react')return React;if(name.endsWith('useWorkspaceStore'))return {useWorkspaceStore:store};
       if(name.endsWith('useUIStore'))return {useUIStore:uiStore};
+      if(name.endsWith('tabChrome'))return {TABBAR_PANEL_BG:'rgb(37, 37, 38)'};
       if(name.endsWith('paneStripGroupInterfaceModel.mjs'))return interfaceModel;
       if(name.endsWith('paneStripCollapseModel.mjs'))return model;
       if(name.endsWith('paneStripGroupMetaHover.mjs'))return {ownPaneStripGroupMetaHover:(owner,toggle,_target,inside)=>ownPaneStripGroupMetaHover(owner,toggle,win,inside)};
@@ -44,8 +45,9 @@ function fixture({anchor=200,width=600}={}){
       if(name.endsWith('paneStripGroupsModel.mjs'))return groups;
       if(name.endsWith('pane-strip-color-groups.cjs'))return {paneStripColorGroupsBasis};
       if(name.endsWith('horizontalDragGeometry.mjs'))return {horizontalDragAutoScrollDelta};
-      if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {currentUIActionId:()=> 'owned',uiDiagnosticAbsNow:()=>performance.now(),
-        uiPerformancePhaseForAction:(id,name,fields)=>diagnostics.push({id,name,fields})};
+      if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {captureUIHoverAction:()=>({id:'owned-hover'}),currentUIActionId:()=> 'owned',uiDiagnosticAbsNow:()=>performance.now(),
+        uiPerformancePhaseForAction:(id,name,fields)=>diagnostics.push({id,name,fields}),
+        uiPerformanceCommitForAction:(id,name,fields)=>diagnostics.push({id,name,fields})};
       if(name.endsWith('PaneStripGroupOutline'))return {__esModule:true,default:'Outline'};if(name.endsWith('.css'))return {};throw Error(name);
     }});
   const props={group:state.spaces[0].stripColorGroups.groups[0],entries:state.splitPanes[0].tabs,representative:'b',workflowId:'W',windowId:'win',paneIndex:0,
@@ -53,7 +55,7 @@ function fixture({anchor=200,width=600}={}){
   const render=()=>{let count=0;do{
     assert.ok(count++<12,'finite render settles');cursor=0;dirty=false;root=module.exports.default(props);
     const wrappers=all(root).filter(node=>node.props?.['data-strip-item']!==undefined);
-    const dom={isConnected:true,contains:target=>target?.inside===true,querySelector:()=>null,querySelectorAll:()=>wrappers.map(node=>{
+    const dom={isConnected:true,dataset:{},contains:target=>target?.inside===true,querySelector:()=>null,querySelectorAll:()=>wrappers.map(node=>{
       const id=node.props['data-strip-tab-id'];let item=nodes.get(id);if(!item){item={dataset:{stripTabId:id}};nodes.set(id,item);}
       item.getBoundingClientRect=()=>{rectangleReads++;return {left:anchor+(node.props.style.left||0),right:anchor+(node.props.style.left||0)+80,top:30,bottom:56,width:80,height:26};};return item;
     })};root.props.ref.current=dom;dom.querySelectorAll();
@@ -70,6 +72,29 @@ test('actual Meta toggles repeatedly without pointer movement or reentering the 
       f.emit('keydown',{key:'Meta'});f.emit('keyup',{key:'Meta'});
       assert.equal(f.render().props['data-group-open'],i%2===0?'1':undefined,`cycle ${i+1}`);
     }
+  } finally {f.dispose();}
+});
+test('Fedor fast-control comparison keeps group Meta hold separate from release-to-OPEN work',()=>{
+  const f=fixture();
+  try {
+    f.render().props.onMouseEnter({buttons:0});
+    f.emit('keydown',{key:'Meta',timeStamp:100});
+    assert.equal(f.render().props['data-group-open'],undefined,'group keeps its existing tap semantics');
+    f.emit('keyup',{key:'Meta',timeStamp:1600});
+    assert.equal(f.render().props['data-group-open'],'1');
+    const release=f.diagnostics.find(p=>p.name==='strip-group:meta-release');
+    assert.equal(release.id,'owned-hover');assert.equal(release.fields.heldMs,1500);
+    assert.ok(f.diagnostics.some(p=>p.id===release.id&&p.name==='strip-group:layout'));
+  } finally {f.dispose();}
+});
+test('badge hover action remains the same owner through OPEN geometry and visible commit',()=>{
+  const f=fixture();
+  try {
+    all(f.render()).find(node=>node.type==='Card'&&node.props.id==='b').props.control.hover('own-badge-action');f.render();
+    const phases=f.diagnostics.filter(p=>p.name.startsWith('strip-group:'));
+    assert.ok(phases.some(p=>p.name==='strip-group:open-request'));
+    assert.ok(phases.some(p=>p.name==='strip-group:layout'));
+    assert.ok(phases.every(p=>p.id==='own-badge-action'));
   } finally {f.dispose();}
 });
 test('actual group treats its own context menu as hover during repeated Meta cycles, but releases a foreign menu',()=>{
@@ -119,6 +144,20 @@ test('actual open row reuses the existing outline measurement for font/card widt
   const wrappers=all(f.render()).filter(node=>node.props?.['data-strip-item']!==undefined);
   assert.equal(wrappers.find(node=>node.props['data-strip-tab-id']==='a').props.style.left,-126);
   assert.equal(wrappers.find(node=>node.props['data-strip-tab-id']==='b').props.style.transform,'translateX(0px)');f.dispose();
+});
+test('OPEN gap backdrop uses the existing full-row geometry and panel gray without a second card, hit target or measurement',()=>{
+  const f=fixture();assert.equal(all(f.render()).some(node=>node.props?.['data-pane-strip-group-backdrop']!==undefined),false);
+  all(f.root).find(node=>node.type==='Card'&&node.props.id==='b').props.control.toggle();let tree=f.render();
+  let backdrop=all(tree).find(node=>node.props?.['data-pane-strip-group-backdrop']!==undefined);
+  assert.ok(backdrop);assert.equal(backdrop.props.style.background,'rgb(37, 37, 38)');assert.equal(backdrop.props.style.left,-86);
+  assert.equal(backdrop.props.style.width,252);assert.equal(backdrop.props.style.bottom,-7);assert.equal(backdrop.props['aria-hidden'],'true');
+  assert.equal(all(tree).filter(node=>node.props?.['data-strip-item']!==undefined).length,3);
+  const reads=f.rectangleReads;for(let i=0;i<20;i++)f.emit('mousemove',{clientX:210,clientY:40});assert.equal(f.rectangleReads,reads);
+  all(tree).find(node=>node.type==='Outline').props.onMeasured([{id:'a',left:0,right:120},{id:'b',left:126,right:206},{id:'c',left:212,right:292}]);
+  tree=f.render();backdrop=all(tree).find(node=>node.props?.['data-pane-strip-group-backdrop']!==undefined);
+  assert.equal(backdrop.props.style.left,-126);assert.equal(backdrop.props.style.width,292);
+  const css=fs.readFileSync(new URL('./PaneStripCollapsedGroup.css',import.meta.url),'utf8');
+  assert.match(css,/\.pane-strip-group-backdrop\s*\{[^}]*position:absolute[^}]*z-index:-1[^}]*pointer-events:none/);f.dispose();
 });
 test('actual over-wide group reuses event-sized drag edge scroll so current/last members remain reachable without a timer loop',()=>{
   const f=fixture({anchor:100,width:200});f.render().props.onMouseEnter({buttons:0});f.emit('keydown',{key:'Meta'});f.emit('keyup',{key:'Meta'});f.render();

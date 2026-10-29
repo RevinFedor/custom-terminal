@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Server, RotateCw, Cloud, Terminal, Puzzle, Loader2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
-import { externalMcpServers, mcpCatalogErrorMessage, hubConfigurationNotice } from '../../utils/mcpCatalogPresentation.mjs';
+import { externalMcpServers, mcpCatalogErrorMessage, hubConfigurationNotice, hasHubInventory, mcpRegistrationLabel } from '../../utils/mcpCatalogPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -28,6 +28,7 @@ type HubStatus = {
   servers?: HubServer[];
   clients?: { tabId: string; lastSeen: number }[];
   down?: boolean;
+  browserMaintenance?: { held: boolean; code?: string } | null;
   configurationApplied?: boolean;
   desiredConfiguration?: { error: string | null; needsReview: boolean;
     entries: { name: string; state: string; error?: string }[] };
@@ -135,14 +136,17 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
     setPanelPos({ top: rect.bottom + 6, right: Math.max(8, window.innerWidth - rect.right) });
   }, [open]);
 
-  const servers = status?.servers || [];
+  const inventoryKnown = hasHubInventory(status);
+  const servers = inventoryKnown ? status!.servers! : [];
   const visibleCatalog = catalogScopeRef.current === cwd ? catalog : null;
   const externalServers: CodexMcpServer[] = externalMcpServers(visibleCatalog, servers);
   const configurationNotice = hubConfigurationNotice(status, visibleCatalog);
-  const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering;
+  const browserHeld = status?.browserMaintenance?.held === true;
+  const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering
+    && !(server.name === 'browser' && browserHeld);
   const readyCount = servers.filter(isReady).length;
   const allUp = !configurationNotice && !status?.down && servers.length > 0 && readyCount === servers.length;
-  const dotColor = status?.down || readyCount === 0
+  const dotColor = !inventoryKnown ? '#fbbf24' : readyCount === 0
     ? '#f87171'
     : allUp ? '#4ade80' : '#fbbf24';
 
@@ -225,17 +229,17 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
           >
             <div className="mb-2 flex items-center justify-between">
               <div className="font-medium" style={{ color: '#e4e4e7' }}>
-                MCP-хаб {status?.down ? '· недоступен' : '· порт ' + (status?.port ?? '?')}
+                MCP-хаб {inventoryKnown ? '· порт ' + (status?.port ?? '?') : '· статус неизвестен'}
               </div>
               <div className="text-[11px]" style={{ color: '#71717a' }}>
-                {status?.down ? '' : readyCount + '/' + servers.length + ' активных'}
+                {inventoryKnown ? readyCount + '/' + servers.length + ' активных' : ''}
               </div>
             </div>
 
-            {status?.down && (
+            {status && !inventoryKnown && (
               <div className="mb-2 rounded-md border p-2 text-[11px]"
                 style={{ borderColor: 'rgba(248,113,113,0.35)', background: 'rgba(248,113,113,0.08)', color: '#fca5a5' }}>
-                Хаб не отвечает. MCP-инструменты недоступны до восстановления.
+                Не удалось прочитать статус хаба. Доступность MCP-инструментов не подтверждена.
               </div>
             )}
 
@@ -248,7 +252,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
             <button
               className="mb-2 flex items-center gap-1.5 rounded px-2 py-1 text-[11px] cursor-pointer"
               style={{ border: '1px solid rgba(56,189,248,0.3)', color: '#bae6fd', opacity: restarting ? 0.65 : 1 }}
-              disabled={restarting !== null}
+              disabled={restarting !== null || browserHeld}
               onClick={() => restart()}
             >
               <RotateCw size={12} className={restarting === '__hub__' ? 'animate-spin' : ''} />
@@ -257,7 +261,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
             {restartError && (
               <div role="alert" className="mb-2 rounded border p-2 text-[11px] break-words"
                 style={{ color: '#fca5a5', borderColor: 'rgba(248,113,113,0.3)' }}>
-                {restartError}
+                Последняя попытка: {restartError}
               </div>
             )}
 
@@ -265,12 +269,12 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
               <div key={s.name} className="flex items-center gap-2 rounded px-1 py-[3px]"
                 style={{ opacity: isReady(s) ? 1 : 0.75 }}>
                 <span className="inline-block h-[7px] w-[7px] flex-none rounded-full"
-                  style={{ background: s.recovering ? '#fbbf24' : isReady(s) ? '#4ade80' : '#f87171' }} />
+                  style={{ background: s.recovering || s.name === 'browser' && browserHeld ? '#fbbf24' : isReady(s) ? '#4ade80' : '#f87171' }} />
                 <span className="w-[92px] flex-none font-mono text-[11px]" style={{ color: '#e4e4e7' }}>
                   {s.name}
                 </span>
-                <span className="flex-1 truncate text-[11px]" title={s.lastError || undefined} style={{ color: '#71717a' }}>
-                  {s.recovering
+                <span className="flex-1 truncate text-[11px]" title={s.name === 'browser' && browserHeld ? status?.browserMaintenance?.code : s.lastError || undefined} style={{ color: '#71717a' }}>
+                  {s.name === 'browser' && browserHeld ? 'обслуживание' : s.recovering
                     ? 'восстанавливается · запросов: ' + s.pendingRequests
                     : isReady(s)
                     ? 'pid ' + s.pid + ' · ' + formatUptime(s.startedAt) + (s.restarts > 0 ? ' · рестартов: ' + s.restarts : '')
@@ -280,7 +284,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
                   <button
                     className="flex-none rounded p-1 cursor-pointer"
                     style={{ color: restarting === s.name ? '#38bdf8' : '#71717a' }}
-                    disabled={restarting !== null}
+                    disabled={restarting !== null || s.name === 'browser' && browserHeld}
                     aria-label={'Перезапустить ' + s.name}
                     onClick={() => restart(s.name)}
                     onMouseEnter={(e) => { e.currentTarget.style.color = '#e4e4e7'; }}
@@ -292,7 +296,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
               </div>
             ))}
 
-            {!status?.down && (
+            {inventoryKnown && (
               <div className="mt-2 border-t pt-1.5 text-[11px]" style={{ borderColor: 'rgba(255,255,255,0.08)', color: '#71717a' }}>
                 Активных клиентов-вкладок: {status?.clients?.length ?? 0}
               </div>
@@ -318,7 +322,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
                     <Icon size={12} className="flex-none" style={{ color: '#71717a' }} />
                     <span className="min-w-0 flex-1 truncate font-mono text-[11px]" style={{ color: '#e4e4e7' }}>{server.name}</span>
                     <span className="flex-none text-[11px]" style={{ color: '#71717a' }}>
-                      {!server.enabled ? 'отключён' : server.hubServer ? 'нет в хабе' : 'настроен'}
+                      {mcpRegistrationLabel(server, status)}
                     </span>
                   </div>
                 );

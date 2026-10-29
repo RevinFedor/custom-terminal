@@ -9,6 +9,8 @@ const web = fs.readFileSync(require.resolve('./web-server.js'), 'utf8');
 const mcp = fs.readFileSync(require.resolve('../../mcp/terminal-server.mjs'), 'utf8');
 const runner = fs.readFileSync(require.resolve('../renderer/hooks/usePromptQueueRunner.ts'), 'utf8');
 const registration = main.slice(main.indexOf('function registerTaskCompletionIntent('), main.indexOf('function getActiveAgentExecutionContext('));
+const decisionStart = web.indexOf('async function serializeLoopDecision(');
+const decision = web.slice(decisionStart, web.indexOf('\n}', decisionStart) + 2);
 const routeStart = web.indexOf("m = parsed.pathname.match(/^\\/api\\/terminal-tabs\\/([^/]+)\\/complete-task$/);");
 assert.ok(routeStart > 0, 'canonical completion route exists');
 const route = web.slice(routeStart, web.indexOf('\n  //', routeStart + 120));
@@ -16,12 +18,15 @@ const stopStart = runner.indexOf('      const tabId = data.tabId;\n      const e
 assert.ok(stopStart > 0, 'actual Loop stop branch exists');
 const stopBranch = runner.slice(stopStart, runner.indexOf('      const ownersAtOutcome', stopStart));
 
-function requestHarness({ children = [], eligible = true } = {}) {
+function requestHarness({ children = [], eligible = true, questionPending = false } = {}) {
   const registry = new TaskCompletionIntentRegistry();
   registry.beginTurn({ tabId: 'T', provider: 'codex', sessionId: 'S', turnId: 'turn1', completionEligible: eligible });
   const context = vm.createContext({ taskCompletionIntents: registry,
+    loopDecisionLanes: new Map(),
+    loopPromptMode: require('../shared/loop-dependencies.cjs').loopPromptMode, readPersistedLoopQueue: () => ({}),
+    getMessageLoopWaits: () => ({ blocks: () => questionPending }),
     codexTurnWatchers: new Map([['T', { busy: true }]]), claudeTurnBusy: new Map(), console: { log() {} } });
-  vm.runInContext(registration, context);
+  vm.runInContext(registration + '\n' + decision, context);
   return { registry, async call(body) {
     const response = {};
     Object.assign(context, { parsed: { pathname: '/api/terminal-tabs/T/complete-task' }, req: { method: 'POST' }, res: {},
@@ -66,6 +71,14 @@ test('natural turn without a stop signal does not disable useful read-only Loop 
   vm.runInNewContext(stopBranch, { data: { tabId: 'T' },
     usePromptQueueStore: { getState: () => ({ getQueue: () => queue, setLoopPromptEnabled() { assert.fail('read-only work is not blocked'); } }) } });
   assert.equal(queue.loopPromptEnabled, true);
+});
+test('ordinary complete_task cannot bypass its own unanswered or unprocessed question, even with no child run', async () => {
+  for (const status of ['completed', 'blocked']) {
+    const h = requestHarness({ questionPending: true });
+    const result = await h.call({ sourceMeta: { tabId: 'T' }, status, reason: status === 'blocked' ? 'waiting' : undefined });
+    assert.equal(result.status, 409); assert.equal(result.value.code, 'message_replies_pending');
+    assert.equal(h.registry.getTurn('T').intentId, null);
+  }
 });
 
 test('actual MCP wrapper forwards blocked status and reason with self-only identity', async () => {

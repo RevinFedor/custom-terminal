@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const vm = require('node:vm');
+const { EventEmitter } = require('node:events');
 const ts = require('typescript');
 const childEnv = require('./child-process-env');
 const accounts = require('./codex-account-profiles');
@@ -39,17 +40,23 @@ function harness({ liveFailure = false, bundledFailure = false } = {}) {
     safeJsonParse: (text, fallback) => { try { return JSON.parse(text); } catch { return fallback; } },
     console: { log: line => logs.push(line), warn: line => logs.push(line) },
     execFile: (command, args, options, callback) => {
+      const child = Object.assign(new EventEmitter(), { pid: 100 + calls.length, exitCode: null, signalCode: null });
       calls.push({ command, args: [...args], options });
       const paths = options.env.PATH.split(path.delimiter);
       const cliFound = paths.includes(path.join(os.homedir(), '.local', 'bin'));
       const failed = !cliFound || (args.includes('--bundled') ? bundledFailure : liveFailure);
-      setImmediate(() => callback(failed ? Object.assign(new Error('catalog unavailable'), {
-        code: cliFound ? 'EFAIL' : 'ENOENT',
-      }) : null, failed ? '' : JSON.stringify({ models: rawModels })));
+      setImmediate(() => {
+        callback(failed ? Object.assign(new Error('catalog unavailable'), {
+          code: cliFound ? 'EFAIL' : 'ENOENT',
+        }) : null, failed ? '' : JSON.stringify({ models: rawModels }));
+        child.emit('close', failed ? 1 : 0, null);
+      });
+      return child;
     },
   });
   vm.runInContext('let modelCache = null; let modelCacheInflight = null; const MODEL_CACHE_TTL_MS = 300000;\n'
-    + ['normalizeCodexModel', 'parseCodexModelsCatalog', 'listCodexModels'].map(declaration).join('\n')
+    + ['normalizeCodexModel', 'parseCodexModelsCatalog', 'createCodexModelCatalogLifecycle', 'listCodexModels'].map(declaration).join('\n')
+    + '\nconst codexModelCatalogLifecycle = createCodexModelCatalogLifecycle();'
     + '\nglobalThis.readCatalog = listCodexModels;', context);
   return { read: () => context.readCatalog(), calls, logs, guiEnv };
 }

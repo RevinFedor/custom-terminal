@@ -137,9 +137,14 @@ function readIngress(file = INGRESS, expectedEpoch = null) {
       || typeof f.expectedExtensionRelease !== 'string' || !f.expectedExtensionRelease
       || f.digest !== digest({ version: 1, fenceId: f.fenceId, barrierId: f.barrierId, revision: f.revision,
         scope: f.scope, expectedMainRelease: f.expectedMainRelease, expectedExtensionRelease: f.expectedExtensionRelease,
-        ...(f.coldIntentDigest ? { coldIntentDigest: f.coldIntentDigest } : {}) })
+        ...(f.coldIntentDigest ? { coldIntentDigest: f.coldIntentDigest } : {}),
+        ...(f.profileUpdatePlan ? { profileUpdatePlan: f.profileUpdatePlan } : {}) })
       || f.state === 'released' && (f.releasedRevision !== f.revision + 1 || !/^[a-f0-9]{64}$/.test(f.releaseDigest || ''))) fail('research_ingress_storage_invalid')
     if (!!f.coldIntentDigest !== !!f.coldIntent || f.coldIntentDigest && f.coldIntentDigest !== digest(f.coldIntent)) fail('research_ingress_storage_invalid')
+    if(f.profileUpdatePlan){const p=f.profileUpdatePlan
+      if(p.version!==1||p.kind!=='isolated_yandex_extension'||!id(p.instanceId)||f.scope.length!==1||f.scope[0]!==p.instanceId
+        ||f.coldIntent||!(/^[a-f0-9]{64}$/).test(p.cutId||'')||!(/^[a-f0-9]{64}$/).test(p.filesDigest||'')
+        ||!(/^[a-p]{32}$/).test(p.extensionId||''))fail('research_ingress_storage_invalid')}
   }
   if (new Set(value.fences.map(f => f.barrierId)).size !== value.fences.length) fail('research_ingress_storage_invalid')
   return value

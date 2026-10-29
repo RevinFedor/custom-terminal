@@ -43,6 +43,7 @@ async function fixture(t) {
     normalizeAgentTurnEndReason, isNaturalAgentTurnEndReason, choosePromptQueueContinuationForOutcome,
     isOrchestrationCompletionBlocked: () => controls.orchestration,
     isLoopOrchestrationBlocked: () => controls.loopOrchestration, loopDependenciesBlock: () => controls.wait,
+    messageLoopWaitsBlock: () => false,
     buildInstallContinuationFloor: () => controls.installFloor,
     hasPendingAgentGoalWork: value => value.goalWork?.pending === true,
     hasPriorWorkflowInput: () => controls.priorInput, queueShutdownPending: false, queueManualStopping: new Set(),

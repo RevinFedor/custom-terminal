@@ -43,6 +43,7 @@ function planCodexModelEffortIntentReconcile({
   writerOwnerId,
   processRunning,
   tuiReady,
+  cancelled = false,
 } = {}) {
   const desiredModel = clean(model);
   const desiredEffort = clean(effort).toLowerCase();
@@ -52,6 +53,7 @@ function planCodexModelEffortIntentReconcile({
     || desiredRevision <= 0) {
     return { action: 'none', reason: 'intent-missing' };
   }
+  if (cancelled === true) return { action: 'none', reason: 'intent-cancelled' };
   if (processRunning !== true) {
     return { action: 'queue', reason: 'process-not-running' };
   }

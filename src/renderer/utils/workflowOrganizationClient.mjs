@@ -312,7 +312,14 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
         if(unresolved||released.length)await recover(timing);
         mark(timing,'snapshotStartAbs');
         let payload;
-        try {payload=typeof snapshot === 'function' ? await snapshot() : snapshot;}
+        try {
+          payload=typeof snapshot === 'function' ? snapshot() : snapshot;
+          // Synchronous snapshots finish their local lease/field/order guards
+          // immediately before admission. Do not insert a microtask where a
+          // queued navigation or publication can invalidate those guards.
+          // Async canonical-read snapshots retain their existing await.
+          if(typeof snapshot==='function'&&payload&&typeof payload.then==='function')payload=await payload;
+        }
         finally {mark(timing,'snapshotEndAbs');}
         if(timing)try {
           const spaces=Object.getOwnPropertyDescriptor(payload || {},'spaces')?.value;

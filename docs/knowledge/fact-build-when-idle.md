@@ -9,6 +9,18 @@ DiagnosticReports/Spotlight может коснуться старого отч�
 случай: incident от 19.08 получил mtime 22.08), и `find -newer` тогда ложно
 сообщал об аварии после полностью штатных `before-quit → overlay → app.quit`.
 
+**Уже закрытый Main, внешний прямой installer (26.10).** Standalone MCP hub
+может продолжать работать из того же `.app`, когда UI-приложение уже закрыто.
+Совпадение bundle path не разрешает останавливать его. Plain installer без
+Voice/nonce использует прежний `inspectProdServer`: исходный `absent` разрешает
+подготовку, а непосредственно перед первой заменой bundle требуется свежий
+`absent`. Тогда Quit пропускается; `found/unknown` на повторной проверке оставляет
+установленный bundle нетронутым. Ошибка подготовки не открывает приложение,
+которое пользователь закрыл. При ошибке нового Open и неопределённом текущем
+Main сохраняются артефакты, без path-wide kill/отката поверх живого процесса.
+Это не разрешение shell install из AI-вкладки самого Noted и не изменение
+Voice/app-owned Quit/idle guards. Проверка: `build-install-closed-main.test.mjs`.
+
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
 ## Плановый install без служебных research-промптов (SOURCE20.10)
@@ -39,6 +51,16 @@ hold переживает обычный restart; completed ID не открыв
 а не молча откатывает его и не объявляет восстановление завершённым. Это SOURCE
 contract/tests, не свидетельство уже выполненной установки. Старые idle/owner-ACK
 guards и внешний Voice Record callback остаются отдельными механизмами.
+
+Если после `complete` потерян ответ POST либо завершающего GET, SOURCE26.10
+делает один дополнительный GET той же операции, без повторного POST/установки.
+Успех требует валидную сохранённую `completed` receipt exact operationId и
+отсутствие другого active owner; bootstrap сохраняет exact durable before-restore
+startup proof. При отказе владельца/протокола recovery не запускается; при
+неизвестном или несовпавшем readback сохраняются исходная ошибка и новый bundle.
+Такой случай реально был26.10: команда вернула timeout, но отдельный exact GET
+подтвердил завершённую ту же операцию. Исходная failure-квитанция не переписывается.
+Проверки: `research-maintenance-confirmation.test.cjs` и адресный installer control.
 
 `build:install` / `build:i` и внешний Voice Record hook всегда заново собирают
 текущие исходники. Разовый механизм `release/prepared-install-intent.json` удалён
@@ -162,6 +184,51 @@ blocker/error предыдущего. Это исключает launch storm о�
 
 ## Немедленный снимок и продолжение: `build:i-c`
 
+Шрам24Oct, operation8f0ecd6f: установка/Main restart прошли, но все4continue
+получили terminal owner_changed во время AutoResume. Consumer смешивал отсутствие
+owner proof с доказанной заменой. SOURCE различает startup provisional SIDnull,
+response_state_changed/continuation_runtime_changed и lookup unknown (pending,
+без результата/ввода) и настоящий process-provider/source/cwd mismatch, missing tab,
+Stop либо смену уже pinned PTY (прежний отказ). Fence не переносится вслед за новым
+PTY и не откладывается до ready; пропавший pinned fence — unknown, не замена.
+Readiness event проверяет тот же operation/H/O ещё раз, не новый continue.
+
+Шрам26Oct4196: AutoResume поднял процесс, а автоматический запрос остался pending;
+ручное «Продолжай» Fedor было принято той же вкладкой. Public transitioning/
+unconfirmed writer не равны запрету пользовательского ввода. Подтверждение writer
+может появляться после первого ввода через Main; ожидание этого подтверждения до
+резервирования автоматического запроса создаёт круг. Source pending-причина и
+успешный ручной ввод сами по себе не доказывают историческую причину отсутствия
+writer; большой History для диагностики такого ожидания не прогревается.
+
+SOURCE26Oct разрывает этот круг отдельным Main-owned input-only verdict:
+exact Resume source/lease/launch, текущие PTY/run/lifecycle/process, composer и
+input/Stop revision разрешают подготовку первого ввода без публичного writer.
+Reader ничего не arm/reserve и не объявляет response idle. Original/latest и
+полный интервал зависимостей остаются обязательными до принятия одного frozen
+H/O прежним FIFO и повторяются на ACTIVE HEAD. Latest execution identity может
+читаться при том же provisional proof; это не готовый ответ и не прогрев History.
+Неизвестные source/history/input proof оставляют pending, а не guessed Send.
+
+HEAD возвращает приватный admission прежнему sender; его physical/input/Stop/
+owner fence сохраняется в scope этой попытки и проверяется после await и перед
+paste. Собственная единственная reservation ввода не считается manual input;
+поздний чужой ввод, Stop или замена PTY отзывают запись. Переход provisional→writer
+не снимает этот fence. First submit arm/ensure, paste+Enter и canonical audit
+по-прежнему принадлежат Main. Только подтверждённая прежняя квитанция связывает
+continuation с захваченной задачей; lost ACK/UNKNOWN/restart не создают второй H/O.
+Автоматический agent-route возвращает application-ACK после enqueue, а не ждёт
+физического Send заблокированного HEAD; обычный manual continuation не меняет
+своего ответа. Ready-return last-await перед синхронным enqueue сохраняет FIFO
+порядок callbacks. Source/private fixtures не являются installed/native приёмкой.
+
+CLI отдельно показывает installed и restoration counts: confirmed native input,
+already-working/result-ready, pending и refused. Registered restore не означает
+«все продолжились»; видимый отказ даёт общий ok=false/exit1 при уже установленной
+app, без повторной установки/rollback. Новые terminal refusals сохраняют bounded
+owner observation; старые решения не backfill/replay. Физический запуск и
+содержимое original/latest после readiness остаются отдельными guards.
+
 `npm run build:i-c` запускают из внешнего терминала. Пользователю нужен набор
 работавших вкладок на момент команды, поэтому этот режим сначала сохраняет
 операцию и закрывает Main, затем готовит candidate. Это отдельный явный режим;
@@ -169,6 +236,13 @@ blocker/error предыдущего. Это исключает launch storm о�
 должен уже поддерживать capture/restore v2 с `proofRevision:2`: старый app,
 включая промежуточный v2 без полного recovery-контракта, получает отказ до Quit,
 его нельзя обновить этой же ещё не загруженной функцией.
+
+`capture-quit` v2 — самостоятельный договор сохранения/восстановления, а не
+доказательство допуска обычного Voice-owned install. API связывает capture с
+operationId/expectedMainPid, но не с immutable job/hash Voice. Наличие unresolved
+subjects в сохранённом снимке не запрещает этому режиму запросить Quit. Поэтому
+его capability/ACK не доказывает отсутствие private input leases и не заменяет
+normal input/ownership guards при загрузке исправления admission.
 
 Снимок различает собственный model turn и унаследованное ожидание. Вкладка,
 только ожидающая Terminal MCP/SC, сохраняет прежнюю зависимость без `continue`.
@@ -178,6 +252,46 @@ notification handoff и UNKNOWN не пересоздаются. Входяще�
 Пассивное наблюдение само не отправляет input: exact restart связывает старый
 subject с доказанным continuation, сохраняя отдельное evidence/provenance.
 
+SOURCE26Oct: новый capture сохраняет русский текст «Продолжай работу…» вместе
+с исходными идентификаторами видимых внутренних субагентов. Модель возобновляет
+незавершённых детей, а утраченных пересоздаёт по сохранённым заданиям; уже работающие
+и завершённые дети не дублируются. Это не повтор Terminal MCP или внешнего Research:
+их прежние операции/квитанции сохраняются. Текст заморожен для H/O и проходит тот
+же canonical prompt proof, включая agent-route. Старые captures и UNKNOWN intents
+с прежним `continue` не меняют bytes из-за новой версии приложения.
+
+Ожидание показывается отдельной строкой с одной статусной иконкой, именем вкладки
+и зарезервированным X в верхнем per-tab request dock, независимо от загрузки History.
+ID установки остаётся только в деталях: в короткой строке он вместе с дублирующей
+иконкой отнимал место у названия (шрам27Oct, «пробемы с телеграм»). Клик строки
+открывает только выбранное continuation event в `RequestDetailsPopover`, общем
+с Send/Reply preview. Наведение окно не открывает. Панель310px содержит состояние,
+точную вкладку/задачу/установку; остальные ID и reason доступны в раскрытии.
+Отдельного toolbar с одной иконкой терминала нет: переход во вкладку использует
+обычный source-link внутри панели. Research этой вкладки не подмешиваются по
+совпавшему tabId или captured references; их SC/browser actions остаются в своих
+карточках. Popup X/Escape закрывает просмотр; X строки отменяет exact continuation.
+Оно не рисует synthetic model busy:
+сохранённый запрос, очередь, подтверждённый ввод и результат задачи различаются.
+X отменяет именно эту operation/tab/H/O через прежний cancel-target; статус
+обновляется по authoritative scoped snapshot. Unresolved/paused ошибка остаётся
+видимой при active:false, поэтому её X также доступен и получает durable ACK;
+раньше terminal no-op делал такую строку неудаляемой. Закрытие сохраняет исходные
+state/reason/квитанции в History, не запускает Continue и не отменяет Research.
+UI принимает только ACK того же operation/tab/H/O/requestId, не один ok:true;
+неподтверждённое закрытие остаётся явной ошибкой. Source UI/Node fixtures не доказывают
+загрузку renderer или физический restart/Send установленного приложения.
+
+Шрам26Oct b957: Research77fe84e5 был completed/resultComplete с notification sent,
+пока local автопродолжение вкладки «чаты с hh» оставалось runtime-input-pending.
+Безымянная раскрывающаяся вниз плашка смешивала их для пользователя. Статус
+Research берётся из текущего run owner; capture-time running не заменяет его.
+Ожидание отдельного «Продолжай» не помечает сохранённый Research неотправленным.
+Старый status DTO без имени дополняется уже загруженным exact tab inventory;
+прежний fallback всех Research по tabId удалён29Oct как ложная связь событий.
+History, угадывание SID и создание новой работы для этого не нужны. Эти подписи
+не подтверждают доставку и не снимают recovery hold вместо его прежнего owner.
+
 Результат или reply может оказаться в FIFO раньше `continue`. Он обрабатывается
 первым. Допуск последующего продолжения требует полного verified интервала
 сообщений и canonical receipts именно захваченных зависимостей. Callback не
@@ -185,6 +299,30 @@ subject с доказанным continuation, сохраняя отдельно�
 разрыв источника или неизвестный Enter не дают права на автоматический ввод.
 Проверка интервала читает уже прогретый структурный индекс, не запускает полный
 History ради отрицательного proof. Холодный/неполный индекс остаётся unknown.
+
+Шрам25Oct4196: старый recovery hold пережил новый собственный ответ и отклонил
+Loop до ввода. Это не выключенный Loop и не позднее разрешение Python. Полный
+старый интервал нужен, чтобы **отправить** ещё один Continue после callbacks;
+его отсутствие не опровергает отдельное положительное доказательство новой работы.
+SOURCE различает эти основания: exact canonical receipt самостоятельного запроса
+плюс native natural final того же текущего writer/turn снимают устаревший local
+continue без нового ввода. Callback/Loop/capacity-retry, bare SID/idle и неизвестная
+доставка таким proof не являются. Чтение ограничено metadata последних32receipts,
+не прогревает History; непокрытый/непрямой native input остаётся явным unknown.
+`proofWait` показывает stage и bounded reason оригинала/latest/интервала, а не
+объявляет любой unknown холодным кэшем. Исторический incident e9c не backfill.
+
+Явная отмена target — отдельная операция по exact operation/tab/H/O/requestId,
+без restore/reconcile/Send/Stop. Отзывается будущий ввод и его собственный hold;
+старые confirmed/UNKNOWN/attempt bytes остаются. Снятие hold будит только уже
+сохранённый natural cause через прежние arm/Goal/draft/FIFO/Stop guards, не создаёт
+новый final. Installed legacy API без capability `targetCancellation` этой отмены
+не умеет: `/restore` нельзя использовать как reset, а raw journal не заменяет API.
+Cancel сохраняет как минимум envelope3 (читает прежние1/2); rollback reader без этой версии
+должен явно отказать, а не проигнорировать отмену UNKNOWN/pending. Новые операции
+не понижают уже записанную версию. IDs/исторические operation records остаются.
+Новый frozen restart prompt требует envelope4; новый reader читает1–4, а reader
+без поддержки4 явно отказывает вместо отправки другого текста под прежним H/O.
 
 Loop ON/autoRun/карточки сохраняются. Новая автоматика до enqueue получает
 известный deferred/no-input. Старый Loop cause можно убрать из FIFO только по
@@ -200,7 +338,35 @@ complete; SC сохраняет тот же job и future final. Ошибка п
 Подтверждённый отказ continuation отмечается как unresolved и снимает restart hold;
 сохранённая отрицательная квитанция не превращается в success или автоматический retry.
 
+SOURCE23Oct: завершённая установка и незавершённое восстановление вкладок —
+разные границы. Шрам8374a2e2: app уже открыт, maintenance complete, но глобальный
+`phase !== settled` отклонял второй build:i-c. Новый capture допускается после
+activation предыдущего cut; незакрытый capture старого Main ещё блокирует
+параллельную установку. Та же незавершённая работа переносится ссылкой на прежний
+H/O без второго continue. Отличающийся собственный turn сохраняет свой exact
+subject и ждёт разрешения прежнего per-tab owner перед admission. UNKNOWN не
+закрывается по факту новой сборки, старые operation/receipts не переписываются.
+GET коллекции operations — metadata-only discovery; ошибка concurrent capture
+показывает исходный blocking ID/report. Этот фикс должен быть загружен в Main;
+одной правки CLI недостаточно для старого уже удерживающего guard приложения.
+
 ## Общая активность и допуск установки
+
+SOURCE24.10 разделяет историческую UNKNOWN-доставку и текущий input actor при
+install projection. Main startup может сохранить unresolved receipt без FIFO row.
+Узкое исключение применимо только к unqueued `delivery-unknown` с собственным
+`startupReconciliation:{source:'startup',decision:'unknown'}`, без записанного
+physical input lease и legacy native queue generation. Это только проекция;
+доставка/attempt/payload/assets не меняются и старый Send не повторяется. Текущая
+очередь/исполнитель, неопределённость без startup proof, записанный lease и
+независимые Main physical/identity/runtime guards по-прежнему закрывают install.
+Отсутствие FIFO, возраст записи и другой SID сами по себе не являются таким proof.
+Finite SQL controls проверяют это различие; Source fix не равен loaded Main.
+Старый Main может сам блокировать normal update этим ошибочным historical census:
+audit-only Codex API не заменяет загрузку кода и не подтверждает Claude receipts;
+не удалять journal/receipts и не применять Force ради смены проекции. Поддержанный
+same-job bootstrap должен быть отдельным подтверждённым owner flow.
+
 Единый ответ `/api/active-loaders` объединяет два авторитетных main-process источника: runtime-снимок `computeActiveLoaders()` и durable store оркестраций. Runtime-часть **переиспользует те же самые live-Map'ы, что питают per-tab loader в UI**; inherited/completion-часть читается прямо из сохранённых run, а не из renderer/Zustand:
 
 | Источник | Map в main | Семантика |
@@ -380,6 +546,49 @@ Read-only API projection исправляет legacy классификацию 
 не переписывая original job/report/callback bytes или native receipt. Если исходного
 snapshot нет, legacy active остаётся unknown. Уже frozen callback не переформатируется.
 
+#### Автопродолжение прерванной работы: явный параметр FORCE
+
+`autoContinueInterruptedTabs:true` — отдельное согласие caller для одной
+`force:true` операции Terminal MCP/Voice HTTP. Отсутствие поля и `false` сохраняют
+прежнее поведение и прежний request hash. Добавление `true` к уже сохранённому
+requestId конфликтует: старые установки не получают новых прав задним числом.
+Оба установленных приложения должны объявлять support v1 этого расширения;
+одной новой схемы MCP или исходников на диске недостаточно.
+
+Voice сохраняет request/job и неизменную связь с общим `build:i-c` executor.
+Компиляция остаётся ДО Quit. Работавшие собственные turns выбираются из Main
+перед Quit, после проверки candidate; внешний loader и `wasActive` из отчёта
+не являются списком восстановления. Сохраняются exact execution/source, ссылки
+на зависимости и неизвестные квитанции. Исторический UNKNOWN с другой SID не
+превращается в активную работу. Доказательства cut сохраняются до Quit ACK;
+штатный Main добавляет их IDs в свой прежний shutdown-снимок без изменения
+порядка EARLY-MARK/process proof/drain/Stop. Driver ждёт только захваченный PID,
+без принудительного fallback Quit; maintenance identity сохраняется и при rollback.
+
+После проверки именно этой установки Noted продолжает подходящую собственную
+работу через существующий FIFO. Incoming agent task использует прежний run owner;
+source установки получает только свой `build-install-return`, а не второй generic
+Continue. External-only сохраняет прежний job/run/message без нового input.
+Готовый captured result/reply резервируется прежним owner раньше Continue;
+проверка повторяется после context preparation непосредственно перед enqueue.
+Manual input, Stop/Close, другой owner, draft/Goal и UNKNOWN сохраняют свои guards.
+Unattempted работа после ещё одного недоказанного restart остаётся pending:
+смена PID сама не разрешает повторно запустить ранее остановленную вкладку.
+
+`GET Voice /api/terminal/build-install?requestId=…` отдельно показывает
+`job.autoContinue`, время наблюдения и exact operation report. В нём process
+restore, application admission, native confirmation и natural final различаются;
+`taskCompletion:not-asserted` не означает окончания задачи. Исторические report/
+callback bytes не обновляются вслед за этим отчётом. Cancel отзывается отдельно
+для ещё не начатого automatic input; уже attempted/UNKNOWN остаются у прежней
+квитанции и не replay. Неизменившееся недоступное delivery не порождает retry-loop.
+
+Bootstrap выполняют обычным opt-out обновлением согласованных Noted и Voice,
+затем обновляют MCP schema и проверяют capabilities обоих запущенных владельцев.
+Новые записи журнала используют envelope v2 с чтением прежнего v1; rollback app
+должен понимать этот протокол. SOURCE/private qualification не подтверждает
+установленную цепочку Quit/AutoResume/нативного ввода.
+
 ### Индикатор установки (SOURCE20.10)
 
 Build Install — отдельный typed `install` в правом dock вкладки рядом с MCP
@@ -389,6 +598,45 @@ HTTP/SSE, сохраняет bounded status cache и публикует исхо
 revision, mode, phase/stage, callback/error/report. После restart сначала виден
 честный stale cache, затем состояние живого владельца. Cancel адресует точные
 requestId/jobId/source своему installer API; orchestration detach не вызывается.
+
+Галочка подтверждает установку, а жёлтый цвет оставшегося ожидания относится к
+ответу агента на доставленный callback. Завершение install и доставка уведомления
+ещё не являются естественным концом этого ответа; ручного подтверждения здесь
+нет. Плашка автоматически уходит после exact natural-result proof.
+
+Confirmed audit той же доставки может позже получить canonical UUID или alias.
+Build Install сохраняет исходный callback binding, но принимает это обогащение,
+только если прежние адреса входят в current audit того же O/H/A, session,
+payload/preparation/request и времени audit. Полное равенство JSON было ошибкой:
+source-only binding оставался ждать после добавления UUID. Read-only callback
+accessor и повторная проверка после result await используют тот же guard; само
+обогащение не означает natural final и не даёт новый Send. Чужой attempt/source
+и отмена во время проверки остаются отказами.
+
+По прямому уточнению25Oct X отменяет **запрос**: его ожидание, будущий callback, связанные
+с exact Voice binding будущие auto-continue и собственные таймеры. Уже работающий
+ответ и квитанции остаются; второй Continue не отправляется. Самостоятельная CLI
+операция той же вкладки не считается связанной по одному tabId и не отменяется.
+
+Глобальная публикация continuation содержит реальные cached jobs всех источников;
+`snapshot()` без tabId не является пустым scoped snapshot. Иначе incremental
+renderer merge сохраняет старую карточку после закрытия ожидания, хотя Main уже
+знает `finished/cancelled`. После X hook проверяет `ok` и перечитывает scoped
+Main snapshot через тот же epoch/projection ordering даже при отказе отмены.
+Поздний результат после unmount не обновляет следующего owner; ошибка чтения
+сохраняет stale/error и старые unknown rows, а не удаляет их по пустому списку.
+Новый SOURCE X требует Voice capability `requestCancellation`: отменяет exact
+сохранённый job, включая historical, без воздействия на более новый compiler.
+Исключение совместимости — авторитетно finished legacy job с sent/skipped callback
+без auto-continue: у него уже нет будущей Voice работы, локальная отмена достаточна.
+Отмена ожидания не сдвигает floor за настоящий final, пришедший после request
+во время установки: Root повторяет этот deferred cause один раз. Уже continued
+запись не превращается в cancelled work и сохраняет прежний floor; future input
+отзывается отдельно. X не создаёт свой natural outcome.
+Предыдущий terminal-only cancel остаётся совместимым для старых клиентов, но не
+подменяет новый контракт X. Если владелец/долговечная отмена недоступны, показан
+явный отказ, не фиктивный success. History и UNKNOWN delivery остаются доступными;
+явно отменённый запрос не держит вечное активное ожидание только из-за этой истории.
 
 ### AI-hop изнутри Noted Terminal
 Когда rebuild инициирует агент внутри самого Noted Terminal, он не должен запускать
@@ -417,6 +665,23 @@ callback target/prompt/attempt в своём журнале. Same-ID retry не 
 compiler без terminal receipt остаётся unknown и не respawn'ится. Сохранённый
 primary result переживает потерю close ACK. Поздний canonical callback receipt
 можно принять пассивным чтением после deadline, без нового Send.
+
+`force=false` у Voice job не гарантирует отсутствие OS fallback: обычный driver
+вызывает `graceful-quit.sh 20`, чей поиск по пути packaged app может сопоставить
+также detached MCP hub. Exact-PID `--require-graceful --wait-only` — отдельная
+граница helper, используемая capture-quit flow; она сама не выдаёт install admission
+и не доказывает отсутствие незавершённого ввода.
+
+Шрам24Oct: ошибка process discovery внутри observe может закончить job ещё до
+compiler. `terminal_process_observation_unknown` при `pid/stage/installResult:null`
+и observer-failure log — не npm/install failure. Старый exec helper превращает
+разные execution errors в пустую строку, теряя errno; один такой код не доказывает
+timeout/нагрузку или отсутствие Main. Same-ID POST terminalfailed job возвращает
+его сохранённый результат и не rearm'ит compiler. Уже подтверждённый failure
+callback занимает `build-install-return:<jobId>` и свой frozen intent hash;
+заменять его success текстом под тем же handoff нельзя. Сохраняющий recovery
+после такого исхода должен явно сохранить первый terminal result/callback и
+отдельную identity нового recovery outcome; это не существующий implicit retry.
 
 SOURCE20.10 post-live: app-added working context меняет transport, поэтому hash
 логического callback нельзя сравнивать с transport audit token как одну identity.

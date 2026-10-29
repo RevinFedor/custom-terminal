@@ -1,3 +1,5 @@
+import { useTimelineRootStatusStore, timelineRootCandidate } from '../../store/useTimelineRootStatusStore';
+import { generateRootTimelineOutline } from '../../store/useTimelineOutlineStore';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowRightLeft, Check, Settings2 } from 'lucide-react';
@@ -205,18 +207,21 @@ export default function WorkspaceTitleBarTools({ dashboard = false }: { dashboar
   const outlineKey = outlineTarget
     ? timelineOutlineKey(outlineTarget.toolType, outlineTarget.sessionId)
     : '';
-  const outline = useTimelineOutlineStore((state) => outlineKey ? state.outlines[outlineKey] : undefined);
-  const outlineEligibleUuids = useTimelineOutlineStore((state) => outlineKey ? state.eligibleUuidsByKey[outlineKey] : undefined);
+  const rootStatus = useTimelineRootStatusStore(state => outlineTarget ? state.byTab[outlineTarget.tabId] : undefined);
+  const rootOutline = timelineRootCandidate(outlineTarget?.toolType)
+    && !(rootStatus?.sessionId === outlineTarget?.sessionId && rootStatus?.legacy);
+  const outline = useTimelineOutlineStore((state) => !rootOutline && outlineKey ? state.outlines[outlineKey] : undefined);
+  const outlineEligibleUuids = useTimelineOutlineStore((state) => !rootOutline && outlineKey ? state.eligibleUuidsByKey[outlineKey] : undefined);
   const outlineGenerating = useTimelineOutlineStore((state) => outlineKey ? state.generatingKeys.has(outlineKey) : false);
   const outlineError = useTimelineOutlineStore((state) => outlineKey ? state.errorsByKey[outlineKey] : '');
   const loadTimelineOutline = useTimelineOutlineStore((state) => state.loadOutline);
   const generateTimelineOutline = useTimelineOutlineStore((state) => state.generateOutline);
-  const outlineNewCount = timelineOutlineNewCount(outline, outlineEligibleUuids);
+  const outlineNewCount = rootOutline ? rootStatus?.outlineNewCount || 0 : timelineOutlineNewCount(outline, outlineEligibleUuids);
 
   useEffect(() => {
-    if (!outlineTarget) return;
+    if (!outlineTarget || rootOutline) return;
     void loadTimelineOutline(outlineTarget.toolType, outlineTarget.sessionId);
-  }, [outlineTarget?.toolType, outlineTarget?.sessionId, loadTimelineOutline]);
+  }, [outlineTarget?.toolType, outlineTarget?.sessionId, rootOutline, loadTimelineOutline]);
 
   useEffect(() => {
     if (dashboard || !activeExternalRun) {
@@ -314,6 +319,12 @@ export default function WorkspaceTitleBarTools({ dashboard = false }: { dashboar
 
   const handleGenerateTimelineOutline = useCallback(async () => {
     if (!outlineTarget || outlineGenerating) return;
+    if (rootOutline) {
+      try { const result = await generateRootTimelineOutline({ ...outlineTarget, projectName: centerProjectName || null });
+        if (result) showToast(`${result.groupCount} групп`, 'success');
+      } catch (error: any) { showToast(error?.message || String(error), 'error'); }
+      return;
+    }
     const record = await generateTimelineOutline({
       ...outlineTarget,
       projectName: centerProjectName || null,
@@ -331,7 +342,7 @@ export default function WorkspaceTitleBarTools({ dashboard = false }: { dashboar
       `${count} ${count === 1 ? 'группа' : count < 5 ? 'группы' : 'групп'}${tokens > 0 ? ` · ${tokens.toLocaleString('ru-RU')} входных токенов` : ''}`,
       'success'
     );
-  }, [outlineTarget, outlineGenerating, generateTimelineOutline, centerProjectName, outlineError, showToast]);
+  }, [outlineTarget, outlineGenerating, generateTimelineOutline, centerProjectName, outlineError, showToast, rootOutline]);
 
   return (
     <div
@@ -547,7 +558,7 @@ export default function WorkspaceTitleBarTools({ dashboard = false }: { dashboar
           строки постоянно им незачем — три из четырёх нажимают редко. Состояние
           видно и в свёрнутом виде, иначе работу запустили бы дважды. */}
       <TimelineToolsButton
-        outline={!!outline}
+        outline={rootOutline ? (rootStatus?.outlineCount || 0) > 0 : !!outline}
         outlineNewCount={outlineNewCount}
         outlineGenerating={outlineGenerating}
         outlineDisabled={!outlineTarget}

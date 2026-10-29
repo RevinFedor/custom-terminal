@@ -4,6 +4,7 @@ const CODEX_CANONICAL_REASONS = new Set([
   'codex_trimmed_boundary_whitespace',
   'codex_image_placeholder_canonical',
   'codex_image_path_alias_exact',
+  'codex_image_request_transform',
   'codex_pty_crlf_materialized_as_double_lf',
   'owned_mobile_attachment_paths',
 ]);

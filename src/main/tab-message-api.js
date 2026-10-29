@@ -15,6 +15,11 @@ function compactTabMessage(message) {
 }
 
 function messageApiAcceptance(reservation) {
+  if (reservation.results) return { ok: true, accepted: reservation.messages.length > 0,
+    requestId: reservation.requestId, deduplicated: reservation.deduplicated,
+    results: reservation.results, messages: reservation.messages.map(compactTabMessage),
+    ...(reservation.message ? { messageId: reservation.message.messageId,
+      deliveryState: reservation.message.deliveryState, message: compactTabMessage(reservation.message) } : {}) };
   const message = reservation.message;
   return {
     ok: true,
@@ -48,19 +53,29 @@ async function resolveMessageActor(body, resolveTab) {
 
 // The caller authenticates HTTP before entering this router. MCP's caller tab
 // is carried independently of the requested destination and cannot be overridden.
-async function handleTabMessageApi(req, res, parsed, { service, resolveTab, locateSource, readBody, sendJson }) {
+async function handleTabMessageApi(req, res, parsed, { service, resolveTab, locateSource, readBody, sendJson,
+  projectMessage = message => message }) {
   const root = parsed.pathname === '/api/tab-messages';
+  const batch = parsed.pathname === '/api/tab-messages/replies';
   const selected = parsed.pathname.match(/^\/api\/tab-messages\/([^/]+)(\/replies|\/dismiss|\/cancel|\/source)?$/);
   const dismiss = selected?.[2] === '/dismiss';
   const cancel = selected?.[2] === '/cancel';
   if (!root && !selected) return false;
   try {
-    if (root && req.method === 'GET') {
+    if (batch && req.method === 'POST') {
+      const body = await readBody(req), sourceTabId = messageActorId(body);
+      let reservation = service.existingReplyRequest(sourceTabId, body.requestId, body.messageIds, body.text);
+      if (!reservation) {
+        const source = await resolveMessageActor(body, resolveTab);
+        reservation = await service.replyToMessage({ responder: source, messageIds: body.messageIds, text: body.text, requestId: body.requestId });
+      }
+      sendJson(res, 202, messageApiAcceptance(reservation));
+    } else if (root && req.method === 'GET') {
       const tabId = typeof parsed.query.tabId === 'string' ? parsed.query.tabId.trim() : '';
       if (!tabId) throw apiError('message_tab_required');
       const limit = Math.max(1, Math.min(200, Number(parsed.query.limit) || 100));
       const messages = await service.listForTab(tabId, { limit });
-      sendJson(res, 200, { ok: true, messages: messages.map(compactTabMessage) });
+      sendJson(res, 200, { ok: true, messages: messages.map(message => projectMessage(compactTabMessage(message))) });
     } else if (selected?.[2] === '/source' && req.method === 'GET') {
       if (typeof locateSource !== 'function') throw apiError('tab_message_source_navigation_unavailable', 503);
       const result = await locateSource(decodeURIComponent(selected[1]));
@@ -68,7 +83,7 @@ async function handleTabMessageApi(req, res, parsed, { service, resolveTab, loca
     } else if (selected && !selected[2] && req.method === 'GET') {
       const result = await service.getMessage(decodeURIComponent(selected[1]));
       if (!result) throw apiError('message_not_found', 404);
-      sendJson(res, 200, { ok: true, ...result });
+      sendJson(res, 200, { ok: true, ...result, message: projectMessage(result.message) });
     } else if ((dismiss || cancel) && req.method === 'POST') {
       const body = await readBody(req);
       const tabId = typeof body?.tabId === 'string' ? body.tabId.trim() : '';

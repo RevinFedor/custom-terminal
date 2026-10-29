@@ -586,6 +586,51 @@ metadata public API и controlled bodies, не installed DOM/pixels.
 
 ## Canonical replacement и геометрия
 
+### Primary root: текущие live claims и data commit
+
+SOURCE27Oct primary-ветка не строит renderer Set всех durable identities ради
+live reconciliation. Начальное отсутствие proof — unproved/null, не пустая
+история. Один running demand и один replaceable pending обрабатывают весь
+текущий live fold batches до3; retirement публикуется только после завершения
+всех batches. Поздняя ошибка не удаляет строки, найденные раньше. Legacy и
+composite сохраняют прежние native reducers/Set.
+
+Prepared membership может ответить на plain unmatched, пока удаление live
+строки ещё ждёт существующий data commit именно этой live revision. Streaming
+update после старого commit остаётся видимым; следующий реальный commit может
+использовать уже подготовленный proof. Settings conflict способен сохранить
+строку при plain unmatched=false. Текущая tool-result work — отдельное основание
+для unmatched, даже когда row coverage UNKNOWN. Incoming event остаётся
+синхронным: unknown/new/no-ID, existing stream и прежнее Codex settings exception
+не ждут полного scan. Flush и turn-settled явно await `boolean|null`; UNKNOWN
+завершает своё наблюдение, body notification и query error не создают retry.
+Metadata/external no-adoption wake сохраняют current owner/cut границы; hidden
+и background reconciliation не требуют paint.
+
+Внутренний read-only scan использует captured primitive identities/settings.
+После await проверяются exact root/header/reader/sequence/dataSubject,
+owner/generation/fold/entry refs и cancel. Полные свежие graph+grammar witnesses
+проверяются на dispatch/consume/commit/publication, а не заново для каждого
+historical field/chunk. В actual Panel readCurrent default/full сохраняет
+sticky revoke старого live commit при in-place mismatch; только внутренний
+per-await путь запрашивает cheap structural mode. Это не permanent hash cache:
+inherited/nonenumerable/cyclic значения продолжают проверяться свежими.
+
+Native coercion/fingerprint может синхронно вызвать cleanup. Поэтому public
+model proof повторяет held-parent check после последнего helper await и после
+финального full witness. Публикация несёт локальный captured-lifetime predicate
+`owns`; Panel проверяет его вместе со своими прежними guards ПОСЛЕ вычисления
+remaining-row fingerprints и ДО изменения liveCommit/liveProjection/rows.
+Post-callback checks также запрещают resurrection proof/observation после
+dispose/invalidate/cancel/replacement. Это защита существующего владельца
+представления, не Main ACK/Send/queue/Input authority. Historical signed-text
+integrity hashes сохраняются и могут расти с N; их нельзя считать лишним
+повторным хешированием current payload. Общая memory/native latency этим
+Source-срезом не квалифицируется; протокол и оставшиеся arrays — в
+`fact-transcript-сервис.md`.
+
+### Передача уже показанного содержимого
+
 Working имеет отдельную короткую передачу: локальная вставка сообщения →
 снимок текущей работы из main. `paste-busy=false` завершает вставку, но сам по
 себе не означает отсутствие работы агента. History дочитывает timing по этому

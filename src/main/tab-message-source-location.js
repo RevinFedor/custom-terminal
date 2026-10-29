@@ -6,8 +6,14 @@ function acceptanceObjects(value, depth = 0) {
     try { return acceptanceObjects(JSON.parse(value), depth + 1); } catch { return []; }
   }
   if (typeof value !== 'object' || Array.isArray(value)) return [];
-  if (value.messageId && (value.accepted === true || value.message)) return [value];
   const result = [];
+  if (value.messageId && (value.accepted === true || value.message)) result.push({ body: value, callRequestId: value.requestId });
+  for (const message of Array.isArray(value.messages) ? value.messages : []) {
+    if (message?.messageId && value.accepted === true && value.ok !== false) result.push({
+      body: { ...value, messageId: message.messageId, requestId: message.requestId, message },
+      callRequestId: value.requestId,
+    });
+  }
   if (value.structuredContent) result.push(...acceptanceObjects(value.structuredContent, depth + 1));
   for (const block of Array.isArray(value.content) ? value.content : []) {
     if (block?.type === 'text') result.push(...acceptanceObjects(block.text, depth + 1));
@@ -36,16 +42,18 @@ function findTabMessageSourceLocation(message, history) {
       const args = raw.args || {};
       if (wantedMethod === 'send_message' && args.tabId !== undefined && args.tabId !== message.targetTabId) continue;
       if (wantedMethod === 'reply_to_message' && args.messageId !== undefined && args.messageId !== message.replyTo) continue;
-      if (typeof args.requestId === 'string' && args.requestId !== message.requestId) continue;
+      if (wantedMethod === 'reply_to_message' && args.messageIds !== undefined
+        && (!Array.isArray(args.messageIds) || !(message.replyToIds || [message.replyTo]).every(id => args.messageIds.includes(id)))) continue;
       const candidates = acceptanceObjects(raw.result);
-      const accepted = candidates.find(body => body.messageId === message.messageId
+      const accepted = candidates.find(({ body, callRequestId }) => body.messageId === message.messageId
         && body.ok !== false && body.accepted === true
+        && (typeof args.requestId !== 'string' || args.requestId === (callRequestId || message.requestId))
         && (!body.requestId || body.requestId === message.requestId)
         && (!body.message?.sourceTabId || body.message.sourceTabId === message.sourceTabId)
         && (!body.message?.sourceSessionId || body.message.sourceSessionId === message.sourceSessionId)
         && (!body.message?.targetTabId || body.message.targetTabId === message.targetTabId)
         && (!body.message?.kind || body.message.kind === message.kind)
-        && (body.message?.replyTo === undefined || (body.message.replyTo || null) === (message.replyTo || null)));
+        && (body.message?.replyTo === undefined || (body.message.replyTo || null) === (message.replyTo || null)))?.body;
       const physicalSid = entry.sessionId || history.sessionId;
       if (physicalSid !== message.sourceSessionId && accepted?.message?.sourceSessionId !== message.sourceSessionId) continue;
       const location = { messageId: message.messageId, tabId: message.sourceTabId,
@@ -73,7 +81,7 @@ async function resolveTabMessageSourceLocation(messageId, { getMessage, readOwne
   if (!before?.sessionId || before.toolType !== message.sourceProvider) {
     return { success: false, error: 'tab_message_source_history_unavailable' };
   }
-  const identity = { messageId: message.messageId, kind: message.kind, replyTo: message.replyTo,
+  const identity = { messageId: message.messageId, kind: message.kind, replyTo: message.replyTo, replyToIds: message.replyToIds,
     sourceTabId: message.sourceTabId, sourceProjectId: message.sourceProjectId,
     sourceProvider: message.sourceProvider, sourceSessionId: message.sourceSessionId,
     targetTabId: message.targetTabId, requestId: message.requestId };

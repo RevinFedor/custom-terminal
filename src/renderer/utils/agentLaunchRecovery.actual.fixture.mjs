@@ -48,6 +48,8 @@ export async function mainFixture(toolType = 'codex') {
     getCodexResumeReadIdentityLeaseForTab: () => null,
     AGENT_SEND_DURABLE_STATES: { IN_FLIGHT: 'in-flight' },
     agentSendReceiptStore: { get: () => ({ tabId, provider: toolType, attemptId: 'A', state: 'in-flight' }), isDeliveryCancelled: () => false },
+    historyMutationInput: require(path.join(root, 'src/main/history-mutation-input')).createHistoryMutationInputGate(),
+    readAgentSendPreparation: require(path.join(root, 'src/main/agent-send-preparation')).readAgentSendPreparation,
     projectManager: { db: { db: { prepare: () => ({ all: () => [row] }) } } },
   };
   const names = ['captureAgentLaunchFence', 'getTerminalStopRevision', 'getTerminalLifecycleGeneration',

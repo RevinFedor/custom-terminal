@@ -542,11 +542,15 @@ async function httpApiGet(target, endpoint) {
   return json;
 }
 
-async function httpApiPost(target, endpoint, body) {
+async function httpApiPost(target, endpoint, body, presentationSource = null) {
   const inst = pickWebInstance(target);
+  const encodedSource = presentationSource
+    ? Buffer.from(JSON.stringify(presentationSource), 'utf8').toString('base64url') : null;
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
     method: 'POST',
-    headers: apiAuthHeaders(inst),
+    headers: { ...apiAuthHeaders(inst), ...(encodedSource && encodedSource.length <= 8192 ? {
+      'x-noted-terminal-source': encodedSource,
+    } : {}) },
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -650,7 +654,7 @@ async function selectVoiceInstallInstance() {
   return [...unique.values()][0];
 }
 
-async function verifyVoiceBuildInstall(requireForce = false) {
+async function verifyVoiceBuildInstall(requireForce = false, requireAutoContinue = false) {
   const token = readSharedToken();
   if (!token) throw new Error('Shared web token not found at ' + TOKEN_PATH);
   const inst = await selectVoiceInstallInstance();
@@ -664,11 +668,14 @@ async function verifyVoiceBuildInstall(requireForce = false) {
     throw new Error('Voice Record build installer update required: exact durable request API is unavailable; no install POST sent');
   }
   if (requireForce && identity.capabilities.terminalBuildInstall.force !== true) throw new Error('Voice Record FORCE installer update required; no install POST sent');
+  if (requireAutoContinue && identity.capabilities.terminalBuildInstall.autoContinueInterruptedTabs?.version !== 1) {
+    throw new Error('Voice Record auto-continue installer update required; no install POST sent');
+  }
   return { inst, token };
 }
 
 async function httpPostVoice(endpoint, body) {
-  const { inst, token } = await verifyVoiceBuildInstall(body?.force === true);
+  const { inst, token } = await verifyVoiceBuildInstall(body?.force === true, body?.autoContinueInterruptedTabs === true);
   // A possibly dispatched install must not fall through to a second app after
   // HTTP/transport failure. Read this exact owner's job before any new request.
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
@@ -864,7 +871,7 @@ async function ensureAgentModelSelectionSupport(target, args) {
   }
 }
 
-async function ensureExternalResearchOrchestrationSupport(target, requireBrowserSelection = false) {
+async function ensureExternalResearchOrchestrationSupport(target, requireBrowserSelection = false, requireObserver = false) {
   const capabilities = await httpApiGet(target, '/api/me');
   if (Number(capabilities?.capabilities?.externalResearchOrchestration?.version) !== 1) {
     throw new Error(
@@ -873,6 +880,9 @@ async function ensureExternalResearchOrchestrationSupport(target, requireBrowser
     );
   }
   const browser = capabilities?.capabilities?.externalResearchOrchestration?.browserSelection;
+  if (requireObserver && capabilities?.capabilities?.externalResearchOrchestration?.observeExistingTurn?.version !== 1) {
+    throw Object.assign(new Error('app_update_required: Update Noted Terminal for strict existing-turn observation. No provider action was requested.'), { code: 'app_update_required' });
+  }
   if (requireBrowserSelection && (browser?.version !== 1 || browser.field !== 'browserId'
     || browser.jobOwnerPinned !== true || browser.offlinePreflight !== true)) {
     throw Object.assign(new Error('app_update_required: Update Noted Terminal for explicit/pinned research browser selection. Nothing was started.'),
@@ -896,10 +906,11 @@ function externalResearchBrowserId(value, options) {
   return value.toLowerCase();
 }
 
-async function ensureTabMessagesSupport(target) {
+async function ensureTabMessagesSupport(target, batchReply = false) {
   const response = await httpApiGet(target, '/api/me');
   const capability = response?.capabilities?.tabMessages;
-  if (Number(capability?.version) !== 1 || capability?.replyTo !== true || capability?.durable !== true) {
+  if (Number(capability?.version) !== 1 || capability?.replyTo !== true || capability?.durable !== true
+    || batchReply && capability?.batchReply?.version !== 1) {
     const error = new Error('This Noted Terminal app requires an update for durable tab messages (tabMessages version 1, replyTo and durable). No message POST or send_prompt fallback was attempted.');
     error.code = 'app_update_required';
     throw error;
@@ -1063,6 +1074,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'recheck_tab_response',
   'start_external_research',
   'import_external_conversation',
+  'observe_external_turn',
   'continue_external_research',
   'send_message', 'reply_to_message', 'get_message', 'cancel_message', 'get_send_receipt',
   'notify_user', 'get_user_notification',
@@ -1496,6 +1508,28 @@ const TOOLS = [
       },
       required: ['previousRunId', 'prompt'],
     },
+  },
+  {
+    name: 'observe_external_turn',
+    description: 'Subscribe SC Desktop to ONE explicitly selected existing ChatGPT turn after an authorized manual Browser operation. Uses the same profile and existing tab/document; zero model/paste/upload/Send/Stop/Reload actions and no new browser tab. Read the page first: pass exact account, performance.timeOrigin, selected user/native ID or document-local anchor and excluded old assistant IDs. Regenerate under the same user requires the old final baseline. Unlike ordinary URL import this cannot consume the previous final. Returns tracked runId/jobId; handle the later final/error notification, do not poll. The manual page is never auto-closed.' + ORCHESTRATION_COMPLETION_GUIDANCE,
+    inputSchema: { type: 'object', properties: {
+      runId: { type: 'string', minLength: 2, maxLength: 194, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]+$' },
+      url: { type: 'string' }, browserId: EXTERNAL_RESEARCH_BROWSER_SCHEMA,
+      target: { type: 'object', additionalProperties: false, properties: {
+        version: { type: 'integer', enum: [1] }, recoveryOperationId: { type: 'string' }, sourceRunId: { type: 'string' },
+        generationKind: { enum: ['new_user', 'regenerate'] },
+        document: { type: 'object', properties: { tabId: { type: 'integer' }, timeOrigin: { type: 'number' },
+          documentId: { type: 'string' }, generation: { type: 'integer' } }, required: ['tabId', 'timeOrigin'] },
+        account: { type: 'object', properties: { userId: { type: 'string' }, accountId: { type: 'string' } }, required: ['userId', 'accountId'] },
+        turn: { type: 'object', properties: { quality: { enum: ['native', 'dom_document'] }, conversationId: { type: 'string' },
+          userMessageId: { type: 'string' }, localUserAnchor: { type: 'string' }, assistantMessageId: { type: 'string' } }, required: ['quality', 'conversationId'] },
+        previousUserMessageIds: { type: 'array', items: { type: 'string' }, maxItems: 4096 },
+        previousFinalMessageIds: { type: 'array', items: { type: 'string' }, maxItems: 4096 },
+      }, required: ['version', 'recoveryOperationId', 'generationKind', 'document', 'account', 'turn', 'previousUserMessageIds', 'previousFinalMessageIds'] },
+      timeoutMs: { type: 'integer', minimum: 10000, maximum: 120000, description: 'Unproven binding/read budget, not maximum healthy model duration. Default120000.' },
+      sourceTabId: { type: 'string' }, label: { type: 'string' }, parentRunId: { type: 'string' },
+      waitForDescendants: { type: 'boolean' }, notifySource: { type: 'boolean' }, projectId: { type: 'string' }, cwd: { type: 'string' },
+    }, required: ['runId', 'url', 'browserId', 'target'] },
   },
   {
     name: 'import_external_conversation',
@@ -1933,7 +1967,7 @@ const TOOLS = [
   },
   {
     name: 'send_message',
-    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency and does not revive an interrupted delegation. A reply saying continuing is only a status update; no later task final is forwarded automatically. To receive the final of work already confirmed resumed, use wait_for_tab_response; use delegate_to_session for a new tracked assignment. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance. Only deliveryState=sent confirms delivery; otherwise report the returned pending/queued/error state, never claim delivery from accepted=true. Delivery does not prove the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
+    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency and does not revive an interrupted delegation. A reply saying continuing is only a status update; no later task final is forwarded automatically. To receive the final of work already confirmed resumed, use wait_for_tab_response; use delegate_to_session for a new tracked assignment. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance. Only deliveryState=sent confirms delivery; otherwise report the returned pending/queued/error state, never claim delivery from accepted=true. Delivery does not prove the model has read or answered it. Exact native delivery of the addressed Reply back to the source completes this exchange without waiting for the source natural final; ordinary busy/FIFO/Loop guards remain independent. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1947,15 +1981,17 @@ const TOOLS = [
   },
   {
     name: 'reply_to_message',
-    description: 'Reply to one exact incoming messageId when the facts are ready, before your final answer, then continue your current work. The server derives the recipient from the original message; never copy or override a return tab ID. A reply is durable before delivery. Only deliveryState=sent confirms delivery; accepted=true with pending/queued/error must be reported as that state, not as delivered. Acceptance and delivery do not prove the requesting model has read it. No polling or automatic reply-to-reply acknowledgement. On transport failure retry only identical text/messageId with the returned exact requestId, never a new ID. Source identity comes only from this full session; requires the updated tabMessages API, with no send_prompt fallback.',
+    description: 'Reply to one exact messageId, or pass messageIds for one common answer to multiple incoming questions. The server derives recipients and sends the text once per exact return conversation, retaining every explicit question link. Read results per ID: already-answered preserves the old answer, reply-pending preserves its existing delivery/UNKNOWN, foreign/unknown/legacy-cancel-ambiguous do not get rebound. An empty new messages list means no new delivery; never resend old answers. Card X only hides locally/releases its own wait; it does not prevent late Reply. Only exact native sent delivery completes the exchange, without source natural final or processing ACK. No polling, reply-to-reply ACK, or recipient override. After lost ACK retry only unchanged text/list and exact requestId. Single messageId remains compatible. Requires advertised batchReply version1 for lists; no send_prompt fallback.',
     inputSchema: {
       type: 'object',
       properties: {
         messageId: { type: 'string', minLength: 1, description: 'Original incoming question ID; recipient resolution is server-side.' },
+        messageIds: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Explicit incoming question IDs answered by this one common text. Do not infer links from prose.' },
         text: { type: 'string', minLength: 1, description: 'Answer to this question, including the limits of verification.' },
         requestId: { type: 'string', minLength: 1, description: 'Exact retry key for unchanged text/messageId. Generated before network access when omitted.' },
       },
-      required: ['messageId', 'text'],
+      required: ['text'],
+      oneOf: [{ required: ['messageId'], not: { required: ['messageIds'] } }, { required: ['messageIds'], not: { required: ['messageId'] } }],
       additionalProperties: false,
     },
   },
@@ -2362,6 +2398,7 @@ const TOOLS = [
       properties: {
         requestId: { type: 'string', description: 'Exact retry key. After a lost ACK preserve this ID and the unchanged request; never create a second hook to check delivery.' },
         force: { type: 'boolean', description: 'Explicit one-operation FORCE: skip activity/loader/MCP idle waits, preserve candidate/identity/cancellation checks, return an interruption/recovery report to the exact source. Default false; not a fallback or permission to replay UNKNOWN.' },
+        autoContinueInterruptedTabs: { type: 'boolean', description: 'Explicit FORCE-only opt-in: the app captures exact interrupted own work and continues eligible tabs once through the existing build:i-c executor. The source receives only its callback. Default false; UNKNOWN and manual later work are never replayed. Requires updated Noted and Voice.' },
         prompt: {
           type: 'string',
           description: 'Optional success prompt Voice Record should send back to the originating AI tab after install and session restore. Default is a short Russian completion message.',
@@ -2952,7 +2989,10 @@ async function callTool(name, args) {
 
     case 'start_external_research':
     case 'import_external_conversation':
+    case 'observe_external_turn':
     case 'continue_external_research': {
+      const observing = name === 'observe_external_turn';
+      const importing = name === 'import_external_conversation' || observing;
       if (Object.hasOwn(args, 'browserInstanceId')) throw new Error('Use browserId to select a research profile');
       const browserId = externalResearchBrowserId(args.browserId, args.options);
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
@@ -2966,26 +3006,28 @@ async function callTool(name, args) {
         projectId: args.projectId || PARENT_PROJECT_ID(),
         cwd: args.cwd || PROJECT_CWD_(),
       }, sourceTabId);
-      const importUrl = name === 'import_external_conversation'
+      const importUrl = importing
         ? normalizeChatGPTConversationImportUrl(args.url)
         : null;
-      await ensureExternalResearchOrchestrationSupport(target, !!browserId || name === 'continue_external_research');
+      await ensureExternalResearchOrchestrationSupport(target, !!browserId || name === 'continue_external_research', observing);
       const result = await httpApiPost(target, '/api/external-research/orchestrations', {
         runId: args.runId || undefined,
         sourceTabId,
         browserId,
-        prompt: name === 'import_external_conversation' ? EXTERNAL_CONVERSATION_IMPORT_PROMPT : args.prompt,
+        prompt: importing ? EXTERNAL_CONVERSATION_IMPORT_PROMPT : args.prompt,
         provider: name === 'continue_external_research' ? undefined : (name === 'start_external_research' ? (args.provider || 'chatgpt') : 'chatgpt'),
-        options: name === 'import_external_conversation' ? {
+        options: importing ? {
           readOnlyImport: true,
-          importWaitForFinal: args.waitForFinal === true,
-          importTimeoutMs: Math.max(10_000, Math.min(1_800_000, Number(args.timeoutMs) || 1_800_000)),
+          importWaitForFinal: observing || args.waitForFinal === true,
+          importTimeoutMs: observing ? Math.max(10_000, Math.min(120_000, Number(args.timeoutMs) || 120_000))
+            : Math.max(10_000, Math.min(1_800_000, Number(args.timeoutMs) || 1_800_000)),
           sources: args.sources === true,
           importIncludeActivity: args.includeActivity === true,
-          autoClose: args.autoClose !== false,
+          autoClose: observing ? false : args.autoClose !== false,
+          ...(observing ? { observeExistingTurn: args.target } : {}),
         } : args.options,
-        files: name === 'import_external_conversation' ? undefined : externalResearchFilesForApi(args.files),
-        conversationUrl: name === 'import_external_conversation'
+        files: importing ? undefined : externalResearchFilesForApi(args.files),
+        conversationUrl: importing
           ? importUrl
           : (name === 'start_external_research' ? args.conversationUrl : undefined),
         continueFromRunId: name === 'continue_external_research' ? args.previousRunId : undefined,
@@ -3405,28 +3447,32 @@ async function callTool(name, args) {
       const sourceTabId = PARENT_TAB_ID();
       if (!sourceTabId) throw new Error(name + ' requires a full Noted Terminal session; source identity cannot be supplied by the caller');
       const isReply = name === 'reply_to_message';
-      const address = requireNonemptyString(isReply ? args.messageId : args.tabId, isReply ? 'messageId' : 'tabId');
+      const batch = isReply && args.messageIds !== undefined;
+      if (batch && (args.messageId !== undefined || !Array.isArray(args.messageIds) || !args.messageIds.length)) throw Error('Provide messageId or a nonempty messageIds list, not both');
+      const ids = batch ? args.messageIds.map(id => requireNonemptyString(id, 'question ID')) : null;
+      const address = batch ? null : requireNonemptyString(isReply ? args.messageId : args.tabId, isReply ? 'messageId' : 'tabId');
       const text = requireNonemptyString(args.text, 'text');
       const requestId = args.requestId === undefined ? randomUUID() : requireNonemptyString(args.requestId, 'requestId');
       let postAttempted = false;
       try {
         // Route by the trusted source, never by a caller-supplied destination/project.
         const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, sourceTabId);
-        await ensureTabMessagesSupport(target);
+        await ensureTabMessagesSupport(target, batch);
         postAttempted = true;
         const result = await httpApiPost(
           target,
-          isReply ? '/api/tab-messages/' + encodeURIComponent(address) + '/replies' : '/api/tab-messages',
+          batch ? '/api/tab-messages/replies' : isReply ? '/api/tab-messages/' + encodeURIComponent(address) + '/replies' : '/api/tab-messages',
           {
             sourceTabId,
             ...(!isReply ? { targetTabId: address } : {}),
+            ...(batch ? { messageIds: ids } : {}),
             text,
             requestId,
             sourceMeta: buildSourceMeta(),
           },
         );
         const messageId = result?.messageId || result?.message?.messageId;
-        if (result?.ok === false || typeof messageId !== 'string' || !messageId.trim()) {
+        if (result?.ok === false || (!batch || !Array.isArray(result?.results)) && (typeof messageId !== 'string' || !messageId.trim())) {
           const error = new Error(result?.error || 'Project API returned no durable messageId; acceptance is unconfirmed');
           error.code = result?.code || 'invalid_message_response';
           error.messageId = messageId;
@@ -3577,6 +3623,7 @@ async function callTool(name, args) {
             queue: args.queue === true,
             handoffId: args.handoffId || undefined,
           },
+          buildSourceMeta(),
         );
         if (result.status === 'delivery-unknown' || result.deliveryUnknown === true) {
           return 'Prompt delivery state is unknown for tab ' + args.tabId
@@ -3913,6 +3960,13 @@ async function callTool(name, args) {
     }
 
     case 'build_install_noted_terminal': {
+      if (args.requestId !== undefined && (typeof args.requestId !== 'string' || !/^[\w:.-]{1,180}$/.test(args.requestId))) {
+        throw new Error('invalid install requestId; no source or installer reservation was created');
+      }
+      if (args.autoContinueInterruptedTabs !== undefined && typeof args.autoContinueInterruptedTabs !== 'boolean') {
+        throw new Error('autoContinueInterruptedTabs must be a boolean');
+      }
+      if (args.autoContinueInterruptedTabs === true && args.force !== true) throw new Error('autoContinueInterruptedTabs requires explicit FORCE');
       const requestId = args.requestId || randomUUID();
       const returnToTabId = args.returnToTabId || args.tabId || PARENT_TAB_ID() || '';
       const target = projectHint({ projectId: args.projectId, cwd: args.cwd }, returnToTabId || undefined);
@@ -3957,9 +4011,17 @@ async function callTool(name, args) {
         if (args.force === true && (!returnTo?.tabId || !returnTo.sessionId || returnTo.notifyOnSuccess === false)) {
           throw new Error('FORCE requires an exact source tab/session and the success report callback');
         }
-        await verifyVoiceBuildInstall(args.force === true);
-        if (returnTo) await httpApiPost(target, '/api/build-install/source', { ...returnTo, force: args.force === true, installRequestId: requestId });
-        result = await httpPostVoice('/api/terminal/build-install', { requestId, returnTo, force: args.force === true });
+        await verifyVoiceBuildInstall(args.force === true, args.autoContinueInterruptedTabs === true);
+        if (args.autoContinueInterruptedTabs === true) {
+          const me = await httpApiGet(target, '/api/me');
+          if (me.capabilities?.buildContinue?.voiceInstallBinding?.version !== 1) {
+            throw new Error('Noted auto-continue update required; source and install were not reserved');
+          }
+        }
+        if (returnTo) await httpApiPost(target, '/api/build-install/source', { ...returnTo, force: args.force === true, installRequestId: requestId,
+          ...(args.autoContinueInterruptedTabs === true ? { autoContinueInterruptedTabs: true } : {}) });
+        result = await httpPostVoice('/api/terminal/build-install', { requestId, returnTo, force: args.force === true,
+          ...(args.autoContinueInterruptedTabs === true ? { autoContinueInterruptedTabs: true } : {}) });
       } catch (error) {
         error.message += '\nInstall requestId=' + requestId + '. Read GET /api/terminal/build-install?requestId='
           + encodeURIComponent(requestId) + ' or retry only the identical request with this same requestId.';
@@ -3971,6 +4033,7 @@ async function callTool(name, args) {
       if (job.id) text += '\nJob: ' + job.id;
       text += '\nRequest: ' + requestId;
       if (args.force === true) text += '\nFORCE skips activity/loader/MCP idle waits. The same source receives an interruption/recovery report; unknown calls are never replayed automatically.';
+      if (args.autoContinueInterruptedTabs === true) text += '\nApp-owned auto-continue is explicitly enabled for exact own work interrupted by this install. Source callback is excluded from generic Continue. Process restore, native delivery and natural completion have separate per-target outcomes in job.autoContinue/reportUrl.';
       if (args.force !== true) text += '\nVoice Record waits for local turns and input, including this source turn. Finish this turn after ACK. Strictly saved external Research survives restart; it is not cancelled or detached. Live blockers and preserved waits are in GET /api/terminal/build-install (job.phase / job.wait).';
       if (returnTo) {
         text += '\nReturn target: tab=' + (returnTo.tabId || '-') + (sessionId ? ' session=' + sessionId : ' session=(not yet known)');

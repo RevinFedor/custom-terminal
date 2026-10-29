@@ -9,6 +9,7 @@ import * as chips from './composerChips.mjs';
 import * as images from './promptImageAttachments.mjs';
 import * as clipboard from './composerClipboard.mjs';
 import * as ownership from './historyImageImportOwnership.mjs';
+import * as draftOwners from './historyComposerDraftOwner.mjs';
 import * as cmState from '@codemirror/state';
 import * as cmCommands from '@codemirror/commands';
 import * as persistence from './composerDraftPersistence.mjs';
@@ -33,7 +34,7 @@ const setterSource = part(storeSource, '  setHistoryPromptDraft: (tabId, draft, 
 const applySource = part(source, '  const applyHistoryComposerSnapshot = useCallback((', '  const acceptHistorySlashCommand =');
 const handlerSource = part(source, '  const handleComposerImagePaste = useCallback((', '  const restoreChipToComposer =');
 const copySource = part(source, '  const handleComposerImageAwareCopy =', '  const handleComposerImagePaste =');
-const messageCopySource = part(source, '  const copyPrompt = (event:', '  const requestRewind =');
+const messageCopySource = part(source, '  const copyPrompt = async (event:', '  const requestRewind =');
 const adapterSource = fs.readFileSync(path.join(directory, 'electronComposerClipboardAdapter.ts'), 'utf8');
 const deriveSource = part(source, '  const deriveComposerHistoryPayload =', '  const ');
 const equalSource = part(source, 'const historyComposerAggregateEqual =', 'const retainHistoryDraftImages');
@@ -126,7 +127,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 function harness() {
   let state = { historyPromptDrafts: {}, historyPromptDraftImages: {}, historyPromptDraftChips: {},
     historyPromptDraftUpdatedAt: {}, historyPromptDraftPendingImages: {}, historyComposerViewByTab: {} };
-  const storeContext = vm.createContext({ ...chips, ...ownership, set: update => { state = { ...state, ...update(state) }; } });
+  const listeners = new Set();
+  const storeContext = vm.createContext({ ...chips, ...ownership, ...draftOwners, set: update => {
+    state = { ...state, ...update(state) }; for (const listener of listeners) listener(state);
+  } });
   vm.runInContext(compile('globalThis.methods = {' + setterSource + '};'), storeContext);
   const requests = [];
   const updates = [];
@@ -151,7 +155,9 @@ function harness() {
   vm.runInContext(compile(adapterSource), adapter);
   let nextId = 1;
   const mounted = [];
-  const api = { getState: () => ({ ...state, ...storeContext.methods, showToast() {} }) };
+  const api = { getState: () => ({ ...state, ...storeContext.methods, showToast() {} }),
+    subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); } };
+  storeContext.useUIStore = api;
   function mount(tabId = 'T') {
     const element = { selectionStart: 0, selectionEnd: 0,
       getAttribute: name => name === 'data-history-composer-tab-id' ? tabId : null,
@@ -160,9 +166,10 @@ function harness() {
       applySnapshot(value) { updates.push({ tabId, ...value }); return native.apply(value); },
     };
     const context = vm.createContext({
-      ...chips, ...images, ...clipboard, ...ownership, useUIStore: api,
+      ...chips, ...images, ...clipboard, ...ownership, ...draftOwners, useUIStore: api,
       // This suite's ordinary user-message fixtures have no Research projection.
       researchReply: null,
+      isLocalPromptEntry: entry => entry.role === 'queued' && String(entry.uuid || '').startsWith('local-prompt-'),
       readTerminalMessageClipboard,
       writeHistoryClipboardText: text => writeMeasuredClipboardText({ writeText() {} }, text, 'history'),
       performance, currentUIActionId: () => 'ui-copy-test', uiPerformancePhase() {},

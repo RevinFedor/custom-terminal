@@ -3,12 +3,69 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   resolveHistoryOrchestrationHandoffPresentation,
+  resolveHistoryPromptHandoffSemanticTags,
   resolveHistoryOrchestrationPromptPresentation,
   projectHistoryServicePromptBody,
   resolveHistoryPromptSender,
 } from './historyOrchestrationPromptPresentation.mjs';
 
 const fingerprint = text => createHash('sha256').update(text, 'utf8').digest('hex');
+
+test('one-way MCP user and queued cards preserve sender without reply/run identity or body projection', () => {
+  const tag = { kind: 'prompt-origin', source: 'terminal-mcp', sourceTabId: 'sender',
+    sourceTabName: 'Captured sender', sourceProjectId: 'source-project' };
+  for (const role of ['user', 'queued']) {
+    const entry = { role, content: 'No answer needed', semanticTags: [tag] };
+    const presentation = resolveHistoryOrchestrationPromptPresentation(entry);
+    assert.deepEqual(resolveHistoryPromptSender(presentation), { sourceTabId: 'sender',
+      sourceTabName: 'Captured sender', sourceProjectId: 'source-project' });
+    assert.equal(presentation.runId, undefined);
+    assert.equal(presentation.messageId, undefined);
+    assert.deepEqual(projectHistoryServicePromptBody(entry, fingerprint), { text: entry.content, projected: false });
+  }
+});
+
+test('legacy plain MCP source is explicitly unknown, never guessed from a handoff name or body', () => {
+  const presentation = resolveHistoryOrchestrationPromptPresentation({ role: 'user',
+    content: 'From sender4196', handoffId: 'history4196-owned-looking',
+    semanticTags: [{ kind: 'prompt-origin', source: 'terminal-mcp' }] });
+  assert.deepEqual(resolveHistoryPromptSender(presentation), { label: 'Terminal MCP',
+    description: 'В этой записи не сохранена вкладка-отправитель' });
+});
+
+test('app-owned waiting outcomes use MCP presentation without pretending to be a target reply', () => {
+  const tag = { kind: 'prompt-origin', source: 'system', systemSource: 'tab-message-outcome' };
+  for (const role of ['user', 'queued']) {
+    const entry = { role, content: '[Tab message: waiting outcome]\nTarget: Another tab', semanticTags: [tag] };
+    const before = JSON.stringify(entry);
+    const presentation = resolveHistoryOrchestrationPromptPresentation(entry);
+    assert.deepEqual(presentation, { kind: 'tab-message-outcome', phase: 'prompt' });
+    assert.deepEqual(resolveHistoryPromptSender(presentation), { label: 'Noted · статус вопроса',
+      description: 'Служебное уведомление приложения о вашем исходящем вопросе, не сообщение другой вкладки' });
+    assert.equal(presentation.messageId, undefined);
+    assert.equal(presentation.runId, undefined);
+    assert.deepEqual(projectHistoryServicePromptBody(entry, fingerprint), { text: entry.content, projected: false });
+    assert.equal(JSON.stringify(entry), before);
+  }
+  assert.equal(resolveHistoryOrchestrationPromptPresentation({ role: 'user', content: '[Tab message: waiting outcome]' }), null);
+  assert.equal(resolveHistoryOrchestrationPromptPresentation({ role: 'assistant', semanticTags: [tag] }), null);
+  assert.equal(resolveHistoryOrchestrationPromptPresentation({ role: 'user', semanticTags: [{ ...tag, source: 'user' }] }), null);
+});
+
+test('the exact outcome handoff is purple before audit and preserves frozen semantic tags', () => {
+  const handoffId = 'tab-message-outcome:ed61ac6a-c867-433f-8f93-1d3ba6d9eb52:reply';
+  const handoff = { handoffId, source: 'codex-' + handoffId };
+  assert.deepEqual(resolveHistoryOrchestrationHandoffPresentation(handoff), { kind: 'tab-message-outcome', phase: 'prompt' });
+  assert.deepEqual(resolveHistoryPromptHandoffSemanticTags(handoff), [
+    { kind: 'prompt-origin', source: 'system', systemSource: 'tab-message-outcome' },
+  ]);
+  for (const patch of [{ handoffId: 'other' }, { source: 'tab-message-outcome' },
+    { source: handoffId.replace('ed61ac6a', '00000000') }]) {
+    assert.equal(resolveHistoryOrchestrationHandoffPresentation({ ...handoff, ...patch }), null);
+  }
+  const frozen = { ...handoff, semanticTags: [{ kind: 'orchestration', runId: 'old', phase: 'failure' }] };
+  assert.deepEqual(resolveHistoryPromptHandoffSemanticTags(frozen), frozen.semanticTags);
+});
 
 test('plain MCP prompts select the same purple presentation without invented run identity', () => {
   const entry = { role: 'user', content: 'Continue source check', semanticTags: [{ kind: 'prompt-origin', source: 'terminal-mcp' }] };

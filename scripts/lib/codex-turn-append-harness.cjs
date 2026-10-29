@@ -31,6 +31,7 @@ function createHarness(filePath, options = {}) {
     CODEX_LIVE_USER_EVENT_CARRIER: 'event_msg', CODEX_LIVE_USER_RESPONSE_CARRIER: 'response_item',
     codexKnownSessions: new Map(),
     codexCanonicalPresentation: null,
+    transcriptService: null,
     console: { log: s => result.logs.push(s), warn: s => result.warnings.push(s) },
     codexTurnWatchers: watchers,
     readCodexTurnAppend: async args => {
@@ -72,7 +73,7 @@ function createHarness(filePath, options = {}) {
     result.maxInputBytes = Math.max(result.maxInputBytes, Buffer.byteLength(args[1] || ''));
     return processText(...args);
   };
-  return { state, watchers, result, digest: () => hash.copy().digest('hex'),
+  return { state, watchers, result, context, digest: () => hash.copy().digest('hex'),
     scan: reason => context.scanCodexTurnAppend(state.tabId, reason || 'linked-live-catchup') };
 }
 

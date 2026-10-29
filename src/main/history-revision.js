@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { codexRolloutReadViewBacking } = require('./codex-rollout-read-views');
+const { resolveExistingRollout } = require('./codex-rollout-format');
 
 const HISTORY_REVISION_SCHEMA = 'history-files-v1';
 const MAX_HISTORY_REVISION_SOURCES = 16;
@@ -14,15 +16,18 @@ function normalizeIdentity({ toolType, sessionId, cwd } = {}) {
 }
 
 function normalizeSource(source = {}) {
+  const backing = source.compressedBacking || codexRolloutReadViewBacking(source.filePath);
+  const physical = backing || source;
   return {
-    filePath: path.resolve(String(source.filePath || '')),
-    size: Number(source.size || 0),
-    mtimeMs: Number(source.mtimeMs || 0),
+    filePath: path.resolve(String(physical.filePath || '')),
+    size: Number(physical.size || 0),
+    mtimeMs: Number(physical.mtimeMs || 0),
     // A pathname/size/mtime tuple can survive an atomic replacement, and a
     // writer can restore mtime after an in-place rewrite. Preserve the
     // physical witness captured by the reader, not a newer stat of its path.
-    fileIdentity: String(source.fileIdentity || ''),
-    ctimeMs: Number.isFinite(source.ctimeMs) ? source.ctimeMs : null,
+    fileIdentity: String(physical.fileIdentity || ''),
+    ctimeMs: Number.isFinite(physical.ctimeMs) ? physical.ctimeMs : null,
+    ...(backing || source.representation === 'zstd' ? { representation: 'zstd' } : {}),
     sessionId: String(source.sessionId || ''),
     parentSessionId: source.parentSessionId ? String(source.parentSessionId) : null,
     linkKind: source.linkKind === 'jsonl' || source.linkKind === 'sqlite'
@@ -93,7 +98,8 @@ async function validateHistoryRevision(revision, identityInput, options = {}) {
   }
   if (typeof options.resolvePrimaryFile === 'function') {
     const primaryFile = await options.resolvePrimaryFile();
-    if (!primaryFile || path.resolve(primaryFile) !== sources[0].filePath) {
+    const physicalPrimary = codexRolloutReadViewBacking(primaryFile)?.filePath || primaryFile;
+    if (!physicalPrimary || path.resolve(physicalPrimary) !== sources[0].filePath) {
       return { unchanged: false, reason: 'primary-file-changed' };
     }
   }
@@ -101,6 +107,12 @@ async function validateHistoryRevision(revision, identityInput, options = {}) {
   for (const source of sources) {
     let stat;
     try {
+      if (source.representation === 'zstd') {
+        const current = await resolveExistingRollout(source.filePath);
+        if (current.state !== 'present' || current.filePath !== source.filePath) {
+          return { unchanged: false, reason: 'source-changed', filePath: source.filePath };
+        }
+      }
       stat = await fs.promises.stat(source.filePath);
     } catch {
       return { unchanged: false, reason: 'source-missing', filePath: source.filePath };

@@ -56,8 +56,13 @@ choosing a setting. Desktop Codex SOURCE20Oct refines the queued phase: a desire
 pair waiting for Resume/readiness or Main preparation can be replaced until its
 first controlled input. Main's optional replaceable activity projection is not
 writer authority; missing metadata retains the old lock. After control input
-starts, Model/Effort/Quick stay disabled until settlement. Empty input and the
-save/Enter reply are not completion proof.
+starts, a new Model/Effort/Quick choice remains blocked until settlement; the
+own spinner can now cancel its exact revisioned Main operation, without granting
+another picker or cancelling another owner. Empty input and the save/Enter
+reply are not completion proof; cancellation cannot undo a completed Enter.
+An unresolved newer committed model footer invalidates the preceding live pair
+for that same owner, not the durable intent. Its renderer event clears only the
+exact previously published pair; it cannot erase a changed owner or newer proof.
 Manual Codex picker presentation requires a committed composer footer naming
 model and effort before its activity ends; it does not label Escape as success.
 

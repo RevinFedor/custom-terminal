@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { openTimelineRootOutlineReader } = require('./timeline-root-outline-reader');
 const {
   resolveForkMarkerBoundary,
   selectDirectForkMarker,
@@ -583,14 +584,16 @@ async function logPromptCall(projectManager, payload, status, usage, sourceChars
   }
 }
 
-async function generateTimelineOutline(payload, { projectManager, transcriptService }) {
+async function generateTimelineOutlineRecord(payload, { projectManager, transcriptService, timelineRootReader }) {
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) throw new TimelineOutlineError('session_required', 'sessionId is required');
   const toolType = normalizedToolType(payload?.toolType);
   if (toolType === 'gemini') {
     throw new TimelineOutlineError('unsupported_tool', 'Timeline grouping is not available for Gemini sessions');
   }
-  assertDependencyMethod(transcriptService, 'getTimeline', 'transcript_unavailable', 'Canonical Timeline reader');
+  if (!timelineRootReader) {
+    assertDependencyMethod(transcriptService, 'getTimeline', 'transcript_unavailable', 'Canonical Timeline reader');
+  }
   assertDependencyMethod(projectManager, 'getAIPromptById', 'config_unavailable', 'Timeline grouping AI prompt');
   assertDependencyMethod(projectManager, 'getPrompts', 'prompts_unavailable', 'Saved prompt list');
   assertDependencyMethod(projectManager, 'saveTimelineOutline', 'storage_unavailable', 'Timeline outline storage');
@@ -599,7 +602,8 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
   if (!apiKey) throw new TimelineOutlineError('api_key_missing', 'GEMINI_API_KEY is not configured');
 
   const [timelineResult, promptConfig, presets, barriers] = await Promise.all([
-    transcriptService.getTimeline({ toolType, sessionId, cwd: payload?.cwd }),
+    timelineRootReader ? timelineRootReader.readTimeline()
+      : transcriptService.getTimeline({ toolType, sessionId, cwd: payload?.cwd }),
     Promise.resolve(projectManager.getAIPromptById(TIMELINE_GROUPING_PROMPT_ID)),
     Promise.resolve(projectManager.getPrompts()),
     typeof projectManager.getTimelineGroupingBarriers === 'function'
@@ -673,6 +677,7 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
     const contents = [{ role: 'user', parts: [{ text: requestText }] }];
+    await timelineRootReader?.check();
     const count = await ai.models.countTokens(
       buildCountTokensRequest(model, systemInstruction, requestText)
     );
@@ -693,8 +698,10 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
     if (model.includes('gemini-3') && thinkingLevel !== 'NONE') {
       config.thinkingConfig = { thinkingLevel };
     }
+    await timelineRootReader?.check();
     apiInvoked = true;
     response = await ai.models.generateContent({ model, contents, config });
+    await timelineRootReader?.check();
     responseText = String(response?.text || '').trim();
     if (!responseText) {
       throw new TimelineOutlineError('empty_response', 'Timeline grouping returned an empty response');
@@ -746,6 +753,7 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
     if (saved === false) {
       throw new TimelineOutlineError('storage_failed', 'Timeline outline storage rejected the generated outline');
     }
+    timelineRootReader?.assertCurrent();
     await logPromptCall(
       projectManager,
       aiPayload,
@@ -772,6 +780,41 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
   }
 }
 
+function isRootGeneration(payload) {
+  const root = payload?.resultMode === 'root-status-v1' || payload?.timelineParentLease !== undefined;
+  if (root && (payload.resultMode !== 'root-status-v1' || !payload.timelineParentLease)) {
+    throw new TimelineOutlineError('timeline_root_required', 'Root generation requires root-status-v1 and a retained Timeline lease');
+  }
+  if (payload?.resultMode !== undefined && payload.resultMode !== 'root-status-v1') {
+    throw new TimelineOutlineError('invalid_result_mode', 'Unsupported Timeline outline result mode');
+  }
+  return root;
+}
+
+function generationResult(payload, result) {
+  if (payload.resultMode !== 'root-status-v1' || result?.success !== true) return result;
+  // Project EVERY return, including one-flight hits. Never spread the saved
+  // record/provider metadata into the compact renderer completion receipt.
+  const record = result.data;
+  const receipt = { success: true, resultMode: 'root-status-v1', groupCount: record.outline.groups.length };
+  for (const key of ['promptTokens', 'candidateTokens', 'thoughtTokens', 'totalTokens', 'countedInputTokens', 'sourceChars']) {
+    if (Number.isSafeInteger(record[key]) && record[key] >= 0) receipt[key] = record[key];
+  }
+  return receipt;
+}
+
+async function generateTimelineOutline(payload, { projectManager, transcriptService, event, timelineRootBridge } = {}) {
+  let reader;
+  try {
+    if (isRootGeneration(payload)) reader = await openTimelineRootOutlineReader(event, payload,
+      timelineRootBridge || transcriptService?.historyRootIpc);
+    const result = await generateTimelineOutlineRecord(payload,
+      { projectManager, transcriptService, timelineRootReader: reader });
+    await reader?.check();
+    return generationResult(payload, result);
+  } finally { await reader?.close(); }
+}
+
 function errorResult(error) {
   return {
     success: false,
@@ -780,7 +823,7 @@ function errorResult(error) {
   };
 }
 
-function register({ projectManager, transcriptService }) {
+function register({ projectManager, transcriptService, timelineRootBridge }) {
   const { ipcMain } = require('electron');
   if (!ipcMain || typeof ipcMain.handle !== 'function') {
     throw new TimelineOutlineError('ipc_unavailable', 'Electron IPC is unavailable');
@@ -808,19 +851,45 @@ function register({ projectManager, transcriptService }) {
   }
 
   if (!registeredChannels.has('timeline-outline:generate')) {
-    ipcMain.handle('timeline-outline:generate', async (_event, payload = {}) => {
-      const key = JSON.stringify({
-        toolType: normalizedToolType(payload.toolType),
-        sessionId: payload.sessionId || '',
-        cwd: payload.cwd || '',
-      });
-      if (generationInflight.has(key)) return generationInflight.get(key);
-
-      const promise = generateTimelineOutline(payload, { projectManager, transcriptService })
-        .catch(errorResult)
-        .finally(() => generationInflight.delete(key));
-      generationInflight.set(key, promise);
-      return promise;
+    ipcMain.handle('timeline-outline:generate', async (event, payload = {}) => {
+      let reader;
+      try {
+        const root = isRootGeneration(payload);
+        const key = JSON.stringify({
+          toolType: normalizedToolType(payload.toolType),
+          sessionId: payload.sessionId || '',
+          cwd: payload.cwd || '',
+        });
+        // Capture a concurrent job before async authentication: it may finish
+        // during that read. Reuse remains forbidden until the caller's own
+        // signed cap has authenticated the exact same frozen source.
+        const concurrentJob = generationInflight.get(key);
+        if (root) reader = await openTimelineRootOutlineReader(event, payload,
+          timelineRootBridge || transcriptService?.historyRootIpc);
+        let job = concurrentJob || generationInflight.get(key);
+        if (job && reader && job.sourceKey !== reader.sourceKey) {
+          throw new TimelineOutlineError('generation_source_conflict', 'Another Timeline source is already being grouped');
+        }
+        if (!job) {
+          job = { sourceKey: reader?.sourceKey || null, promise: null };
+          job.promise = generateTimelineOutlineRecord(payload,
+            { projectManager, transcriptService, timelineRootReader: reader })
+            .finally(() => { if (generationInflight.get(key) === job) generationInflight.delete(key); });
+          generationInflight.set(key, job);
+        }
+        const result = await job.promise;
+        reader?.assertCurrent();
+        // A joining caller also proves its own retained cap survived the job.
+        await reader?.check();
+        return generationResult(payload, result);
+      } catch (error) {
+        const result = errorResult(error);
+        if (payload?.resultMode === 'root-status-v1') {
+          result.code = typeof result.code === 'string' ? result.code.slice(0, 128) : 'timeline_outline_failed';
+        }
+        return result;
+      }
+      finally { await reader?.close(); }
     });
     registeredChannels.add('timeline-outline:generate');
   }

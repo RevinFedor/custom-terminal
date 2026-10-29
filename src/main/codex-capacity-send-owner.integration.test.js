@@ -106,6 +106,7 @@ function sendFixture(t, options = {}) {
   const writes = [];
   const context = vm.createContext({
     require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     crypto: require('node:crypto'),
     ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: store,

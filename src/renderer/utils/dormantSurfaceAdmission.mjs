@@ -41,10 +41,21 @@ export function createDormantSurfaceAdmissionQueue({
 
       const token = ++sequence;
       let finished = false;
+      let overdue = false;
       let timer = null;
       const lease = {
         key,
         token,
+        reportOverdue(reason = 'timeout') {
+          if (finished || overdue || !active || active.key !== key || active.token !== token) return false;
+          overdue = true;
+          if (timer !== null) clearTimer(timer);
+          timer = null;
+          // A deadline is not evidence that source work stopped. Keep its
+          // admission until actual source settlement or owner cancellation.
+          emit({ phase: 'overdue', key, token, reason, pending: pending.size });
+          return true;
+        },
         complete(reason = 'completed') {
           if (finished) return false;
           finished = true;
@@ -58,7 +69,7 @@ export function createDormantSurfaceAdmissionQueue({
         },
       };
       active = { key, token, lease };
-      timer = setTimer(() => lease.complete('timeout'), timeoutMs);
+      timer = setTimer(() => lease.reportOverdue('admission-timeout'), timeoutMs);
       emit({ phase: 'start', key, token, pending: pending.size });
       try {
         job.start(lease);

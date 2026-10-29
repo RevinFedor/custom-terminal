@@ -23,7 +23,7 @@ export function createPerfIncidentChannel({
 } = {}) {
   let writer: Writer | null = null;
   let lastSentAt = -Infinity, sourceSeq = 0;
-  let actionRingEvicted = 0, actionPhasesDropped = 0;
+  let actionRingEvicted = 0, actionPhasesDropped = 0, actionCommitReportsDropped = 0, actionCommitsOmitted = 0;
   const drops = { noConnection: 0, rateLimit: 0, backpressure: 0, writeThrow: 0 };
   const drop = (reason: DropReason) => { drops[reason] = addDiagnosticCount(drops[reason]); return false; };
   const nextSequence = () => (sourceSeq = Math.min(Number.MAX_SAFE_INTEGER, sourceSeq + 1));
@@ -31,9 +31,13 @@ export function createPerfIncidentChannel({
     const actions = readActionHealth();
     actionRingEvicted = Math.max(actionRingEvicted, addDiagnosticCount(0, actions.actionRingEvicted));
     actionPhasesDropped = Math.max(actionPhasesDropped, addDiagnosticCount(0, actions.actionPhasesDropped));
+    actionCommitReportsDropped = Math.max(actionCommitReportsDropped, addDiagnosticCount(0, actions.actionCommitReportsDropped ?? 0));
+    actionCommitsOmitted = Math.max(actionCommitsOmitted, addDiagnosticCount(0, actions.actionCommitsOmitted ?? 0));
     return { version: 1, counterLimit: DIAGNOSTIC_COUNTER_LIMIT, drops: { ...drops }, actionRingEvicted, actionPhasesDropped,
+      actionCommitReportsDropped, actionCommitsOmitted,
       saturated: Object.values(drops).some(n => n === DIAGNOSTIC_COUNTER_LIMIT)
-        || actionRingEvicted === DIAGNOSTIC_COUNTER_LIMIT || actionPhasesDropped === DIAGNOSTIC_COUNTER_LIMIT,
+        || actionRingEvicted === DIAGNOSTIC_COUNTER_LIMIT || actionPhasesDropped === DIAGNOSTIC_COUNTER_LIMIT
+        || actionCommitReportsDropped === DIAGNOSTIC_COUNTER_LIMIT || actionCommitsOmitted === DIAGNOSTIC_COUNTER_LIMIT,
       delivery: 'socket-write-only-no-ack' };
   };
   const write = (packet: Packet) => {

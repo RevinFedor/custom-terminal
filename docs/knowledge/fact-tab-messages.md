@@ -24,14 +24,25 @@ linked Markdown/`publish_context_update`. Иначе уточняющий воп
 
 ## API и identity
 
+Ответ связан с вопросами явными IDs, не названием вкладки, порядком или анализом
+текста. SOURCE27Oct после прямого «да фиксируем» принимает один messageId либо
+messageIds и общий текст. Для одной exact переписки текст доставляется ОДИН раз,
+а все включённые вопросы сохраняют связь с той же reply-row/квитанцией. Соседние
+неуказанные вопросы не закрываются. Модель передаёт IDs, пользователь не должен
+сопоставлять UUID вручную. Старый single-ID вызов остаётся совместимым.
+
 - MCP: `send_message({tabId,text,requestId?})`,
-  `reply_to_message({messageId,text,requestId?})`, `get_message({messageId})`,
+  `reply_to_message({messageId,text,requestId?})` либо `{messageIds,text,requestId?}`,
+  `get_message({messageId})`,
   явный `cancel_message({messageId})`.
 - REST: `POST /api/tab-messages`, `POST /api/tab-messages/:id/replies`,
+  `POST /api/tab-messages/replies` для explicit messageIds,
   `GET /api/tab-messages/:id`, `GET /api/tab-messages?tabId=...`.
 - `tabMessages:{version:1,durable:true,replyTo:true}` в `/api/me` проверяется
   MCP до POST. Старый backend требует обновления; fallback на send_prompt
   не создаёт поддерживаемого отношения вопрос/ответ и потому не выполняется.
+  Для списка дополнительно требуется batchReply.version1. Старому App не
+  отправляется batch и не делается скрытый fanout одиночных Replies.
 - MCP получает source из identity вызывающей сессии hub. Reply не принимает
   произвольный return-tab: сервер выводит его из исходного вопроса и проверяет
   responder. Закреплены project/provider/session обеих сторон; совпадение имени
@@ -53,6 +64,21 @@ linked Markdown/`publish_context_update`. Иначе уточняющий воп
 - Ответ хранится как отдельное сообщение с `replyTo`. Один вопрос имеет один
   явный содержательный ответ; уточнение оформляется новым вопросом. Reply
   не требует автоматического ответного acknowledgement агентом.
+
+Batch возвращает results по каждому ID и messages только новых доставок.
+Already-answered сохраняет прежний ответ; reply-pending сохраняет прежнюю
+pending/UNKNOWN операцию без замены текста/повторного ввода. Foreign/not-found
+не получают чужой связи. Legacy-cancel-ambiguous не угадывается как старый X.
+Если новых ответов нет, messages пуст: это не успешная новая доставка.
+Q1 уже отвечен, Q2 ждёт, Q3 скрыт → Q1 already-answered + одна новая reply-row
+для Q2/Q3. Один native sent завершает обе указанные переписки, не natural final.
+Идемпотентный request receipt и все question pointers пишутся атомарно: потеря
+ACK/reopen не создаёт второй Reply, конкуренция не заменяет уже принятый ответ.
+Single и batch используют общее пространство requestId, даже когда batch вернул
+только already-answered/not-found и не создал R. Иначе после reopen тот же ключ
+мог незаметно стать другим вопросом; отсутствие новой R-row не освобождает ключ.
+Разные exact return conversations получают отдельные deliveries, не retarget
+одного frozen input. Старый single-ID retry также не меняет payload или адрес.
 
 Явная операция `build:i-c` добавляет узкий post-delivery restart binding.
 Если вопрос был доставлен в A, захвачен именно этот участник/вопрос, а единственный
@@ -165,7 +191,126 @@ pin снимается; отмена имеет отдельный компак�
 не снимая queue/unknown-asset owners. Startup освобождает остаток crash между записями.
 Wake идёт от событий lifecycle/input, модель не поллит историю или статус.
 
+## Собственные вопросы и обычный Loop (SOURCE27.10)
+
+Fedor27Oct явно отделил обычную адресную переписку от подписки на окончание работы.
+Вопрос доставлен → один точный Reply сохранён и подтверждённо доставлен обратно →
+переписка завершена. Конец consuming turn источника не требуется: источник может
+продолжать свою длинную работу. Это не доказательство чтения/понимания ответа.
+Делегации, response-observation, Research и explicit own-turn dependencies
+сохраняют собственные completion-контракты.
+
+Владелец ожидания прежний Main MessageLoopWaits/SQLite, не mounted UI и не fake run.
+Outstanding inventory читается у message owner, не из усечённого списка карточек.
+Один вопрос имеет один ответ; explicit список messageIds связывает несколько
+вопросов с одной доставкой. При обратном порядке и смешанном состоянии исход
+каждого ID остаётся независимым; текст сам связей не создаёт.
+
+~~~text
+own question -> all-work message hold
+  Reply saved / accepted / queued / unknown -> доставка ещё не завершена
+  exact native Reply receipt               -> exchange DONE, message hold снят
+  отказ / deadline                         -> durable конечный outcome
+ordinary Loop -> отдельно busy / FIFO / current cause / Goal / Stop / install
+~~~
+
+Sent не выводится из accepted=true. Private delivery reader проверяет сохранённые
+question↔reply IDs, destination, operation/handoff/attempt, immutable FIFO request
+fingerprint, prompt hash и canonical native user/source identity. Неподтверждённый
+callback либо чужой receipt не закрывает ожидание. Перед asynchronous commit
+перечитывается exact receipt вместе с aliases; RAM identity и SQLite revision CAS
+защищают от старого продолжения, отмены и конфликтующего writer. При EIO release
+не публикуется. Durable delivery settlement не содержит выдуманных replyProcessed
+или natural=true и после reopen не требует History/turn scan.
+
+Первый вопрос сохраняет абсолютный deadline30минут; сохранение первого Reply
+начинает отдельный срок подтверждения его ДОСТАВКИ, не обработки. ACK/restart срок
+не продлевают. Reserved/preparing не является доказанным отказом. No-reply,
+доказанный delivery failure и unconfirmed return deadline дают конечный сохранённый
+исход, но не no-Send и не разрешение повторить question/Reply/UNKNOWN.
+Статус Noted — отдельный one-way outbox прежнего FIFO с frozen ID/body и private
+admission, а не обязательная вторая модельная задача. Он не ждёт natural final.
+Lost ACK не создаёт вторую отправку; retry возможен лишь по прежнему доказанному
+no-input/readiness механизму с тем же ID. При недоступном source outcome остаётся
+в журнале без небезопасного ввода и без expired-deadline polling.
+
+Legacy returning/processing-timeout записи с exact delivered Reply заканчиваются
+штатным restore/reconcile прежнего владельца без дополнительного модельного хода.
+Исторические proofs/body/IDs сохраняются, но больше не являются gate. Устаревший
+processing notice сначала durable помечается revoked, затем прежний cancellation
+owner снимает только его будущую доставку. Не начатый FIFO item получает no-input;
+у crossed/UNKNOWN сохраняются прежние receipt/attempt и input-slot guard. Raw DB
+recovery и second-notice Send для legacy C не нужны и не разрешаются.
+Поздний настоящий Reply остаётся у того же question ID: пока его доставка pending,
+это собственная фаза; exact sent завершает её без поглощения чужих вопросов.
+Старый status не закрывает ещё не доставленный поздний Reply.
+
+Message release не создаёт busy:false, parent final либо Loop Send. Отдельная
+generic Main native-input boundary связывает natural cause с текущим provider/SID/
+physical lifecycle и последним admitted input. Она не читает сообщения и не
+проверяет их обработку. Новый canonical input делает старый cause неприменимым
+даже в gap до следующего busy-start; повтор старого final не обновляет frozen token.
+HEAD проверяет его до и после readiness await. Незавершённый/неизвестный input
+остаётся у FIFO, Goal/Stop/install/delegation guards не обходятся.
+Никогда не начатый устаревший Loop-head отзывается как deferred, не Loop OFF;
+начатый/UNKNOWN не признаётся no-input. Root не создаёт natural cause из delivery,
+а отозванную старую причину не пытается использовать заново.
+
+После локального X отдельно сохраняется порядок уже принятых Replies. Если
+старый, ещё не начатый Loop оказался HEAD перед таким Reply, existing admission
+читает scalar O/H/target reservation у того же SQLite FIFO до и после readiness
+await. Старый Loop уступает принятый ввод, оставаясь включённым. Это не ожидание
+обработки Reply: после native receipt остаётся только обычный current-input fence.
+Pending/UNKNOWN/attempted transport не становится no-input; тела/history не читаются.
+Если принятый Reply ещё готовит context и FIFO row отсутствует, старый Loop тоже
+не допускается. Несовпавший tab/H у read-only reservation остаётся unknown для
+этого input; чужой terminal/confirmed receipt не разрешает обгон. Это закрывает
+pre-reservation await gap, не добавляет ожидание consuming turn.
+Если удерживает только неотвеченный Q, а принятого Reply ещё нет, тот же не начатый
+FIFO Loop остаётся waiting, не cancelled. Source X снимает hold без смены cause/
+H/O; immutable cancellation здесь навсегда заблокировала бы этот разрешённый ход.
+При accepted Reply прежний Loop по-прежнему уступает очередь. При changed native
+input ранний FIFO replay обязан сохранять guarded deferred/causeInvalidated, как
+pre-paste refusal: generic cancellation ошибочно выключала бы Loop целиком.
+
+### Исторический Контракт23–25Oct
+
+Прежний Source действительно требовал exact processing natural final и создавал
+reply_processing_timeout после уже доставленного ответа. Поэтому один долгий
+ход источника задерживал несколько корректно доставленных ответов.27Oct Fedor
+отверг именно этот product gate; исправление только цвета Reply его не устраняло.
+Доказательства25Oct pinning/streaming и пять guard/race исправлений сохранены в
+рабочем [историческом RESULT](../tmp/message-return-repair-20261025/RESULT.md).
+Модули physical/structural verification не ослаблены и не превращены в ACK proof,
+но normal Send/Reply больше не включает их capture/History путь.
+
+get_message и list/IPC показывают loopWait с отдельной revision. Header и нижний
+Reply одинаково отражают transport: подтверждённый ответ зелёный, завершённая
+переписка уходит из live tracker, история и детали остаются. Saved/queued текст не
+превращается в received. No-reply и unconfirmed delivery outcome остаются attention,
+без утверждения, что адресат «не ответил», когда ответ уже сохранён.
+Нужен coherent App update Main+renderer; MCP refresh сам его не устанавливает.
+Source/private SQL/API/SSR и packaging preflight не являются loaded/UI acceptance.
+
 ## UI и инструкции
+
+Desktop snapshot добавляет к последним100 compact Q/R все видимые незавершённые
+вопросы и связанные pending Replies. Иначе после50 новых пар remount терял старый
+активный Q, хотя durable hold оставался. Generic bounded list/History limit не
+меняется; hidden участник не возвращается через active inventory. Это чтение
+message metadata, не raw provider History и не замена отдельной History pagination.
+
+Повторная сверка одной receipt не должна создавать новую message revision.
+Send-store возвращает updatedAt числом, а messages хранит receiptUpdatedAt как
+SQLite TEXT. Source25Oct канонизирует cursor строкой до bind: прежнее число после
+SQL не сравнивается каждый wake с другим JS-типом. Новая receipt/acceptance по-прежнему
+публикуется; старый неканонический cursor может один раз нормализоваться.
+Renderer merge также сохраняет прежние index/row objects, если duplicate/stale
+event не добавил данных. Поздний immutable body, отмена, сильнее delivery и новая
+loopWait revision сохраняют прежнюю семантику.47 real-SQL backend и33 projection
+checks подтверждают этот Source-контракт; они не доказывают installed latency или
+причину конкретного зависания. Долгое app-ожидание Reply само не означает открытый
+MCP RPC. Инцидент/незавершённая whole-app проверка — рабочая оптимизация History.
 
 Пустой status dock не измеряет rail/pane и не держит ResizeObserver, пока нет
 видимых requests/messages/error либо открытого History/settings/message panel.
@@ -186,10 +331,24 @@ pane; это UI-проверка, не доказательство MCP message 
 дополнительных галочек и правой стрелки. Полный message-item48px включает этот
 дочерний ряд; основной header не становится выше native-run.
 Это два индикатора, не две команды с одинаковым действием.
+Каркас открытого Send/Reply preview вынесен в `RequestDetailsPopover`: тот же
+компонент используется для одного выбранного Build Continue event. Он сохраняет
+боковое позиционирование/viewport clamp, ограничение высоты, click-outside и
+capture-phase Escape. Selection остаётся у dock owner: одновременно открыт
+один message или continuation preview; выбор другого события закрывает прежнее.
+Данные сообщений, чтение их полного текста и delivery/cancel остаются у прежних
+owners. Hover не создаёт preview и не выполняет чтение другого события.
 По умолчанию внутри сообщения общий source-header вместо слов «Вопрос/Ответ» показывает
 стрелку и кликабельное имя отправителя. `↙` означает входящий вопрос/request,
 `↗` — ответ на исходящий вопрос/completion; это причинная роль переписки, не
 факт отправки текущей строки наружу. Тот же header используется в body preview.
+Одностороннее уведомление `send_prompt` тоже имеет входящий header с именем
+и точным tab-link, но не становится вопросом/делегацией и не требует Reply.
+Его `phase:prompt` несёт обычный MCP origin с сохранёнными source-полями;
+стрелка пассивна без messageId. Старый общий MCP origin без адреса показывает
+нейтральное `Terminal MCP`; tooltip сообщает об отсутствии сохранённого отправителя.
+Имя по handoff/тексту не угадывается.
+Сохранение и immutable retry этого provenance — `fact-terminal-mcp.md`.
 В меню окна `⋮` под Timeline есть `MCP как user`: настройка выбранной вкладки
 сразу показывает её входящие MCP/межвкладочные сообщения обычными оранжевыми
 user-bubbles без source-header. Выключение возвращает источник и фиолетовый фон;
@@ -220,6 +379,13 @@ hover/pressed/focus-visible состояния в постоянном24px slot;
 не получает оформление кнопки. Read-only locator сверяет нормализованный MCP carrier
 и его acceptance/requestId, сохраняет отдельные writer/read SID и повторно
 проверяет владельца после I/O. Цитата, похожий текст и соседний номер не подходят.
+Для нескольких return conversations один batch-call имеет outer requestId, а R
+каждой группы — собственный ключ. Locator связывает их только через структурный
+accepted messages[] envelope и explicit question IDs, не через сходство suffix/
+текста. Source/session/target/tool-family guards остаются прежними. Restart consumer
+тоже учитывает все replyToIds и дедуплицирует только полностью одинаковые proofs:
+две Q-ссылки на один R не означают два native input; разные attempts/audits не
+сливаются. Отмена первого Q не уничтожает proof живого соседнего Q.
 History раскрывает содержащую группу, догружает exact row и тем же seek-owner
 центрирует именно tool header. Однократная подсветка начинается после реального
 монтажа и стабильного положения, не после таймера загрузки. Новый click, смена
@@ -249,6 +415,12 @@ label остаётся provenance, live-состояние задаёт офор
 зелёный, `waiting-for-input/unconfirmed` жёлтые, `failed` красный. Жёлтый означает
 неопределённость или требуемое внимание, а не штатное ожидание очереди. Стадии
 независимы: доставленный вопрос остаётся зелёным на Send, пока Reply ещё ожидается.
+SOURCE27Oct: нижний `Reply` показывает именно доставку и остаётся зелёным после
+подтверждённого возврата, включая metadata-only запись. Header/visibility тоже
+завершают обмен по доставке, без отдельного processing wait. Прежний natural-final
+gate отменён прямым решением27Oct: длинный рабочий ход источника не создаёт новый
+reply_processing_timeout после delivered Reply. Это не смысловая оценка ответа и
+не разрешение повторить вопрос. Source/API/SSR не квалифицируют установленный UI.
 Успех перехода принимается только после `await true` от общего Root-входа;
 его внутренний `placeTab` сохраняет существующее окно/workflow. `activateCenterTab`
 не является отдельным menu-navigation контрактом. Чужое окно/workflow не
@@ -266,6 +438,10 @@ viewport-clamped overlay, но состояние списка не теряет
 только dock этого не замечала; регрессия обязана открывать пару из прокрученной
 History. Parent listener читает child ref без переподписки на каждый selection:
 иначе закрытие ребёнка могло снять outside-listener посреди того же события.
+Escape принадлежит открытой popup-поверхности: History/settings и message preview
+перехватывают его в document capture с preventDefault/stopPropagation, до xterm
+target. Bubble-only listener мог закрыть popup уже после отправленного terminal
+Escape и прервать работающий Codex. Закрытие popup не является Stop/отменой Loop.
 
 Общая `History` содержит chronological union native/browser run и question-thread,
 вопрос с ответом считается одной записью. Постоянное место кнопки не зависит от
@@ -281,23 +457,31 @@ Dock имеет один скролл3px и одну общую рамку. Вн
 различие сдвигало native X правее message X. Оба header используют общий
 компонент, не независимые почти одинаковые стили.
 
-По уточнению Fedor12.10 зелёные карточки не показываются в compact dock слева
-от History: успешная доставка вопроса И ответа скрывает переписку сразу,
-без прежней4секундной задержки. History сохраняет пару; открытый preview не
-закрывается. Ожидание ответа, saved-only, queued/unconfirmed/failed остаются
-видимыми. Visibility берётся из текущего presentation, не timestamps; отдельного
+По уточнению Fedor12.10 завершённые зелёные карточки не показываются в compact
+dock слева от History. SOURCE27Oct завершает обе стороны по exact native доставке
+Reply, включая source с собственным Loop. Его текущий рабочий ход может ещё
+продолжаться: это не повод оставлять успешную переписку в активном dock. Прежнее
+условие12Oct о подтверждённой обработке возврата отменено новым решением27Oct.
+History сохраняет пару; открытый preview не закрывается. Ожидание ответа,
+saved-only, queued/unconfirmed/failed остаются видимыми. Visibility берётся из
+текущего presentation строки, не timestamps; отдельного
 success-expiry timer больше нет. Это UI-проекция, не автоматический dismiss/ack,
 не отмена доставки и не доказательство смыслового прочтения моделью.
 После remount зелёные карточки также остаются только в History.
 
-X переписки означает отмену будущей доставки и ожидания ответа, а не hide.
-По уточнению Fedor09.10 закрытый MCP-вопрос не должен неожиданно отправляться
-после следующего ручного сообщения. `cancelledAt/cancelledByTabId` записываются
-атомарно с delivery-control question и уже сохранённого reply. До Enter отмена
-запрещает ввод, после него сохраняет неизвестный/подтверждённый исход; уже
-переданное нельзя обещать отозвать. Процесс адресата не останавливается.
-Поздний ответ сохраняется читаемым, но не пересылается; restart, callbacks и
-повтор того же ID не оживляют dispatch. History и immutable текст не удаляются.
+SOURCE27Oct X обычной переписки — LOCAL hide и снятие своего ожидания, не отмена
+вопроса/ответа и не Stop. Прежнее правило09Oct «X отменяет доставку» явно заменено
+новым решением Fedor. Source X сохраняет sourceDismissedAt, снимает только её
+message hold и прекращает новые no-reply/status notices. Target X сохраняет
+targetDismissedAt, но не снимает ожидание source. Поздний Reply штатно доставляется,
+остаётся в History; hidden карточка не воскресает от receipt/list/reopen.
+Закрытие не отзывает уже принятую отправку и не переигрывает UNKNOWN.
+
+Самостоятельная явная отмена переписки остаётся другим действием:
+cancelledAt/cancelledByTabId и новый cancelOrigin=explicit сохраняются с delivery
+control прежним owner. Процесс не останавливается, исторические квитанции остаются.
+Отмена одного вопроса не отзывает shared Reply, пока он принадлежит другому
+неотменённому вопросу. UI X к этому действию не подключён.
 IPC `tab-messages:cancel`, REST `POST /api/tab-messages/:id/cancel` (`{tabId}`)
 и MCP `cancel_message` сходятся в один owner. Участник проверяется по thread,
 reply ID адресует вопрос. Capability `tabMessages.cancellation.version=1`
@@ -305,15 +489,23 @@ reply ID адресует вопрос. Capability `tabMessages.cancellation.ver
 `get_message.cancelledAt`, повтор допускается лишь с тем же ID. HTTP также
 возвращает `requestedMessageId`, отдельно от корневого question ID.
 
-Legacy `dismissMessage`, IPC `tab-messages:dismiss` и `/dismiss` сохранены как
-per-side hide (`sourceDismissedAt/targetDismissedAt`), без изменения доставки.
-Старые hides не мигрируют в отмену задним числом. UI теперь вызывает cancel;
-ошибка не скрывает строку оптимистично. Native run X остаётся отдельным owner.
+UI X использует прежние dismissMessage, IPC tab-messages:dismiss и /dismiss,
+без новых controls или отдельного recovery service. Ошибка не скрывает строку
+оптимистично. Native run/Build Install/Research X сохраняют свои owners.
 Новая cancellation metadata сливается монотонно даже если более поздний delivery
-event пришёл раньше её ACK. Старый participant-hide и новая отмена проецируются
+event пришёл раньше её ACK. Participant-hide и явная отмена проецируются
 в тот же exact History handoff: late queued receipt/list не возвращает ghost.
 Это не удаление настоящей canonical user-строки. Физический slot и сохранённые
 delivery facts различаются по `fact-terminal-mcp.md::Main FIFO принятых Send`.
+
+Старые cancelledAt не содержали происхождения: карточка X и explicit API писали
+одинаковые поля. Fedor отдельно выбрал сохранить эту неопределённость до адресного
+решения, не разбирать её массовым снятием guards. Additive migration сохраняет
+old receipts/UNKNOWN/frozen inputs и сообщает cancellationOrigin=legacy-unknown;
+batch возвращает legacy-cancel-ambiguous, не новый Reply input. Старые настоящие
+per-side hides уже не блокируют поздний ответ и после reopen снимают собственный
+message wait. Новый Source-контракт требует coherent Main+renderer App и новой
+версии Terminal MCP для списка IDs; Source/private PASS не является loaded proof.
 
 History/Timeline получают durable tag `kind:tab-message`; текстовые цитаты
 сервисной разметки сами по себе тег не создают. По требованию Fedor вопрос и reply

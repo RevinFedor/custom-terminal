@@ -1,5 +1,7 @@
 'use strict';
 
+const rootText = require('./history-paged-text');
+
 // Codex in-process subagents leave two rollout generations on disk:
 //
 //   v1 `multi_agent_v1` (cli ≤0.144): spawn_agent output carries {agent_id,
@@ -58,9 +60,9 @@ function extractCodexSpawnIdentities(value, namespace = 'multi_agent_v1') {
   const visit = (candidate) => {
     if (Array.isArray(candidate)) { candidate.forEach(visit); return; }
     if (!candidate || typeof candidate !== 'object') return;
-    const agentId = typeof candidate.agent_id === 'string' ? candidate.agent_id.trim() : '';
-    const taskName = typeof candidate.task_name === 'string' ? candidate.task_name.trim() : '';
-    const nickname = typeof candidate.nickname === 'string' ? candidate.nickname.trim() : '';
+    const agentId = rootText.isText(candidate.agent_id) ? candidate.agent_id.trim() : '';
+    const taskName = rootText.isText(candidate.task_name) ? candidate.task_name.trim() : '';
+    const nickname = rootText.isText(candidate.nickname) ? candidate.nickname.trim() : '';
     if (namespace === 'multi_agent_v1'
       && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agentId)) return;
     if (namespace === 'collaboration' && !agentId && !taskName.startsWith('/root/')) return;
@@ -68,7 +70,8 @@ function extractCodexSpawnIdentities(value, namespace = 'multi_agent_v1') {
     const key = agentId || taskName;
     if (!found.has(key)) found.set(key, { agent_id: agentId, task_name: taskName, nickname });
   };
-  if (typeof value === 'string') {
+  if (rootText.isText(value)) {
+    value = rootText.materialize(value, 'subagent-spawn-json');
     try { visit(JSON.parse(value)); }
     catch { for (const line of value.split('\n')) { try { visit(JSON.parse(line.trim())); } catch {} } }
   } else visit(value);
@@ -100,6 +103,29 @@ function isCodexSubagentWorkStartingCall(call) {
     && CODEX_SUBAGENT_WORK_START_NAMES.has(normalized.toolName);
 }
 
+// A successful native-v1 control can reopen a persisted child after close or
+// a parent process restart. It is not a new spawn, and needs no old card in
+// RAM. Only the exact UUID argument + this call's typed receipt prove it;
+// prose, mailbox delivery, a missing result or an old completed status cannot.
+function codexSubagentAcceptedWorkStart(call, outputPayload, isError = false) {
+  call = normalizeCodexSubagentCall(call);
+  if (isError || call?.namespace !== 'multi_agent_v1'
+    || !isCodexSubagentWorkStartingCall(call)) return null;
+  const targets = ['id', 'target', 'agent_id'].map(key => call.args?.[key])
+    .filter(value => value != null).map(value => typeof value === 'string' ? value.trim() : '');
+  const threadId = targets[0] || '';
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)
+    || targets.some(value => value !== threadId)) return null;
+  const output = parseMaybeJson(outputPayload);
+  if (!output || typeof output !== 'object' || Array.isArray(output) || output.error) return null;
+  const accepted = call.toolName === 'resume_agent'
+    ? output.status === 'pending_init' || output.status === 'running'
+    : call.toolName === 'send_input'
+      && typeof output.submission_id === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(output.submission_id);
+  return accepted ? { threadId } : null;
+}
+
 function codexSubagentTerminalOutcomes(call, outputPayload) {
   call = normalizeCodexSubagentCall(call);
   if (!isCodexSubagentControlCall(call)) return [];
@@ -108,7 +134,7 @@ function codexSubagentTerminalOutcomes(call, outputPayload) {
   const outcomes = [];
   const add = (key, status) => {
     if (!key || !status || typeof status !== 'object') return;
-    if (typeof status.completed === 'string') outcomes.push({ key, status: 'completed', result: status.completed });
+    if (rootText.isText(status.completed)) outcomes.push({ key, status: 'completed', result: status.completed });
     else if (status.interrupted !== undefined || status.errored !== undefined
       || status.shutdown !== undefined) outcomes.push({ key, status: 'interrupted' });
   };
@@ -136,13 +162,13 @@ function codexSubagentTerminalOutcomes(call, outputPayload) {
 }
 
 function describeSubagentSpawn(args = {}) {
-  const taskName = typeof args.task_name === 'string' && args.task_name.trim()
+  const taskName = rootText.isText(args.task_name) && args.task_name.trim()
     ? args.task_name.trim()
     : '';
-  const agentType = typeof args.agent_type === 'string' && args.agent_type.trim()
+  const agentType = rootText.isText(args.agent_type) && args.agent_type.trim()
     ? args.agent_type.trim()
     : '';
-  const message = typeof args.message === 'string' ? args.message.trim() : '';
+  const message = rootText.isText(args.message) ? args.message.trim() : '';
   // v2 messages are encrypted (Fernet, gAAAA… prefix) — never show them.
   const messagePreview = message && !message.startsWith('gAAAA')
     ? message.slice(0, 80)
@@ -165,7 +191,7 @@ function timestampMs(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function createCodexSubagentTracker(seed = {}) {
+function createCodexSubagentTracker(seed = {}, { own = value => value } = {}) {
   const cardByCallId = seed.cardByCallId || new Map();
   const cardByAgentKey = seed.cardByAgentKey || new Map();
 
@@ -207,14 +233,14 @@ function createCodexSubagentTracker(seed = {}) {
     /** Register a spawn_agent function_call → returns the TaskAction card. */
     registerSpawn(call) {
       const baseDescription = describeSubagentSpawn(call?.args || {});
-      const card = {
+      const card = own({
         tool: 'Task',
         toolUseId: String(call?.callId || ''),
         baseDescription,
         description: baseDescription + ' · running',
         subagentStatus: 'running',
         startedAt: timestampMs(call?.timestamp),
-      };
+      });
       if (card.toolUseId) cardByCallId.set(card.toolUseId, card);
       // v2 task_name maps to agent_path `/root/<task_name>`; register both.
       const taskName = String(call?.args?.task_name || '').trim();
@@ -256,7 +282,7 @@ function createCodexSubagentTracker(seed = {}) {
         // Rejections arrive as PLAIN TEXT, which JSON parsing drops to null —
         // read the reason from the raw payload, falling back to structured
         // error fields when the refusal did come back as an object.
-        const raw = typeof outputPayload === 'string' ? outputPayload.trim() : '';
+        const raw = rootText.isText(outputPayload) ? outputPayload.trim() : '';
         const structured = String(output?.error || output?.message || '').trim();
         const reason = structured || raw;
         card.spawnRejected = true;
@@ -345,7 +371,7 @@ function createCodexSubagentTracker(seed = {}) {
       const applyOutcome = (agentKey, status) => {
         const card = agentKey ? cardByAgentKey.get(String(agentKey)) : null;
         if (!card || !status || typeof status !== 'object') return;
-        if (typeof status.completed === 'string') {
+        if (rootText.isText(status.completed)) {
           card.result = status.completed;
           card.subagentStatus = 'completed';
           card.description = card.baseDescription;
@@ -451,7 +477,7 @@ function createCodexSubagentTracker(seed = {}) {
         // agents whose wait_agent timed out and were then force-closed sat as
         // permanent live chips (4 of 32 closes in the corpus).
         const previous = output?.previous_status;
-        const completed = typeof previous?.completed === 'string' ? previous.completed : null;
+        const completed = rootText.isText(previous?.completed) ? previous.completed : null;
         const target = String(call?.args?.target || call?.args?.id || call?.args?.agent_id || '').trim();
         const card = target ? cardByAgentKey.get(target) : null;
         if (card) {
@@ -473,7 +499,7 @@ function createCodexSubagentTracker(seed = {}) {
         const agents = Array.isArray(output?.agents) ? output.agents : [];
         for (const agent of agents) {
           const card = cardByAgentKey.get(String(agent?.agent_name || ''));
-          const completed = typeof agent?.agent_status?.completed === 'string'
+          const completed = rootText.isText(agent?.agent_status?.completed)
             ? agent.agent_status.completed
             : null;
           if (card && completed !== null) {
@@ -490,6 +516,8 @@ function createCodexSubagentTracker(seed = {}) {
     hasCards() {
       return cardByCallId.size > 0;
     },
+
+    *iterateCards() { yield* cardByCallId.values(); },
 
     allCards() {
       return [...cardByCallId.values()];
@@ -516,6 +544,7 @@ function createCodexSubagentTracker(seed = {}) {
 
 function parseMaybeJson(value) {
   if (value == null) return null;
+  if (rootText.isPagedText(value)) return rootText.parseJson(value);
   if (typeof value === 'object') return value;
   if (typeof value !== 'string') return null;
   try {
@@ -529,6 +558,7 @@ module.exports = {
   CODEX_SUBAGENT_CONTROL_NAMES,
   CODEX_SUBAGENT_SPAWN_NAMES,
   createCodexSubagentTracker,
+  codexSubagentAcceptedWorkStart,
   codexSubagentTerminalOutcomes,
   describeSubagentSpawn,
   extractCollabFinalAnswer,

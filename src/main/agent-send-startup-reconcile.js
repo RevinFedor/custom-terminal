@@ -995,7 +995,9 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     // slot transformation, while live sends use expectedImagePaths and thus
     // require exact provider path/slot identity.
     expectedImagePaths: context.expectedImagePaths,
-    allowUnprovenImageCarrier: context.expectedImagePaths.length === 0,
+    ...(context.imageRequestProjection?.audit?.imageRequestProjection?.version === 2
+      ? { imageRequestProjection: context.imageRequestProjection.audit.imageRequestProjection }
+      : { allowUnprovenImageCarrier: context.expectedImagePaths.length === 0 }),
     sentAt: numericTimestamp(context.boundary.capturedAt)
       ?? numericTimestamp(context.record.updatedAt)
       ?? 0,
@@ -1079,6 +1081,12 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     audit.imageRequestProjection = {
       kind: context.imageRequestProjection.kind,
       imageCount: context.imageRequestProjection.imageCount,
+    };
+    if (context.imageRequestProjection.audit.imageRequestProjection?.version === 2) audit.imageTransformEvidence = {
+      actualText: match.actualText, actualHash: match.actualHash, actualLen: match.actualText.length,
+      actualImagePaths: codexUserMessageImageRefs(match.candidate.record).map(ref => ref.path),
+      actualIdentity: { sessionId: context.sessionId, filePath: validated.transcriptPath,
+        byteOffset: match.candidate.byteOffset, timestamp: match.candidate.record.timestamp },
     };
   }
   const identity = agentPromptAuditMatchesHash(context.promptHash, audit);

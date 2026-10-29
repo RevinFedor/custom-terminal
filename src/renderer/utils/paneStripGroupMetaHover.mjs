@@ -4,9 +4,12 @@ import {paneStripGroupMetaStep} from './paneStripCollapseModel.mjs';
 let active=null;
 export function ownPaneStripGroupMetaHover(owner,toggle,target=window,isInside=null) {
   if(active?.owner===owner)return active.release;
-  active?.release();let key={};
-  const down=event=>{key=paneStripGroupMetaStep(key,{type:'down',key:event.key,repeat:event.repeat});};
-  const up=event=>{key=paneStripGroupMetaStep(key,{type:'up',key:event.key});if(key.toggle)toggle();};
+  active?.release();let key={},downAt=null;
+  const down=event=>{if(event.key==='Meta')downAt=Number.isFinite(event.timeStamp)?event.timeStamp:null;
+    key=paneStripGroupMetaStep(key,{type:'down',key:event.key,repeat:event.repeat});};
+  const up=event=>{key=paneStripGroupMetaStep(key,{type:'up',key:event.key});
+    if(key.toggle)toggle(event,downAt!==null&&Number.isFinite(event.timeStamp)&&event.timeStamp>=downAt?event.timeStamp-downAt:null);
+    if(event.key==='Meta')downAt=null;};
   const pointer=()=>{key=paneStripGroupMetaStep(key,{type:'pointer'});};
   const blur=()=>{key={};release();};
   const move=event=>{if(isInside&&!isInside(event))release();};

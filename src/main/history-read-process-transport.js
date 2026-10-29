@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
+const { historyPrimaryRootEnabled } = require('../shared/history-primary-rollout.cjs');
 const unavailable = () => Object.assign(new Error('History reader process state is unknown'), { code: 'HISTORY_READER_TRANSPORT_UNKNOWN' });
 
 // The adapter deliberately does not equate 'error', disconnected IPC or kill()
@@ -75,7 +76,10 @@ function createHistoryProcessTransport(workerData) {
   if (process.type !== 'browser' || !electron.app?.isReady() || !electron.utilityProcess?.fork) {
     throw Object.assign(new Error('History reader requires a ready Electron Main utilityProcess'), { code: 'HISTORY_READER_TRANSPORT_UNKNOWN' });
   }
-  const child = electron.utilityProcess.fork(path.join(__dirname, 'history-read-process.js'), [], {
+  const entry = historyPrimaryRootEnabled(process.env)
+    ? path.join(__dirname, 'history-root-engine', 'main', 'history-read-process.js')
+    : path.join(__dirname, 'history-read-process.js');
+  const child = electron.utilityProcess.fork(entry, [], {
     env: { ...process.env, NOTED_HISTORY_READER_PROCESS: '1' },
     serviceName: 'Noted History Reader', stdio: 'inherit',
   });

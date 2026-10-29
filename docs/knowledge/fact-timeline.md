@@ -57,9 +57,26 @@
 ## 2. Behavior Specs
 
 - **Visibility (Range-based):** Timeline отображается всегда, когда в текущем табе есть активная сессия AI.
-    - **Logic:** Вместо поиска текста промпта во вьюпорте используется принцип «владения блоком». Каждое сообщение пользователя "владеет" диапазоном строк от своей позиции до начала следующего сообщения.
+    - **History/SDK viewport:** подсветка получает UUID через один источник
+      текущего владельца; подписаны конкретные смонтированные маркеры и начальные
+      plan/fork-полоски. Изменение диапазона не должно заново запускать весь
+      `Timeline.entries.map` внутри синхронного scroll-коммита Virtuoso. Такой
+      вложенный React-проход наблюдался в installed110; SOURCE112 убирает его
+      без задержки публикации. Скрытие отключает наблюдение, но сохраняет объект
+      источника: пересоздание при возврате снова заставляло все строки рисоваться.
+      После возврата свежий диапазон согласуется в layout effect до paint.
+      Legacy terminal reachability и response-only остаются отдельной веткой.
+    - Свёрнутая группа считается видимой по любому участнику, повторные UUID
+      обновляют все соответствующие маркеры, compact summary учитывает только
+      собственного непосредственного предшественника. Сравнение множества ключей
+      строки с viewport обходит меньшую сторону: viewport тоже может содержать
+      тысячи assistant UUID. Проверка только «мало DOM-строк History» не исключала
+      миллионы membership probes в Timeline. Native private112 подтвердил
+      переключение цветов первой/дальней/первой точки, полный текст и переходы;
+      installed/нагрузочная приёмка фиксируется отдельно в рабочем tmp.
+    - **Terminal logic:** Для терминального вьюпорта используется принцип «владения блоком». Каждое сообщение пользователя "владеет" диапазоном строк от своей позиции до начала следующего сообщения.
     - **Indicator:** Точка превращается в черточку (Viewport Dash), если вьюпорт терминала пересекается с диапазоном строк этого сообщения. Это гарантирует, что таймлайн всегда показывает активную точку, даже если пользователь скроллит длинный ответ AI, а сам промпт уехал за экран.
-    - **Response-Only Indicator:** Если вьюпорт пересекает диапазон entry, но позиция самого промпта (`markerRow`) находится **выше** верхней границы вьюпорта — значит пользователь видит только ответ AI. В этом случае черточка отображается приглушённым серым (`rgba(255,255,255,0.35)`) без glow, вместо яркого белого (`rgba(255,255,255,0.75)` + glow). Размер черточки одинаковый (10px). Определение: `blockStart < viewport.top`. Работает для обоих движков (Claude OSC markers, Gemini text positions).
+    - **Response-Only Indicator (terminal):** Если вьюпорт пересекает диапазон entry, но позиция самого промпта (`markerRow`) находится **выше** верхней границы вьюпорта — значит пользователь видит только ответ AI. В этом случае черточка отображается приглушённым серым (`rgba(255,255,255,0.35)`) без glow, вместо яркого белого (`rgba(255,255,255,0.75)` + glow). Размер черточки одинаковый (10px). Определение: `blockStart < viewport.top`. Работает для обоих движков (Claude OSC markers, Gemini text positions).
     - **Invisible Intent (Психология фокуса):** Приглушение индикатора необходимо, чтобы пользователь мгновенно понимал: на экране сейчас только результат работы ИИ, а сам вопрос находится выше. Это снижает когническую нагрузку при быстром скролле длинных диалогов.
     - **Shield Logic:** Маркеры сжатия (`compact`) служат приоритетной границей. Если сразу после сжатия происходит техническая смена ID сессии, система блокирует создание ложного `FORK` маркера. См. [`fix-compact-logic.md`](fix-compact-logic.md).
     - **Compact self-tooltip:** Оранжевая полоска/граница и точка — два входа в один compact, даже когда Claude записал пару `compact_boundary` + `isCompactSummary`. Readable Claude показывает свой summary/Copy/full content; недостающий текст читается bounded вокруг exact compact. SOURCE Codex hover тоже доступен, но только как metadata: одна `context compacted (encrypted)`, время записи и postTokens при наличии. Он не запрашивает/расшифровывает capsule и не выдаёт verbatim `replacement_history` за summary. ПКМ `Копировать compact` остаётся отдельным explicit verbatim path. См. [`fact-codex.md::Timeline и History`](fact-codex.md) и [`fact-группировка-таймлайна.md`](fact-группировка-таймлайна.md).
@@ -75,6 +92,9 @@
         - **Заполненная точка:** Контент найден в буфере терминала (reachable). Клик выполнит скролл.
         - **Полое кольцо (Ring):** Контент отсутствует в буфере (unreachable) из-за очистки скроллбека или принадлежности к Old History Zone. При клике появится красный крестик.
     - **Bounds:** Timeline и панель истории ограничены верхней границей терминала. Они не заходят в область табов проектов или терминалов.
+    - **Собственное меню полосы:** в SOURCE26Oct кнопка и портал strip-menu с exact `tabId` считаются внутренним действием раскрытого overlay Timeline. Capture `mousedown` не сворачивает его до последующего click пункта; иначе menu toggle мог открыть его обратно. Чужое/неизвестное меню, backdrop и обычный outside-click сохраняют прежнее сворачивание. Owner берётся из data-атрибута обоих корней, не из положения popup.
+    - **Портал root Timeline:** общий корень menu/range/note в `TimelineRootSurface` сохраняет `data-timeline-context-menu`, как прежний Timeline. Workspace проверяет этот маркер в capture `mousedown`; bubble `stopPropagation()` самого popup приходит позже и не заменяет маркер. Без него выбор диапазона сворачивал expanded Timeline до выполнения click, меняя layout и scroll window. Настоящий outside-click по-прежнему сворачивает неприкреплённый overlay.
+    - **Scroll и следование за концом у root:** движение вверх выходит из follow даже при overflow меньше прежнего допуска60px; иначе compact список высотой320px во viewport300px возвращался вниз и скрывал первую точку. Совпадающее с `desiredOffset` событие от собственного layout writer не создаёт новое намерение follow. Движение вниз сохраняет прежний допуск60px, resize-clamp у фактического глобального конца сохраняет follow; physical corridor не подменяет global end. Обычный новый logical append и refresh метаданных сохраняют прежние разные политики. Регрессии исполняют actual scroll callback и read model в `timelineViewReadModel.actual.test.mjs`.
     - **Legacy History side-panel persistence:** Только для поверхностей, где History остаётся боковой панелью, открыта/закрыта — состояние per-tab (`historyPanelOpenTabs`), а ширина — app-wide setting (`noted-terminal-history-panel-width` через persisted localStorage/SQLite mirror). В header такой панели есть reset-кнопка `↻W`, возвращающая ширину к дефолту 580px. У primary History нет отдельного open-флага, header, reset-width или крестика.
     - **Persistent Mount:** Timeline никогда не удаляется из DOM при переключении на Home, чтобы не вызывать скачков верстки. Он скрывается через проп `isVisible`, сохраняя свою ширину (32px).
     - **Read-only Home preview:** когда Timeline встроен в ProjectHome preview, он остаётся collapsed-рельсой (~32px), принудительно не раскрывается в tree-mode и отключает действия редактирования/rewind/context menu/double-click. Клик по точке только просит HistoryPanel перейти к `entry.uuid`; терминальный scroll/reachability здесь не участвует, потому что пользователь смотрит архивную сессию без открытия терминала. Мотивация: Home preview должен дать inspect-before-resume, а не запускать рабочий контекст побочным кликом.
@@ -127,6 +147,14 @@
       hover-ромб не касается её. Note/loading/error/fork/plan indicators
       следуют той же детской колонке. Collapsed header и wide preview не смещаются.
     - External research отличается от межвкладочного MCP по exact `orchestration/runKind=external-research`: его точка использует bundled SC Desktop icon. С19.10 SOURCE, request/completion/failure этого канала остаются отдельными исходными точками и разрывают MCP/subagent серии, даже рядом с другим Research; модель значения не имеет. Видимый размер совпадает с ромбом в том же viewport/hover состоянии, а не задан отдельными14px: квадратная сторона ромба после поворота45° даёт границу `side × sqrt(2)`. Постоянный14px slot сохраняет отступы и высоту строки; у самой картинки снят `max-width:100%`, иначе hover-диагональ зажималась по ширине. Модель, provider label и слова в body не являются classifier; старый tag без runKind не угадывается. Межвкладочный MCP сохраняет ромб, а SC-точка — тот же канал provenance, не успех или работа браузера. Подтверждённый временный handoff переносит полный immutable tag, поэтому до canonical adoption источник не меняется на generic MCP. Docs/prompt/agent badges у SC рисуются отдельным компактным рядом, не поверх значка. SC-marker навигирует к исходному History UUID; открытие задачи SC Desktop остаётся отдельным действием существующего source-header.
+    - У терминальной ошибки Research SC-artwork получает малиновый SVG-tint из
+      `--cb-error-text`, сохраняя alpha/luminance, размер и прежний hit target.
+      Исход берётся из canonical outcome того же exact tag, а не модели или
+      «Готов…»: completion-фаза доставки сама не доказывает success. History
+      использует тот же predicate для красного глобуса. Running/queued/success,
+      partial files при success и явное ручное прерывание сохраняют прежний цвет;
+      legacy failure без outcome остаётся ошибкой. Текст, grouping, UUID и клики
+      не меняются; детали — History::Компактный ответ External Research.
     - Orchestration-turn не участвует в AI prompt summary, auto-title и ручной semantic outline: его устойчивый смысл уже задан tag'ом и `runId`, а пересказ служебного уведомления создавал бы второй, менее точный label.
     - Возврат после `build:install` и автоматический повтор после Codex capacity используют общий `prompt-origin/source=system` с `systemSource=build-install-return|codex-capacity-retry`. Возврат сохраняет фиолетовый ромб; по уточнению09.10 автоматический `Continue` получает обычную круглую точку приглушённого фиолетового цвета, как Loop, без поворота45°. Это presentation subtype, а не изменение system/service происхождения: такие записи по-прежнему не участвуют в auto-title, prompt summary, semantic outline и счётчике новых запросов человека. Они не являются orchestration run, не входят в MCP-группу и не открывают несуществующий run. Источник задаётся send-сценарием, не словом continue в body.
     - Старые system-уведомления восстанавливаются один раз при startup из `confirmed` receipt с exact audit той же attempt/provider/session/hash. Если receipt ещё не знает canonical UUID, pending sidecar хранит точную `auditSourceIdentity`; привязка разрешена только при совпадении с source identity/alias канонической записи. Совпавших текста и времени недостаточно, JSONL не меняется. После привязки sidecar переживает restart и обычную доказанную Codex child projection.
@@ -213,11 +241,11 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 
 **Overlay, не resizable cell.** Внешний slot в Workspace flex-row всегда 32px (как в collapsed). Реальный container — `position: absolute; right: 0; width: timelineWidth`, вылезает влево поверх терминала с `backdrop-filter: blur(8px)`. Чат/терминал в layout НЕ сжимаются при раскрытии. Принцип см. [`methodology/дизайн-принципы.md::Resizable side panel = overlay над контентом`](../methodology/дизайн-принципы.md).
 
-**Unpinned overlay закрывается кликом мимо.** Если expanded Timeline открыт, но `timelinePinned=false`, клик по терминалу, file sidebar или любой другой workspace-поверхности сворачивает его обратно в 32px rail. Это временный scan-режим: пользователь быстро посмотрел историю и вернулся к терминалу без повторного нажатия на кнопку раскрытия. Внутренние поверхности Timeline (`[data-timeline]`, context-menu, Cmd-hover popover) исключены из outside-close.
+**Overlay закрывается кликом мимо.** Expanded Timeline всегда лежит поверх чата/терминала. Клик по терминалу, file sidebar или другой workspace-поверхности сворачивает его обратно в32px rail; внутренние Timeline/context-menu/Cmd-hover и меню полосы своего owner сохраняют прежнее действие. Это временный scan-режим без reflow чата.
 
 **Возврат на вкладку без replay-анимации.** `timelineTreeModeTabs` хранится per-tab. Если пользователь вернулся на вкладку, где expanded Timeline уже был открыт, ширина должна восстановиться мгновенно, без анимации `32px → timelineWidth`. Анимация допустима только для явного жеста на текущей вкладке (`Cmd+\` / `Option+\` / кнопка Timeline), а не для tab-switch restore. Реализация: width transition выключается на первый render после смены `tabId` и включается обратно на следующий frame.
 
-**Pin-кнопка — продолжение того же жеста, не outside-click.** StatusBar wrapper `H/T` помечен `data-history-timeline-pin-toggle`; mousedown по `T` не закрывает unpinned overlay до click-handler'а, а позволяет превратить уже открытый Timeline в pinned layout. В pinned mode внешний slot резервирует полную `timelineWidth`, terminal layout сжимается осознанно, и global outside-close не работает: закрытие/сворачивание снова становится явным действием пользователя.
+**Timeline всегда поверх, отдельного pin-режима нет.** По прямому решению Fedor27.10 переключатель Timeline в StatusBar удалён; сохранённое старое значение не может вернуть колонку ни при старте, ни при позднем hydrate. Resize меняет только ширину absolute-панели, внешний slot остаётся32px. Независимый History pin сохранён; старое combined-значение читается только как его прежний migration seed, поэтому удаление Timeline-настройки не меняет выбранный режим боковой History. StatusBar History-кнопка остаётся внутренним действием для outside-close.
 
 **Тип записи кодирует только цвет dot.** Изначально в превью был chip (`PROMPT/COMPACT/CONTINUED/AGENT/DOCS`) + timestamp в первой строке — юзер потребовал убрать («тип уже виден из цвета кружочка, лейбл дублирует»). См. [`methodology/дизайн-принципы.md::Семантика передаётся одним каналом`](../methodology/дизайн-принципы.md). Превью теперь только текстовая часть entry, line-clamp настраивается отдельно (Settings → Шрифты → «Таймлайн — строки», по умолчанию 3, диапазон [1, 10]).
 
@@ -354,7 +382,7 @@ canonical adoption остаётся identity-only. Обычные/unproved со�
 - **Триггер tab/session = (tabId | sessionId), потребитель = первый non-empty commit `entries`.** Timeline — **единственный инстанс**, его `tabId`/`sessionId` props свопаются при смене таба (`isVisible` остаётся `true` внутри проекта, он трекает только workspace/terminal-view, поэтому «Продолжить» с тем же sessionId и смена таба — обе ловятся одним ключом `${tabId}::${sessionId}`). На тик смены ключа `entries` ещё держит данные **прошлого** таба → скроллить сразу нельзя. Решение: `pendingBottomRef` арм'ится на смене ключа, **консьюмится на первом non-empty изменении ссылки `entries`** (post-load commit от `loadTimeline`), затем дизарм. **Timing-independent** — нет `setTimeout`-окна, которое мог бы обогнать медленный IPC-load тяжёлой сессии.
 - **Триггер append = рост `entries.length` внутри того же `(tabId | sessionId)`.** Это отдельный ref-снимок `{ key, length }`, чтобы не путать новую запись с первым commit после переключения вкладки. Если длина выросла — Timeline делает instant jump вниз, даже если пользователь был проскроллен выше. Если длина не изменилась — refresh мог обновить токены/статусы/summary, и скролл не трогается.
 - **Триггер expanded-open = переход rail → expanded layout (`Cmd+\`).** Отдельный ref-key по `(tabId | sessionId | layout)` нужен потому, что это не новая запись и не новая сессия: данные те же, но высоты DOM-строк стали другими. На первом non-empty expanded render делается тот же instant bottom jump.
-- **Pinned Timeline меняет ширину терминала.** Когда `timelinePinned=true`, раскрытие/сворачивание Timeline (`Cmd+\`) участвует в flex-layout и xterm получает новую ширину; после `transitionend` по width Timeline шлёт `timeline:pinned-layout-settled`, а активный Terminal делает финальный `safeFit()` и `scrollToBottom()`. Без этого длинный TUI после reflow остаётся не у нижнего prompt'а, хотя визуально пользователь только раскрыл правую колонку.
+- **Раскрытие Timeline не меняет ширину терминала.** Его fixed32px slot и absolute expanded-панель не запускают специальный terminal fit/scroll-to-bottom. Настоящее изменение размеров terminal container по-прежнему обрабатывается обычным safeFit; сам Timeline сохраняет свой отдельный expanded-open bottom-jump.
 - **Двойной `requestAnimationFrame` + `scrollTop = scrollHeight`** (не `scrollTo({top})`): первый кадр пишет позицию, второй переписывает после того как `content-visibility: auto` досчитал реальные высоты off-screen entries (без второго кадра на длинных сессиях приземление чуть выше низа). Это **не** виртуализованный список (Timeline на `content-visibility`, не Virtuoso) — поэтому `scrollHeight` валиден сразу, в отличие от HistoryPanel/SDK где нужен `scrollToIndex` (см. [`fix-sdk-virtualization-tab-switch.md::Graveyard миграции`](fix-sdk-virtualization-tab-switch.md)).
 - **Graveyard:** прежняя реализация скроллила на тик смены `sessionId` с guard `sessionId !== prevSessionRef && entries.length > 0` и deps `[sessionId, entries.length]`. Два бага: (1) скролл происходил по **stale** `scrollHeight` прошлого таба, а после `loadTimeline` повторно не срабатывал (guard уже удовлетворён) → приземление на верх; (2) `entries.length` вместо `entries`-ref не ловил случай когда у двух табов одинаковое число entries; (3) не реагировал на смену `tabId` при том же sessionId. Не возвращать guard по `prevSessionRef`.
 
@@ -651,6 +679,15 @@ identity. Более ранний prompt A с тем же текстом не п
 
 Если Rewind возвращает mismatch/empty после возможного rollback, это error-state расхождения, а не короткий feedback. Toast для такого случая persistent: не исчезает по таймеру, закрывается только крестиком, клик по телу раскрывает один абзац с объяснением что могло уже примениться в истории и какой слой остаётся источником правды. При переключении проектов тот же tab-scoped toast не должен заново проигрывать анимацию появления — это не новое событие, а уже известное состояние.
 
+Успех Rewind/Delete, в отличие от ошибки, не требует подтверждения пользователем.
+Фоновое завершение показывается обычным success-toast с общим сроком2500ms и
+ссылкой на вкладку, не бессрочной карточкой `REWIND ГОТОВ`. Видимая вкладка уже
+показывает свой тост — глобальный дубль не нужен. Удаление уведомления не очищает
+native Rewind state и не подтверждает готовность ввода. Running-индикатор остаётся
+до результата; failed-карточка не исчезает по времени либо от перехода к её вкладке,
+только по явному ×. Общий принцип — `methodology/дизайн-принципы.md::Ошибка —
+объявление со своим сроком жизни, не состояние поверхности`.
+
 **Scroll Stabilization (Авто-скролл):**
 После отката Claude TUI часто вызывает "прыжки" скролла к началу буфера из-за интенсивной перерисовки. 
 - Система автоматически подписывается на событие `onScroll` терминала после подтверждения отката.
@@ -717,6 +754,35 @@ Timeline — один компонент на ~9k строк, и до мемои
 - **Unchanged-путь `claude:get-timeline`:** renderer шлёт ревизию прошлого ответа (ifRevision), main сверяет статы файлов цепочки + mtime папки проекта (fork/resume-ребёнок появляется новым файлом) и отвечает `outcome=unchanged` без resolveSessionChain (тот стоил 250-440мс на каждый тёплый свап); renderer держит rows в кэше по ревизии. Claude-ветка кладёт в общий кэш-слот sessionBoundaries+claudeMemoryBoundaryUuid через meta-поле.
 
 ### Первый показ Timeline не ждёт тишины ввода
+
+Описанная ниже array/LRU-модель сохраняется у обычного default и legacy callers.
+SOURCE private physical-Codex root-profile строит в reader три разные координаты:
+frozen canonical entry, logical rank после прежних live/handoff/note/working-file/
+Goal projections и visual atom после grouping/strips. Renderer держит фактическое
+окно и несколько выбранных action subjects; off-window range/notes/navigation
+разрешаются подписанными capabilities, а не индексом смонтированного массива.
+Root receipt не означает paint: предыдущее окно освобождается после точного React
+commit. Copy/Full/action и outline job имеют собственный lease. Summary/outline
+read selectors получают window annotations/scalar status; полный generation/body
+sink остаётся отдельной границей и не становится bounded от оконного read path.
+Это SOURCE scope под прежним private E2E flag, не общий GUI или memory PASS.
+
+Deferred UI refresh на закрытом History-first-paint/visibility/height/busy gate
+сливается по `source > metadata > view`. При admission pending-регистр забирается
+синхронно вместе с текущим payload, чтобы layout effect и следующий drain effect
+не создали два OPEN из одного намерения. Более позднее событие сохраняет свой
+trailing request. Height0 тоже сохраняет намерение. Это не отменяет первый
+History paint, FIFO или independent background action leases; поздний root/header
+не равен опубликованному/измеренному окну.
+
+26.10 SOURCE Copy turn/range этого root-profile форматирует выбранные tool/compact
+packets на страницах до независимого UTF16-документа. Native singleton packet DTO
+больше не является промежуточным шагом; прежние filters, labels/fences, patch
+ordering и уже существующие output limits сохранены по native export oracle.
+Конечные19Source-контролей/45сравнений проверяют contents/frozen/leases/UNKNOWN
+перед zero-native-packet assertion. Полный selected prompt/renderer join, rich
+Markdown, конечный clipboard string и historical Input остаются отдельными
+body owners; эта producer-граница не доказывает их memory bound или GUI PASS.
 
 У уже смонтированной рельсы строки, metadata и durable revision принадлежат
 её exact owner (`tab/tool/session/cwd`) вместе. Общий LRU на8owners/20kentries

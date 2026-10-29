@@ -483,9 +483,126 @@ function createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendP
   };
 }
 
+// A single panel's diagnostic join. It retains scalar IDs and two weak samples,
+// never a transcript, source bytes, DOM, timer, cache entry or writer authority.
+const historyWitnessStrings = ['ownerKey','sessionId','actionId','readId','baseReadId','readActionId',
+  'revisionToken','baseRevisionToken','payloadGeneration','uuid','sourceIdentity','contentRevision'];
+const historyWitnessNumbers = ['generation','presentationVisit','sourceSequence','recordByteOffset',
+  'capturedAbs','committedAbs','observedAbs','adoptionSequence','omitted','errors','metadataOmitted'];
+function historyWitnessSnapshot(value) {
+  const out = Object.create(null);
+  let omitted = 0;
+  for (const key of historyWitnessStrings) {
+    const raw = own(value, key), bounded = short(raw, 512);
+    // Refuse rather than truncate identities: prefixes are not exact proof.
+    out[key] = raw && bounded === raw ? raw : null;
+    if (raw != null && out[key] === null) omitted++;
+  }
+  for (const key of historyWitnessNumbers) {
+    const raw = own(value, key);
+    const valid = typeof raw === 'number' && Number.isFinite(raw) && raw >= 0
+      && (key.endsWith('Abs') || Number.isSafeInteger(raw));
+    out[key] = valid ? raw : null;
+    if (raw != null && !valid) omitted++;
+  }
+  for (const [key, allowed] of Object.entries({
+    origin: ['read','snapshot-restore'], boundary: ['selected-projection-commit','surface-callback'],
+    qualification: ['durable-row-reference','live-sequence','unqualified-live-version','unqualified-revision','unqualified-row'],
+  })) out[key] = allowed.includes(own(value,key)) ? own(value,key) : null;
+  out.metadataOmitted = Math.min(DIAGNOSTIC_COUNTER_LIMIT, (out.metadataOmitted || 0) + omitted);
+  out.sample = 'projection-tail-only'; out.cacheTier = 'unknown';
+  out.rowMount = 'unqualified'; out.browserPresentation = 'unqualified';
+  return out;
+}
+
+export function createHistoryCommitWitnessDiagnostics({ enabled = () => !!diagnostics,
+  now = absNow, commit = uiPerformanceCommitForAction } = {}) {
+  let adopted = null, committed = null, omitted = 0, errors = 0, ordinal = 0;
+  const safely = (operation, fallback = null) => {
+    try { return enabled() ? operation() : fallback; }
+    catch { errors = increment(errors); return fallback; }
+  };
+  const identityMatches = (left, right) => ['ownerKey','sessionId','generation','presentationVisit']
+    .every(key => left?.[key] != null && left[key] === own(right,key));
+  const reject = () => { omitted = increment(omitted); committed = null; return false; };
+  const publish = (packet, boundary) => commit(packet.actionId, 'history:' + boundary + ':' + packet.adoptionSequence,
+    { historyWitness: historyWitnessSnapshot({ ...packet, boundary, observedAbs: now(), omitted, errors }) });
+  return {
+    begin(identity, actionId, origin) {
+      return safely(() => {
+        if (ordinal === DIAGNOSTIC_COUNTER_LIMIT) { reject(); return null; }
+        return { ...historyWitnessSnapshot({ ...identity, actionId, origin, capturedAbs: now() }), ordinal: ++ordinal };
+      });
+    },
+    observeRead(attempt, invoke) {
+      if (!attempt) return invoke;
+      return (channel, payload) => {
+        safely(() => {
+          const fields = historyWitnessSnapshot({ readId: own(payload,'diagnosticReadId'),
+            readActionId: own(payload,'diagnosticActionId') });
+          attempt.readId = fields.readId; attempt.readActionId = fields.readActionId;
+          attempt.metadataOmitted += fields.metadataOmitted;
+        });
+        return invoke(channel, payload); // Preserve the original value/promise/error and call count.
+      };
+    },
+    adopt(attempt, source) {
+      return safely(() => {
+        if (!attempt || adopted && attempt.ordinal < adopted.ordinal) return reject();
+        const row = own(source,'row');
+        adopted = { packet: historyWitnessSnapshot({ ...attempt, adoptionSequence: attempt.ordinal,
+          revisionToken: own(source,'revisionToken'), payloadGeneration: own(source,'payloadGeneration') }),
+          row: row && typeof row === 'object' ? new WeakRef(row) : null, ordinal: attempt.ordinal, reported: false };
+        committed = null;
+        return true;
+      }, false);
+    },
+    candidate() { return safely(() => adopted); },
+    commit(candidate, identity, row) {
+      return safely(() => {
+        if (!candidate || candidate !== adopted || !identityMatches(candidate.packet, identity)) return reject();
+        // A later live update is a different committed version. It cannot
+        // borrow the first version's action/read or its timestamp after rAF.
+        if (candidate.reported) {
+          if (committed?.row?.deref() !== row) return reject();
+          return false;
+        }
+        const live = own(row,'liveProjection') === true;
+        // Transition render may still contain the former row. Object identity,
+        // not UUID/text equality, joins the durable sample to this adoption.
+        if (!live && candidate.row?.deref() !== row) return reject();
+        const packet = historyWitnessSnapshot({ ...candidate.packet,
+          uuid: own(row,'uuid'), sourceIdentity: own(row,'sourceIdentity'),
+          contentRevision: own(row,'contentRevision'), recordByteOffset: own(row,'recordByteOffset'),
+          sourceSequence: live ? own(row,'sourceSequence') : null, committedAbs: now() });
+        const rowOwnsSession = own(row,'sessionId') === packet.sessionId && !!packet.uuid;
+        packet.qualification = !rowOwnsSession ? 'unqualified-row' : live
+          ? Number.isSafeInteger(packet.sourceSequence) ? 'live-sequence' : 'unqualified-live-version'
+          : packet.revisionToken ? 'durable-row-reference' : 'unqualified-revision';
+        packet.baseRevisionToken = packet.revisionToken;
+        packet.baseReadId = packet.readId;
+        if (live || !rowOwnsSession) { packet.revisionToken = null; packet.readId = null; }
+        committed = { candidate, packet, row: row && typeof row === 'object' ? new WeakRef(row) : null };
+        candidate.reported = true;
+        return publish(packet, 'selected-projection-commit');
+      }, false);
+    },
+    present(identity) {
+      return safely(() => {
+        if (!committed || committed.candidate !== adopted || !identityMatches(committed.packet, identity)) return reject();
+        // No lookup of current input after rAF. A retained focus cannot become
+        // a new presentation/read, nor acquire a later action's identity.
+        return publish(committed.packet, 'surface-callback');
+      }, false);
+    },
+    health() { return { omitted, errors }; },
+  };
+}
+
 export function createUIActionDiagnostics({ now = absNow, emit = console.warn, notify = () => {}, onPendingFrame = () => {}, max = 96 } = {}) {
   const boot = Math.floor(now()).toString(36);
-  let sequence = 0, current = null, dropped = 0, phasesDropped = 0;
+  let sequence = 0, current = null, dropped = 0, phasesDropped = 0, commitReportsDropped = 0, commitsOmitted = 0;
+  const commits = new WeakMap();
   max = Number.isFinite(max) ? Math.max(1, Math.min(96, Math.floor(max))) : 96;
   const actions = [];
   const capture = (event, eventAbs, target = {}, frameProof = true, keys = {}) => {
@@ -525,13 +642,15 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
     }
     return nearest;
   };
-  const report = (action, kind, durationMs, extra = {}) => {
+  const report = (action, kind, durationMs, extra = {}, notifyEligible = true) => {
     const data = { ...action, kind, durationMs: round(durationMs),
       ...summarizeUIAction(action, extra),
       inputDelayMs: finite(own(extra, 'inputDelayMs')) ?? round(action.receivedAbs - action.startAbs),
-      ringDropped: dropped };
+      ringDropped: dropped,
+      ...(kind === 'visible-commit' ? { commitPhase: short(own(extra, 'commitPhase'), 140),
+        ...(own(extra,'historyWitness') ? { historyWitness: historyWitnessSnapshot(own(extra,'historyWitness')) } : {}) } : {}) };
     emit('[Perf:UIAction] ' + JSON.stringify(data));
-    if (durationMs >= 100) notify({ id: action.id, event: action.event, startAbs: action.startAbs, durationMs });
+    if (notifyEligible && durationMs >= 100) notify({ id: action.id, event: action.event, startAbs: action.startAbs, durationMs });
   };
   const drag=createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendPhase});
   return {
@@ -540,6 +659,21 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
       const action=actions.find(action=>action.id===id);
       if(!action)return false;
       appendPhase(action,name,values);return true;
+    },
+    commitForAction(id,name,values={}) {
+      const action=actions.find(action=>action.id===id),phaseName=short(name,140);
+      if(!action||!phaseName){commitsOmitted=increment(commitsOmitted);return false;}
+      let seen=commits.get(action);if(!seen){seen=new Set();commits.set(action,seen);}
+      if(seen.has(phaseName))return false;
+      if(seen.size>=32){commitsOmitted=increment(commitsOmitted);return false;}
+      seen.add(phaseName);appendPhase(action,phaseName,values);
+      // A cold/async reveal can arrive AFTER the two frame callbacks already
+      // emitted their record. Preserve the late boundary with the same ID,
+      // without another frame loop, native capture request or paint claim.
+      try{report(action,'visible-commit',now()-action.startAbs,{commitPhase:phaseName,
+        historyWitness:own(values,'historyWitness')},false);}
+      catch{commitReportsDropped=increment(commitReportsDropped);return false;}
+      return true;
     },
     eventTiming(event, eventAbs, durationMs, extra = {}) {
       const action = matching(event, eventAbs);
@@ -571,7 +705,8 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
     currentId() { return current && now() - current.receivedAbs <= 2000 ? current.id : null; },
     pending() { const at = now(); return actions.some(a => a.frameProof && a.frames < 2
       && Number.isFinite(a.receivedAbs) && a.receivedAbs <= at); },
-    health() { return { actionRingEvicted: dropped, actionPhasesDropped: phasesDropped }; },
+    health() { return { actionRingEvicted: dropped, actionPhasesDropped: phasesDropped,
+      actionCommitReportsDropped:commitReportsDropped,actionCommitsOmitted:commitsOmitted }; },
   };
 }
 
@@ -667,6 +802,20 @@ export function captureUIAction(event) {
   if(clipboardState)action.clipboardState=clipboardState;
   return action;
 }
+// Only an actually admitted hover owner calls this. Reuse a captured physical
+// key action; pointer hover uses the same bounded action/frame ring. No timer,
+// global mousemove subscription, geometry or message-text read is introduced.
+export function captureUIHoverAction(event) {
+  if (!diagnostics || !event || !Number.isFinite(event.timeStamp) || event.timeStamp < 0) return null;
+  const keyboard = event.type === 'keydown' || event.type === 'keyup';
+  if (keyboard && event.key !== 'Meta') return null;
+  if (!keyboard && !['mousemove', 'mouseover', 'mouseenter', 'mouseout', 'mouseleave',
+    'pointerover', 'pointerenter', 'pointerout', 'pointerleave'].includes(event.type)) return null;
+  const at = performance.timeOrigin + event.timeStamp;
+  const existing = keyboard ? diagnostics.matching(event.type, at) : null;
+  return existing || diagnostics.capture(keyboard ? event.type : 'hover', at,
+    describeDiagnosticTarget(event.target), true, keyboard ? describeDiagnosticKey(event) : {});
+}
 export function uiDragDiagnostic(name, fields) { try { diagnostics?.drag.event(name,fields); } catch { diagnostics?.drag.failed(); } }
 export function uiDragInput(event) { try { diagnostics?.drag.input(event); } catch { diagnostics?.drag.failed(); } }
 export function uiDragAdmission(admission) { try { diagnostics?.drag.admission(admission); } catch { diagnostics?.drag.failed(); } }
@@ -674,9 +823,12 @@ export function uiDragActionId(gestureId) { return diagnostics?.drag.actionId(ge
 export function uiDragDiagnosticsEnabled() { return diagnostics?.drag.enabled() || false; }
 export function uiPerformancePhase(name, values) { diagnostics?.phase(name, values); }
 export function uiPerformancePhaseForAction(id,name,values) { return diagnostics?.phaseForAction(id,name,values) || false; }
+export function uiPerformanceCommitForAction(id,name,values) { return diagnostics?.commitForAction(id,name,values) || false; }
 export function currentUIActionId() { return diagnostics?.currentId() || null; }
+export function uiPerformanceDiagnosticsEnabled() { return diagnostics !== null; }
 export function getUIActionDiagnosticHealth() {
-  return diagnostics?.health() || { actionRingEvicted: 0, actionPhasesDropped: 0 };
+  return diagnostics?.health() || { actionRingEvicted: 0, actionPhasesDropped: 0,
+    actionCommitReportsDropped:0,actionCommitsOmitted:0 };
 }
 export function recordUIEventTiming(entry) {
   return diagnostics?.eventTiming(entry.name, performance.timeOrigin + entry.startTime, entry.duration, {

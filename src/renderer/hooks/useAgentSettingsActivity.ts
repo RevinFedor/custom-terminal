@@ -1,7 +1,9 @@
 import { useEffect, useSyncExternalStore } from 'react';
 const { ipcRenderer } = window.require('electron');
 
-type Activity = { tabId: string; sequence: number; busy: boolean; target: string | null; toolType?: string | null; replaceable?: boolean };
+type Activity = { tabId: string; sequence: number; busy: boolean; target: string | null; toolType?: string | null;
+  replaceable?: boolean; cancelTarget?: { revision: number; actionSequence: number; activityId?: number;
+    scope: { terminalInstanceId: string | null; lifecycleGeneration: string | null; terminalRunSeq: number; stopRevision: number } } };
 
 // A projection cache, not an operation owner. Listen even when a particular
 // ControlBar is unmounted, so A→B→A does not first display an empty busy state.

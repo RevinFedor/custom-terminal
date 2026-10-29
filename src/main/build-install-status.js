@@ -24,7 +24,8 @@ async function findVoiceInstallOwner({ directory = path.join(os.homedir(), '.not
       const response = await fetchImpl(baseUrl + '/api/me', { headers, signal: AbortSignal.timeout(1500) });
       const info = await response.json();
       if (response.ok && info.application === 'voice-record' && info.pid === row.pid
-        && info.capabilities?.terminalBuildInstall?.durableRequests === true) owners.push({ ...row, baseUrl });
+        && info.capabilities?.terminalBuildInstall?.durableRequests === true) owners.push({ ...row, baseUrl,
+          installCapabilities: info.capabilities.terminalBuildInstall });
     } catch {}
   }
   const unique = [...new Map(owners.map(owner => [owner.pid + ':' + owner.port, owner])).values()];
@@ -40,7 +41,7 @@ function createBuildInstallStatus({ token, read = () => null, write = () => {}, 
   const epoch = randomUUID(); let publication = 0;
   const headers = () => ({ Authorization: 'Bearer ' + token(), 'Content-Type': 'application/json' });
   const snapshot = tabId => ({ version: 1, epoch, publication, known: connected, stale: !connected, error,
-    jobs: [...jobs.values()].filter(job => job.returnTo?.tabId === tabId).sort((a, b) => b.startedAt - a.startedAt) });
+    jobs: [...jobs.values()].filter(job => !tabId || job.returnTo?.tabId === tabId).sort((a, b) => b.startedAt - a.startedAt) });
   const publish = () => changed({ version: 1, epoch, publication: ++publication, known: connected, stale: !connected, error, jobs: [...jobs.values()] });
   const apply = job => {
     if (!job?.id || !job.requestId || !job.returnTo?.tabId) return;
@@ -94,13 +95,29 @@ function createBuildInstallStatus({ token, read = () => null, write = () => {}, 
   return { snapshot, apply,
     start() { if (!running) { running = true; void connect(); } },
     stop() { running = false; generation++; controller?.abort(); clearTimeout(retry); retry = null; },
-    async cancel({ tabId, requestId, id }) {
+    async cancel({ tabId, requestId, id, action }) {
       const job = jobs.get(id);
       if (!connected || !owner || !job || job.requestId !== requestId || job.returnTo?.tabId !== tabId) throw Error('installer cancel owner unproven');
+      if (action === 'cancel-request' && owner.installCapabilities?.requestCancellation?.version !== 1) {
+        if (job.running === false && job.phase === 'finished' && job.installOutcomeUnknown !== true
+          && ['sent', 'skipped'].includes(job.callback?.status) && !job.autoContinueInterruptedTabs && !job.autoContinue?.binding) {
+          // Legacy Voice already has no future work for this exact job. The
+          // caller has revoked its Noted wait/input; do not break that existing
+          // terminal X flow or POST to a newer singleton compiler.
+          publish(); return { ok: true, alreadySettled: true, legacyTerminal: true, job };
+        }
+        throw Error('Voice Record update required: exact request cancellation unavailable');
+      }
+      if (action !== 'cancel-request' && job.running === false && job.phase === 'finished' && job.installOutcomeUnknown !== true
+        && ['sent', 'skipped'].includes(job.callback?.status)) {
+        publish();
+        return { ok: true, alreadySettled: true, job };
+      }
       const response = await fetchImpl(owner.baseUrl + '/api/terminal/build-install/cancel', { method: 'POST', headers: headers(),
-        body: JSON.stringify({ requestId, id, reason: 'cancelled from Noted task dock' }), signal: AbortSignal.timeout(5000) });
+        body: JSON.stringify({ requestId, id, ...(action === 'cancel-request' ? { action } : {}),
+          reason: 'cancelled from Noted task dock' }), signal: AbortSignal.timeout(5000) });
       const result = await response.json();
-      if (!response.ok) throw Error(result.error || 'installer cancel not confirmed');
+      if (!response.ok || result?.ok !== true) throw Error(result?.error || 'installer cancel not confirmed');
       if (result.job) apply(result.job); return result;
     },
   };

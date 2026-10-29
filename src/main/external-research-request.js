@@ -47,6 +47,16 @@ function normalizeExternalResearchRequest(body = {}) {
   if (conversationUrl && provider !== 'chatgpt') {
     throw new Error('conversationUrl is supported only for provider=chatgpt');
   }
+  if (options.observeExistingTurn) {
+    const t = options.observeExistingTurn;
+    if (provider !== 'chatgpt' || files.length || !browserId || !/^https:\/\/chatgpt\.com\/c\/[^/?#]+\/?$/.test(conversationUrl)
+      || t.version !== 1 || !Number.isInteger(t.document?.tabId) || !Number.isFinite(t.document?.timeOrigin)
+      || !t.account?.userId || !t.account?.accountId || !t.recoveryOperationId
+      || !['new_user', 'regenerate'].includes(t.generationKind) || !['native', 'dom_document'].includes(t.turn?.quality)
+      || !Array.isArray(t.previousUserMessageIds) || !Array.isArray(t.previousFinalMessageIds)
+      || ['model', 'effort', 'speed', 'composeOnly'].some(key => Object.hasOwn(options, key))) throw new Error('invalid existing-turn observation: exact profile/document/account/turn baseline required, no author options/files');
+    options.readOnlyImport = true; options.importWaitForFinal = true; options.autoClose = false; options.temporaryChat = false;
+  }
   return { provider, prompt, options, files, conversationUrl, ...(browserId ? { browserId } : {}) };
 }
 
@@ -77,6 +87,7 @@ function externalResearchRequestFingerprint({
 }
 
 function externalResearchTargetLabel(request) {
+  if (request.options?.observeExistingTurn) return 'ChatGPT · наблюдение выбранного хода';
   const provider = request.provider === 'chatgpt'
     ? 'ChatGPT'
     : request.provider === 'claude'
@@ -104,7 +115,7 @@ function continuationRequest(previous, body = {}, { validateMode = true, existin
   const nextOptions = body.options && typeof body.options === 'object' && !Array.isArray(body.options)
     ? { ...(previousIntent.options || {}), ...body.options }
     : { ...(previousIntent.options || {}) };
-  const operationOptions = ['readOnlyImport', 'composeOnly', 'importWaitForFinal', 'importTimeoutMs', 'importIncludeActivity'];
+  const operationOptions = ['readOnlyImport', 'composeOnly', 'importWaitForFinal', 'importTimeoutMs', 'importIncludeActivity', 'observeExistingTurn'];
   // A follow-up is an author operation, even when the previous result arrived
   // through a read-only import. Only presentation/model preferences inherit.
   // Preserve normalization of already frozen legacy operations for SAME-ID

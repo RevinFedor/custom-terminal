@@ -38,9 +38,11 @@ for (const { actualNotification, answer, mode, label } of cases) test((reproduce
     execPath: process.env.SC_RESEARCH_TEST_EXEC_PATH || path.join(sc, 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron'),
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  const pending = new Map(); let sequence = 0, readyResolve, childExited = false;
-  const ready = new Promise(resolve => { readyResolve = resolve; });
-  child.once('exit', () => { childExited = true; });
+  const pending = new Map(); let sequence = 0, readyResolve, readyReject, childExited = false, readyReceived = false, childStderr = '';
+  const ready = new Promise((resolve, reject) => { readyResolve = value => { readyReceived = true; resolve(value); }; readyReject = reject; });
+  child.stderr.on('data', chunk => { childStderr = (childStderr + chunk).slice(-8192); });
+  child.once('error', readyReject);
+  child.once('exit', (code, signal) => { childExited = true; if (!readyReceived) readyReject(Error('owned SC worker exited before ready: ' + JSON.stringify({ code, signal, stderr: childStderr }))); });
   child.on('message', value => { if (value.ready) readyResolve(value); else { const request = pending.get(value.id); if (request) { pending.delete(value.id); value.ok ? request.resolve(value) : request.reject(Error(value.error)); } } });
   const command = (action, params = {}) => bounded(new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, action, ...params }); }), action);
   const db = new Database(path.join(root, 'noted-queue.db')), receipts = createAgentSendReceiptStore(db);

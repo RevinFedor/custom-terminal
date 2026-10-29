@@ -631,6 +631,7 @@ export function SplitPaneAttachRow({
       <button
         ref={stripMenuButtonRef}
         data-split-strip-menu-button
+        data-split-strip-menu-owner={vacant ? undefined : tabId}
         title="Меню полосы вкладок"
         aria-label="Меню полосы вкладок"
         aria-haspopup="menu"
@@ -728,6 +729,7 @@ export function SplitPaneAttachRow({
           <div
             ref={stripMenuRef}
             data-split-strip-menu
+            data-split-strip-menu-owner={vacant ? undefined : tabId}
             role="menu"
             style={{
               position: 'fixed',

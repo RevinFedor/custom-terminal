@@ -284,6 +284,35 @@ bridge. Поэтому холодный/reloading renderer не оставляе
 MCP не выбирает пункт повторным Send; настройка System по-прежнему владеет
 разрешённым автоматическим выбором, readiness подтверждается отдельно.
 
+Source22Oct: при unattended MCP Resume без заданной Goal policy выбирается
+Leave paused, без вопроса пользователю/удаления Goal. Сохранённые true/false и
+explicit override сохраняют приоритет. `start_ai` несёт внутренний Main context;
+Send/delegate/tab-message определяются по exact Main receipt O/A/tab/provider.
+Ручной desktop null остаётся manual. После написанной стрелки отсутствие нового
+выделения в коротком capture не означает отказ: Main держит ту же операцию
+`awaiting-selection` до existing frame events/исходного cold launch deadline.
+Без selected-frame proof нет Enter; без composer/owner proof нет ready.
+Это не продление60s Send и не автоматический повтор после expiry.
+
+Source23Oct same-Goal identity не включает фон ЗА доказанной native панелью:
+Main строит приватную seq/mirror/snapshot-bound проекцию по совпавшим cell-bound
+границам обеих options, сохраняя весь Goal body и строгие controls/footer.
+Посторонняя перерисовка не создаёт новый operationId; смена самого Goal остаётся
+отказом. Недоказанные границы не дают нового разрешения, используется прежняя
+консервативная проверка полного кадра. GET хранит только derived key того же
+admitted frame и не перечитывает mutable pixels; write заново проверяет current
+frame/owner. Wire/action/recovery/readiness authority и срок Send прежние.
+
+Для recovery до доставки Source: `get_codex_goal` → только разрешённый текущим
+operation `resolve_codex_goal` по saved Resume/Leave (при unattended manual —
+Leave paused). Pending/unknown или отсутствие availableActions не разрешают
+вторую клавишу/новый Start. Failed final `not-submitted` с paste/Enter=false и
+inputSlot=none отличается от UNKNOWN: после восстановления readiness допустима
+новая явно разрешённая отправка исходного текста, не переписывание старого ID.
+Один timeout сам по себе не доказывает no-input и не обещает успех повтора.
+Если штатный exact recovery недоступен без человека, owner сообщает конкретный
+blocker через разрешённый `notify_user`; общий History fanout/Stop чужих не нужен.
+
 Cold Codex Send использует `startupWait` того же main-owned launch: его
 absolute deadline, terminal/run/lifecycle proof, не собственный ранний30s отказ.
 Новый wake срок не продлевает; смена launch, Stop, manual picker и startup failure
@@ -505,14 +534,23 @@ current-generation outcome. Это корректная неопределённ
 `continuation_runtime_unknown`. Проверять также preparation и latest-request read:
 снятие одного раннего guard не исправляет всю цепочку. Готовность ввода нельзя
 объявлять доказательством результата. Continue отдельно соединяет coherent Main
-input-ready с exact writer/launch и стабильной response revision; generic busy=null
-сохраняется. Проверка последнего задания читает только verified execution identity,
+input-ready с exact writer/launch и стабильной response revision; SOURCE26Oct
+допускает также отдельный Main input-only proof exact provisional Resume source
+с exclusive lease, свежим process scope и current composer. Это не read/copy
+verdict и не публичный writer; generic busy=null/transitioning сохраняются.
+Проверка последнего задания читает только verified execution identity,
 включая interrupted/no-final, без выдачи этого чтения за готовый ответ. Обе границы
 повторяются в FIFO preparation. Уже готовый exact исходный результат не требует
 input-ready; его доставка сохраняет прежние ownership/Goal/background guards.
 Повтор durable intent использует сохранённый target, иначе stopped→ready незаметно
 меняет fingerprint уже принятого Send. Исторический run не принимается по двум
-пустым UUID. Проверка SOURCE и граница установленной версии — в рабочем tmp темы.
+пустым UUID. Новый provisional intent сохраняет physical launch pin и требование
+Main admission на HEAD даже после подтверждения writer. HEAD передаёт input/Stop/
+owner fence той же durable попытке; только её собственная reservation может
+изменить свою input revision, поздний manual input не может. Раннее разрешение
+enqueue само по себе не разрешает paste/Enter. Default/manual и Claude routes
+сохраняют прежние guards. Проверка SOURCE и граница установленной версии — в
+рабочем tmp темы.
 
 Request и PTY transport могут иметь разные hashes после доказанного codec.
 Target и source-followup conduits сохраняют основание преобразования
@@ -654,8 +692,34 @@ snapshot запроса в SQLite `agent_send_queue`, связывая его с
 refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
 от смонтированной History. Ошибка сохранения не является ACK.
 
-Подготовка принятого Codex Send имеет один Main-issued срок 60s: начало — вход
-в ACTIVE HEAD executor до `prepareSend`, не enqueue/FIFO wait. Чтения/wakes,
+SOURCE26Oct сохраняющий capacity repair различает ожидание обычного FIFO и
+`recovery-deferred` **автоматического** Run After head. Иначе hold очереди после
+перегрузки держит head перед тем Continue, которого сам ждёт. Отложить можно
+только waiting/no-attempt/no-write head с неизменными request hash, H/O и точным
+physical owner. Для warm session-only expectation этот read-side pin берётся
+один раз при исходном admission, не из нового runtime при replay; старый head
+без pin остаётся unknown для такого пропуска. Receipt остаётся reserved/preparing,
+его delivery truth и отмена не переписываются. `capacityRecoveryDeferred` —
+отдельная проверяемая queue-order проекция, не подтверждение доставки.
+
+Existing Main Continue идёт обычным путём, без перестановки manual/UNKNOWN.
+Natural proof того же Main owner/другого turn лишь сохраняет release bookend:
+сам он не перевооружает очередь. Новый current Root demand, включая штатный
+`joinAutomaticAgentPrompt`, может вернуть **тот же** frozen head в FIFO; прежний
+admission заново проверяет arm/source/Goal/draft/Stop и write boundary. Late
+positive admission до deferral не оживляет head. Stop/Close отменяют его обычным
+durable owner; смена generation, исход без final, surface-only и отсутствие proof
+не разрешают re-admission. Новые automatic requests проверяются до enqueue и
+ещё раз после context await; `deferred` до reserve не создаёт второго Send.
+
+Подготовка принятого Codex Send имеет один Main-issued срок:60s для warm/unknown,
+120s для новых cold scopes. Main один раз в ACTIVE HEAD, до `prepareSend`, читает
+прежний synchronous inspection: known inactive/starting Codex либо известный
+отсутствующий адресат для восстановления выбирают cold. Snapshot не выдаёт
+input/writer authority; остальные guards сохраняются. Новая cold preparation
+имеет version2/kind=cold-codex; старые version1 остаются ровно60s и не продлеваются.
+Начало — HEAD, не enqueue/FIFO wait. Cold renderer bridge тоже допускает120s;
+его transport ACK/timeout не заменяет durable outcome. Чтения/wakes,
 settings и возврат PTY lock срок не обновляют; cold использует минимум этого
 срока и original startup deadline. Незавершённый кадр сохраняет тот же H/O/A,
 frozen assets и reservation; continuation ждёт вне PTY/global settings queues,
@@ -683,9 +747,23 @@ presence reply не оставил его до expiry. Это только reche
 Bridge привязан к исходным WebContents/frame. Автоматический renderer loss
 отзывает future input, но сам не освобождает possible-Enter slot как явная
 пользовательская отмена: нужны прежние fresh absent/new-ready-owner proofs.
-Узкий SQLite BUSY/LOCKED ДО executor и ДО attempt паркует уже committed item с
-тем же executor до существующего runtime wake; не пишет failed под тем же lock,
-не теряет request и не раскручивает self-pump. Начатые/unknown attempts не retry.
+SQLite BUSY/LOCKED сохраняет committed item, но не доказывает no-input. После
+штатного wake только exact zero-attempt CAS возвращает pre-attempt dispatch в
+waiting с прежними H/O, fingerprint и FIFO-позицией. Начатые/UNKNOWN не retry,
+cancelled не оживает. Web stop/start удерживает старого живого исполнителя того
+же DB owner до unwind; новый объект очереди не принимает его за потерянный Main.
+SQL polling/self-pump и новая отправка для проверки не используются.
+
+SOURCE29Oct закрывает окно «admission прошёл, HEAD preparation ещё ждёт proof»:
+Build/agent Continue возвращает private Main deferred, не final no-input failure.
+Тот же frozen item ждёт события; original task/latest input/Stop/foreign owner/
+natural final проверяются заново. Первый HEAD сохраняет start+warm/cold mode
+атомарно до callback. Queue hash всего request и logical receipt fingerprint
+различны: каждый проверяется в своём namespace. Reopen/wake не обновляет срок.
+Failure-only expiry завершает только доказанно не начатый ввод, не даёт ready
+и не отпускает ещё исполняющийся async owner. SQLite BUSY на самом expiry
+сохраняет unknown до штатного wake. Прежняя certified automatic no-write A1 —
+другая ветка: разрешённый A2 получает новый HEAD scope, не срок A1; UNKNOWN не кандидат.
 
 Pre-beginAttempt проверка адресата не должна смешивать раннюю event projection
 с поздним process proof: нормальная adoption первого cold Send иначе превращала
@@ -710,6 +788,11 @@ Run After входит в этот же FIFO с отдельным automatic adm
 такой кадр паркует исходный item до attempt, а flush только будит повторный
 допуск. Это не новый executor и не право повторить неизвестный Send; обычная
 ручная отправка во время streaming этим idle/frame gate не ограничивается.
+Input-only Main reader automatic Send не материализует History ради unconfirmed
+writer: fresh process/provider/owner/input/Stop/frame остаются обязательными,
+фактический sender отдельно доказывает право ввода. Public busy/writer/SID не
+подделываются. Run After с context condition сохраняет полный coherent
+read-identity proof; saved SID не становится текущим writer.
 Подробнее — `fact-prompt-queue.md`, тонкости Resume input-ready.
 
 Desktop History может явно объединить две соседние ручные `IN APP QUEUE`
@@ -760,6 +843,14 @@ executor отменённое пользователем намерение, у�
 SDK не получает выдуманный PTY-proof. Cancel и canonical receipt действуют через
 общих владельцев, а автоматический physical-owner retirement ограничен PTY.
 
+SOURCE24.10 install projection отдельно распознаёт legacy receipt после startup:
+нет FIFO row, состояние delivery-unknown/startup decision unknown, нет explicit
+input lease/native queue generation. Такая запись сохраняет UNKNOWN и не получает
+slot-release или новое право Send. Current executor/queued input и Main physical/
+identity guards остаются обязательными; возраст/другой SID сами не дают исключения.
+Это ремонт допуска установки, не дополнительный способ освободить unknown head;
+подробности и loaded deployment boundary — `fact-build-when-idle.md`.
+
 `deliveryControl` хранится отдельно от изменяемой квитанции; компактный marker
 отменённого operation ID переживает receipt-prune, без повторного prompt body.
 Pre-write guard читает durable отмену даже после потери process-local callback.
@@ -807,6 +898,13 @@ receipt-retention: остаются pinned до явного скрытия ли
 при возврате, image asset IDs входят в
 прежний GC inventory. Зависимые cold items удерживают exact proof начального
 provider writer, а не подставляют текущий SID в момент исполнения.
+
+Source27Oct: сохранность этих snapshots включает History merge/overlay и cold
+receipt hydration без успешного чтения canonical History. Строка сохраняет точные
+IDs действий и исходный authoring для Copy после RAM eviction. Main X возвращает
+малый exact post-dismiss control; renderer применяет его до consume и инвалидирует
+старые list leases. Это не отмена доставки, не освобождение UNKNOWN slot и не ↩
+после первой записи. Одного увеличения TTL без этих переходов недостаточно.
 
 SOURCE11.10: ранний native process Stop расширяет прежний `/stop` через
 `sendIntentCancellation` v1. `pendingSends` содержит immutable project
@@ -942,6 +1040,15 @@ MCP — `release_send_queue_head`; capability `sendQueue.explicitUnknownRelease.
 остаются прежними; новый Enter этой записи запрещён. Это не no-write settlement.
 Нет глобального автоматического skip. Running executor, foreign attempt/owner
 и другой requestId отказывают; same-ID replay после restart не повторяет audit/input.
+SOURCE27Oct: та же явная операция допустима для уже submitted `audit-pending`,
+если executor закончен, запись всё ещё exact head, а адресный audit дал
+absent/unknown. Native `QUEUED` мог уже перейти во ввод без durable подтверждения;
+ожидание смены самого enum на delivery-unknown оставляло recovery недоступным.
+Receipt остаётся audit-pending, меняется только отдельная FIFO disposition.
+Desktop показывает у такой карточки «Продолжить очередь» с явным подтверждением,
+отдельно от Copy/X/раннего ↩. Отмена подтверждения ничего не меняет. Потерянный
+ACK повторяет прежний requestId; смена owner не переносит UI-результат. Это
+не автоматический skip, не повтор сообщения и не команда Stop.
 Следующий сохранённый item проходит прежний idle/target/readiness допуск.
 Cancelled follower не оживляется. GET старого handoff показывает release отдельно
 от доставки; позднее настоящее подтверждение старой записи остаётся возможным.
@@ -976,12 +1083,56 @@ durable `sent`. Таймаут не понижает уже доказанный
 
 #### Квитанция после перезапуска и её показ в History
 
+Для addressed Send/Reply (не одностороннего `send_prompt`) SOURCE ordinary/all-work
+Loop имеет отдельное ожидание собственного вопроса. Error/deadline возвращает
+app-owned status, не новый вопрос/Reply. По решению Fedor27Oct exact native delivery
+адресного Reply завершает переписку без natural final источника; status не создаёт
+вторую mandatory processing dependency. Accepted/queued недостаточно, обычные
+busy/FIFO/Goal/Stop/install/current-cause guards Loop остаются независимыми.
+`get_message` передаёт `loopWait` без новых
+аргументов MCP. Owner/восстановление и App update —
+[fact-tab-messages](./fact-tab-messages.md#собственные-вопросы-и-обычный-loop-source2710).
+
+SOURCE27Oct полный контракт дополнен explicit messageIds в reply_to_message:
+один общий текст/одна доставка для новой части одной переписки и отдельные results
+по всем ID. Already-answered не перезаписывается, pending/UNKNOWN не replay;
+пустой messages означает отсутствие новой доставки. Batch требует отдельного
+batchReply.version1 capability до POST; single-ID вызов совместим. Карточка X
+использует local dismiss: снимается только своё ожидание, поздний Reply остаётся
+доставляемым и в History. Explicit cancel_message не является обработчиком X.
+Уже принятый Reply сохраняет прежнюю FIFO reservation: локальное снятие ожидания
+не позволяет старому never-attempted Loop-head обогнать его. После native delivery
+остаются обычные busy/current-input guards, не новое ожидание обработки ответа.
+Старый cancelledAt без происхождения сохраняет legacy-unknown до адресного
+решения Fedor; массового снятия guard или повторных inputs нет. Эти изменения
+требуют нового App Main/renderer и Terminal MCP help/wire; Source не loaded proof.
+
 Обычный `send_prompt` имеет происхождение `terminal-mcp` даже без run/message.
 History и Timeline используют его фиолетовый канал через presentation metadata,
 а не строку в тексте. Старое подтверждённое сообщение без этой пометки может
 получить её при startup из exact receipt/source/attempt/provider/session/hash,
 включая canonical carrier aliases; delivery-unknown и чужие proofs не backfill.
 Оформление не меняет receipt state, payload или право на следующий Enter.
+
+У одностороннего `send_prompt` отсутствие Reply не отменяет подпись источника.
+MCP передаёт identity своей hub-сессии в bounded `x-noted-terminal-source`
+(base64url JSON), отдельно от неизменных prompt/body fingerprints. Project API
+разрешает tab/project по каталогу приложения и берёт имя оттуда, не из текста
+или caller label. `prompt-origin:terminal-mcp` сохраняет sourceTabId/Name/ProjectId
+в прежнем presentation snapshot/FIFO и exact-audit sidecar. Это только display
+provenance, не source execution/callback authority. Повтор существующего queue
+handoff сохраняет исходную presentation даже после rename/close источника или
+обновления MCP; старые receipts/fingerprints/JSONL не переписываются.
+History user/queued показывает общий входящий source-header; без messageId нет
+ложного Reply или кнопки перехода к исходному question call. У старой записи,
+где сохранился лишь общий MCP-тег, нейтральная подпись `Terminal MCP`, а tooltip
+явно сообщает, что вкладка-отправитель не сохранена: handoff/body не доказывают
+автора. Нужны обе новые стороны (Noted renderer/Main и работающий MCP child), не
+один refresh каталога. Detached terminal child переживает App restart: равенство
+обновлённых файлов на диске не подтверждает его загруженный код. Fresh отсутствие
+source-header логируется как `[TerminalMcpPromptSource] ... reason=missing-header`;
+immutable replay не переопределяет источник и не считается новой потерей header.
+Private Source-проверка не является installed приёмкой.
 
 Обычная отправка из desktop History является ещё одним caller-ом той же
 квитанции, а не отдельным renderer-only исключением. Когда операция достигает
@@ -1050,6 +1201,17 @@ Hide не запускает audit/Send/Stop/release; поздний прежн�
 действительным. Для receiptless локальной карточки положительное Main absence
 read разрешает только сохраняющий recovery marker, не новую отрицательную
 квитанцию. Не путать это действие с отменой MCP question/reply.
+
+После прежнего cancel/Stop либо Main-owned retirement input slot History может
+показывать `UNCONFIRMED`, пока durable delivery остаётся `audit-pending` или
+`enter-armed`. X сверяет именно эту текущую Main-проекцию и exact operation/
+attempt, не требует переписать delivery в буквальный `delivery-unknown`.
+Шрам26.10: после Stop карточка была UNKNOWN, но guard проверял лишь SQL-state
+и отказывал `unknown-presentation-changed`. Durable cancel достаточен без ещё
+одного queue read; для retirement используется прежний Main queue projector,
+ошибка этого read не разрешает hide. Live CONFIRMING без такого proof, чужой
+attempt и новое canonical confirmation не получают hide от старой UNKNOWN
+карточки. Прежний уже принятый hide остаётся идемпотентным после late exact audit.
 
 Для native краткая галочка «принято Mac» читает ту же durable квитанцию, не
 создаёт второй executor/ACK. Exact audit-pending+submitted, typed provider queue
@@ -1154,7 +1316,38 @@ Stop, пришедший во время per-send `/model`/`/effort`/Think, пр
 каждого шага: уже доказанная команда не откатывается, но оставшиеся настройки и
 пользовательский prompt больше не выполняются.
 
-Portable image marker является намерением вложить файл только когда внутри указан абсолютный filesystem path. Относительный путь или prose-пример проходит в prompt дословно, не занимает image-slot и не запускает staging; документация с буквальным `[imagePath: example only]` не должна приводить к `codex_image_path_unavailable`. Доступный абсолютный путь сохраняет обычный attachment-flow. Если абсолютный файл исчез между подготовкой и отправкой, это не отменяет весь prompt: marker становится позиционным `imageError`, а окружающий текст и остальные вложения отправляются. В UI известная недоступность показывается постоянным предупреждением до Send; после явного Send повторный отказ всего сообщения уже не является допустимым способом сообщить о ней. Direct plan и preflight replacement обязаны проверять одну и ту же границу абсолютности.
+В legacy raw-text Portable image marker является намерением вложить файл только когда внутри указан абсолютный filesystem path. Относительный путь или prose-пример проходит в prompt дословно, не занимает image-slot и не запускает staging; документация с буквальным `[imagePath: example only]` не должна приводить к `codex_image_path_unavailable`. Доступный абсолютный путь сохраняет обычный attachment-flow. Если абсолютный файл исчез между подготовкой и отправкой, это не отменяет весь prompt: marker становится позиционным `imageError`, а окружающий текст и остальные вложения отправляются. В UI известная недоступность показывается постоянным предупреждением до Send; после явного Send повторный отказ всего сообщения уже не является допустимым способом сообщить о ней. Direct plan и preflight replacement обязаны проверять одну и ту же границу абсолютности.
+
+SOURCE27Oct сохраняет происхождение частей до раскрытия настоящих paste/saved/
+context объектов. Их тела буквальны, включая абсолютные примеры imagePath;
+разрешённые attachment occurrences передаются прежнему sender как точные ranges
+с hash полного prompt. Идентичные wrapper-теги, вручную написанные в legacy prompt,
+сами такого права не дают. Deferred MD prepend/refresh переносит ranges по своим
+фактически выполненным edits и сохраняет final prompt+plan в прежнем handoff;
+повтор H возвращает эту пару, не перечитывает новые файлы для старого UNKNOWN.
+Настоящее вложение с тем же путём, что в буквальном примере, имеет отдельную
+occurrence: пример не поглощает attachment declaration.
+
+Разрешённый missing-image текст также нуждается в подтверждении. Прежняя image
+request projection теперь хранит ordered preflight/staging outcomes, включая
+all-missing и mixed, до первого payload write. Live и startup сверяют один exact
+request→transport→native carrier; финальный receipt owner повторяет проверку
+сохранённого O/A-bound proof, causal address и реальных hashes. Только доказанные
+положительные image slots могут менять native representation; error code/номер,
+буквальные markers и внутренние пробелы остаются точными. Исходный hash не
+подменяется transport hash. `confirmed` означает доставленный текст с диагностикой,
+не доставленное отсутствующее изображение. Старый UNKNOWN без pre-Enter proof не
+лечится ретроспективной сборкой плана или разрешением произвольного canonical reason.
+
+SOURCE27Oct дополнительно различает body подтверждённого External Research и
+авторский ввод: **даже абсолютный** `[imagePath: …]` внутри замороженного тела
+ответа является текстом эксперта, не намерением прикрепить файл в Codex. Точные
+offsets и hash принадлежат уже существующему orchestration snapshot/authoring
+plan; markers вне тела сохраняют прежний attachment-flow. Раньше такой текст
+менялся на `imageError`, и Codex фактически получал изменённый transport, но
+durable receipt отклонял его из-за разницы request/transport hashes. Подмена не
+доказывает отсутствие доставки; старые неразрешённые receipts не replay и не
+обновляются одним новым кодом. См. `fact-оркестрация-вкладок::Завершение и уведомление источника`.
 
 ### Таймауты и неизвестный исход отправки
 

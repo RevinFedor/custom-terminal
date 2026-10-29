@@ -37,6 +37,7 @@ function harness({ suppressed = false } = {}) {
   const previews = [];
   const prompts = new Map();
   const context = {
+    workingDirectoryOperations: null, // independent read-side wake owner, absent in this fixture
     ...predicates,
     codexCanonicalPresentation: null,
     codexProviderSemanticSources: new Map([['T', owner]]),

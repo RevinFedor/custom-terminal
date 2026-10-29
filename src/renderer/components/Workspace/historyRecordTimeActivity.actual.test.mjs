@@ -16,9 +16,9 @@ const compiled = ts.transpileModule(source, { compilerOptions: {
 
 // Execute the actual overlay hook; only DOM/observer delivery and React's
 // publication sink are controlled. This proves admission, not native paint.
-function harness({ presented = true } = {}) {
+function harness({ presented = true, portalLayer = '' } = {}) {
   const calls = { selectors: 0, rects: 0, styles: 0, hit: 0 };
-  const listeners = new Map(), observers = [], frames = new Map(), refs = [];
+  const listeners = new Map(), observers = [], frames = new Map(), refs = [], diagnostics = [];
   let cleanup, view = null, hostChanged, frameId = 0;
   class Element {
     constructor(kind, parent = null) {
@@ -52,7 +52,8 @@ function harness({ presented = true } = {}) {
   };
   const context = vm.createContext({
     exports: {}, Element, HTMLElement: Element, ResizeObserver: Observer, MutationObserver: Observer,
-    getComputedStyle: () => { calls.styles++; return { display: 'block', visibility: 'visible', opacity: '1', fontSize: '14px', fontFamily: 'sans-serif' }; },
+    getComputedStyle: () => { calls.styles++; return { display: 'block', visibility: 'visible', opacity: '1', fontSize: '14px', fontFamily: 'sans-serif',
+      getPropertyValue: name => name === '--history-record-time-layer' ? portalLayer : '' }; },
     innerWidth: 800, innerHeight: 600, CSS: { escape: value => value },
     performance: { now: () => 0 },
     document: { body: new Element('body'), querySelectorAll() { calls.selectors++; return []; },
@@ -63,7 +64,10 @@ function harness({ presented = true } = {}) {
     require: name => name === 'react' ? react : name === 'react-dom' ? { createPortal() {} }
       : name.includes('composerControlsHost') ? { getComposerControlsHost: () => null,
         subscribeComposerControlsHost: (_tab, callback) => { hostChanged = callback; return () => { hostChanged = null; }; } }
-      : name.includes('uiPerformanceDiagnostics') ? { uiPerformancePhase() {} }
+      : name.includes('uiPerformanceDiagnostics') ? { uiPerformancePhase() {},
+        captureUIHoverAction: () => ({ id: 'own-time-hover' }), uiDiagnosticAbsNow: () => 100,
+        uiPerformancePhaseForAction: (id, name, fields) => diagnostics.push({ id, name, fields }),
+        uiPerformanceCommitForAction: (id, name, fields) => diagnostics.push({ id, name, fields }) }
       : name.includes('historyRecordTimePresentation') ? presentation
       : name.includes('history-record-time') ? recordTimes : require(name),
   });
@@ -72,7 +76,7 @@ function harness({ presented = true } = {}) {
   const emit = (name, extra = {}) => listeners.get(name)?.({ key: 'Meta', metaKey: true, target: row, clientX: 10, clientY: 10, ...extra });
   const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback()); };
   const reset = () => Object.keys(calls).forEach(key => { calls[key] = 0; });
-  return { calls, panel, row, emit, flush, reset, notify() { observers.forEach(observer => observer.callback()); hostChanged?.(); flush(); },
+  return { calls, panel, row, emit, flush, reset, diagnostics, notify() { observers.forEach(observer => observer.callback()); hostChanged?.(); flush(); },
     dispose() { cleanup(); }, get view() { return view; } };
 }
 
@@ -83,6 +87,19 @@ test('idle mounts and resize/control changes do not walk or measure retained His
   for (let i = 0; i < 3; i++) h.notify();
   assert.equal(h.calls.selectors, 0); assert.equal(h.calls.rects, 0); assert.equal(h.view, null);
   h.dispose();
+});
+
+test('archive owner layer is inherited into its body Portal without changing ordinary History', () => {
+  for (const [value, expected] of [['',25],['161',161]]) {
+    const h = harness({portalLayer:value});h.emit('mousemove',{metaKey:false});h.emit('keydown');
+    assert.equal(h.view?.portalLayer,expected);h.dispose();
+  }
+});
+test('invalid or nonpositive owner layer preserves the ordinary Portal layer', () => {
+  for (const portalLayer of ['0','-1','unknown','2147483648']) {
+    const h = harness({portalLayer});h.emit('mousemove',{metaKey:false});h.emit('keydown');
+    assert.equal(h.view?.portalLayer,25);h.dispose();
+  }
 });
 
 test('Cmd then hover and hover then Cmd both acquire the exact timestamp; release stops measurements', () => {
@@ -131,4 +148,80 @@ test('blur clears point and prevents observer work from resurrecting the old ann
   h.emit('blur'); h.reset(); h.notify(); h.emit('keydown');
   assert.equal(h.view, null); assert.equal(h.calls.selectors, 0); assert.equal(h.calls.rects, 0);
   h.dispose();
+});
+
+test('Fedor fast-control: hovering then Meta admits the timestamp on keydown without waiting for a frame or release', () => {
+  const h = harness();
+  try {
+    h.emit('mousemove', { metaKey: false }); assert.equal(h.view, null);
+    h.emit('keydown', { timeStamp: 100 });
+    assert.equal(h.view?.key, 'exact-row');
+    assert.equal(h.view.diagnostic.actionId, 'own-time-hover');
+    assert.ok(h.diagnostics.some(p => p.id === 'own-time-hover' && p.name === 'history-record-time:view-request'));
+    // No flush or keyup was used to obtain the admitted React publication.
+    h.emit('keyup', { metaKey: false }); assert.equal(h.view, null);
+  } finally { h.dispose(); }
+});
+
+test('timestamp visible-style commit is once-per-gesture data, without a new layout/paint probe', () => {
+  const ast = ts.createSourceFile('overlay.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = node => {
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useLayoutEffect'
+      && node.arguments[0]?.getText(ast).includes('history-record-time:visible-commit')) callback = node.arguments[0].getText(ast);
+    ts.forEachChild(node, visit);
+  };
+  visit(ast); assert.ok(callback);
+  const phases = [], view = { diagnostic: { actionId: 'own-gesture', requestedAbs: 100, committed: false } };
+  const fn = vm.runInNewContext('(' + ts.transpileModule(callback, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText.trim().replace(/;$/, '') + ')', {
+    view, labelRef: { current: { getBoundingClientRect() { throw Error('no extra geometry'); } } }, tabId: 'tab',
+    uiDiagnosticAbsNow: () => 120, uiPerformanceCommitForAction: (id, name, fields) => phases.push({ id, name, fields }),
+  });
+  fn(); assert.equal(phases.length, 0, 'unpositioned/hidden label is not a visible commit');
+  view.position = { left: 1, top: 2 }; fn(); fn();
+  assert.equal(phases.length, 1); assert.equal(phases[0].name, 'history-record-time:visible-commit');
+  assert.equal(phases[0].fields.durationMs, 20);
+});
+
+test('actual overlay admits the group interval, updates its end and releases without extra idle work', () => {
+  const h = harness();
+  h.row.dataset.historyTimeKind = 'group';
+  h.row.dataset.historyTimeKey = 'group:time-range';
+  h.row.dataset.historyTimeEndAt = '2026-10-10T17:29:00.000Z';
+  h.emit('mousemove', { metaKey: false }); h.emit('keydown');
+  assert.equal(h.view?.key, 'group:time-range');
+  assert.equal(h.view?.endAt, '2026-10-10T17:29:00.000Z');
+  assert.equal(h.view?.scope, 'group');
+  assert.match(h.view?.label, / — /);
+  h.row.dataset.historyTimeEndAt = '2026-10-10T17:31:00.000Z'; h.notify();
+  assert.equal(h.view?.endAt, '2026-10-10T17:31:00.000Z');
+  h.row.dataset.historyTimeEndAt = '2026-10-10T17:31:12.000Z'; h.notify();
+  assert.equal(h.view?.endAt, '2026-10-10T17:31:12.000Z');
+  h.emit('keyup'); h.reset(); h.notify();
+  assert.equal(h.view, null); assert.equal(h.calls.rects, 0); assert.equal(h.calls.selectors, 0);
+  h.dispose();
+});
+
+test('layout measurement dependencies change when only seconds of a group endpoint change', () => {
+  const ast = ts.createSourceFile('overlay.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let dependencies;
+  function visit(node) {
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useLayoutEffect'
+      && node.arguments[0].getText(ast).includes('controllerRef.current?.measure')) dependencies = node.arguments[1].getText(ast);
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.ok(dependencies);
+  const get = new Function('view', 'return ' + dependencies);
+  const before = { key: 'group', at: '2026-10-10T17:24:00Z', endAt: '2026-10-10T17:31:00Z', label: 'same minute label' };
+  assert.notDeepEqual(get(before), get({ ...before, endAt: '2026-10-10T17:31:12Z' }));
+});
+
+test('invalid or reversed range metadata cannot reuse a previous hovered interval', () => {
+  for (const bad of ['not-a-date', '2026-10-10T17:23:00.000Z']) {
+    const h = harness(); h.emit('mousemove');
+    assert.equal(h.view?.key, 'exact-row');
+    h.row.dataset.historyTimeEndAt = bad; h.notify();
+    assert.equal(h.view, null); h.dispose();
+  }
 });

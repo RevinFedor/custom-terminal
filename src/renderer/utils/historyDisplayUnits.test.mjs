@@ -56,11 +56,11 @@ test('MIXED noise (read + mcp + git + run) collapses into ONE unit', () => {
   // line each. A different MCP server no longer breaks the run either.
   assert.equal(units.length, 1);
   assert.equal(units[0].kind, 'group');
-  assert.equal(units[0].familyKey, 'noise');
+  assert.equal(units[0].familyKey, 'work');
   assert.equal(units[0].facts.length, 6);
 });
 
-test('edits collapse WITH EACH OTHER but never merge into noise', () => {
+test('edits and other tool families share the same uninterrupted work group', () => {
   const entries = [
     bashRow('read'),
     bashRow('read'),
@@ -71,16 +71,15 @@ test('edits collapse WITH EACH OTHER but never merge into noise', () => {
     bashRow('run'),
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
-  assert.equal(units.length, 3);
-  assert.equal(units[0].familyKey, 'read');
-  assert.equal(units[1].familyKey, 'edit');
-  assert.equal(units[1].facts.length, 3);
-  assert.equal(units[2].familyKey, 'run');
+  assert.equal(units.length, 1);
+  assert.equal(units[0].familyKey, 'work');
+  assert.equal(units[0].facts.length, 7);
+  assert.deepEqual(units[0].entries, entries);
   assert.equal(entrySeriesFamily(entries[2]), 'edit');
   assert.equal(entrySeriesFamily(entries[0]), 'noise');
 });
 
-test('a row mixing a shell call and an edit belongs to the edit block', () => {
+test('a row mixing a shell call and an edit keeps both inside the work block', () => {
   // Codex's normal working shape: ONE record holds the script it ran and the
   // patch that script produced. Treating that mix as "never collapses" left
   // a whole session of such records as hundreds of unmergeable rows standing
@@ -95,17 +94,21 @@ test('a row mixing a shell call and an edit belongs to the edit block', () => {
   ], { threshold: 2 });
   assert.equal(units.length, 1);
   assert.equal(units[0].kind, 'group');
-  assert.equal(units[0].familyKey, 'edit');
+  assert.equal(units[0].familyKey, 'work');
   // The shell call rides INSIDE the edit block — it is not lost, and the
   // header counts it, so «Edited 2 files · Ran 1 command» stays honest.
   assert.equal(units[0].facts.length, 3);
 });
 
-test('a mix with no edit at all stays uncollapsed', () => {
+test('a mix with no edit keeps both supported calls in one work group', () => {
   const composite = row('assistant', {
     actions: [raw('Read', 'read'), raw('Plan', 'plan')],
   });
-  assert.equal(entrySeriesFamily(composite), null);
+  assert.equal(entrySeriesFamily(composite), 'noise');
+  const units = buildHistoryDisplayUnits([composite]);
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].facts.length, 2);
 });
 
 test('caption (shared messageId, Claude) joins the group and does not break it', () => {
@@ -402,21 +405,18 @@ test('error count stays in the unit data (context menu/debug) — header no long
   assert.equal(units[0].errorCount, 1);
 });
 
-test('NO third text state: text before a single call stays an ordinary paragraph', () => {
+test('one caption and one call form a real group; standalone reply stays separate', () => {
   const caption = row('assistant', { content: 'Проверяю обработчик', messageId: 'm1' });
   const call = bashRow('run', { messageId: 'm1' });
   const reply = row('assistant', { content: 'итог '.repeat(200) });
   const units = buildHistoryDisplayUnits([caption, call, reply], { threshold: 2 });
-  // Text is a group headline OR an ordinary paragraph — with no group here it
-  // renders as its own entry, ordinary text style (user rejected the glued
-  // mini-caption: wrong indents, wrong size, belongs to nothing).
-  assert.equal(units.length, 3);
-  assert.equal(units[0].kind, 'entry');
-  assert.equal(units[0].entry, caption);
-  assert.equal(units[0].captionOf, undefined);
-  assert.equal(units[1].entry, call);
-  assert.deepEqual(resolveHistoryDisplayTarget(units, caption.uuid), { index: 0 });
-  assert.deepEqual(resolveHistoryDisplayTarget(units, call.uuid), { index: 1 });
+  assert.equal(units.length, 2);
+  assert.equal(units[0].kind, 'group');
+  assert.deepEqual(units[0].entries, [caption, call]);
+  assert.deepEqual(units[0].captionEntries, [caption]);
+  assert.equal(units[1].entry, reply);
+  assert.deepEqual(resolveHistoryDisplayTarget(units, caption.uuid), { index: 0, groupKey: units[0].key });
+  assert.deepEqual(resolveHistoryDisplayTarget(units, call.uuid), { index: 0, groupKey: units[0].key });
 });
 
 test('group key is stable while a live series grows at the tail', () => {
@@ -441,7 +441,7 @@ test('mixed-group breakdown keeps first-appearance order and per-family counts',
   ];
   const breakdown = groupFamilyBreakdown(facts);
   assert.deepEqual(breakdown.map((b) => b.family), ['read', 'git', 'run', 'mcp']);
-  assert.deepEqual(breakdown.map((b) => b.count), [1, 2, 1, 2]);
+  assert.deepEqual(breakdown.map((b) => b.count), [2, 2, 1, 2]);
   assert.deepEqual(breakdown.map((b) => b.callCount), [2, 2, 1, 2]);
   // git's distinguishing token is the SUBCOMMAND, never the word "git"
   assert.deepEqual([...breakdown[1].words.keys()], ['diff', 'status']);
@@ -452,21 +452,20 @@ test('mixed-group breakdown keeps first-appearance order and per-family counts',
   assert.deepEqual(breakdown[0].subjects, ['PresentationVideo.tsx']);
 });
 
-test('outer breakdown keeps docs and regular files as separate honest phrases', async () => {
+test('outer breakdown counts docs and regular calls without a misleading docs accent', async () => {
   const { groupFamilyBreakdown } = await import('./historyDisplayUnits.mjs');
   const breakdown = groupFamilyBreakdown([
     { family: 'read', targetKey: 'docs/a.md', targetLabel: 'a.md', docsKind: 'search' },
     { family: 'read', targetKey: 'docs/b.md', targetLabel: 'b.md', docsKind: 'search' },
     { family: 'read', targetKey: 'src/main.js', targetLabel: 'main.js' },
   ]);
-  assert.equal(breakdown.length, 2);
+  assert.equal(breakdown.length, 1);
   assert.deepEqual(breakdown.map((bucket) => [bucket.family, bucket.docsKind, bucket.count]), [
-    ['read', 'search', 2],
-    ['read', '', 1],
+    ['read', '', 3],
   ]);
 });
 
-test('edit block swallows a short noise pocket BETWEEN edits (E N N E → one block)', () => {
+test('mixed work stays together across a short pocket between edits', () => {
   const entries = [
     row('assistant', { actions: [raw('Edit', 'edit')] }),
     bashRow('run'),                                   // test run
@@ -476,11 +475,11 @@ test('edit block swallows a short noise pocket BETWEEN edits (E N N E → one bl
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
   assert.equal(units.length, 1);
   assert.equal(units[0].kind, 'group');
-  assert.equal(units[0].familyKey, 'edit');
+  assert.equal(units[0].familyKey, 'work');
   assert.equal(units[0].entries.length, 4);
 });
 
-test('noise TAIL after the last edit is NOT absorbed (E E N N → block + noise group)', () => {
+test('work after the last edit remains in the same group', () => {
   const entries = [
     row('assistant', { actions: [raw('Edit', 'edit')] }),
     row('assistant', { actions: [raw('Edit', 'edit')] }),
@@ -488,29 +487,27 @@ test('noise TAIL after the last edit is NOT absorbed (E E N N → block + noise 
     bashRow('read'),
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
-  assert.equal(units.length, 2);
-  assert.equal(units[0].familyKey, 'edit');
-  assert.equal(units[0].facts.length, 2);
-  assert.equal(units[1].familyKey, 'noise');
-  assert.equal(units[1].facts.length, 2);
+  assert.equal(units.length, 1);
+  assert.equal(units[0].familyKey, 'work');
+  assert.equal(units[0].facts.length, 4);
+  assert.deepEqual(units[0].entries, entries);
 });
 
-test('a 4+ noise gap breaks the edit block (corpus boundary)', () => {
+test('four or more other calls do not split a work group between edits', () => {
   const entries = [
     row('assistant', { actions: [raw('Edit', 'edit')] }),
     bashRow('read'), bashRow('read'), bashRow('search'), bashRow('run'),
     row('assistant', { actions: [raw('Edit', 'edit')] }),
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
-  // edit alone, noise group of 4, edit alone
-  assert.equal(units.length, 3);
-  assert.equal(units[0].kind, 'entry');
-  assert.equal(units[1].kind, 'group');
-  assert.equal(units[1].familyKey, 'noise');
-  assert.equal(units[2].kind, 'entry');
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].familyKey, 'work');
+  assert.equal(units[0].facts.length, 6);
+  assert.deepEqual(units[0].entries, entries);
 });
 
-test('short text inside the edit gap rides along (E t N E → one block)', () => {
+test('one short commentary between tool calls remains the group caption', () => {
   const entries = [
     row('assistant', { actions: [raw('Edit', 'edit')] }),
     row('assistant', { content: 'Исходный product-файл восстановлен полностью' }),
@@ -519,11 +516,12 @@ test('short text inside the edit gap rides along (E t N E → one block)', () =>
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
   assert.equal(units.length, 1);
-  assert.equal(units[0].familyKey, 'edit');
+  assert.equal(units[0].familyKey, 'work');
   assert.equal(units[0].entries.length, 4);
+  assert.deepEqual(units[0].captionEntries, [entries[1]]);
 });
 
-test('noise PREFIX stays outside the edit block (git, E read E → git card + block)', () => {
+test('work before the first edit stays in the same group', () => {
   const entries = [
     bashRow('git'),
     row('assistant', { actions: [raw('Edit', 'edit')] }),
@@ -531,10 +529,10 @@ test('noise PREFIX stays outside the edit block (git, E read E → git card + bl
     row('assistant', { actions: [raw('Edit', 'edit')] }),
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
-  assert.equal(units.length, 2);
-  assert.equal(units[0].kind, 'entry'); // lone git — below noise threshold
-  assert.equal(units[1].kind, 'group');
-  assert.equal(units[1].familyKey, 'edit');
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].familyKey, 'work');
+  assert.deepEqual(units[0].entries, entries);
 });
 
 test('position-based caption glues without structural proof (Claude split messages)', () => {
@@ -653,7 +651,7 @@ test('messageId keeps a trailing reasoning row with the response that owns it', 
   assert.equal(units[0].thinkingSeconds, 9);
 });
 
-test('messageId moves reasoning forward through its caption instead of orphaning it', () => {
+test('reasoning linked to the first caption remains visible in the mixed work group', () => {
   const entries = [
     row('assistant', { actions: [raw('Edit', 'edit')], messageId: 'old' }),
     row('assistant', { actions: [raw('Edit', 'edit')], messageId: 'old2' }),
@@ -663,10 +661,10 @@ test('messageId moves reasoning forward through its caption instead of orphaning
     row('assistant', { actions: [raw('Read', 'read')], messageId: 'next2' }),
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
-  assert.equal(units.length, 2);
-  assert.equal(units[0].thinkingSeconds, 0);
-  assert.equal(units[1].thinkingSeconds, 4);
-  assert.equal(units[1].entries[0].thinking, 'prepare next reads');
+  assert.equal(units.length, 1);
+  assert.equal(units[0].thinkingSeconds, 4);
+  assert.deepEqual(units[0].entries, entries);
+  assert.deepEqual(units[0].captionEntries, [entries[3]]);
 });
 
 test('reasoning leading INTO a run opens that run', () => {

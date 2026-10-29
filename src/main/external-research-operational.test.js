@@ -33,9 +33,9 @@ test('SC attention is durably frozen once, independent of final callback and res
   const run = await f.store.getInternal('own'), notices = Object.values(run.externalResearchOperational.notices);
   assert.equal(notices.length, 1); assert.equal(notices[0].origin, 'sc'); assert(canDeliver(run, notices[0]));
   assert.match(notices[0].body, /не поручение продолжать продуктовую реализацию до консультации/);
-  assert.match(notices[0].body, /send_message и жди/);
-  assert.match(notices[0].body, /Не восстанавливай канал самостоятельно новым Chat/);
-  assert.match(notices[0].body, /Не начинай независимые правки/);
+  assert.match(notices[0].body, /external-research-recovery/);
+  assert.match(notices[0].body, /не жди обязательного разрешения владельца SC/);
+  assert.match(notices[0].body, /Независимая разрешённая работа продолжается/);
   assert.equal(run.resultAvailable, false); assert.equal(run.resultComplete, false); assert.equal(run.notificationStatus, 'pending');
   assert.equal(run.sourceFollowupStartedAt, null);
   const repeat = f.snapshot(); repeat.execution.controlRevision++; repeat.execution.attention.updateSeq += 3;
@@ -45,6 +45,37 @@ test('SC attention is durably frozen once, independent of final callback and res
   assert.equal(Object.values(reopened.externalResearchOperational.notices)[0].body, notices[0].body);
   const publicRun = await f.store.get('own');
   assert.equal(JSON.stringify(publicRun).includes(notices[0].body), false, 'status must not leak the prepared model prompt');
+});
+test('follow-up N4b: typed reader/owner outcomes survive RunStore restore, distinct frozen bodies and delivery refs', async t => {
+  const f = await fixture(t), first = f.snapshot();
+  first.execution.uiRecovery = { reportedAt: 1000, status: 'blocked', outcome: 'ui_recovery_input_unproven', attempts: [] };
+  first.execution.attention.recoveryDisposition = { kind: 'ui_recovery_reported', phase: 'ui_recovery', phaseInstanceId: 'ui-report-1',
+    operationId: 'ui-attempt', code: 'ui_recovery_input_unproven', nextAction: 'owner_recovery_required' };
+  await f.store.applyExternalResearchSnapshot('own', first);
+  const second = structuredClone(first); second.execution.controlRevision++; second.execution.attention.updateSeq++; second.execution.attention.wakeSeq++;
+  second.execution.attention.recoveryDisposition = { kind: 'reader_validation_expired', phase: 'reader_validation', phaseInstanceId: 'reader-phase-1',
+    operationId: 'reader-op', code: 'research_reader_validation_expired', nextAction: 'reconcile_existing_reader' };
+  await f.store.applyExternalResearchSnapshot('own', second);
+  const restored = f.reopened(), run = await restored.getInternal('own');
+  assert.deepEqual(run.externalResearchOperational.sc.latestAttention.recoveryDisposition, second.execution.attention.recoveryDisposition);
+  const notices = Object.values(run.externalResearchOperational.notices);
+  assert.equal(notices.length, 2); assert.notEqual(notices[0].body, notices[1].body);
+  assert(notices[1].body.includes('research_reader_validation_expired'));
+  assert(notices[1].body.includes('reconcile_existing_reader'));
+  const { noticeRef } = require('./external-research-operational-delivery');
+  assert.deepEqual(noticeRef(notices[1]).recoveryDisposition, second.execution.attention.recoveryDisposition);
+  const h = deliveryHarness(restored); h.service.schedule('own'); await h.service.drain();
+  assert.equal(h.sent.length, 1); assert(h.sent[0].prompt.includes('reader_validation_expired'));
+  assert.deepEqual(h.sent[0].operationalNoticeRef.recoveryDisposition, second.execution.attention.recoveryDisposition);
+  const repeat = structuredClone(second); repeat.execution.controlRevision++; repeat.execution.attention.updateSeq++;
+  await restored.applyExternalResearchSnapshot('own', repeat);
+  assert.equal(Object.values((await restored.getInternal('own')).externalResearchOperational.notices).length, 2);
+  const changed = structuredClone(repeat); changed.execution.controlRevision++; changed.execution.attention.updateSeq++;
+  changed.execution.attention.recoveryDisposition = first.execution.attention.recoveryDisposition;
+  await restored.applyExternalResearchSnapshot('own', changed);
+  const current = await restored.getInternal('own');
+  assert.equal(canDeliver(current, notices[1]), false, 'a resolved/replaced phase cannot deliver a frozen stale failure');
+  h.service.stop(); await restored.flush();
 });
 test('local transport outage persists before SC exists, and a healthy exact snapshot clears it without fake epoch', async t => {
   const f = await fixture(t);
@@ -195,6 +226,33 @@ function terminalSnapshot(f, withExecution = true) {
   } else delete value.execution;
   return value;
 }
+
+test('source-input uncertainty after a saved final identifies delivery, not a missing provider answer', async t => {
+  const f = await fixture(t), finished = terminalSnapshot(f);
+  finished.execution.finalReceipt = { id: 'noted_own', epoch: 'epoch', digest: 'a'.repeat(64) };
+  await f.store.applyExternalResearchSnapshot('own', finished);
+  const run = await f.store.getInternal('own');
+  const recorded = recordLocalOperationalFailure(run, { phase: 'delivering', reason: 'delivery_blocked', code: 'external_completion_input_unconfirmed' });
+  const notice = run.externalResearchOperational.notices[recorded.noticeId];
+  assert.equal(notice.origin, 'noted-delivery');
+  assert.match(notice.body.split('\n')[1], /^Ответ ChatGPT сохранён\. Подтверждение доставки в Codex-вкладку пока не получено\./);
+  assert.match(notice.body, /Ввод мог быть доставлен/);
+  assert.match(notice.body, /не описание исхода Research и не отчёт о файлах/);
+  assert.match(notice.body, /external_completion_input_unconfirmed/);
+  assert.doesNotMatch(notice.body, /Осмотри ту же страницу|не замена ответа Astra|Полного ответа пока нет/);
+  assert.match(notice.body, /external-research-recovery/);
+  assert.match(notice.body, /"remoteOutcome":"terminal_proven"/);
+  assert.equal(run.status, 'completed'); assert.equal(run.resultComplete, true);
+});
+
+test('failed Research delivery warning does not falsely assert a successful answer', async t => {
+  const f = await fixture(t), run = await f.store.getInternal('own');
+  run.status = 'failed'; run.resultComplete = true; run.externalResearchStatus = 'error';
+  require('./external-research-completion-delivery').initializeDelivery(run);
+  const recorded = recordLocalOperationalFailure(run, { phase: 'delivering', reason: 'delivery_blocked', code: 'external_completion_input_unavailable' });
+  const notice = run.externalResearchOperational.notices[recorded.noticeId];
+  assert.match(notice.body, /Исход запроса сохранён/); assert.doesNotMatch(notice.body, /Ответ ChatGPT сохранён/);
+});
 function interceptTerminalRename(file, inspect) {
   const original = fs.promises.rename;
   fs.promises.rename = async (from, to) => {

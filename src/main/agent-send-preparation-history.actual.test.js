@@ -12,6 +12,8 @@ async function fixture() {
   const imports = {
     './historyPromptPresentation.mjs': await import('../renderer/utils/historyPromptPresentation.mjs'),
     './agentLocalCommand.mjs': await import('../renderer/utils/agentLocalCommand.mjs'),
+    './historySendRecovery.mjs': await import('../renderer/utils/historySendRecovery.mjs'),
+    './historySendTiming.mjs': await import('../renderer/utils/historySendTiming.mjs'),
   };
   const module = { exports: {} }, actualRequire = createRequire(path.join(__dirname, '../renderer/utils/historyPromptHandoffs.ts'));
   const context = vm.createContext({ module, exports: module.exports,

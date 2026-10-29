@@ -1,3 +1,5 @@
+// Actual footer/callback/Main handler + private real SQL/handoff/sparse owners.
+// React scheduling, IPC transport and queue execution are finite adapters only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,9 +12,8 @@ import { X, RotateCcw } from 'lucide-react';
 import { createRequire } from 'node:module';
 import { historySendReturnEnabled, historySendPresentationAction as currentPresentationAction } from './historySendReturn.mjs';
 import { planHistoryPromptPresentationDismissal } from './historyPromptPresentationDismissal.mjs';
-import { hydrateHistoryPromptHandoffFromDurableReceipt, dismissReceiptlessHistoryPromptPresentation,
-  HistoryPromptHandoffStore } from './historyPromptHandoffs.ts';
 import { readHistorySendRecovery, saveHistorySendRecovery } from './historySendRecovery.mjs';
+import { installHistoryPromptPanelRows, privateHistoryPromptHandoffs } from './test-helpers/historyPromptPanelFixture.mjs';
 
 const require = createRequire(import.meta.url);
 const { DirectorySqlite } = require('../../main/fixtures/workflow-directory-sqlite.cjs');
@@ -87,15 +88,27 @@ function harness(t, { durable = true, attempt = true, reason = 'send-proven-not-
     record = store.get(identity.operationKey);
   }
   const calls = [], removed = [], consumed = [], notices = [], handlers = new Map(), released = [];
-  const handoff = { tabId: 'T', handoffId: 'H', queueStatus: unknown ? 'delivery-unknown' : 'failed', statusReason: reason,
+  const handoffs = privateHistoryPromptHandoffs();
+  const input = { tabId: 'T', handoffId: 'H', toolType: 'codex', text: 'original', sessionIdHint: 'private-SID',
     ...(record ? { sendOperationKey: record.operationKey, sendAttemptId: record.attemptId } : {}),
     historyReturn: { token: 'H', state: 'available' }, authoringText: 'original', authoringImagePaths: [{ path: '/private/image.png' }] };
-  const current = [handoff];
+  const owner = handoffs.beginHistoryPromptHandoff(input);
+  assert.ok(owner && Object.isFrozen(owner), 'actual immutable handoff owner');
+  handoffs.settleHistoryPromptHandoff('T', 'H', { queueStatus: unknown ? 'delivery-unknown' : 'failed', reason });
+  // The stale click row is distinct from the actual immutable store owner.
+  const handoff = { ...handoffs.getHistoryPromptHandoffsSnapshot('T')[0], role: 'queued', content: 'original' };
+  const metadata = { text: handoff.content, submittedAt: handoff.submittedAt,
+    sendOperationKey: handoff.sendOperationKey, sendAttemptId: handoff.sendAttemptId };
+  const persisted = [];
   const scope = {
-    tabId: 'T', toolType: 'codex', useCallback: fn => fn, returnPromptInflight: { current: new Set() },
-    getHistoryPromptHandoffsSnapshot: () => current, isLocalPromptEntry: e => e.uuid?.startsWith('local-prompt-'),
-    historySendReturnEnabled, historySendPresentationAction, planHistoryPromptPresentationDismissal, dismissReceiptlessHistoryPromptPresentation,
-    consumeHistoryPromptHandoff: (...args) => consumed.push(args), removeLocalPromptEntry: (...args) => removed.push(args),
+    ...handoffs,
+    tabId: 'T', toolType: 'codex', sessionId: 'private-SID', useCallback: fn => fn, returnPromptInflight: { current: new Set() },
+    historyOwnerKeyRef: { current: 'private-owner' }, historyOwnerGenerationRef: { current: 1 },
+    historySnapshotOwner: { tabId: 'T', sessionId: 'private-SID' },
+    promptHandoffMetaRef: { current: new Map([['H', metadata]]) }, suppressedPromptsRef: { current: new Map() },
+    historyDiag() {}, setPrimarySuppressionRevision() {},
+    persistVolatileOverlay: (_owner, rows) => persisted.push(rows),
+    historySendReturnEnabled, historySendPresentationAction, planHistoryPromptPresentationDismissal,
     showHistoryIncidentToast: (...args) => notices.push(args),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptStore: store,
     DESKTOP_HISTORY_SEND_SURFACE: 'desktop-history', path: require('node:path'), srcMainDir: '/private/source',
@@ -108,12 +121,51 @@ function harness(t, { durable = true, attempt = true, reason = 'send-proven-not-
     // must not touch it, even when a failed card has a valid return token.
   };
   const context = vm.createContext(scope);
+  const presentation = installHistoryPromptPanelRows(context, panel, {
+    initialRows: [{ uuid: 'local-prompt-T-H', role: 'queued', ...handoff }],
+  });
+  t.after(presentation.close);
+  const remove = context.removeLocalPromptEntry, consume = context.consumeLocalPromptEntry;
+  context.removeLocalPromptEntry = (...args) => { removed.push(args); return remove(...args); };
+  context.consumeLocalPromptEntry = (...args) => { consumed.push(args); return consume(...args); };
   const start = main.indexOf("ipcMain.handle('agent:dismiss-send-receipt-presentation'");
   const end = main.indexOf("ipcMain.handle('agent:record-history-context'", start);
   vm.runInContext(main.slice(start, end), context);
   vm.runInContext(compile('const ' + callback + '; globalThis.dismiss = dismissPromptPresentation;'), context);
-  return { db, store, identity, record, current, handoff, calls, removed, consumed, notices, released,
+  return { db, store, identity, record, handoffs, handoff, calls, removed, consumed, notices, released, persisted,
+    rows: presentation.rows, sparseOwner: presentation.owner,
+    current: () => handoffs.getHistoryPromptHandoffsSnapshot('T'),
+    advancePending() {
+      const next = handoffs.beginHistoryPromptHandoff({ ...input, sendAttemptId: 'new-pending-attempt', initialStatus: 'application-queued' });
+      assert.equal(next.queueStatus, 'application-queued');
+      return next;
+    },
+    bindIdentity(fields) { assert.equal(handoffs.bindHistoryPromptHandoffSendIdentity('T', 'H', fields).ok, true); },
+    replaceLocalIdentity(fields) {
+      assert.equal(handoffs.consumeHistoryPromptHandoffIfCurrent('T', 'H', handoffs.getHistoryPromptHandoffsSnapshot('T')[0]), true);
+      const next = handoffs.beginHistoryPromptHandoff({ ...input, ...fields,
+        initialReceipt: { queueStatus: unknown ? 'delivery-unknown' : 'failed', reason } });
+      assert.ok(next && Object.isFrozen(next));
+      Object.assign(handoff, next);
+      return next;
+    },
     dismiss: () => context.dismiss({ uuid: 'local-prompt-T-H', ...handoff }), context };
+}
+
+function assertRetired(h) {
+  assert.equal(h.rows().length, 0);
+  assert.equal(h.context.promptHandoffMetaRef.current.has('H'), false);
+  assert.equal(h.current().length, 0);
+  assert.equal(h.sparseOwner.current().rows.length, 0);
+  assert.equal(h.sparseOwner.current().entries.deref(), h.rows());
+}
+
+function assertRetained(h) {
+  assert.equal(h.rows().length, 1);
+  assert.equal(h.context.promptHandoffMetaRef.current.has('H'), true);
+  assert.equal(h.current().length, 1);
+  assert.equal(h.sparseOwner.current().rows[0], h.rows()[0]);
+  assert.equal(h.sparseOwner.current().entries.deref(), h.rows());
 }
 
 for (const attempt of [false, true]) test('actual callback → Main → private real SQL only dismisses failed presentation; attempt=' + attempt, async t => {
@@ -128,10 +180,11 @@ for (const attempt of [false, true]) test('actual callback → Main → private 
   assert.deepEqual({ ...after.receipt, presentationDismissedAt: undefined, presentationDismissedSurface: undefined },
     { ...h.record.receipt, presentationDismissedAt: undefined, presentationDismissedSurface: undefined });
   assert.ok(after.receipt.presentationDismissedAt);
-  const hydration = hydrateHistoryPromptHandoffFromDurableReceipt({ ...after,
+  const hydration = h.handoffs.hydrateHistoryPromptHandoffFromDurableReceipt({ ...after,
     applicationQueue: { version: 1, state: 'failed' } });
   assert.equal(hydration.hydrated, false); assert.equal(hydration.reason, 'durable-history-presentation-dismissed');
   assert.equal(h.removed.length, 2); assert.equal(h.consumed.length, 2);
+  assertRetired(h);
 });
 
 test('an exact provider refusal dismisses presentation without clearing its actual terminal draft', async t => {
@@ -142,6 +195,7 @@ test('an exact provider refusal dismisses presentation without clearing its actu
   const after = h.store.get(h.identity.operationKey);
   assert.equal(after.state, 'provider-not-accepted'); assert.equal(after.receipt.enterWritten, true);
   assert.equal(after.receipt.draftPreserved, true);
+  assertRetired(h);
 });
 
 test('lost dismiss ACK retains the card; a later explicit click joins the same durable dismissal', async t => {
@@ -152,19 +206,23 @@ test('lost dismiss ACK retains the card; a later explicit click joins the same d
   await h.dismiss();
   assert.equal(h.removed.length, 0); assert.equal(h.consumed.length, 0); assert.equal(h.calls.length, 1);
   assert.ok(h.store.get(h.identity.operationKey).receipt.presentationDismissedAt);
+  assertRetained(h);
   await h.dismiss();
   assert.equal(h.removed.length, 1); assert.equal(h.consumed.length, 1); assert.equal(h.calls.length, 2);
+  assertRetired(h);
 });
 
 test('proved receiptless failure removes only the local presentation', async t => {
   const h = harness(t, { durable: false }); await h.dismiss();
   assert.deepEqual(h.calls, []); assert.equal(h.removed.length, 1); assert.equal(h.consumed.length, 1);
+  assertRetired(h);
 });
 
 test('unknown receipt failure retains card and data rather than pretending dismissal succeeded', async t => {
   const h = harness(t, { durable: false, reason: 'send-refused-before-submit' }); await h.dismiss();
   assert.equal(h.calls.length, 1); assert.equal(h.notices.length, 1);
   assert.deepEqual(h.removed, []); assert.deepEqual(h.consumed, []);
+  assertRetained(h);
 });
 
 test('Main rejects a stale failed card after a new attempt, without dismiss/release', async t => {
@@ -172,13 +230,16 @@ test('Main rejects a stale failed card after a new attempt, without dismiss/rele
   await h.dismiss();
   assert.equal(h.notices.length, 1); assert.deepEqual(h.removed, []); assert.deepEqual(h.released, []);
   assert.equal(h.store.get(h.identity.operationKey).receipt?.presentationDismissedAt, undefined);
+  assertRetained(h);
 });
 
 test('a locally advanced pending handoff cannot be hidden by its stale failed row', async t => {
   const h = harness(t); const entry = { uuid: 'local-prompt-H', ...h.handoff };
-  h.current[0] = { ...h.handoff, queueStatus: 'application-queued' };
+  h.advancePending();
   await h.context.dismiss(entry);
   assert.deepEqual(h.calls, []); assert.deepEqual(h.removed, []); assert.deepEqual(h.consumed, []);
+  assertRetained(h);
+  assert.equal(h.current()[0].queueStatus, 'application-queued');
 });
 
 test('actual unknown X only hides its exact durable presentation, retaining delivery and slot authority', async t => {
@@ -201,17 +262,19 @@ test('actual unknown X only hides its exact durable presentation, retaining deli
   assert.equal(h.consumed.length, 1);
   const reopened = createAgentSendReceiptStore(h.db).get(h.identity.operationKey);
   assert.equal(reopened.state, 'delivery-unknown');
-  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(reopened).reason, 'durable-history-presentation-dismissed');
+  assert.equal(h.handoffs.hydrateHistoryPromptHandoffFromDurableReceipt(reopened).reason, 'durable-history-presentation-dismissed');
+  assertRetired(h);
 });
 
 test('unknown X refuses a stale attempt rather than hiding the newer owner', async t => {
   const h = harness(t, { unknown: true });
-  h.handoff.sendAttemptId = 'stale-attempt';
+  h.replaceLocalIdentity({ sendAttemptId: 'stale-attempt' });
   await h.dismiss();
   assert.equal(h.notices.length, 1);
   assert.deepEqual(h.removed, []);
   assert.deepEqual(h.released, []);
   assert.equal(h.store.get(h.identity.operationKey).receipt?.presentationDismissedAt, undefined);
+  assertRetained(h);
 });
 
 const storageFor = t => {
@@ -237,21 +300,17 @@ test('receiptless unknown X preserves its recovery snapshot, and reload/late hyd
   assert.deepEqual(saved.input, frozen);
   assert.equal(saved.phase, 'dispatched');
   assert.ok(saved.presentationDismissedAt);
-  const handoffs = fs.readFileSync(new URL('./historyPromptHandoffs.ts', import.meta.url), 'utf8');
-  const start = handoffs.indexOf('try {\n  for (const { input, phase, presentationDismissedAt, presentationDismissedReturnToken }');
-  const end = handoffs.indexOf('export const hydrateHistoryPromptHandoffImages', start);
-  assert.ok(start > 0 && end > start);
-  const reloaded = new HistoryPromptHandoffStore();
-  vm.runInNewContext(compile(handoffs.slice(start, end)), { historyPromptHandoffStore: reloaded,
-    receiptlessPresentationDismissals: new Map(), readHistorySendRecovery: () => readHistorySendRecovery(storage), console });
-  assert.equal(reloaded.getSnapshot('T').length, 0);
+  const reloaded = privateHistoryPromptHandoffs();
+  assert.equal(reloaded.getHistoryPromptHandoffsSnapshot('T').length, 0);
   const late = { ...h.identity, attemptId: 'late-owned-attempt', state: 'delivery-unknown', receipt: { promptText: 'original' },
     historyReturn: { token: 'H', state: 'writing' } };
-  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(late).reason, 'local-history-presentation-dismissed');
+  assert.equal(reloaded.hydrateHistoryPromptHandoffFromDurableReceipt(late).reason, 'local-history-presentation-dismissed');
   assert.deepEqual(readHistorySendRecovery(storage)[0].input.imagePaths, frozen.imagePaths);
-  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt({ ...late,
+  assert.equal(reloaded.hydrateHistoryPromptHandoffFromDurableReceipt({ ...late,
     historyReturn: { token: 'different-return-owner', state: 'writing' } }).hydrated, true,
   'receiptless presentation marker must not hide an unrelated/newly proven owner');
+  assert.equal(h.rows().length, 0);
+  assert.equal(h.context.promptHandoffMetaRef.current.has('H'), false);
 });
 
 test('receiptless hide requires a successful Main absence read, not a lost IPC or ambiguous receipt', async t => {
@@ -264,6 +323,7 @@ test('receiptless hide requires a successful Main absence read, not a lost IPC o
     assert.equal(h.notices.length, 1);
     assert.deepEqual(h.removed, []);
     assert.deepEqual(readHistorySendRecovery(), []);
+    assertRetained(h);
   }
 });
 
@@ -276,6 +336,7 @@ test('failed recovery persistence keeps the receiptless unknown card and origina
   assert.deepEqual(h.removed, []);
   assert.equal(readHistorySendRecovery(storage)[0].input.text, 'original');
   assert.equal(readHistorySendRecovery(storage)[0].presentationDismissedAt, undefined);
+  assertRetained(h);
 });
 
 test('actual Main X keeps unknown FIFO barrier/assets; only late exact audit releases the original follower', async t => {
@@ -332,12 +393,13 @@ test('actual Main X keeps unknown FIFO barrier/assets; only late exact audit rel
 });
 
 test('unknown X rejects a foreign operation even with the matching tab/handoff/attempt', async t => {
-  const h = harness(t, { unknown: true }); h.handoff.sendOperationKey = 'foreign-operation';
+  const h = harness(t, { unknown: true }); h.replaceLocalIdentity({ sendOperationKey: 'foreign-operation' });
   await h.dismiss();
   assert.equal(h.notices.length, 1);
   assert.deepEqual(h.removed, []);
   assert.deepEqual(h.released, []);
   assert.equal(h.store.get(h.identity.operationKey).receipt.presentationDismissedAt, undefined);
+  assertRetained(h);
 });
 
 test('newly bound identity during an absence read keeps the unknown card, without a local hide marker', async t => {
@@ -346,23 +408,33 @@ test('newly bound identity during an absence read keeps the unknown card, withou
   let ready; h.context.agentSendReceiptStartupReady = new Promise(resolve => { ready = resolve; });
   const waiting = h.dismiss();
   await Promise.resolve();
-  h.current[0] = { ...h.handoff, sendOperationKey: 'late-operation', sendAttemptId: 'late-attempt' };
+  h.bindIdentity({ sendOperationKey: 'late-operation', sendAttemptId: 'late-attempt' });
   ready(); await waiting;
   assert.deepEqual(h.removed, []);
   assert.deepEqual(readHistorySendRecovery(), []);
+  assertRetained(h);
 });
 
-test('actual local-row removal preserves canonical equal-text and other handoffs', () => {
+test('actual local-row removal preserves canonical equal-text and other handoffs', t => {
   assert.ok(removeCallback);
-  let rows = [{ uuid: 'local-prompt-H', role: 'queued', handoffId: 'H', content: 'same text' },
+  const rows = [{ uuid: 'local-prompt-H', role: 'queued', handoffId: 'H', content: 'same text' },
     { uuid: 'canonical-user', role: 'user', handoffId: 'H', content: 'same text' },
     { uuid: 'local-prompt-other', role: 'queued', handoffId: 'other', content: 'same text' }];
-  const context = vm.createContext({ tabId: 'T', historySnapshotOwner: 'owner', useCallback: fn => fn,
-    promptHandoffMetaRef: { current: new Map() }, suppressedPromptsRef: { current: new Map() },
-    presentationEntriesRef: { current: rows }, persistVolatileOverlay() {}, historyDiag() {},
-    isLocalPromptEntry: row => row.role === 'queued' && row.uuid.startsWith('local-prompt-'),
-    setEntries: update => { rows = update(rows); } });
-  vm.runInContext(compile('const ' + removeCallback + '; globalThis.remove = removeLocalPromptEntry;'), context);
-  context.remove('H', 'unknown-presentation-dismissed');
-  assert.deepEqual(rows.map(row => row.uuid), ['canonical-user', 'local-prompt-other']);
+  const handoffs = privateHistoryPromptHandoffs();
+  const owner = handoffs.beginHistoryPromptHandoff({ tabId: 'T', handoffId: 'H', toolType: 'codex', text: 'same text' });
+  const metadata = { text: 'same text' };
+  const context = vm.createContext({ ...handoffs, tabId: 'T', historySnapshotOwner: 'owner', useCallback: fn => fn,
+    historyOwnerKeyRef: { current: 'owner' }, historyOwnerGenerationRef: { current: 1 },
+    promptHandoffMetaRef: { current: new Map([['H', metadata]]) }, suppressedPromptsRef: { current: new Map() },
+    persistVolatileOverlay() {}, historyDiag() {}, setPrimarySuppressionRevision() {} });
+  const presentation = installHistoryPromptPanelRows(context, panel, { initialRows: rows });
+  t.after(presentation.close);
+  const removal = context.captureLocalPromptRemoval('H', owner);
+  assert.ok(removal);
+  context.removeLocalPromptEntry('H', 'unknown-presentation-dismissed', removal);
+  assert.deepEqual(presentation.rows().map(row => row.uuid), ['canonical-user', 'local-prompt-other']);
+  assert.equal(context.promptHandoffMetaRef.current.has('H'), false);
+  assert.equal(presentation.owner.current().entries.deref(), presentation.rows());
+  assert.deepEqual(presentation.owner.current().rows.map(row => row.handoffId), ['other']);
+  assert.equal(handoffs.getHistoryPromptHandoffsSnapshot('T')[0], owner, 'row removal is not handoff consumption');
 });

@@ -4,8 +4,8 @@
   "entry": "mcp-hub.js",
   "files": {
     "mcp-hub.js": "c7d9a34a115bb41a62243c7811c8c2392c2e17e4946712df8e23e1b10adf3153",
-    "mcp-browser-maintenance.js": "55c64a33a89a1b074e2a3765085bf11bbc5c50bd48c248732b6041582b85411b",
-    "research-host-protocol.cjs": "b38281c0791e85715c06306be0df7e9a6c098e1c49160a13d7e99a330f824dc2",
+    "mcp-browser-maintenance.js": "a240d7f6d21cba39fe234baa82334a3c0b17c27ecf44ced78238a33dadcbc773",
+    "research-host-protocol.cjs": "c307ba4e8899d3c7fc8befbccf727dbc60028536f1e041538593c27444ad0fae",
     "mcp-hub-config.js": "901fa5bd25d3c7f4f04295fa07bdf8eb610748cb32ef51ff451a850a0ac12329",
     "child-process-env.js": "62b979e0a26372896ef3d7e3deb7f1bbe7ab9588fc9d517ebee2089c328bced9"
   }

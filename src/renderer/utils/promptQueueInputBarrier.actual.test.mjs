@@ -37,6 +37,7 @@ function fixture() {
     getEffectiveQueueTrigger: () => 'T', isLoopPromptActive: () => false,
     deferredOwnerSends: new Map(), queueShutdownPending: false, queueManualStopping: new Set(),
     autoCompactCoordinator: null, prevBusyRef: new Map(), isOrchestrationCompletionBlocked: () => false,
+    capacityWorkflowBlocked: () => false, // no capacity fact in this input-owner fixture
     promptTabTriggerReady: () => true, hasPendingAgentGoalWork: () => false,
     useWorkspaceStore: { getState: () => ({ openProjects: new Map() }) },
   });

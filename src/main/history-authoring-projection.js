@@ -92,9 +92,12 @@ function normalizeHistoryAuthoringProjection(value) {
 function historyAuthoringProjectionFromReceipt(record) {
   if (record?.state !== 'confirmed' || record.provider !== 'codex') return null;
   const receipt = record.receipt, audit = record.auditIdentity, proof = receipt?.imageRequestProjection;
-  const nativeSlots = receipt?.canonicalReason === 'codex_image_placeholder_canonical';
+  const transformedImages = proof?.version === 2 && receipt?.canonicalReason === 'codex_image_request_transform';
+  if (transformedImages && proof.stages.some(stage => stage.outcomes.some(outcome => outcome.kind === 'unavailable'))) return null;
+  const nativeSlots = receipt?.canonicalReason === 'codex_image_placeholder_canonical'
+    || transformedImages && receipt.actualHash !== proof.transportHash;
   if (receipt?.ownedAttachmentProjection) return ownedHistoryAuthoringProjection(record);
-  if ((!nativeSlots && (!proof?.authoringTransport || receipt.canonicalReason !== 'codex_image_path_alias_exact'))
+  if ((!nativeSlots && (!proof?.authoringTransport || !['codex_image_path_alias_exact', 'codex_image_request_transform'].includes(receipt.canonicalReason)))
     || !proof || (nativeSlots && (receipt.canonicalized !== true || receipt.exactAuditConfirmed !== true))
     || !audit || audit.attemptId !== record.attemptId || audit.provider !== 'codex'
     || !nonempty(audit.sessionId) || audit.sessionId !== record.sessionId
@@ -143,7 +146,10 @@ function ownedHistoryAuthoringProjection(record) {
     || receipt.exactAuditConfirmed !== true || receipt.auditTimestamp !== audit.auditTimestamp
     || receipt.actualHash !== audit.promptHash) return null;
   const imageProof = receipt.imageRequestProjection;
-  const nativeSlots = receipt.canonicalReason === 'codex_image_placeholder_canonical';
+  if (imageProof?.version === 2 && imageProof.stages.some(stage => stage.outcomes.some(outcome => outcome.kind === 'unavailable'))) return null;
+  const nativeSlots = receipt.canonicalReason === 'codex_image_placeholder_canonical'
+    || imageProof?.version === 2 && receipt.canonicalReason === 'codex_image_request_transform'
+      && receipt.actualHash !== imageProof.transportHash;
   if (imageProof ? !readPersistedCodexImageRequestProjection(record).valid
     : receipt.actualHash !== owned.preparedHash || receipt.transportText !== owned.proof.preparedText) return null;
   const request = owned.proof.requestText, snapshot = receipt.ownedAttachments;

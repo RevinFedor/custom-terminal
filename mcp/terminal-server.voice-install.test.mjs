@@ -10,7 +10,7 @@ const declaration = name => {
   return start < 0 ? '' : source.slice(start, source.indexOf('\n}', start) + 2);
 };
 function harness(candidates, identities, response = async () => ({ ok: true, status: 202,
-  text: async () => JSON.stringify({ ok: true, job: { id: 'one-job' } }) }), forceSupported = true) {
+  text: async () => JSON.stringify({ ok: true, job: { id: 'one-job' } }) }), forceSupported = true, autoSupported = false) {
   const posts = [];
   const context = vm.createContext({
     readSharedToken: () => 'fixture-token', TOKEN_PATH: '/fixture/token', PORT_DIR: '/fixture',
@@ -27,7 +27,8 @@ function harness(candidates, identities, response = async () => ({ ok: true, sta
     fetch: async (url, options) => {
       if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ application: 'voice-record',
         pid: Number(new URL(url).port) === 7888 ? 10 : 20,
-        capabilities: { terminalBuildInstall: { version: 2, durableRequests: true, force: forceSupported } } }) };
+        capabilities: { terminalBuildInstall: { version: 2, durableRequests: true, force: forceSupported,
+          ...(autoSupported ? { autoContinueInterruptedTabs: { version: 1 } } : {}) } } }) };
       posts.push({ url, options }); return response(url);
     },
   });
@@ -98,7 +99,7 @@ test('HTTP failure or uncertain response never posts the same install to a secon
 
 // Execute the production tool case, with only API/identity transport leaves
 // controlled; discovery-only helper tests cannot prove this admission seam.
-function toolCaseHarness() {
+function toolCaseHarness(autoSupported = true) {
   const begin = source.indexOf("    case 'build_install_noted_terminal': {");
   const end = source.indexOf('\n    default:', begin);
   assert.ok(begin > 0 && end > begin);
@@ -107,6 +108,7 @@ function toolCaseHarness() {
     randomUUID: () => 'one-request', PARENT_TAB_ID: () => '', PARENT_PROJECT_ID: () => 'P',
     PROJECT_CWD_: () => '/private/project', projectHint: () => ({ cwd: '/private/project', projectId: 'P' }),
     httpGet: async () => ({ tabs: [] }), httpGetOnPort: async () => ({ tabs: [] }),
+    httpApiGet: async () => ({ capabilities: { buildContinue: autoSupported ? { voiceInstallBinding: { version: 1 } } : {} } }),
     verifyVoiceBuildInstall: async () => {},
     httpApiPost: async (target, route, body) => { calls.push({ kind: 'source', target, route, body }); return {}; },
     httpPostVoice: async (route, body) => { calls.push({ kind: 'voice', route, body });
@@ -135,4 +137,22 @@ test('actual FORCE tool case rejects missing source or disabled success report B
   const normal = toolCaseHarness();
   await normal.invoke({ returnToTabId: '753', sessionId: 'S', notifyOnSuccess: false });
   assert.equal(normal.calls[1].body.returnTo.notifyOnSuccess, false); assert.equal(normal.calls[1].body.force, false);
+});
+
+test('auto-continue is explicit FORCE-only and checks both apps before either mutation', async () => {
+  for (const args of [{ autoContinueInterruptedTabs: true }, { autoContinueInterruptedTabs: 'true', force: true }]) {
+    const h = toolCaseHarness(); await assert.rejects(h.invoke(args)); assert.equal(h.calls.length, 0);
+  }
+  const oldNoted = toolCaseHarness(false);
+  await assert.rejects(oldNoted.invoke({ force: true, autoContinueInterruptedTabs: true, returnToTabId: '753', sessionId: 'S' }), /Noted auto-continue update/);
+  assert.equal(oldNoted.calls.length, 0);
+  const candidates = [{ pid: 10, port: 7888 }], identities = { 10: { command: installed } };
+  const oldVoice = harness(candidates, identities);
+  await assert.rejects(oldVoice.post({ force: true, autoContinueInterruptedTabs: true }), /auto-continue installer update/);
+  assert.equal(oldVoice.posts.length, 0);
+  const current = harness(candidates, identities, undefined, true, true);
+  await current.post({ force: true, autoContinueInterruptedTabs: true });
+  assert.equal(JSON.parse(current.posts[0].options.body).autoContinueInterruptedTabs, true);
+  const h = toolCaseHarness(); await h.invoke({ force: true, autoContinueInterruptedTabs: true, returnToTabId: '753', sessionId: 'S', requestId: 'same' });
+  assert.equal(h.calls[1].body.autoContinueInterruptedTabs, true); assert.equal(h.calls[1].body.requestId, 'same');
 });

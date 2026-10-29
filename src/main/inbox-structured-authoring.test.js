@@ -9,7 +9,7 @@ const {agentSendTargetPreconditionFailure}=require('./agent-send-target-precondi
 const {withPromptOriginPresentation}=require('./history-prompt-presentations');
 const {promptAuditFingerprint}=require('./prompt-audit-fingerprint');
 const {buildCodexImagePastePlan}=require('./codex-image-transport');
-const source=fs.readFileSync(path.join(__dirname,'web-server.js'),'utf8');
+const source=fs.readFileSync(path.join(process.env.ACTUAL_SOURCE_DIR || __dirname,'web-server.js'),'utf8');
 const tree=ts.createSourceFile('web.js',source,ts.ScriptTarget.Latest,true);
 const fn=name=>{const node=tree.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text===name);assert.ok(node,name);return node.getText(tree);};
 
@@ -26,7 +26,9 @@ async function harness(t,{durable=false,unknown=false}={}){
  const descriptor=()=>({tabId:'T',toolType:'codex',tabType:'terminal',projectId:'__noted_inbox__',sessionId:changed?'OTHER':'S'});
  const cleanOptionalString=(v,f='')=>typeof v==='string'?v.trim()||f:f;
  const sendJson=(res,status,value)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(value));};
- const ctx={...structured,...registry,AGENT_SEND_RECEIPT_STATES:registry.RECEIPT_STATES,classifyAgentSendReceipt,resolveOrchestrationSendOptions,
+ const ctx={...structured,...registry,...require('./agent-send-preparation'),AGENT_SEND_RECEIPT_STATES:registry.RECEIPT_STATES,classifyAgentSendReceipt,resolveOrchestrationSendOptions,
+   require,path,srcMainDir:__dirname,readAgentRuntimeSnapshot:null,buildContinueOperations:null,
+   COMPLETION_ADMISSION:Symbol('private-completion-admission'),
    agentSendTargetPreconditionFailure,withPromptOriginPresentation,promptAuditFingerprint,crypto,console:{log(){},warn(){}},shortId:x=>x,
    agentSendReceiptStartupReady:Promise.resolve(),agentSendReceiptStore:store,agentSendReceiptRegistry:registry.createAgentSendReceiptRegistry(),agentSendBridgeTimeoutMs:1000,
    externalRuns:runs,externalRunByTabId:new Map(),externalRunByConversationKey:new Map(),INBOX_PROJECT_ID:'__noted_inbox__',
@@ -56,7 +58,7 @@ async function harness(t,{durable=false,unknown=false}={}){
  const names=['runAgentSendScenario','runPreparedAgentSendScenario','externalRunResponseFields','replayExternalRunResponse',
   'sendSendFailure','sendDeliveryUnknown','sendAuditPending','durableAgentSendReplay','durableAgentSendFailure',
   'durableRecordHasProviderQueueAcceptance','externalRunStatusFromDurableRecord',
-  'inboxSetupOutcome','inboxSetupRetryable','assertInboxSetupOwner','settleInboxSetupBeforeSend'];
+  'inboxSetupOutcome','inboxSetupRetryable','assertInboxSetupOwner','settleInboxSetupBeforeSend','readDurableInboxRun'];
  const start=source.indexOf("  if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST')");
  const end=source.indexOf("  if (parsed.pathname === '/api/inbox/sessions/resume'",start);
  vm.createContext(ctx);vm.runInContext(names.map(fn).join('\n'),ctx);

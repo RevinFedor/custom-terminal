@@ -35,6 +35,7 @@ const modules = {
   useOrchestrationStore: `export const useOrchestrationStore={getState:()=>({hydrated:true,initialized:true,inheritedBusyTabIds:new Set(),runs:new Map()}),subscribe:()=>()=>{}};
     export const initializeOrchestrationStore=async()=>{};
     export const isOrchestrationCompletionBlocked=()=>false;
+    export const isLoopOrchestrationBlocked=()=>false;
     export const subscribeOrchestrationRunChanges=()=>()=>{};`,
   historyAgentRuntimes: `export const getHistoryAgentRuntime=()=>globalThis.ports.runtime;`,
   agentSendPreparation: `export const prepareAgentRuntimeForSend=(...a)=>globalThis.ports.prepareRuntime(...a);
@@ -181,7 +182,7 @@ async function fixture(t, initialQueue = null) {
       }
       throw new Error('unexpected controlled IPC ' + channel);
     } };
-  const module = { exports: {} }, window = { require: () => ({ ipcRenderer: ipc }), addEventListener() {}, removeEventListener() {} };
+  const module = { exports: {} }, window = { require: name => name === 'node:crypto' ? require(name) : ({ ipcRenderer: ipc }), addEventListener() {}, removeEventListener() {} };
   const context = vm.createContext({ module, exports: module.exports, require, console: quiet, process, ports,
     window, document: {}, Buffer, AbortController, structuredClone, crypto: { randomUUID: () => 'private-' + (++n) },
     setTimeout: fn => { const id = Symbol(); timers.set(id, fn); return id; }, clearTimeout: id => timers.delete(id) });
@@ -228,6 +229,23 @@ function findArrow(property, predicate) {
   };
   visit(overlayTree); assert.ok(arrow, property); return arrow;
 }
+
+test('actual automatic Run after carries literal chip provenance and raw Post attachments to Main', async t => {
+  const f = await fixture(t);
+  const composer = await import('./composerChips.mjs');
+  const chip = { id: 'literal-paste', kind: 'paste', text: 'example [imagePath: /synthetic/not-an-attachment.png]' };
+  f.state().updatePrompt('T', f.id, { text: composer.buildPasteChipMarker(chip) + '\n[Image #1]', chips: [chip], images: 1,
+    imagePaths: [{ id: 1, path: '/synthetic/real.png', mediaType: 'image/png', size: 1 }] });
+  f.state().setPostPromptText('T', 'post [imagePath: /synthetic/post.png]'); f.state().setPostPromptEnabled('T', true);
+  await f.fire(); await f.settle();
+  assert.equal(f.sends.length, 1, JSON.stringify(f.toasts));
+  const sent = f.sends[0], staged = [];
+  const plan = require('../../main/codex-image-transport').buildCodexImagePastePlan(sent.prompt, source => {
+    staged.push(source); return { success: true, path: source, inputPath: '/alias/' + staged.length + '.png' };
+  }, { authoringTransport: sent.presentationSnapshot.authoringTransport });
+  assert.deepEqual(staged, ['/synthetic/real.png', '/synthetic/post.png']);
+  assert.ok(plan.text.includes(chip.text));
+});
 
 for (const result of [
   { success: true, submitted: true, status: 'sent' },

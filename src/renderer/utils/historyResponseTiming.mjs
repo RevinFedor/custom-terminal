@@ -139,3 +139,20 @@ export function historyResponseTailLabel(timing, now = Date.now()) {
     ? `${timing.phase === 'compacting' ? 'Compacting' : 'Working'} · ${duration}`
     : `Worked · ${duration}`;
 }
+
+// Compaction owns a different operational interval; it must stay at the tail
+// rather than being attached to a response's work header.
+export function historyResponseWorkTailTiming(timing) {
+  return timing?.phase === 'compacting' ? null : timing || null;
+}
+
+/** Only attach an active clock to a chapter that began in this interval. An
+ * older tail can still be on screen before the new user's row arrives. */
+export function historyResponseWorkClock(group, tailTiming) {
+  if (group?.responseTiming) return group.responseTiming;
+  const timing = historyResponseWorkTailTiming(tailTiming);
+  if (!timing || group?.activeTail !== true || typeof group.firstTimestamp !== 'string'
+    || group.firstTimestamp.length > 64) return null;
+  const first = Date.parse(group.firstTimestamp), started = Number(timing.startTs);
+  return Number.isFinite(first) && Number.isFinite(started) && first >= started ? timing : null;
+}

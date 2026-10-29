@@ -31,6 +31,8 @@ function hooks(){
 function menuFixture({runtimePort,colorOnly=false}={}) {
   const h=hooks(),entries=[{projectId:'P',tabId:'a'},{projectId:'Q',tabId:'b'}],calls=[],toasts=[],listeners=new Set();let current=true;
   const state={organizationReady:true,isRestoring:false,activeSpaceId:'W',splitPanes:[{windowId:'win',tabs:entries,tabId:'a'}],
+    tabWorkflowMembership:Object.fromEntries(entries.map(entry=>[entry.tabId,{workflowId:'W',revision:1}])),
+    pendingTabWorkflowMembership:{},
     spaces:[{id:'W'}],centerStrips:{},tabCatalog:{},tabTitleNamingIds:new Set(),
     openProjects:new Map([['P',{projectPath:'/P',tabs:new Map([['a',{commandType:'claude',claudeSessionId:'SIDa'}]])}],
       ['Q',{projectPath:'/Q',tabs:new Map([['b',{commandType:'claude',claudeSessionId:'SIDb'}]])}]]),
@@ -48,7 +50,7 @@ function menuFixture({runtimePort,colorOnly=false}={}) {
   vm.runInNewContext(transformSync(source,{loader:'tsx',format:'cjs'}).code,{module,exports:module.exports,crypto:webcrypto,window:h.window,document:{body:{}},
     require:name=>{
       if(name==='react')return h.React;if(name==='react-dom')return {createPortal:element=>element};
-      if(name==='lucide-react')return Object.fromEntries(['ChevronRight','Copy','Palette','RotateCw','Square'].map(name=>[name,name]));
+      if(name==='lucide-react')return Object.fromEntries(['ChevronRight','Copy','Palette','RotateCw','Square','PanelLeftClose','PanelLeftOpen','Ungroup','LoaderCircle'].map(name=>[name,name]));
       if(name.endsWith('useWorkspaceStore'))return {useWorkspaceStore:store};
       if(name.endsWith('useUIStore'))return {useUIStore:{getState:()=>({showToast:(...args)=>toasts.push(args)})}};
       if(name.endsWith('codexWriterIdentity'))return {requireCodexSurfaceSessionId:async()=>{throw Error('unexpected codex lookup');}};
@@ -83,13 +85,14 @@ test('actual button handlers use captured cross-namespace targets for window/not
   const f=menuFixture(),controls=all(f.render()).find(node=>node.type===f.mock.TabNotificationControls);
   controls.props.onOnce(true);await tick();assert.deepEqual(f.calls.slice(0,2),[['once','P','a',true],['once','Q','b',true]]);f.h.dispose();
 });
-test('actual color submenu disables mixed membership; exact selection commits only through the old organization owner',async()=>{
+test('actual color submenu uses the old owner; one-group plus free switches to explicit Add',async()=>{
   const f=menuFixture();let tree=f.render();button(tree,'group-color').props.onMouseEnter();tree=f.render();
   const picker=all(tree).find(node=>node.type===f.mock.PaneStripGroupColorPicker);assert.ok(picker);
   assert.equal(f.calls.length,0);picker.props.onCommit('#abcdef');await tick();
   assert.deepEqual(f.calls.slice(0,2),[['color',['a','b'],'#abcdef'],['save']]);
   f.state.spaces[0].stripColorGroups={version:1,revision:1,groups:[{id:'g',revision:1,color:'#123456',tabIds:['a']}]};
-  assert.equal(button(f.render(),'group-color').props.disabled,true);f.h.dispose();
+  tree=f.render();assert.equal(button(tree,'group-color'),undefined);
+  assert.equal(button(tree,'group-add').props.disabled,false);f.h.dispose();
 });
 test('actual collapsed representative exposes group toggle/color settings without broadening single-target runtime actions',async()=>{
   const f=menuFixture({colorOnly:true});f.state.spaces[0].stripColorGroups={version:1,revision:1,
@@ -113,6 +116,52 @@ test('actual color flyout remains mounted while its one save awaits ACK, then be
   picker=all(tree).find(node=>node.type===f.mock.PaneStripGroupColorPicker);assert.ok(picker);
   assert.equal(picker.props.disabled,false);assert.equal(f.calls.filter(call=>call[0]==='save').length,1);
   f.h.dispose();
+});
+test('collapse/show-all has distinct icons and a single local spinner until its canonical commit settles',async()=>{
+  for(const collapsed of [false,true]) {
+    const f=menuFixture({colorOnly:true});let release,calls=0;
+    f.state.spaces[0].stripColorGroups={version:1,revision:1,groups:[{id:'g',revision:1,color:'#123456',tabIds:['a','b'],collapsed}]};
+    f.state.commitPaneStripGroupPresentation=()=>{calls++;return new Promise(resolve=>release=resolve);};
+    let tree=f.render(),toggle=button(tree,'group-collapse');
+    assert.ok(all(toggle).some(node=>node.type===(collapsed?'PanelLeftOpen':'PanelLeftClose')));
+    toggle.props.onClick(event());toggle.props.onClick(event());tree=f.render();toggle=button(tree,'group-collapse');
+    assert.equal(calls,1);assert.equal(toggle.props['aria-busy'],true);assert.equal(toggle.props.disabled,true);
+    assert.ok(all(toggle).some(node=>node.type==='span'&&node.props.className.includes('noted-infinite-animation')));
+    assert.equal(button(tree,'group-color').props.disabled,true);assert.equal(f.calls.some(call=>call[0]==='save'),false);
+    release({revision:2});await tick();tree=f.render();assert.equal(button(tree,'group-collapse').props['aria-busy'],undefined);
+    assert.equal(f.calls.filter(call=>call[0]==='save').length,1);assert.equal(f.calls.filter(call=>call[0]==='close').length,1);f.h.dispose();
+  }
+});
+test('ungroup is a sibling SVG inside the compact color control, then the same captured selection can create a group again',async()=>{
+  const f=menuFixture({colorOnly:true});f.state.spaces[0].stripColorGroups={version:1,revision:1,
+    groups:[{id:'g',revision:1,color:'#123456',tabIds:['a','b']}]};
+  let release;
+  f.state.commitPaneStripGroupPresentation=(lease,id,options)=>{f.calls.push(['presentation',lease.entries.map(entry=>entry.tabId),id,options]);
+    return new Promise(resolve=>release=()=>{f.state.spaces[0].stripColorGroups={version:1,revision:2,groups:[]};resolve({revision:2});});};
+  let tree=f.render(),wrapper=all(tree).find(node=>node.props?.['data-pane-strip-group-color-control']!==undefined);
+  assert.deepEqual(all(wrapper).filter(node=>node.type==='button').map(node=>node.props['data-tab-context-action']),['group-ungroup','group-color']);
+  assert.equal(all(button(tree,'group-color')).filter(node=>node.type==='button').length,1,'no nested button');
+  assert.equal(button(tree,'group-color').props.className.includes('flex-1'),false,'color hit target fits its content');
+  button(tree,'group-ungroup').props.onClick(event());tree=f.render();assert.equal(button(tree,'group-ungroup').props['aria-busy'],true);
+  assert.deepEqual(f.calls[0].slice(0,3),['presentation',['a','b'],'g']);assert.equal(f.calls[0][3].ungroup,true);
+  release();await tick();tree=f.render();assert.equal(button(tree,'group-ungroup'),undefined);assert.equal(button(tree,'group-color').props.disabled,false);
+  assert.equal(f.calls.some(call=>call[0]==='remove'||call[0]==='close'),false);
+  button(tree,'group-color').props.onMouseEnter();tree=f.render();all(tree).find(node=>node.type===f.mock.PaneStripGroupColorPicker).props.onCommit('#abcdef');await tick();
+  assert.deepEqual(f.calls.find(call=>call[0]==='color'),['color',['a','b'],'#abcdef']);f.h.dispose();
+});
+test('single collapsed representative ungroup uses group-settings targets, while Full keeps its single original target',async()=>{
+  const runtime=[],f=menuFixture({runtimePort:{run:async(action,lease)=>runtime.push([action,lease.entries.map(entry=>entry.tabId)])}});
+  f.state.spaces[0].stripColorGroups={version:1,revision:1,groups:[{id:'g',revision:1,color:'#123456',tabIds:['a','b'],collapsed:true}]};
+  f.lease.entries=f.lease.entries.slice(0,1);let tree=f.render();button(tree,'group-ungroup').props.onClick(event());await tick();
+  assert.deepEqual(f.calls[0].slice(0,3),['presentation',['a','b'],'g']);assert.equal(f.lease.entries.length,1);
+  tree=f.render();button(tree,'close').props.onClick(event());await tick();assert.deepEqual(runtime,[['close',['a']]]);f.h.dispose();
+});
+test('failed group action clears only its loader and keeps the menu available for review',async()=>{
+  const f=menuFixture({colorOnly:true});f.state.spaces[0].stripColorGroups={version:1,revision:1,groups:[{id:'g',revision:1,color:'#123456',tabIds:['a','b']}]};
+  f.state.commitPaneStripGroupPresentation=async()=>{throw Error('strip_group_save_unconfirmed');};
+  button(f.render(),'group-collapse').props.onClick(event());await tick();const tree=f.render();
+  assert.equal(button(tree,'group-collapse').props['aria-busy'],undefined);assert.equal(button(tree,'group-collapse').props.disabled,false);
+  assert.equal(f.calls.some(call=>call[0]==='save'||call[0]==='close'),false);assert.equal(f.toasts.length,1);f.h.dispose();
 });
 test('actual new runtime command invokes one injected captured-set adapter, with no renderer foreach/whole-workflow fallback',async()=>{
   const calls=[],f=menuFixture({runtimePort:{run:async(action,lease)=>calls.push([action,lease.entries.map(entry=>entry.tabId)])}});
@@ -175,8 +224,7 @@ test('actual chip Cmd/Shift select without activation/removal; selected right-cl
     if(name.endsWith('useUIStore'))return {useUIStore:{getState:()=>({filePreview:null})}};
     if(name.endsWith('chipHoverIntent.mjs'))return {CHIP_HOVER_STYLE};
     if(name.endsWith('paneStripBadgeHover.mjs'))return {createPaneStripBadgeHover};
-    if(name.endsWith('NavigationDwellStroke'))return {__esModule:true,default:'DwellStroke'};
-    if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {currentUIActionId:()=>null,uiPerformancePhaseForAction(){}};
+    if(name.endsWith('uiPerformanceDiagnostics.mjs'))return {captureUIHoverAction:()=>null,currentUIActionId:()=>null,uiPerformancePhaseForAction(){},uiPerformanceCommitForAction(){}};
     if(name.endsWith('taskPlanNavigation')||name.endsWith('tabLinkedFilePreview'))return {};throw Error(name);
   }});
   const props={projectId:'P',tabId:'a',shown:true,paneFocused:false,paneIndex:0,inSplit:true,inStrip:true};

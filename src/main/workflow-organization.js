@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const { startSnapshotPrune } = require('./workflow-snapshot-prune');
 const { orderedWorkflows } = require('../shared/workflow-order.cjs');
-const {mergePaneStripColorGroups,paneStripColorGroupEdits,assertPaneStripGather}=require('../shared/pane-strip-color-groups.cjs');
+const {mergePaneStripColorGroups,paneStripColorGroupEdits,assertPaneStripGather,paneStripLayoutOwner}=require('../shared/pane-strip-color-groups.cjs');
 const {assertPaneStripGroupRelease,paneStripGroupReleases}=require('../shared/pane-strip-group-admission.cjs');
 const {assertPaneStripPair}=require('../shared/pane-strip-pair-guard.cjs');
 const {dragFamily,dragPlacement}=require('../shared/workflow-drag.cjs');
@@ -526,9 +526,50 @@ class WorkflowOrganization {
       return { tabId: request.tabId, registered: true, workflowId, membershipRevision: 1 };
     });
   }
+  /** Explicit Add changes only strip membership/order. Its complete snapshot
+   * must not smuggle a workflow move under that authority. Reuse the catalog
+   * already captured for this transaction; no second native/record census. */
+  assertStripGroupAddSnapshot(request,requested,previous,catalog,edits,releases) {
+    const adds=[...edits.values()].filter(edit=>Object.hasOwn(edit,'add'));
+    if(!adds.length)return;
+    if(adds.length!==1||edits.size!==1||releases.size||request.stripReleaseDeferrals?.length
+      ||requested.size!==previous.length||previous.some(workflow=>!requested.has(workflow.id)))
+      fail('workflow_strip_groups_add_changed');
+    const supplied=Array.isArray(request.tabWorkflowMembership)
+      ?Object.fromEntries(request.tabWorkflowMembership.map(member=>[member.tabId,member])):request.tabWorkflowMembership;
+    for(const tab of catalog) {
+      const proposal=supplied[tab.tabId],member=tab.membership;
+      if(!member||!proposal||typeof proposal!=='object'||Array.isArray(proposal)
+        ||proposal.tabId!==tab.tabId||proposal.workflowId!==member.workflowId||proposal.revision!==member.revision
+        ||proposal.expectedMembershipRevision!==member.revision)fail('workflow_strip_groups_membership_changed');
+    }
+    const edit=adds[0],old=previous.find(workflow=>workflow.id===edit.workflowId);
+    if(!old||paneStripColorGroupsBasis(old.metadata.stripColorGroups)!==edit.basis)fail('workflow_strip_groups_revision_changed');
+    const group=old.metadata.stripColorGroups?.groups.find(value=>value.id===edit.add.groupId);
+    const owner=paneStripLayoutOwner(old.layout,edit.gather.owner);
+    if(!group||!owner)fail('workflow_strip_groups_order_changed');
+    const byId=new Map(catalog.map(tab=>[tab.tabId,tab])),added=new Set(edit.add.tabIds);
+    for(const tabId of [...group.tabIds,...edit.add.tabIds]) {
+      const tab=byId.get(tabId),row=tab?.nativeRow;
+      if(tab?.membership?.workflowId!==edit.workflowId||tab.executionResolved!==true||!row)
+        fail('workflow_strip_groups_membership_changed');
+      // Only a positively archived old member may lack a live owner slot.
+      // An unresolved binding/unknown subject is never an inactive proof.
+      if(row.execution_archived===1) {
+        if(added.has(tabId))fail('workflow_strip_groups_membership_changed');
+        continue;
+      }
+      const namespace=tab.executionSubject?.executionNamespace||tab.executionSubject?.projectId;
+      const matches=owner.slots.filter(slot=>slot.tabId===tabId);
+      if(!id(namespace)||matches.length!==1||matches[0].projectId!==namespace)fail('workflow_strip_groups_order_changed');
+    }
+    return edit.workflowId;
+  }
   commitWorkspace(request) {
     return this.mutate('commitWorkspace', request, generation => {
       if (!Array.isArray(request.spaces) || !request.tabWorkflowMembership || typeof request.tabWorkflowMembership !== 'object') fail('workflow_complete_snapshot_required');
+      // Add is an explicit field edit, not an alternate top-level command.
+      if(Object.hasOwn(request,'add'))fail('workflow_strip_groups_basis_invalid');
       const previous = this.listWorkflows();
       const requested = new Map();
       for (const space of request.spaces) {
@@ -572,6 +613,7 @@ class WorkflowOrganization {
         : request.tabWorkflowMembership;
       const catalog = this.listGlobalTabs();
       if (Object.keys(supplied).length !== catalog.length || catalog.some(tab => !Object.hasOwn(supplied, tab.tabId))) fail('workflow_incomplete_membership_snapshot');
+      const stripGroupAdd=this.assertStripGroupAddSnapshot(request,requested,previous,catalog,stripGroupEdits,stripReleases);
       const newIds = new Set();
       for (const [workflowId, space] of requested) if (!this.getWorkflow(workflowId)) {
         const metadata = clone(space);
@@ -617,6 +659,20 @@ class WorkflowOrganization {
         else if(gathered)proposedLayout.centerStrips={...proposedLayout.centerStrips,[gathered.centerKey]:gathered.slots};
         const foreign = layoutReferences(proposedLayout).filter(ref => this.getMembership(ref.tabId)?.workflowId !== workflowId).map(ref => ref.tabId);
         const layout = removeLayoutTabs(proposedLayout, foreign);
+        if(stripGroupAdd) {
+          // Add owns one live strip, never saved profiles or another window.
+          // Restore just its proved gather when comparing the full existing
+          // placement footprint. Unrelated settings retain normal merging.
+          const unchanged=clone(layout);
+          if(workflowId===stripGroupAdd) {
+            const owner=stripGroupEdits.get(workflowId).gather.owner;
+            const before=paneStripLayoutOwner(old.layout,owner),after=paneStripLayoutOwner(unchanged,owner);
+            if(!before||!after)fail('workflow_strip_groups_order_changed');
+            if(after.pane)after.pane.tabs=before.slots;
+            else unchanged.centerStrips={...unchanged.centerStrips,[after.centerKey]:before.slots};
+          }
+          if(stableJson(dragPlacement(unchanged))!==stableJson(dragPlacement(old.layout)))fail('workflow_strip_groups_order_changed');
+        }
         if(deferredStripReleases.some(value=>value.workflowId===workflowId)
           &&(stableJson(dragPlacement(layout))!==stableJson(dragPlacement(old.layout))
             ||paneStripColorGroupsBasis(stripColorGroups)!==paneStripColorGroupsBasis(old.metadata.stripColorGroups)))
@@ -625,7 +681,12 @@ class WorkflowOrganization {
         if (!old) this.insertWorkflow({ id: workflowId, kind: 'user', revision: 1, metadata, layout });
         else {
           this.validateLayout(workflowId, layout);
-          this.assertLayoutPair(old,layout,stripColorGroups);
+          // Exact Add has proved raw append + coherent live gather above.
+          // An unchanged saved profile may already place the new member away
+          // from the group. Do not rewrite it or grant any placement change:
+          // compare its old layout with the same newly accepted membership.
+          this.assertLayoutPair(workflowId===stripGroupAdd
+            ?{...old,metadata:{...old.metadata,stripColorGroups}}:old,layout,stripColorGroups);
           if (stableJson(old.metadata) !== stableJson(metadata) || stableJson(old.layout) !== stableJson(layout)) {
             this.journal(generation, { reason: 'snapshot-workflow', before: old });
             this.db.prepare('UPDATE workflow_org_workflows SET metadata_json=?,layout_json=?,revision=? WHERE workflow_id=?')

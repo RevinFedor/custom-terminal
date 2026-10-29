@@ -1,6 +1,9 @@
-import React, { memo, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useHistoryAgentCatalogGroupLive } from './HistoryAgentCatalogLiveness';
 import { historyGroupCaptionIdentity, resolveHistoryGroupCaption, previousHistoryGroupCaption } from '../../utils/historyGroupCaption.mjs';
-import { historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
+import { historyGroupRecordTimeAttributes, historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
+import { historyLivePresentationKey } from '../../utils/historyLiveProjection.mjs';
+import { boundedHistoryWorkMarkdown, boundedHistoryWorkToolPart } from '../../utils/historyWorkPreview.mjs';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import {
   FAMILY_LABELS,
@@ -257,6 +260,53 @@ const historyGroupHeaderText = (segments: HistoryGroupHeaderSegment[]): string =
   }).join(' · ')
 );
 
+export const HistoryResponseWorkHeader = memo(({ children, expanded, onToggle, recordTimeAttributes = {} }: {
+  children: React.ReactNode;
+  expanded: boolean;
+  onToggle: () => void;
+  recordTimeAttributes?: Record<string, string>;
+}) => (
+  <div className="hp-history-response-work-head" role="button" tabIndex={0}
+    aria-expanded={expanded} {...recordTimeAttributes} onClick={onToggle} onKeyDown={(event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggle(); }
+    }}>
+    {children}
+    {expanded ? <ChevronDown size={12} aria-hidden="true" /> : <ChevronRight size={12} aria-hidden="true" />}
+  </div>
+));
+
+/** One bounded line; once a commentary exists, later tool calls never replace it. */
+export const HistoryResponseWorkPreview = memo(({ group }: { group: any }) => {
+  const entry = group?.previewEntry, fact = group?.previewFact;
+  if (!entry && !fact) return null;
+  const hasBody = !!entry && typeof entry.content === 'string' && entry.content.length > 0;
+  const pending = !!entry && !hasBody && (entry.rowStub === true || entry.hasContent === true);
+  const text = entry ? boundedHistoryWorkMarkdown(entry.content, entry.previewTruncated === true) : '';
+  if (entry && !text && !pending) return null;
+  let toolLabel = '';
+  if (!entry && fact) {
+    const family = boundedHistoryWorkToolPart(fact.family) || 'other';
+    const title = historyGroupFamilyLabel(family);
+    const server = family === 'mcp' ? mcpServerDisplayLabel(boundedHistoryWorkToolPart(fact.mcpServer) || 'mcp') : '';
+    const detail = family === 'mcp'
+      ? [server.toLowerCase() === 'mcp' ? '' : server,
+        boundedHistoryWorkToolPart(fact.mcpMethod).replace(/_/g, ' ')].filter(Boolean).join(' · ')
+      : family === 'read' || family === 'edit' || family === 'search'
+        ? boundedHistoryWorkToolPart(fact.targetLabel || fact.subject)
+        : family === 'run' || family === 'git' ? boundedHistoryWorkToolPart(fact.bashWord) : '';
+    toolLabel = [title, detail].filter(Boolean).join(' · ');
+  }
+  return <div className="hp-history-work-preview" data-history-work-preview={entry ? 'text' : 'tool'}
+    {...historyRecordTimeAttributes(group.previewRecordTime,
+      group.key + ':work-preview:' + (entry?.uuid || 'tool'), entry ? 'text' : 'tool')}>
+    <span className="hp-history-work-preview-branch" aria-hidden="true">└</span>
+    <div className="hp-history-work-preview-text" data-history-work-preview-error={!entry && fact?.isError ? '1' : undefined}>
+      {pending ? <span aria-label="Загрузка комментария">…</span>
+        : entry ? <Markdown text={text} preview /> : toolLabel}
+    </div>
+  </div>;
+});
+
 /** Presentation-only group header shared by the primary History and nested
  * subagent transcripts. It owns no scroll, persistence or virtualization. */
 export const HistoryCollapsedGroupRow = memo(({
@@ -268,6 +318,7 @@ export const HistoryCollapsedGroupRow = memo(({
   captionOwnerKey = '',
   captionIdentity = null,
   onCaptionChange,
+  onCaptionContextMenu,
 }: {
   group: HistoryPresentationGroup;
   expanded: boolean;
@@ -278,6 +329,7 @@ export const HistoryCollapsedGroupRow = memo(({
   captionOwnerKey?: string;
   captionIdentity?: string | null;
   onCaptionChange?: (groupKey: string, next: any, previous: any, anchor: HTMLElement | null, commit: () => void) => void;
+  onCaptionContextMenu?: (event: React.MouseEvent<HTMLDivElement>, entry: any) => void;
 }) => {
   const captionScope = captionOwnerKey + '|' + group.key;
   const [captionChoice, setCaptionChoice] = useState<{ scope: string; identity: string | null } | null>(null);
@@ -289,6 +341,7 @@ export const HistoryCollapsedGroupRow = memo(({
   if (captionChoice && captionChoice.scope !== captionScope) setCaptionChoice(null);
   const choice = captionChoice?.scope === captionScope ? captionChoice.identity : captionIdentity;
   const selected = resolveHistoryGroupCaption(captions, choice);
+  const groupTime = useMemo(() => historyGroupRecordTimeAttributes(group.entries, group.key), [group.entries, group.key]);
   const cycleCaption = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault(); event.stopPropagation();
     if (selected.count < 2) return;
@@ -297,28 +350,33 @@ export const HistoryCollapsedGroupRow = memo(({
     if (onCaptionChange) onCaptionChange(group.key, next.entry, selected.entry, captionAnchor.current, commit);
     else commit();
   };
+  const inFlight = group.familyKey !== 'research' && isTurnBusy && group.facts.some(fact => fact.inFlight === true);
+  const catalogLive = useHistoryAgentCatalogGroupLive(group.entries,
+    () => group.entries.some(entry => liveBackgroundUuids.has(entry.uuid)),
+    group.familyKey !== 'research' && !inFlight,
+    () => group.entries.some(entry => { const uuid = entry.uuid; return typeof uuid !== 'string' && liveBackgroundUuids.has(uuid); }));
   if (group.familyKey === 'research') return <ConversationMessage layout="user"
     className="hp-history-research-group" data-history-research-group-expanded={expanded ? '1' : undefined}
     contentClassName="hp-history-research-group-bubble">
     <button type="button" className="hp-history-research-group-toggle" aria-expanded={expanded}
+      {...groupTime}
       aria-label={`${expanded ? 'Collapse' : 'Expand'} Research group: ${group.entries.length} results${group.errorCount ? ', ' + group.errorCount + ' failed' : ''}`}
       onClick={onToggle}>
       <span className="hp-history-research-group-icon">{toolIcon('Bash', 14, 'group')}</span>
       <span>Research <span className="hp-history-research-group-count">×{group.entries.length}</span></span>
       {group.errorCount > 0 && <span className="hp-history-research-group-errors">· {group.errorCount} failed</span>}
       <span className="hp-history-research-group-flex" />
-      {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+      {expanded ? <ChevronDown size={11} className="hp-history-group-chevron" /> : <ChevronRight size={11} className="hp-history-group-chevron" />}
     </button>
   </ConversationMessage>;
-  const live = (isTurnBusy && group.facts.some((fact) => fact.inFlight === true))
-    || group.entries.some((entry) => liveBackgroundUuids.has(entry.uuid));
+  const live = inFlight || catalogLive;
   const inner = group.level === 2;
-  const { segments, digest } = inner
+  const { segments } = inner
     ? historyInnerGroupHeaderData(group)
     : historyGroupHeaderData(group);
   const headerText = historyGroupHeaderText(segments);
   const captionEntry = selected.entry;
-  const captionPending = captionEntry?.rowStub === true;
+  const captionPending = captionEntry?.rowStub === true && captionEntry?.captionTextComplete !== true;
   const caption = captionEntry && typeof captionEntry.content === 'string' && captionEntry.content.trim()
     ? captionEntry.content
     : '';
@@ -328,10 +386,20 @@ export const HistoryCollapsedGroupRow = memo(({
       data-history-group-live={live ? '1' : undefined}
       data-history-group-level={inner ? '2' : '1'}
       data-history-docs-kind={group.docsKind || undefined}
+      onContextMenu={onCaptionContextMenu && !expanded && captionEntry?.uuid ? event => {
+        if (event.defaultPrevented) return;
+        // The full group width owns the caption's vertical band, including
+        // its horizontal padding. Do not give the tool header this text's ID.
+        const rect = captionAnchor.current?.getBoundingClientRect();
+        if (rect && event.clientY >= rect.top && event.clientY < rect.bottom) {
+          return onCaptionContextMenu(event, captionEntry);
+        }
+      } : undefined}
     >
       <div className="hp-history-group-head">
         <div
           className="hp-history-group-head-inner"
+          {...groupTime}
           role="button"
           tabIndex={0}
           aria-expanded={expanded}
@@ -376,11 +444,11 @@ export const HistoryCollapsedGroupRow = memo(({
             })}
           </span>
           {expanded
-            ? <ChevronDown size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />
-            : <ChevronRight size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />}
+            ? <ChevronDown size={11} className="hp-history-group-chevron" style={{ color: '#6f6d68', flexShrink: 0 }} />
+            : <ChevronRight size={11} className="hp-history-group-chevron" style={{ color: '#6f6d68', flexShrink: 0 }} />}
         </div>
       </div>
-      {!expanded && (caption || captionPending || digest) && (
+      {!expanded && (caption || captionPending) && (
         <div className="hp-history-group-detail" ref={captionAnchor} data-history-caption-uuid={captionEntry?.uuid}>
           <span className="hp-history-caption-gutter" style={{ width: selected.count > 1 ? Math.max(2, String(selected.count).length) + 'ch' : undefined }}>
             <span aria-hidden>└</span>
@@ -393,7 +461,7 @@ export const HistoryCollapsedGroupRow = memo(({
           </span>
           <div className="hp-history-caption-text" {...(caption ? historyRecordTimeAttributes(captionEntry?.recordTime,
             captionEntry?.uuid + ':caption', 'text') : {})}>{captionPending ? 'Loading text…'
-              : caption ? <Markdown text={caption} preview /> : digest}</div>
+              : <Markdown text={caption} preview />}</div>
         </div>
       )}
     </div>
@@ -404,11 +472,12 @@ function setHistoryGroupRailHighlight(source: HTMLElement, groupKey: string, hig
   const transcript = source.closest<HTMLElement>('.hp-history-transcript, .hp-history-nested-transcript');
   if (!transcript) return;
   const members = transcript.querySelectorAll<HTMLElement>(
-    '[data-history-group-member], [data-history-subgroup-member]',
+    '[data-history-group-member], [data-history-subgroup-member], [data-history-work-member]',
   );
   for (const member of members) {
     const ownsGroup = member.getAttribute('data-history-group-member') === groupKey
-      || member.getAttribute('data-history-subgroup-member') === groupKey;
+      || member.getAttribute('data-history-subgroup-member') === groupKey
+      || member.getAttribute('data-history-work-member') === groupKey;
     if (!ownsGroup) continue;
     if (highlighted) member.setAttribute('data-history-group-rail-hot', '1');
     else member.removeAttribute('data-history-group-rail-hot');
@@ -494,6 +563,61 @@ export const HistoryGroupRail = ({
     }}
   />
 );
+
+export const HistoryResponseWorkMember = ({ groupKey, onCollapse, children }: {
+  groupKey: string;
+  onCollapse: (groupKey: string, source?: 'foot' | 'rail') => void;
+  children: React.ReactNode;
+}) => (
+  <div className="hp-history-response-member" data-history-work-member={groupKey}>
+    <HistoryGroupRail groupKey={groupKey} onCollapse={onCollapse} title="Свернуть работу" />
+    {children}
+  </div>
+);
+
+/** Text and several calls sometimes share one physical row. This local
+ * second-level group keeps that UUID intact; exact tool IDs own its state. */
+export const HistoryCompositeWorkActions = memo(({ entry, facts, store, children, onReveal,
+  liveBackgroundUuids, isTurnBusy }: {
+  entry: any;
+  facts: HistoryPresentationFact[];
+  store: { isOpen: (ids: string[]) => boolean; set: (ids: string[], value: boolean) => void;
+    acknowledge: (ids: string[]) => void; subscribe: (ids: string[], listener: () => void) => () => void };
+  children: React.ReactNode;
+  onReveal: (anchor: HTMLElement | null, opening: boolean, commit: () => void,
+    source?: 'header' | 'rail' | 'foot') => void;
+  liveBackgroundUuids: ReadonlySet<string>;
+  isTurnBusy: boolean;
+}) => {
+  const ids = useMemo(() => facts.flatMap(fact => [
+    JSON.stringify(['presentation', historyLivePresentationKey(entry), String(fact.toolUseId)]),
+    JSON.stringify([entry.uuid, String(fact.toolUseId)]),
+  ]), [entry, facts]);
+  const subscribe = useCallback((listener: () => void) => store.subscribe(ids, listener), [store, ids]);
+  const getSnapshot = useCallback(() => store.isOpen(ids), [store, ids]);
+  const expanded = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  useLayoutEffect(() => { if (expanded) store.acknowledge(ids); }, [expanded, ids, store]);
+  const anchor = useRef<HTMLDivElement>(null);
+  const group = useMemo(() => ({ kind: 'group', key: 'inline:' + ids[0], level: 1,
+    familyKey: 'work', entries: [entry], facts, captionEntries: [],
+    errorCount: facts.filter(fact => fact.isError).length }), [entry, facts, ids]);
+  const toggle = useCallback((opening: boolean, source: 'header' | 'rail' | 'foot' = 'header') => {
+    onReveal(anchor.current, opening, () => store.set(ids, opening), source);
+  }, [ids, onReveal, store]);
+  return <>
+    <div ref={anchor} data-history-group={group.key}>
+      <HistoryCollapsedGroupRow group={group} expanded={expanded} onToggle={() => toggle(!expanded)}
+        liveBackgroundUuids={liveBackgroundUuids} isTurnBusy={isTurnBusy} />
+    </div>
+    {expanded && <div className="hp-history-group-member" data-history-group-member={group.key}>
+      <HistoryGroupRail groupKey={group.key} onCollapse={(_key, source) => toggle(false, source || 'rail')}
+        nested title="Свернуть вызовы" />
+      {children}
+      <HistoryGroupFoot groupKey={group.key} onCollapse={(_key, source) => toggle(false, source || 'foot')}
+        title="Свернуть вызовы" />
+    </div>}
+  </>;
+});
 
 export interface HistoryTranscriptStep {
   id?: string;
@@ -981,6 +1105,9 @@ export const HistoryTranscriptPresentation = memo(({
               isTurnBusy={isTurnBusy}
               isLastUnit={index === units.length - 1}
               onToggle={() => toggleGroup(group.key)}
+              onCaptionContextMenu={onMessageContextMenu ? (event, entry) => {
+                if (entry.transcriptStep) onMessageContextMenu(event, entry.transcriptStep);
+              } : undefined}
             />
           );
           if (!group.parentGroup) return <React.Fragment key={group.key}>{header}</React.Fragment>;

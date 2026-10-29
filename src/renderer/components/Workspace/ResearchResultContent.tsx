@@ -6,7 +6,7 @@ import './ResearchResultContent.css';
 /** Host owns disclosure, raw Copy and saved-job navigation. No new reader or
  * lifecycle here; the bounded body follows the existing MCP output metrics. */
 export function ResearchResultContent({ result, open, onToggle, title, model, sourceAction, browserAction, onCopy, copied, forceExpanded = false }: {
-  result: { previewText: string; displayText: string; summary: string | null; code: string | null; failed?: boolean };
+  result: { previewText: string; displayText: string; summary: string | null; code: string | null; failed?: boolean; fileWarning?: string };
   open: boolean; onToggle: () => void; title?: string | null; model?: string | null; sourceAction?: React.ReactNode;
   browserAction?: React.ReactNode;
   onCopy: (event: React.MouseEvent<HTMLButtonElement>) => void; copied: boolean; forceExpanded?: boolean;
@@ -40,6 +40,7 @@ export function ResearchResultContent({ result, open, onToggle, title, model, so
       </div>
     </div>
     {open ? <div className="hp-research-result-body" data-research-full tabIndex={0} aria-label="Research answer">
+      {result.fileWarning && <div data-research-file-warning role="status">{result.fileWarning}</div>}
       {result.summary && <div className="hp-research-result-format">{result.summary}</div>}
       {typeof result.code === 'string' ? <pre className="cb-generic-out hp-research-result-code">{result.code}</pre>
         : <Markdown text={result.displayText} />}

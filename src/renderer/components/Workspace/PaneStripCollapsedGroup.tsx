@@ -10,12 +10,13 @@ import type {StripEntry} from './PaneTabStrip';
 import type {PaneStripSelectionLease} from './PaneStripSelection';
 import './PaneStripCollapsedGroup.css';
 import PaneStripGroupOutline from './PaneStripGroupOutline';
-import {currentUIActionId,uiDiagnosticAbsNow,uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
+import {captureUIHoverAction,currentUIActionId,uiDiagnosticAbsNow,uiPerformancePhaseForAction,uiPerformanceCommitForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
 import {horizontalDragAutoScrollDelta} from '../../utils/horizontalDragGeometry.mjs';
 import {paneStripHoverInside,paneStripHoverMenu} from '../../utils/paneStripHoverScope.mjs';
+import {TABBAR_PANEL_BG} from './tabChrome';
 
 export type PaneStripGroupControl={groupId:string;revision:number;available:boolean;count:number;color:string;open:boolean;busy:boolean;unread:boolean;
-  toggle:()=>void;hover:()=>void;selected:(tabId:string,activate:()=>Promise<boolean>,onActivated?:()=>void)=>void};
+  toggle:()=>void;hover:(diagnosticActionId?:string|null)=>void;selected:(tabId:string,activate:()=>Promise<boolean>,onActivated?:()=>void)=>void};
 type Props={group:{id:string;color:string;tabIds:string[];revision:number;collapsed?:boolean};entries:StripEntry[];
   representative:string;workflowId:string;windowId:string|null;paneIndex:number|null;rowGap:number;presented:boolean;
   membershipPreview?:boolean;
@@ -48,6 +49,8 @@ export default function PaneStripCollapsedGroup(props:Props) {
       useWorkspaceStore.setState({activeTabNavigationIntent:null});
   };
   const close=(revoke=false)=>{epoch.current++;scopeRef.current=null;
+    // Revoke the measured OPEN receipt synchronously, before React removes it.
+    if(root.current){delete root.current.dataset.groupReleaseLayout;delete root.current.dataset.groupReleaseOrder;}
     const selection=selectionRef.current;selectionRef.current=null;cancelNavigation(selection);
     setSelecting(false);setRequest(null);setView(null);
     // Closing on a Meta tap does not move the pointer. Keep this hovered owner
@@ -82,7 +85,7 @@ export default function PaneStripCollapsedGroup(props:Props) {
       }};
     scope.lease=lease;return scope;
   };
-  const open=(entry:'click'|'hover',toggle=true)=>{
+  const open=(entry:'click'|'hover',toggle=true,diagnosticActionId?:string|null)=>{
     if(!latest.current.presented)return;
     const current=viewRef.current||requestRef.current;
     if(current) {
@@ -97,7 +100,7 @@ export default function PaneStripCollapsedGroup(props:Props) {
     }
     const mode=paneStripGroupOpenMode(entry,useUIStore.getState().paneStripCloseOnClick);
     interaction.current={mode,inside:true,dragging:latest.current.dragging,waitForReentry:false};
-    const actionId=currentUIActionId();uiPerformancePhaseForAction(actionId,'strip-group:open-request',{memberCount:latest.current.entries.length});
+    const actionId=diagnosticActionId??currentUIActionId();uiPerformancePhaseForAction(actionId,'strip-group:open-request',{memberCount:latest.current.entries.length});
     epoch.current++;
     try {
       const scope=captureScope();scopeRef.current=scope;
@@ -156,11 +159,14 @@ export default function PaneStripCollapsedGroup(props:Props) {
     }).finally(()=>{if(selectionRef.current===intent){selectionRef.current=null;setSelecting(false);
       if(!viewRef.current&&!requestRef.current)scopeRef.current=null;}});
   };
-  const toggleRef=useRef(()=>{});toggleRef.current=()=>open('hover');
+  const toggleRef=useRef<(event?:KeyboardEvent,heldMs?:number|null)=>void>(()=>{});
+  toggleRef.current=(event,heldMs)=>{const action=event?captureUIHoverAction(event):null;
+    if(action)uiPerformancePhaseForAction(action.id,'strip-group:meta-release',{heldMs,holdMeasured:heldMs!=null});
+    open('hover',true,action?.id);};
   const isInside=(event:{target:EventTarget|null;clientX?:number;clientY?:number})=>paneStripHoverInside({
     root:root.current,target:event.target,memberIds:latest.current.entries.map(entry=>entry.tabId),boxes:boxes.current,
     open:!!viewRef.current||!!requestRef.current,x:event.clientX,y:event.clientY});
-  const ownMeta=()=>{metaRelease.current=ownPaneStripGroupMetaHover(root.current,()=>toggleRef.current(),window,event=>{
+  const ownMeta=()=>{metaRelease.current=ownPaneStripGroupMetaHover(root.current,(event:KeyboardEvent,heldMs:number|null)=>toggleRef.current(event,heldMs),window,event=>{
     const inside=isInside(event);hovered.current=inside;return inside;
   });};
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;epoch.current++;metaRelease.current?.();
@@ -257,13 +263,32 @@ export default function PaneStripCollapsedGroup(props:Props) {
     setView({...view,order:ids,offsets,...(geometry?{anchorId:representative,anchorOffset:geometry.anchorOffset,direction:geometry.direction,overflow:geometry.overflow}:{})});
   },[membersKey,representative,view?.selectionRevision]);
   useLayoutEffect(()=>{
-    const node=root.current;if(!node||!view)return;
+    const node=root.current;if(!node)return;
+    if(!view){delete node.dataset.groupReleaseLayout;delete node.dataset.groupReleaseOrder;return;}
     boxes.current=Array.from(node.querySelectorAll<HTMLElement>('[data-strip-item]'),chip=>chip.getBoundingClientRect());
+    node.dataset.groupReleaseOrder=JSON.stringify(view.order);
+    // Read-only release metadata from THIS existing measurement. Order and
+    // sibling X offsets may change in our preview; owner, anchor, orientation
+    // and member sizes may not. No new rectangles, reader or observer.
+    const anchor=boxes.current[entries.findIndex(entry=>entry.tabId===representative)];
+    const metrics=entries.map((entry,index)=>{const box=boxes.current[index];return box&&anchor
+      ?[entry.projectId,entry.tabId,box.right-box.left,box.bottom-box.top,box.top-anchor.top]:null;});
+    if(anchor&&[anchor.left,anchor.top,anchor.right,anchor.bottom].every(Number.isFinite)
+      &&metrics.every(item=>item&&item.slice(2).every(Number.isFinite)&&Number(item[2])>0&&Number(item[3])>0))
+      node.dataset.groupReleaseLayout=JSON.stringify([
+      epoch.current,workflowId,windowId,paneIndex,group.id,view.definitionRevision,representative,
+      view.selectedFirst===true,view.direction||'right',layoutKey,rowGap,view.anchorOffset,
+      anchor.left,anchor.top,anchor.right-anchor.left,anchor.bottom-anchor.top,
+      metrics.sort((a,b)=>String(a![1]).localeCompare(String(b![1]))),
+    ]);
+    else delete node.dataset.groupReleaseLayout;
     const badge=node.querySelector('[data-pane-strip-group-count]');if(badge)boxes.current.push(badge.getBoundingClientRect());
-    uiPerformancePhaseForAction(view.diagnostic?.actionId,'strip-group:layout',{durationMs:uiDiagnosticAbsNow()-view.diagnostic?.startAbs,
-      rectangleCount:boxes.current.length,memberCount:entries.length});
+    const fields={durationMs:uiDiagnosticAbsNow()-view.diagnostic?.startAbs,rectangleCount:boxes.current.length,memberCount:entries.length};
+    if(view.diagnostic&&!view.diagnostic.layoutCommitted){view.diagnostic.layoutCommitted=true;
+      uiPerformanceCommitForAction(view.diagnostic.actionId,'strip-group:layout',fields);}
+    else uiPerformancePhaseForAction(view.diagnostic?.actionId,'strip-group:layout',fields);
     onPresentation();
-  },[view,membersKey,layoutKey]);
+  },[view,membersKey,layoutKey,rowGap,representative]);
   useEffect(()=>{
     if(!view&&!request&&!selecting)return;
     const node=root.current;
@@ -337,7 +362,11 @@ export default function PaneStripCollapsedGroup(props:Props) {
       ...(geometry?{anchorId:representative,anchorOffset:geometry.anchorOffset,direction:geometry.direction,overflow:geometry.overflow}:{})});
   };
   const control:PaneStripGroupControl={groupId:group.id,revision:group.revision,available:presented,count:entries.length-1,color:group.color,open:visible,busy:preparing||selecting,unread,
-    toggle:()=>open('click'),hover:()=>open('hover',false),selected:select};
+    toggle:()=>open('click'),hover:actionId=>open('hover',false,actionId),selected:select};
+  // The existing OPEN geometry also covers the gaps. This backdrop neither
+  // owns a flow slot nor adds hit targets or another layout observation.
+  const openLeft=visible?Math.min(...view.offsets.values()):0;
+  const openRight=visible?Math.max(...entries.map(entry=>(view.offsets.get(entry.tabId)||0)+(widths.current.get(entry.tabId)||0))):0;
   // Every group keeps exactly one flow slot, even while its other cards are
   // absolute. The current card is the same DOM node before/after OPEN.
   return <span ref={root} className="pane-strip-collapsed-group" data-pane-strip-collapsed-group={group.id}
@@ -350,6 +379,8 @@ export default function PaneStripCollapsedGroup(props:Props) {
     onMouseLeave={event=>{hovered.current=paneStripHoverMenu(event.relatedTarget,latest.current.entries.map(entry=>entry.tabId)).owned;
       if(!viewRef.current&&!hovered.current){metaRelease.current?.();metaRelease.current=null;}}}
     onDoubleClick={event=>event.stopPropagation()}>
+    {visible&&<span data-pane-strip-group-backdrop aria-hidden="true" className="pane-strip-group-backdrop"
+      style={{left:openLeft,width:openRight-openLeft,bottom:-rowGap,background:TABBAR_PANEL_BG}}/>}
     {entries.map(entry=>{
       const isRepresentative=entry.tabId===representative,left=view?.offsets.get(entry.tabId)||0;
       return <span key={entry.tabId} data-strip-item data-strip-tab-id={entry.tabId}

@@ -71,6 +71,7 @@ curl --fail --silent --show-error \
 | `GET /api/terminal-tabs/inspect?tabIds=[...]` | До8 точных вкладок: passive runtime/turn, own background, jobs/delivery; optional cached final |
 | `POST /api/terminal-tabs/:tabId/send` | Send в выбранную сессию |
 | `GET /api/terminal-tabs/:tabId/send-receipts` | Прежняя доставка без повторного Enter |
+| `GET /api/orchestrations/:runId/source` | SOURCE25Oct: только имя/ID исходной вкладки exact external Research; без status reconciliation, capability `researchSourceLabel.version=1` |
 | `GET /api/terminal-tabs/:tabId/history` | Structured history snapshot/delta |
 | `POST /api/terminal-tabs/:tabId/interrupt` | Прервать текущий ответ |
 | `POST /api/terminal-tabs/:tabId/stop` | Остановить процесс, сохраняя разговор |

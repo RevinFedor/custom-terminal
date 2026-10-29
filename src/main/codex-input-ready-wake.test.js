@@ -89,16 +89,19 @@ test('a pending settings intent reconciles on the same ready edge without a rend
   assert.ok(handler, 'top-level readiness owner, not a temporary operation listener');
   const events = new EventEmitter();
   const calls = [];
+  const fastCalls = [];
   vm.runInNewContext(handler.getText(ast), {
     ipcMain: events,
     historyMutationInput: { notify: async () => {} },
     scheduleCodexModelEffortIntentReconcile: (...args) => calls.push(args),
+    scheduleCodexFastIntentReconcile: (...args) => fastCalls.push(args),
   });
   events.emit('agent:readiness-changed-internal', null, { tabId: 'T', toolType: 'codex', status: 'waiting' });
   events.emit('agent:readiness-changed-internal', null, { tabId: 'T', toolType: 'claude', status: 'ready' });
   assert.equal(calls.length, 0);
   events.emit('agent:readiness-changed-internal', null, { tabId: 'T', toolType: 'codex', status: 'ready', source: 'codex-input-control-frame' });
   assert.deepEqual(calls, [['T', 'input-ready:codex-input-control-frame']]);
+  assert.deepEqual(fastCalls, [['T', 'input-ready:codex-input-control-frame']]);
 });
 
 test('committed picker release publishes readiness once, after the initialized composer, on the same lifecycle', () => {

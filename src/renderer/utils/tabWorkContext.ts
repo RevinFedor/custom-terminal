@@ -92,17 +92,18 @@ export function useTabWorkContext(tabId: string) {
   );
 }
 
-export async function prepareTabWorkContext(tabId: string, handoffId: string, prompt: string) {
+export async function prepareTabWorkContext(tabId: string, handoffId: string, prompt: string,
+  authoringTransport?: { sourceHash: string; imageRanges: Array<{ start: number; end: number; path: string }> }) {
   let result;
-  try { result = await ipcRenderer.invoke('tab-work-context:prepare', { tabId, handoffId, prompt }); }
+  try { result = await ipcRenderer.invoke('tab-work-context:prepare', { tabId, handoffId, prompt, authoringTransport }); }
   catch (error) {
     // A dev renderer can reload before its old main process. That main cannot
     // own context updates yet, so ordinary pre-feature sends stay available.
-    if (isLegacyBackend(error)) return { prompt, prefix: '' };
+    if (isLegacyBackend(error)) return { prompt, prefix: '', authoringTransport };
     throw error;
   }
   if (result?.success !== true) throw new Error(result?.error || 'Could not prepare working context');
-  return result as { prompt: string; prefix: string };
+  return result as { prompt: string; prefix: string; authoringTransport?: typeof authoringTransport };
 }
 
 export async function settleTabWorkContext(tabId: string, handoffId: string | undefined, result: any) {

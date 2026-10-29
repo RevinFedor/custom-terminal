@@ -25,6 +25,7 @@ function fixture() {
     aiStoppingTabs: new Map(), agentLaunchIntentSenders: new Set(), agentLaunchPreparations: registry,
     resolveAuthoritativeTabProjectId: () => 'P', agentSendRequestTargetFailure: () => null,
     AGENT_SEND_DURABLE_STATES: { IN_FLIGHT: 'in-flight' },
+    readAgentSendPreparation: require('./agent-send-preparation').readAgentSendPreparation,
     agentSendReceiptStore: { get: () => ({ tabId: 'T', provider: 'codex', attemptId: 'A', state: 'in-flight' }),
       isDeliveryCancelled: () => false },
     projectManager: { db: { db: { prepare: () => ({ all: () => [
@@ -36,6 +37,57 @@ function fixture() {
   return { env, sender, term, registry, request, capture: () => env.captureAgentLaunchFence('T'),
     begin: input => env.beginAgentLaunchIntent({ sender }, input) };
 }
+
+// Keep the real target/continuation guards in this launch composition. The
+// normal fixture above isolates intent ownership; replacing this guard with
+// a null stub hid the no-Send AutoResume failure on 26Oct.
+function targetControlFixture() {
+  const f = fixture();
+  Object.assign(f.env, {
+    agentSendTargetPreconditionFailure: require('./agent-send-target-precondition').agentSendTargetPreconditionFailure,
+    readAgentSendDestinationAtWriteBoundary: () => ({ toolType: 'codex', sessionId: 'S' }),
+  });
+  const targetNames = ['agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure', 'agentSendContinuationInputFailure'];
+  vm.runInContext(targetNames.map(name => ast.statements.find(n => ts.isFunctionDeclaration(n)
+    && n.name?.text === name).getText(ast)).join('\n'), f.env);
+  return f;
+}
+
+for (const expectedTarget of [undefined, { toolType: 'codex', sessionId: 'S' }]) {
+  test('actual ordinary Resume begins without a Send receipt; expected target ' + !!expectedTarget, () => {
+    const f = targetControlFixture();
+    f.env.agentSendReceiptStore.get = () => assert.fail('ordinary Resume must not read a Send receipt');
+    const result = f.begin({ ...f.request, launchFence: f.capture(), expectedTarget });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(f.registry.getIntent(result.launchIntent.token).writeState, 'none');
+    assert.equal(f.registry.getIntent(result.launchIntent.token).revoked, false);
+  });
+}
+
+for (const request of [{}, { sendOperationKey: 'O' }, { sendOperationKey: 'O', sendAttemptId: 'A' }]) {
+  test('actual target guards tolerate absent receipt at ' + JSON.stringify(request), () => {
+    const f = targetControlFixture(); f.env.agentSendReceiptStore.get = () => null;
+    assert.equal(f.env.agentSendRequestTargetFailure('T', 'codex', request), null);
+    assert.equal(f.env.agentSendContinuationInputFailure('T', request), null);
+  });
+}
+
+test('receipt-free launch still rejects an explicitly foreign target without a write', () => {
+  const f = targetControlFixture();
+  const result = f.begin({ ...f.request, launchFence: f.capture(), expectedTarget: { toolType: 'claude', sessionId: 'foreign' } });
+  assert.equal(result.success, false); assert.equal(result.code, 'agent_send_target_changed');
+  assert.equal(result.launchWritten, false);
+});
+
+test('receipt-free target control retains Stop cancellation and never replaces its captured fence', () => {
+  const f = targetControlFixture(), original = f.capture();
+  f.env.terminalStopRevisions.set(f.term, 1);
+  const result = f.begin({ ...f.request, launchFence: original, expectedTarget: { toolType: 'codex', sessionId: 'S' } });
+  assert.equal(result.success, false); assert.equal(result.code, 'agent_launch_cancelled');
+  const retired = f.registry.getIntentByIdentity({ ...f.request, senderId: 1 });
+  assert.equal(retired.revoked, true); assert.equal(retired.finished, true); assert.equal(retired.attempt, 0);
+  assert.equal(result.launchWritten, null, 'the unchanged retirement contract retains uncertainty');
+});
 
 test('Stop before FIRST begin refuses the original physical fence with the revocation event completely absent', () => {
   const f = fixture(); const original = f.capture();

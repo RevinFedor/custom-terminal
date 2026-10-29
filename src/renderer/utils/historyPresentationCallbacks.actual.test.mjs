@@ -13,7 +13,16 @@ const file = path.resolve(import.meta.dirname, '../components/Workspace/HistoryP
 const source = fs.readFileSync(file, 'utf8');
 const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 let rangeBody, emptyEffect, convergenceBody, resizeFinishBody;
+const gateNames = new Set(['armHistoryViewportPaintProof', 'historyViewportProofRefusalRef',
+  'consumeHistoryViewportPaintProof', 'publishHistorySurfacePresented']);
+const gateStatements = new Map();
 function walk(node) {
+  if (ts.isVariableStatement(node)) {
+    for (const declaration of node.declarationList.declarations) {
+      const name = declaration.name.getText(tree);
+      if (gateNames.has(name)) { assert(!gateStatements.has(name)); gateStatements.set(name, node.getText(tree)); }
+    }
+  }
   if (ts.isJsxAttribute(node) && node.name.getText(tree) === 'rangeChanged'
     && node.initializer?.expression?.getText(tree).includes('viewportPaintOwner')) rangeBody = node.initializer.expression.getText(tree);
   if (ts.isCallExpression(node) && node.expression.getText(tree) === 'useEffect'
@@ -25,7 +34,8 @@ function walk(node) {
   ts.forEachChild(node, walk);
 }
 walk(tree); assert.ok(rangeBody); assert.ok(emptyEffect); assert.ok(convergenceBody); assert.ok(resizeFinishBody);
-const gates = source.slice(source.indexOf('  const armHistoryViewportPaintProof = useCallback('), source.indexOf('  // Virtuoso now renders display UNITS.'));
+assert.equal(gateStatements.size, gateNames.size, 'actual named paint gates; no obsolete comment delimiter');
+const gates = [...gateNames].map(name => gateStatements.get(name)).join('\n');
 const warmStart = source.indexOf('      let refreshRaf2 = 0;', source.indexOf('// Warm return:'));
 const warmEnd = source.indexOf('      deferredWarmRefreshCancelRef.current = cancelDeferredRefresh;', warmStart);
 assert.ok(warmStart > 0 && warmEnd > warmStart);
@@ -41,10 +51,13 @@ function setup() {
   const scroller = { isConnected: true, querySelector: () => realRow,
     querySelectorAll: selector => selector === '.cb-diff-defer' ? [] : [realRow] };
   const scope = {
-    useCallback: fn => fn, tabId: 'tab-fixture', sessionId: 's', toolType: 'claude', cwd: '/fixture',
+    useCallback: fn => fn, useRef: current => ({ current }), primaryPhysicalCandidate: false,
+    primaryRootRef: { current: null }, primaryInputsCurrent: () => true,
+    tabId: 'tab-fixture', sessionId: 's', toolType: 'claude', cwd: '/fixture',
     historyOwnerKey: owner, historyOwnerKeyRef: { current: owner }, historyOwnerGenerationRef: { current: 1 }, generation: 1,
     historyOwnerDomId: 'dom-owner', historyPresentationProofRef: { current: { presented: true, visit: 1 } },
     viewportReadyOwnerKeyRef: { current: '' }, surfacePresentedOwnerRef: { current: '' },
+    historyCommitDiagnosticsRef: { current: null },
     displayEntriesRef: { current: [{}] }, setViewportReadyOwnerKey() {}, setViewportProofRequired() {},
     historyResizeRef: { current: { active: () => scope.resizing, refresh() {} } }, resizing: false,
     historyPresentationOwnsWrite, resolveHistoryViewportPaintProof, historyOwnerDigest: key => key,

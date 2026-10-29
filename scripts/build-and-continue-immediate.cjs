@@ -8,6 +8,31 @@ const maintenanceApi = require('./research-maintenance.cjs');
 const ROOT = path.resolve(__dirname, '..');
 const ENDPOINT = '/api/build-continue/operations';
 
+function restorationSummary(operation) {
+  if (!operation || !Array.isArray(operation.targets)) return { known: false, needsAttention: true };
+  const counts = { confirmed: 0, alreadyWorking: 0, resultReady: 0, notNeeded: 0, refused: 0, pending: 0 };
+  for (const target of operation.targets) {
+    if (target.state === 'confirmed') counts.confirmed++;
+    else if (target.state === 'already-working') counts.alreadyWorking++;
+    else if (target.state === 'result-ready') counts.resultReady++;
+    else if (target.state === 'not-needed') counts.notNeeded++;
+    else if (['superseded', 'paused', 'unresolved'].includes(target.state)) counts.refused++;
+    else counts.pending++;
+  }
+  const unresolved = operation.unresolved?.length || 0;
+  return { known: true, phase: operation.phase, targets: operation.targets.length, ...counts,
+    carried: operation.carriedTargets?.length || 0, unresolved,
+    needsAttention: counts.refused > 0 || unresolved > 0 };
+}
+function logRestoration(operation, log) {
+  const summary = restorationSummary(operation);
+  log('restoration=' + JSON.stringify(summary));
+  for (const target of operation?.targets || []) if (['superseded', 'paused', 'unresolved'].includes(target.state)) {
+    log('not continued tab=' + target.tabId + ' state=' + target.state + ' reason=' + (target.reason || 'unknown'));
+  }
+  return summary;
+}
+
 async function runBuildContinue({ operationId = randomUUID(), resume = false, projectDir = ROOT,
   inspect = api.inspectProdServer, readToken = api.readToken, request = api.requestJson,
   wait = api.waitForProdServer, maintenance = maintenanceApi.createClient(),
@@ -20,7 +45,7 @@ async function runBuildContinue({ operationId = randomUUID(), resume = false, pr
     const response = await request({ port: server.port, token, method, requestPath, body, timeoutMs: 15000 });
     if (response.statusCode < 200 || response.statusCode >= 300 || response.body?.ok !== true) {
       throw Object.assign(Error(response.body?.error || response.body?.code || 'API HTTP ' + response.statusCode),
-        { code: response.body?.code, operationId, httpStatus: response.statusCode });
+        { code: response.body?.code, operationId: response.body?.operationId || operationId, httpStatus: response.statusCode });
     }
     return response.body;
   };
@@ -33,7 +58,9 @@ async function runBuildContinue({ operationId = randomUUID(), resume = false, pr
   log('operation=' + operationId);
   if (resume) {
     if (!oldServer) throw Error('Open the preserved app to recover operation=' + operationId + '; no replacement operation was created');
-    return call(oldServer, 'POST', ENDPOINT + '/' + encodeURIComponent(operationId) + '/restore', { version: 2 });
+    const response = await call(oldServer, 'POST', ENDPOINT + '/' + encodeURIComponent(operationId) + '/restore', { version: 2 });
+    const restoration = logRestoration(response.operation, log);
+    return { ...response, ok: response.ok && !restoration.needsAttention, restoration };
   }
   if (!install) ({ buildInstallNotedTerminal: install } = await import('./build-install-noted-terminal.mjs'));
   const scope = maintenance.installScope('install:noted:continue:' + operationId, { log });
@@ -46,7 +73,12 @@ async function runBuildContinue({ operationId = randomUUID(), resume = false, pr
     beforeQuit: oldServer ? async () => {
       let ack;
       try { ack = await call(oldServer, 'POST', ENDPOINT, { version: 2, action: 'capture-quit', operationId, expectedMainPid: oldServer.pid }); }
-      catch (error) { if (error.httpStatus) error.quitRequested = false; throw error; }
+      catch (error) {
+        if (error.httpStatus) error.quitRequested = false;
+        if (error.code === 'build_continue_operation_pending') log('previous capture still pending; operation='
+          + error.operationId + '; report=' + ENDPOINT + '/' + encodeURIComponent(error.operationId));
+        throw error;
+      }
       if (ack.operation?.id !== operationId || ack.operation?.sourceMainPid !== oldServer.pid) throw Error('Capture ACK changed owner');
       log('captured at ' + new Date(ack.operation.capturedAt).toISOString() + '; report=' + ack.reportUrl);
     } : async () => {},
@@ -60,7 +92,8 @@ async function runBuildContinue({ operationId = randomUUID(), resume = false, pr
   const server = await wait({ token, previousPid: oldServer.pid });
   const continuation = await call(server, 'POST', ENDPOINT + '/' + encodeURIComponent(operationId) + '/restore', { version: 2 });
   log('restore registered; report=' + continuation.reportUrl + (result.ok ? '' : '; previous app reopened after build failure'));
-  return { ok: result.ok, install: result, continuation, operationId };
+  const restoration = logRestoration(continuation.operation, log);
+  return { ok: result.ok && !restoration.needsAttention, install: result, continuation, restoration, operationId };
 }
 
 async function main() {
@@ -72,6 +105,7 @@ async function main() {
     const result = await runBuildContinue({ ...(args.length ? { resume: true, operationId: args[1] } : {}), signal: controller.signal });
     console.log('[build:i-c] ' + JSON.stringify({ ok: result.ok, operationId: result.operationId || result.operation?.id,
       installed: result.install?.installed, restorePhase: result.continuation?.operation?.phase || result.operation?.phase,
+      restoration: result.restoration,
       reportUrl: result.continuation?.reportUrl || result.reportUrl, recovery: result.install?.recovery }));
     process.exitCode = result.ok === false ? 1 : 0;
   } finally { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
@@ -80,4 +114,4 @@ if (require.main === module) main().catch(error => {
   console.error('[build:i-c] ' + error.message + (error.operationId ? ' operation=' + error.operationId : ''));
   process.exitCode = 1;
 });
-module.exports = { runBuildContinue, ENDPOINT };
+module.exports = { runBuildContinue, ENDPOINT, restorationSummary };

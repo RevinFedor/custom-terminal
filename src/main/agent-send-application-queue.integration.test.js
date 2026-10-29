@@ -31,6 +31,34 @@ function exported(name) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('enqueue IPC diagnostics preserve the exact result/error and never dispatch twice', async () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const tree = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+  const registration = tree.statements.find(node => ts.isExpressionStatement(node)
+    && ts.isCallExpression(node.expression) && node.expression.expression.getText(tree) === 'ipcMain.handle'
+    && node.expression.arguments[0]?.text === 'agent:enqueue-prompt');
+  assert.ok(registration);
+  const handlers = new Map(), logs = [], input = { tabId: 'T', handoffId: 'H', source: 'prompt-loop' };
+  const result = { submitted: null, deliveryUnknown: true, code: 'unknown-original' };
+  const failure = Object.assign(Error('original error'), { code: 'EIO', cause: Error('original cause') });
+  let calls = 0, fail = false;
+  vm.runInNewContext(registration.getText(tree), { path, srcMainDir: __dirname,
+    ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
+    console: { log: line => logs.push(line), warn: line => logs.push(line) },
+    require: () => ({ enqueueDesktopAgentPrompt: async request => { assert.equal(request, input); calls++;
+      if (fail) throw failure; return result; } }),
+  });
+  const handler = handlers.get('agent:enqueue-prompt');
+  assert.equal(await handler(null, input), result);
+  fail = true;
+  await assert.rejects(handler(null, input), error => error === failure);
+  assert.equal(calls, 2);
+  const observations = logs.map(line => JSON.parse(line.slice(line.indexOf('{'))));
+  assert.deepEqual(observations.map(row => row.stage), ['ipc-entry', 'ipc-return', 'ipc-entry', 'ipc-error']);
+  assert.equal(observations[1].deliveryUnknown, true); assert.equal(observations[3].code, 'EIO');
+  assert(observations.every(row => row.tabId === 'T' && row.handoffId === 'H' && !Object.hasOwn(row, 'prompt')));
+});
+
 test('returned History H cannot begin a late Main attempt; next original FIFO item still dispatches', async t => {
   const h = harness(t, 'codex');
   const control = require('./history-send-return').historySendReturnControl(h.store);
@@ -43,6 +71,23 @@ test('returned History H cannot begin a late Main attempt; next original FIFO it
   assert.equal(old.receipt.code, 'history_send_returned'); assert.equal(h.writes.length, 0);
   await h.send('next'); await tick(); await tick();
   assert.equal(h.writes.length, 1); assert.equal(h.writes[0].handoffId, 'next');
+});
+
+for (const stage of ['before-context', 'after-context']) test('capacity holds a new automatic input '+stage+' before immutable FIFO admission', async t => {
+  const h = harness(t, 'codex');
+  let capacity = stage === 'before-context', release, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  h.context.captureTabInspection = () => ({ known: true, toolType: 'codex', sessionId: 'S',
+    runtime: { liveLifecycle: true }, turn: { outcome: capacity ? 'model_capacity' : 'task_complete' } });
+  if (stage === 'after-context') h.context.tabWorkContext.prepare = async (_tab, _handoff, prompt) => {
+    entered(); await new Promise(resolve => { release = resolve; }); return { prompt };
+  };
+  const pending = h.send('AUTO', { source: 'prompt-queue', promptQueueIntent: { version: 1, kind: 'queue', itemId: 'card',
+    armedAt: 1, triggerTabId: 'T', conditionKey: '-', triggerKey: 'null' } });
+  if (stage === 'after-context') { await ready; capacity = true; release(); }
+  const result = await pending;
+  assert.equal(result.deferred, true); assert.equal(result.submitted, false); assert.equal(result.code, 'run_after_capacity_wait');
+  assert.equal(h.store.get('history:T:AUTO'), null); assert.equal(h.queue.item('history:T:AUTO'), null); assert.equal(h.writes.length, 0);
 });
 
 test('returning waiting History follower does not cancel native queued head or next follower', async t => {
@@ -71,6 +116,7 @@ function harness(t, provider, options = {}) {
     // Match the private admission capability now present in the real Main.
     // Ordinary user sends never receive this symbol as a serialized field.
     COMPLETION_ADMISSION: Symbol('owned-external-completion-admission'),
+    getBuildContinueOperations: () => ({ pending: () => false }), buildContinueOperations: null,
     ...require('./agent-send-preparation'),
     ...registry, agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
@@ -103,10 +149,12 @@ function harness(t, provider, options = {}) {
     },
   });
   vm.runInContext(['durableRecordHasProviderQueueAcceptance','durableAgentSendReplay','publicAgentSendReceipt',
-    'durableAgentSendFailure','runPreparedAgentSendScenario','runAgentSendScenario','readScenarioDestination'].map(declaration).join('\n'), context);
+    'durableAgentSendFailure','runPreparedAgentSendScenario','runAgentSendScenario','runAfterCapacityBlocksNewSend','readScenarioDestination'].map(declaration).join('\n'), context);
   vm.runInContext('var enqueueDesktopAgentPrompt = ' + exported('enqueueDesktopAgentPrompt'), context);
   vm.runInContext('var mergeQueuedAgentMessages = ' + exported('mergeQueuedAgentMessages'), context);
-  const queue = new AgentSendQueue({ store, execute: request => context.runPreparedAgentSendScenario({
+  const queue = new AgentSendQueue({ store, now: () => vm.runInContext('Date.now()', context),
+    capturePreparationMode: request => require('./agent-send-preparation').selectSendPreparationMode(request.provider, context.captureTabInspection?.(request.tabId)),
+    execute: request => context.runPreparedAgentSendScenario({
     ...request, applicationQueueExecution: true,
   }) });
   context.agentSendQueue = queue;
@@ -158,6 +206,27 @@ for (const process of ['found', 'unknown']) test('snapshot completion: exact FIF
   assert.equal(h.queue.item(key).id, original.id);
   assert.equal(h.queue.item(key).request_json, original.request_json);
   assert.equal(runtime.state.lookups, 1);
+});
+
+test('actual post-context reservation gate defers Continue before enqueue; the captured Reply keeps its earlier FIFO slot', { timeout: 5000 }, async t => {
+  const h = harness(t, 'codex'), token = Symbol('private-build-continue');
+  h.context.BUILD_CONTINUE_ADMISSION = token;
+  let replyReady = false, replyReserved = false;
+  h.context.tabWorkContext.prepare = async (_tab, _handoff, prompt) => { replyReady = true; return { prompt }; };
+  h.context.buildContinueOperations = { prepareReservation: async () => ({ ready: !replyReady || replyReserved,
+    isCurrent: () => replyReserved }) };
+  const send = (id, extra = {}) => h.context.runAgentSendScenario({ tabId: 'T', provider: 'codex', sessionId: 'S',
+    handoffId: id, sendOperationKey: 'history:T:' + id, prompt: 'test ' + id, expectedTarget: { toolType: 'codex', sessionId: 'S' },
+    source: 'history-panel', applicationQueueAcceptedResponse: true, ...extra });
+  const options = { source: 'build-install-continue:exact-operation', [token]: true };
+  const deferred = await send('continue', options);
+  assert.equal(deferred.deferred, true); assert.equal(deferred.submitted, false);
+  assert.equal(h.queue.item('history:T:continue'), null); assert.equal(h.store.get('history:T:continue'), null);
+  await send('reply', { source: 'tab-message:exact-reply' }); replyReserved = true;
+  await send('continue', options); await tick();
+  assert.deepEqual(h.writes.map(row => row.handoffId), ['reply']);
+  h.confirm('reply'); await h.queue.result('history:T:continue');
+  assert.deepEqual(h.writes.map(row => row.handoffId), ['reply', 'continue']);
 });
 
 for (const mode of ['native-v2-order', 'stop-during-reconcile', 'unconfirmed']) {
@@ -620,24 +689,32 @@ test('RunAfter automatic admission keeps the old absent-marker fingerprint and d
   }));
 });
 
-function automaticWaitHarness(t, { legacy = false } = {}) {
-  const h = harness(t, 'codex');
-  let ready = true, busy = true, cancelled = false, inputWrites = 0;
+let automaticWaitMainHandler = null;
+function automaticWaitHandler() {
+  if (automaticWaitMainHandler) return automaticWaitMainHandler;
   const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
   const tree = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
   const handler = tree.statements.find(node => ts.isExpressionStatement(node)
     && node.expression.expression?.getText(tree) === 'ipcMain.handle'
     && node.expression.arguments?.[0]?.text === 'codex:send-command');
-  assert.ok(handler);
+  assert.ok(handler); automaticWaitMainHandler = handler.getText(tree);
+  return automaticWaitMainHandler;
+}
+function automaticWaitHarness(t, { legacy = false } = {}) {
+  const h = harness(t, 'codex');
+  const inputRuntime = runtimeSnapshotCompletionFixture();
+  let ready = true, busy = true, cancelled = false, messageWait = false, inputWrites = 0;
   const ipc = new Map();
   const frameFixture = require('./fixtures/codex-draft-request-observation.cjs');
   const ownerSource = ['captureAgentInputIdentity', 'agentSendExecutionFailure']
     .map(frameFixture.actualFunction).join('\n');
-  vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource + '\n' + handler.getText(tree), {
+  vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource + '\n' + automaticWaitHandler(), {
     ...require('./agent-send-preparation'), agentSendReceiptStore: h.store,
     ipcMain: { handle: (key, fn) => ipc.set(key, fn) }, path, srcMainDir: __dirname,
-    require: () => ({ certifyAutomaticReadinessWait: (...args) => h.queue.certifyAutomaticReadinessWait(...args),
-      readAutomaticSendAdmission: async () => ready }),
+    require: () => ({ buildInstallAutomationBlocked: () => false,
+      certifyAutomaticReadinessWait: (...args) => h.queue.certifyAutomaticReadinessWait(...args),
+      readAutomaticSendAdmission: async () => messageWait ? { cancel: true,
+        ...(messageWait === true ? { reason: 'loop-message-dependency-pending' } : messageWait) } : ready }),
     console: { log() {}, warn() {}, error() {} }, nodePerformance: { now: () => Date.now() },
     terminals: new Map([['T', {}]]), terminalCommandState: new Map(),
     codexLastRunCommandPayload: new Map(), aiStoppingTabs: new Map(),
@@ -650,6 +727,10 @@ function automaticWaitHarness(t, { legacy = false } = {}) {
     // controller is a separate port and its frame/keys are not exercised here.
     prepareCodexMainComposerForSend: async () => ({ success: true }),
     agentSendCancellations: { isCancelled: () => cancelled },
+    readMainPublicRuntimeSnapshot: (tabId, options) => {
+      inputRuntime.state.busy = busy;
+      return inputRuntime.context.readMainPublicRuntimeSnapshot(tabId, options);
+    },
     getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: true, sessionStatus: busy ? 'busy' : 'active', inputReady: true, busy }),
     agentSendRequestTargetFailure: () => null, CODEX_PASTE_AUDIT_TIMEOUT_MS: 100,
     safePasteAndSubmit: async (_term, _command, options) => {
@@ -666,9 +747,29 @@ function automaticWaitHarness(t, { legacy = false } = {}) {
     triggerTabId: 'T', conditionKey: '', triggerKey: 'null' };
   return { ...h, promptQueueIntent, inputWrites: () => inputWrites,
     setReady: value => ready = value, setBusy: value => busy = value, setCancelled: value => cancelled = value,
+    setMessageWait: value => messageWait = value,
     start: () => h.send('auto-wait', { source: 'prompt-queue', ...(legacy ? {} : { promptQueueIntent }) }),
   };
 }
+
+test('late Main message dependency refusal preserves Loop preparation as deferred, with proven zero input for this exact attempt', async t => {
+  const h = automaticWaitHarness(t); h.setBusy(false); h.setMessageWait(true);
+  const result = await h.send('late-message-loop', { source: 'prompt-loop' });
+  assert.equal(result.submitted, false); assert.equal(result.deferred, true);
+  assert.equal(result.error, 'loop_message_wait');
+  assert.equal(h.store.get('history:T:late-message-loop').receipt.enterWritten, false);
+  assert.equal(h.store.get('history:T:late-message-loop').receipt.pasteWritten, false);
+  assert.equal(h.inputWrites(), 0);
+});
+test('late Main cancel without the exact message-dependency reason retains its original cancellation and no-input guards', async t => {
+  for (const verdict of [{}, { reason: 'manual-stop' }, { reason: 'other-dependency' }]) {
+    const h = automaticWaitHarness(t); h.setBusy(false); h.setMessageWait(verdict);
+    const result = await h.send('other-late-cancel', { source: 'prompt-loop' });
+    assert.equal(result.cancelled, true); assert.notEqual(result.deferred, true);
+    assert.equal(result.error, 'automatic-intent-changed'); assert.equal(result.submitted, false);
+    assert.equal(h.inputWrites(), 0);
+  }
+});
 
 test('actual pre-paste busy gate parks the SAME new automatic intent, then one wake writes once', async t => {
   const h = automaticWaitHarness(t);
@@ -1135,6 +1236,81 @@ test('preparation: time inside active prepareSend is charged before beginAttempt
   assert.equal(record.receipt.preflightScope.preparation.startedAt, 1000);
   assert.equal(record.receipt.preflightScope.preparation.deadlineAt - now, 15000);
   assert.equal(h.writes.length, 1);
+});
+
+for (const status of ['inactive', 'starting']) test('cold120: actual HEAD issuer captures ' + status + ' once before75s preparation', async t => {
+  const h = harness(t, 'codex'); let now = 1000, reads = 0;
+  h.context.Date = class extends Date { static now() { return now; } };
+  h.context.captureTabInspection = () => { reads++; return { known: true, exists: true, toolType: 'codex',
+    runtime: { known: true, status: reads === 1 ? status : 'active' } }; };
+  const waits = [];
+  h.context.bridgeRequest = (action, payload, timeout) => { waits.push(timeout); return h.physicalBridge(action, payload); };
+  await h.context.runPreparedAgentSendScenario({ tabId: 'T', handoffId: 'cold-head',
+    sendOperationKey: 'history:T:cold-head', provider: 'codex', sessionId: 'S', prompt: 'frozen',
+    source: 'history-panel', applicationQueueAcceptedResponse: true,
+    prepareSend: async () => { now += 75000; return null; } });
+  await h.queue.result('history:T:cold-head');
+  const record = h.store.get('history:T:cold-head');
+  assert.equal(record.receipt.preflightScope?.preparation.deadlineAt, 121000,
+    JSON.stringify({record,reads,item:h.queue.item('history:T:cold-head')}));
+  assert.equal(record.receipt.preflightScope.preparation.startedAt, 1000);
+  assert.equal(record.receipt.preflightScope.preparation.kind, 'cold-codex');
+  assert.equal(reads, 1, 'ready/settings/prepare cannot reclassify or renew the HEAD');
+  assert.equal(h.writes.length, 1);
+  assert.ok(waits[0] >= 120000, 'the renderer bridge must not keep its older60s ceiling');
+});
+
+for (const inspection of [
+  null,
+  { known: false, toolType: 'codex', runtime: { known: true, status: 'inactive' } },
+  { known: true, exists: true, toolType: 'codex', runtime: { known: true, status: 'active' } },
+  { known: true, exists: true, toolType: 'codex', runtime: { known: false, status: 'inactive' } },
+  { known: true, exists: true, toolType: 'claude', runtime: { known: true, status: 'inactive' } },
+]) test('cold120: warm/unknown snapshot keeps actual60s issuer: ' + JSON.stringify(inspection), async t => {
+  const h = harness(t, 'codex'); let now = 1000;
+  h.context.Date = class extends Date { static now() { return now; } };
+  h.context.captureTabInspection = () => inspection;
+  await h.send('warm'); await tick();
+  assert.equal(h.store.get('history:T:warm').receipt.preflightScope.preparation.deadlineAt, 61000);
+  assert.equal(h.writes.length, 1);
+});
+
+test('cold120: archived target restoration chooses120s without granting input before restore', async t => {
+  const h = harness(t, 'codex');
+  h.context.captureTabInspection = () => ({ known: true, exists: false });
+  await h.send('closed'); await tick();
+  assert.equal(h.store.get('history:T:closed').receipt.preflightScope.preparation.kind, 'cold-codex');
+  assert.equal(h.writes.length, 1, 'existing target/restore executor still owns submission');
+});
+
+test('cold120: queued cold hint cannot extend a follower already warm at HEAD', async t => {
+  const h = harness(t, 'codex'); let now = 1000, cold = false;
+  h.context.Date = class extends Date { static now() { return now; } };
+  h.context.captureTabInspection = () => ({ known: true, exists: true, toolType: 'codex',
+    runtime: { known: true, status: cold ? 'inactive' : 'active' } });
+  await h.send('head'); await tick(); cold = true;
+  await h.send('warm-follower'); await tick();
+  now += 150000; cold = false; h.confirm('head'); await h.queue.result('history:T:warm-follower');
+  const next = h.store.get('history:T:warm-follower').receipt.preflightScope;
+  assert.equal(next.preparation.version, 1);
+  assert.equal(next.preparation.deadlineAt, now + 60000);
+});
+
+test('cold120: actual FIFO wait gets its clock only when the cold follower becomes HEAD', async t => {
+  const h = harness(t, 'codex'); let now = 1000, cold = false;
+  h.context.Date = class extends Date { static now() { return now; } };
+  h.context.captureTabInspection = () => ({ known: true, exists: true, toolType: 'codex',
+    runtime: { known: true, status: cold ? 'inactive' : 'active' } });
+  await h.send('head'); await tick();
+  await h.send('cold-follower'); await tick();
+  const waiting = h.store.get('history:T:cold-follower'); assert.equal(waiting.attemptId, null);
+  now += 150000; cold = true; h.confirm('head'); await h.queue.result('history:T:cold-follower');
+  const head = h.store.get('history:T:head').receipt.preflightScope;
+  const next = h.store.get('history:T:cold-follower').receipt.preflightScope;
+  assert.equal(next.preparation.startedAt, now);
+  assert.equal(next.preparation.deadlineAt, now + 120000);
+  assert.equal(head.preparation.deadlineAt, 61000, 'old HEAD and its grant are never renewed');
+  assert.deepEqual(h.writes.map(x => x.handoffId), ['head', 'cold-follower']);
 });
 
 function actualOwnedBridge(t, h, { enter = false } = {}) {

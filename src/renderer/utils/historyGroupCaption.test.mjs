@@ -16,14 +16,14 @@ test('count original caption blocks once, not lines/digests/tool outputs/thinkin
   assert.deepEqual(historyGroupCaptionEntries(entries).map(e=>e.uuid),['a','b']);
 });
 
-test('group carries the same original caption list and latest default without changing chronology', () => {
+test('each group keeps exactly one original caption without changing chronology', () => {
   const rows=[caption('a','First'),call(1),caption('b','Second'),call(2),caption('c','Third'),call(3)];
-  const closed=buildHistoryDisplayUnits(rows)[0];
-  assert.deepEqual(closed.captionEntries.map(e=>e.uuid),['a','b','c']);
-  assert.equal(closed.captionEntry,rows[4]);
-  assert.deepEqual(closed.entries,rows);
-  const units=buildHistoryDisplayUnits(rows,{expandedKeys:new Set([closed.key])});
-  assert.equal(units[0].key,closed.key);
+  const closed=buildHistoryDisplayUnits(rows);
+  assert.equal(closed.length,3);
+  assert.deepEqual(closed.map(g=>g.captionEntries.map(e=>e.uuid)),[['a'],['b'],['c']]);
+  assert.deepEqual(closed.flatMap(g=>g.entries),rows);
+  const units=buildHistoryDisplayUnits(rows,{expandedKeys:new Set([closed[0].key])});
+  assert.equal(units[0].key,closed[0].key);
 });
 
 test('latest → previous → first → latest wraps without group expansion or row mutation', () => {
@@ -45,15 +45,15 @@ test('exact choice survives append and live/canonical aliases; missing identity 
   assert.equal(resolveHistoryGroupCaption(after,'missing').entry.uuid,'c');
 });
 
-test('actual Main stubs keep the same count; selected stub uses the existing hydration address', () => {
-  const rows=[caption('a','A'),call(1),caption('b','B'),call(2)],full=buildHistoryDisplayUnits(rows)[0];
+test('actual Main stubs preserve separate captions and hydrate the selected group address', () => {
+  const rows=[caption('a','A'),call(1),caption('b','B'),call(2)],full=buildHistoryDisplayUnits(rows);
   const stubs=buildHistoryDisplayUnits(rows.map(makeHistoryRowStub));
-  assert.equal(stubs[0].captionEntries.length,full.captionEntries.length);
-  const selections=new Map([[stubs[0].key,'b']]);
-  assert.equal(findHistoryHydrationStub(stubs,{start:0,end:0},0,selections)?.entry.uuid,'b');
-  assert.equal(resolveHistoryGroupCaption(stubs[0].captionEntries,'b').entry.rowStub,true);
-  const protectedRows=stubs[0].captionEntries.map(row=>new Proxy(row,{get(target,key){if(key==='content')throw Error('selection read a body');return target[key]}}));
-  assert.equal(previousHistoryGroupCaption(protectedRows).entry.uuid,'a');
+  assert.deepEqual(stubs.map(g=>g.captionEntries.length),full.map(g=>g.captionEntries.length));
+  const selections=new Map([[stubs[1].key,'b']]);
+  assert.equal(findHistoryHydrationStub(stubs,{start:1,end:1},0,selections)?.entry.uuid,'b');
+  assert.equal(resolveHistoryGroupCaption(stubs[1].captionEntries,'b').entry.rowStub,true);
+  const protectedRows=stubs[1].captionEntries.map(row=>new Proxy(row,{get(target,key){if(key==='content')throw Error('selection read a body');return target[key]}}));
+  assert.equal(previousHistoryGroupCaption(protectedRows).entry.uuid,'b');
 });
 
 test('selection hints are bounded metadata and belong to the caller, not a global store', () => {

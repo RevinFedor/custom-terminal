@@ -89,6 +89,7 @@ export function timelineAutomaticPromptVariant(entry) {
   if (isSystemPromptEntry(entry)) {
     const tag = entry.semanticTags.find(tag => tag?.kind === 'prompt-origin' && tag.source === 'system'
       && systemPromptSource(tag.systemSource));
+    if (systemPromptSource(tag.systemSource) === 'tab-message-outcome') return null;
     return { kind: 'system', title: systemPromptSource(tag.systemSource) === 'build-install-return'
       ? 'Build Install return' : 'Capacity retry' };
   }

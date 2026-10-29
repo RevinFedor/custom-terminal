@@ -1,6 +1,7 @@
 'use strict';
 
 const { causal } = require('./perf-causal-context');
+const { installTimelineWorkingFileVersions } = require('./timeline-working-file-version-schema');
 
 // Named call sites only: retain the original statement and separate compile/execute timing.
 function sqlStatement(siteId, operation, prepare, execute) {
@@ -61,6 +62,7 @@ function refreshUpdateWrapper(prompt, update) {
   let cursor = 0;
   let output = '';
   let found = false;
+  const edits = [];
   while (cursor < source.length) {
     let markerAt = -1;
     let markerLength = 0;
@@ -81,12 +83,14 @@ function refreshUpdateWrapper(prompt, update) {
       continue;
     }
     output += source.slice(cursor, openAt);
+    edits.push({ start: output.length, end: output.length + closeAt + '</saved_prompt>'.length - openAt,
+      text: found ? '' : replacement });
     if (!found) output += replacement;
     found = true;
     cursor = closeAt + '</saved_prompt>'.length;
   }
   output += source.slice(cursor);
-  return { prompt: output, found };
+  return { prompt: output, found, edits };
 }
 
 function backtrackLineDiff(trace, previousLines, currentLines) {
@@ -1008,6 +1012,7 @@ class TabWorkContext {
       CREATE INDEX IF NOT EXISTS tab_context_handoffs_prompt
         ON tab_context_handoffs(tab_id, payload_hash, status);
     `);
+    installTimelineWorkingFileVersions(this.db);
     const updateColumns = new Set(
       sqlStatement('tabContext.init.tab_context_updates', 'all', () => this.db.prepare('PRAGMA table_info(tab_context_updates)'), statement => statement.all()).map((column) => column.name),
     );
@@ -1022,6 +1027,9 @@ class TabWorkContext {
     }
     if (!handoffColumns.has('continuation_facts')) {
       this.db.exec("ALTER TABLE tab_context_handoffs ADD COLUMN continuation_facts TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!handoffColumns.has('authoring_transport_json')) {
+      this.db.exec('ALTER TABLE tab_context_handoffs ADD COLUMN authoring_transport_json TEXT');
     }
     this.consolidatePendingFileBatches();
   }
@@ -1702,13 +1710,19 @@ class TabWorkContext {
       before_text,after_text,start_line,end_line,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`), statement => statement.run(crypto.randomUUID(), row.tab_id, title, text, error ? 'file-error' : 'file', row.path, row.hash, digest || null, error ? null : row.content, content ?? null, presentation?.span.startLine || null, presentation?.span.endLine || null, Date.now()));
   }
 
-  async prepare(tabId, handoffId, prompt) {
+  async prepare(tabId, handoffId, prompt, authoringTransport = null) {
     if (!tabId || !handoffId || !String(prompt).trim() || isLocalSlashCommandPrompt(prompt)) return { prompt, prefix: '' };
     const saved = sqlStatement('tabContext.prepare.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
     if (saved) {
-      if (promptAuditFingerprint(prompt) === saved.payload_hash) return { prompt, prefix: saved.prefix };
+      const transport = saved.authoring_transport_json ? JSON.parse(saved.authoring_transport_json) : null;
+      if (promptAuditFingerprint(prompt) === saved.payload_hash) {
+        if (authoringTransport && transport && JSON.stringify(authoringTransport) !== JSON.stringify(transport.final)) throw fail('context handoff authoring changed', 409);
+        return { prompt, prefix: saved.prefix, ...(transport ? { authoringTransport: transport.final } : {}) };
+      }
       if (hash(prompt) !== saved.base_hash) throw fail('context handoff reused for another prompt', 409);
-      return { prompt: saved.prepared_prompt || saved.prefix + prompt, prefix: saved.prefix };
+      if (authoringTransport && transport && JSON.stringify(authoringTransport) !== JSON.stringify(transport.source)) throw fail('context handoff authoring changed', 409);
+      return { prompt: saved.prepared_prompt || saved.prefix + prompt, prefix: saved.prefix,
+        ...(transport ? { authoringTransport: transport.final } : {}) };
     }
     if ((this.readReceipts?.(tabId) || []).some((receipt) => receipt.handoffId === handoffId)) {
       return { prompt, prefix: '' };
@@ -1737,7 +1751,7 @@ class TabWorkContext {
     return causal.syncWork('tabContext.prepare.commit', { tabId }, () => {
       // Another caller may have reserved this same handoff while file IO yielded.
       if (sqlStatement('tabContext.prepare.tab_context_handoffs.2', 'get', () => this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId))) {
-        return this.prepare(tabId, handoffId, prompt);
+        return this.prepare(tabId, handoffId, prompt, authoringTransport);
       }
       if (continuationFacts.length) {
         const claimedFacts = new Set(sqlStatement('tabContext.prepare.tab_context_handoffs.3', 'all', () => this.db.prepare(`SELECT continuation_facts FROM tab_context_handoffs
@@ -1749,19 +1763,28 @@ class TabWorkContext {
       const updates = this.presentUpdates(updateRows);
       const memberIds = updateRows.map((row) => row.id);
       let preparedBase = prompt;
+      const { validateAuthoringTransport, editAuthoringTransport } = require('./structured-authoring');
+      const sourceTransport = validateAuthoringTransport(prompt, authoringTransport || {
+        sourceHash: hash(prompt), imageRanges: require('../shared/prompt-web-images.cjs').collectLegacyPromptImageRanges(prompt),
+      });
+      let finalTransport = sourceTransport;
       const missing = [];
       for (const update of updates) {
         const refreshed = refreshUpdateWrapper(preparedBase, update);
+        finalTransport = editAuthoringTransport(preparedBase, finalTransport, refreshed.edits).authoringTransport;
         preparedBase = refreshed.prompt;
         if (!refreshed.found) missing.push(update);
       }
       const prefix = [completionContextText(continuationFacts), ...missing.map(updateWrapper)].filter(Boolean).join('\n\n');
       const separatorPrefix = prefix ? prefix + '\n\n' : '';
       const full = separatorPrefix + preparedBase;
+      finalTransport = editAuthoringTransport(preparedBase, finalTransport,
+        separatorPrefix ? [{ start: 0, end: 0, text: separatorPrefix }] : []).authoringTransport;
       this.db.transaction(() => {
         sqlStatement('tabContext.prepare.tab_context_handoffs.4', 'run', () => this.db.prepare(`INSERT OR IGNORE INTO tab_context_handoffs(
-          tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at,continuation_facts
-        ) VALUES (?,?,?,?,?,?,?,?,?)`), statement => statement.run(tabId, handoffId, hash(prompt), separatorPrefix, full, promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(), JSON.stringify(continuationFacts.map(fact => fact.id))));
+          tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at,continuation_facts,authoring_transport_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)`), statement => statement.run(tabId, handoffId, hash(prompt), separatorPrefix, full, promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(), JSON.stringify(continuationFacts.map(fact => fact.id)),
+          JSON.stringify({ source: sourceTransport, final: finalTransport })));
         for (const id of memberIds) {
           sqlStatement('tabContext.prepare.tab_context_updates.2', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'"), statement => statement.run(id));
         }
@@ -1769,7 +1792,7 @@ class TabWorkContext {
       if (updates.length) this.touch(tabId);
       if (continuationFacts.length) console.log('[OrchestrationContext] prepared tab=' + tabId.slice(-12)
         + ' handoff=' + handoffId + ' facts=' + continuationFacts.length + ' (not result/delivery proof)');
-      return { prompt: full, prefix: separatorPrefix };
+      return { prompt: full, prefix: separatorPrefix, authoringTransport: finalTransport };
     });
   }
 

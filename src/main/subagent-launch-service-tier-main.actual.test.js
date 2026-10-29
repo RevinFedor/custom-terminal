@@ -119,7 +119,7 @@ test('actual Main root and NEW_TASK waits have distinct reasons without advancin
     fs.writeFileSync(filePath, serialize(rows('priority')));
     for (const [boundary, reason] of [
       [{rootMetaSeen: false}, 'root-meta-pending'],
-      [{rootMetaSeen: true, requiresBoundary: true, found: false}, 'new-task-boundary-pending'],
+      [{rootMetaSeen: true, sessionId: 'child-A', requiresBoundary: true, found: false}, 'new-task-boundary-pending'],
     ]) {
       const main = harness(filePath, {findCodexSubagentNewTaskBoundary: async () => boundary});
       const first = await main.read('reader-pending');
@@ -335,4 +335,154 @@ test('an already open Main reader resets launch metadata when its file is replac
     assert.equal(replaced.launchSettings.model, 'gpt-6-luna');
     main.release('reader-A');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('actual Main rejects a foreign physical root before any child-body read and caches only its refusal', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-foreign-root-'));
+  const filePath = path.join(dir, 'selected-child-A.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize([{...meta, payload: {...meta.payload, id: 'foreign'}}, ...rows('priority').slice(1)]));
+    const main = harness(filePath);
+    for (let i = 0; i < 2; i++) {
+      const result = await main.read('reader-A');
+      assert.equal(result.success, false);
+      assert.equal(result.reason, 'child-root-identity-mismatch');
+      assert.equal(result.pending, false); assert.equal(result.reset, true);
+      assert.deepEqual(Array.from(result.steps), []);
+      assert.equal(result.launchSettings, undefined); assert.equal(result.requestServiceTier, undefined);
+    }
+    assert.deepEqual(main.counts(), {scans: 1, reads: 0});
+    assert.equal(main.caches.subagentStepReaderCache.size, 0);
+    assert.equal(main.caches.subagentPayloadSourceCache.size, 0);
+    assert.equal(main.logs.length, 1, 'no repeated phase log or body/path logging');
+    assert.match(main.logs[0], /child-root-identity-mismatch/);
+    assert.doesNotMatch(main.logs[0], /selected-child-A.jsonl|Synthetic payload/);
+    main.release('reader-A');
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main independently refuses a foreign boundary SID or an identity error, including legacy hits', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-boundary-root-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    for (const boundary of [
+      {rootMetaSeen: true, sessionId: 'foreign', found: true, requiresBoundary: true, offset: 42},
+      {rootMetaSeen: true, sessionId: 'foreign', found: false, requiresBoundary: false, offset: 0},
+      {rootMetaSeen: true, sessionId: 'child-A', identityError: 'session-meta-mismatch', found: true, requiresBoundary: true, offset: 42},
+    ]) {
+      const main = harness(filePath, {findCodexSubagentNewTaskBoundary: async () => boundary});
+      const result = await main.read('reader-A');
+      assert.equal(result.success, false); assert.equal(result.reason, 'child-root-identity-mismatch');
+      assert.equal(main.counts().reads, 0); main.release('reader-A');
+    }
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main revalidates same-reader child changes while preserving parent-context read semantics', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-reader-owner-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    const main = harness(filePath);
+    const a = await main.read('reader-A'); assert.equal(a.success, true);
+    const wrongChild = await main.read('reader-A', a.offset, {agentSessionId: 'child-B'});
+    assert.equal(wrongChild.success, false); assert.deepEqual(Array.from(wrongChild.steps), []);
+    const ownAgain = await main.read('reader-A', a.offset); assert.equal(ownAgain.success, true);
+    const otherParent = await main.read('reader-A', ownAgain.offset, {parentSessionId: 'other-parent'});
+    assert.equal(otherParent.success, true); assert.equal(otherParent.requestServiceTier, null);
+    assert.equal(main.counts().reads, 3); main.release('reader-A');
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main rejects a foreign source replacement during tail read and can reopen a corrected exact source', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-tail-identity-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  const replace = records => { const next = path.join(dir, 'next.jsonl'); fs.writeFileSync(next, serialize(records)); fs.renameSync(next, filePath); };
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    const main = harness(filePath);
+    const first = await main.read('reader-A');
+    replace([{...meta, payload: {...meta.payload, id: 'foreign'}}, ...rows('priority').slice(1)]);
+    const wrong = await main.read('reader-A', first.offset);
+    assert.equal(wrong.success, false); assert.equal(wrong.reason, 'child-root-identity-mismatch');
+    assert.deepEqual(Array.from(wrong.steps), []); assert.equal(main.caches.subagentStepReaderCache.size, 0);
+    replace(rows('default'));
+    const recovered = await main.read('reader-A', first.offset);
+    assert.equal(recovered.success, true); assert.equal(recovered.reset, true);
+    assert.equal(recovered.launchServiceTier.serviceTier, 'default'); main.release('reader-A');
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main carries boundary source identity across the await before its first skip-offset body read', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-boundary-handoff-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    let replaceOnce = true;
+    const main = harness(filePath, {readAgentStepsAsync: async args => {
+      if (replaceOnce) {
+        replaceOnce = false;
+        const next = path.join(dir, 'replacement.jsonl');
+        fs.writeFileSync(next, serialize([{...meta, payload: {...meta.payload, id: 'foreign'}}, newTask,
+          {type: 'response_item', payload: {type: 'noop', padding: 'x'.repeat(2000)}},
+          {type: 'response_item', payload: {type: 'message', role: 'assistant', content: [{type: 'output_text', text: 'FOREIGN_BODY'}]}}]));
+        fs.renameSync(next, filePath);
+      }
+      return reader.readAgentStepsAsync(args);
+    }});
+    const result = await main.read('reader-A');
+    assert.equal(result.success, false, 'an old root/skip offset cannot authorize a replacement physical source');
+    assert.equal(result.reason, 'child-root-identity-mismatch');
+    assert.deepEqual(Array.from(result.steps), []); main.release('reader-A');
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main accepts native v1 child id plus proven parent session context and publishes own header/body', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-native-v1-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  try {
+    const ownMeta = {type: 'session_meta', payload: {id: 'child-A', session_id: 'parent',
+      parent_thread_id: 'parent', thread_source: 'subagent', multi_agent_version: 'v1',
+      source: {subagent: {thread_spawn: {parent_thread_id: 'parent', depth: 1}}}}};
+    fs.writeFileSync(filePath, serialize([ownMeta, snapshot('priority'), context,
+      {type: 'response_item', payload: {type: 'message', role: 'assistant', content: [{type: 'output_text', text: 'OWN_NATIVE_BODY'}]}}]));
+    const main = harness(filePath);
+    const result = await main.read('native-A');
+    assert.equal(result.success, true); assert.equal(result.launchSettings.model, 'gpt-6-luna');
+    assert.equal(result.launchSettings.effort, 'max'); assert.equal(result.launchSettings.sessionId, 'child-A');
+    assert.equal(result.launchServiceTier.serviceTier, 'priority');
+    assert.ok(result.steps.some(step => step.text === 'OWN_NATIVE_BODY'));
+    const eof = await main.read('native-A', result.offset);
+    assert.equal(eof.success, true); assert.equal(eof.offset, result.offset);
+    assert.equal(main.counts().scans, 1); main.release('native-A');
+    const reopened = await main.read('native-reopen');
+    assert.equal(reopened.success, true); assert.ok(reopened.steps.some(step => step.text === 'OWN_NATIVE_BODY'));
+    main.release('native-reopen');
+  } finally { fs.rmSync(dir, {recursive: true}); }
+});
+
+test('actual Main root refusal logs bounded expected/actual provenance without transcript or path', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-main-root-diagnostic-'));
+  const filePath = path.join(dir, 'child.jsonl');
+  try {
+    const foreignId = 'FOREIGN-' + 'x'.repeat(500);
+    fs.writeFileSync(filePath, serialize([{type: 'session_meta', payload: {
+      id: foreignId, session_id: 'parent', parent_thread_id: 'parent',
+      thread_source: 'subagent', multi_agent_version: 'v1',
+      source: {subagent: {thread_spawn: {parent_thread_id: 'parent'}}},
+      base_instructions: 'PRIVATE_NATIVE_BODY',
+    }}]));
+    const main = harness(filePath);
+    const result = await main.read('bad-A'); assert.equal(result.success, false);
+    const value = main.logs.find(line => line.startsWith('[SubagentSteps] unavailable '));
+    const log = JSON.parse(value.slice('[SubagentSteps] unavailable '.length));
+    assert.equal(log.childSessionId, 'child-A'); assert.equal(log.rootId, foreignId.slice(0, 128));
+    assert.equal(log.rootSessionId, 'parent'); assert.equal(log.rootParentId, 'parent');
+    assert.equal(log.sourceParentId, 'parent'); assert.equal(log.rootVersion, 'v1');
+    assert.equal(log.rootThreadSource, 'subagent'); assert.equal(log.identityTruncated, true);
+    assert.equal(log.identityError, 'session-meta-mismatch'); assert.ok(log.sourceIdentity.ino > 0);
+    assert.doesNotMatch(value, /PRIVATE_NATIVE_BODY|child\.jsonl/);
+    await main.read('bad-A'); assert.equal(main.logs.length, 1); main.release('bad-A');
+  } finally { fs.rmSync(dir, {recursive: true}); }
 });

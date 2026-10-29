@@ -2,16 +2,17 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { getComposerControlsHost, subscribeComposerControlsHost } from '../../utils/composerControlsHost.mjs';
 import {
-  historyRecordTimeLabel, intersectRect, placeHistoryRecordTime, rectsIntersect,
+  historyRecordTimeLabel, historyRecordTimeRangeLabel, intersectRect, placeHistoryRecordTime, rectsIntersect,
 } from '../../utils/historyRecordTimePresentation.mjs';
 import recordTimes from '../../../shared/history-record-time.cjs';
-import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
+import { captureUIHoverAction, uiDiagnosticAbsNow, uiPerformancePhase, uiPerformancePhaseForAction, uiPerformanceCommitForAction } from '../../utils/uiPerformanceDiagnostics.mjs';
 
 type Rect = { left: number; top: number; right: number; bottom: number };
 type View = {
-  element: HTMLElement; key: string; label: string; scope: string; at: string;
-  fontSize: number; fontFamily: string; maxWidth: number;
+  element: HTMLElement; key: string; label: string; scope: string; at: string; endAt?: string;
+  fontSize: number; fontFamily: string; maxWidth: number; portalLayer: number;
   position?: { left: number; top: number; placement: string };
+  diagnostic?: { actionId: string; requestedAbs: number; committed: boolean };
 };
 const TARGET = '[data-history-time-key]';
 const EXCLUDED = '.cb-row-copy,.cb-msg-actions,.cb-collapse-top,.cb-collapse-bottom,button[data-history-collapse],'
@@ -59,7 +60,7 @@ function lastVisibleLine(element: HTMLElement, scroller: HTMLElement, clip: Rect
     }
   }
   if (last) {
-    for (const glyph of element.querySelectorAll<SVGElement>('svg.cb-tool-chevron')) {
+    for (const glyph of element.querySelectorAll<SVGElement>('svg.cb-tool-chevron,svg.hp-history-group-chevron')) {
       const rect = glyph.getBoundingClientRect();
       if (rect.width && rect.bottom >= last.top && rect.top <= last.bottom && rect.right <= clip.right) {
         last = { ...last, right: Math.max(last.right, rect.right) };
@@ -172,27 +173,47 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
       if (!scroller || !scroller.contains(found)) return null;
       const time = recordTimes.normalizeHistoryRecordTime({ version: 1, timestamp: found.dataset.historyTimeAt,
         kind: found.dataset.historyTimeSourceKind, scope: found.dataset.historyTimeScope });
-      return time ? { found, time } : null;
+      const endAt = found.dataset.historyTimeEndAt;
+      const end = endAt ? recordTimes.normalizeHistoryRecordTime({ version: 1, timestamp: endAt,
+        kind: 'message', scope: 'record' }) : undefined;
+      if (endAt && (!end || !time || Date.parse(end.timestamp) < Date.parse(time.timestamp))) return null;
+      return time ? { found, time, end } : null;
     }
-    function activate() {
+    function activate(event?: MouseEvent | KeyboardEvent) {
       const resolved = resolveTarget();
       if (!resolved) { target = null; targetObserver.disconnect(); targetMutation.disconnect(); clear(); return; }
       refreshChrome();
-      const { found, time } = resolved;
+      const { found, time, end } = resolved;
+      const action = event ? captureUIHoverAction(event) : null;
+      const diagnostic = action ? { actionId: action.id, requestedAbs: uiDiagnosticAbsNow(), committed: false }
+        : viewRef.current?.diagnostic;
+      if (action) uiPerformancePhaseForAction(action.id, 'history-record-time:target-admitted', { tab: tabId });
       if (target !== found) {
         target = found; targetObserver.disconnect(); targetMutation.disconnect();
         targetObserver.observe(found);
         targetMutation.observe(found, { childList: true, characterData: true, subtree: true, attributes: true });
       }
       const font = getComputedStyle(found);
-      const next = { element: found, key: found.dataset.historyTimeKey || '', label: historyRecordTimeLabel(time),
-        scope: time.scope, at: time.timestamp, fontSize: parseFloat(font.fontSize) * 0.9,
-        fontFamily: font.fontFamily, maxWidth: Math.max(0, Math.min(innerWidth, panel.getBoundingClientRect().right)
+      // A body Portal does not inherit its owner's stacking context. Higher
+      // surfaces publish their layer locally; ordinary History keeps layer25.
+      const requestedLayer = font.getPropertyValue?.('--history-record-time-layer')?.trim();
+      const numericLayer = requestedLayer ? Number(requestedLayer) : 25;
+      const portalLayer = Number.isSafeInteger(numericLayer) && numericLayer > 0
+        && numericLayer <= 2147483647 ? numericLayer : 25;
+      const next = { element: found, key: found.dataset.historyTimeKey || '',
+        label: end ? historyRecordTimeRangeLabel(time, end) : historyRecordTimeLabel(time),
+        scope: end ? 'group' : time.scope, at: time.timestamp, endAt: end?.timestamp,
+        fontSize: parseFloat(font.fontSize) * 0.9,
+        diagnostic, portalLayer, fontFamily: font.fontFamily, maxWidth: Math.max(0, Math.min(innerWidth, panel.getBoundingClientRect().right)
           - Math.max(0, panel.getBoundingClientRect().left) - 16) };
       const current = viewRef.current;
       if (current?.element === found && current.key === next.key && current.label === next.label && current.scope === next.scope
-        && current.at === next.at && current.fontSize === next.fontSize && current.maxWidth === next.maxWidth) measure();
-      else setView(next);
+        && current.at === next.at && current.endAt === next.endAt
+        && current.fontSize === next.fontSize && current.maxWidth === next.maxWidth && current.portalLayer === next.portalLayer) measure();
+      else {
+        uiPerformancePhaseForAction(diagnostic?.actionId, 'history-record-time:view-request', { tab: tabId });
+        setView(next);
+      }
     }
     function measure() {
       const current = viewRef.current, scroller = scrollerRef.current, label = labelRef.current;
@@ -215,6 +236,7 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
         .forEach(node => { if (shown(node)) obstacles.push(node.getBoundingClientRect()); });
       const size = label.getBoundingClientRect();
       const position = placeHistoryRecordTime({ anchor, clip, pane, size, obstacles, safeTop });
+      uiPerformancePhaseForAction(current.diagnostic?.actionId, 'history-record-time:positioned', { tab: tabId, available: !!position });
       // A clipped/removed target cannot keep an old annotation alive.
       if (!position || !element.isConnected || !rectsIntersect(element.getBoundingClientRect(), scroller.getBoundingClientRect())) {
         clear(); return;
@@ -237,9 +259,9 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
         target = null; clear(); return;
       }
       const hit = event.target instanceof Element ? event.target.closest(TARGET) : null;
-      if (hit !== target || changed) { if (hit !== target) chromeDirty = true; activate(); }
+      if (hit !== target || changed) { if (hit !== target) chromeDirty = true; activate(event); }
     };
-    const down = (event: KeyboardEvent) => { if (event.key === 'Meta') { chromeDirty = true; meta = true; activate(); } };
+    const down = (event: KeyboardEvent) => { if (event.key === 'Meta') { chromeDirty = true; meta = true; activate(event); } };
     const up = (event: KeyboardEvent) => { if (event.key === 'Meta') { meta = false; clear(); } };
     const blur = () => { meta = false; target = null; point = null; clear(); };
     const leave = () => { chromeDirty = true; target = null; point = null; clear(); };
@@ -263,13 +285,24 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
     };
   }, [enabled, ownerKey, panelRef, scrollerRef, tabId]);
 
-  useLayoutEffect(() => { if (view) controllerRef.current?.measure(); }, [view?.element, view?.key, view?.label, view?.scope, view?.fontSize, view?.maxWidth]);
+  useLayoutEffect(() => { if (view) controllerRef.current?.measure(); }, [view?.element, view?.key, view?.label,
+    view?.scope, view?.at, view?.endAt, view?.fontSize, view?.maxWidth]);
+  // React applied the visible style. This commit is distinct from native paint;
+  // the common frame/native diagnostics retain that separate boundary.
+  useLayoutEffect(() => {
+    const diagnostic = view?.diagnostic;
+    if (!view?.position || !labelRef.current || !diagnostic || diagnostic.committed) return;
+    diagnostic.committed = true;
+    uiPerformanceCommitForAction(diagnostic.actionId, 'history-record-time:visible-commit', {
+      tab: tabId, durationMs: uiDiagnosticAbsNow() - diagnostic.requestedAbs,
+    });
+  }, [view?.position, view?.diagnostic, tabId]);
   if (!view) return null;
   return createPortal(<div ref={labelRef} data-history-record-time-overlay data-owner={ownerKey}
-    data-history-time-key={view.key} data-source-at={view.at} data-scope={view.scope}
+    data-history-time-key={view.key} data-source-at={view.at} data-source-end-at={view.endAt} data-scope={view.scope}
     data-placement={view.position?.placement} aria-hidden="true"
     style={{ position: 'fixed', left: view.position?.left || 0, top: view.position?.top || 0,
-      visibility: view.position ? 'visible' : 'hidden', zIndex: 25, pointerEvents: 'none', userSelect: 'none',
+      visibility: view.position ? 'visible' : 'hidden', zIndex: view.portalLayer, pointerEvents: 'none', userSelect: 'none',
       display: 'flex', flexWrap: 'wrap', gap: '0 8px', maxWidth: view.maxWidth, boxSizing: 'border-box',
       color: '#8f8d88', fontSize: view.fontSize, fontFamily: view.fontFamily, fontWeight: 400, lineHeight: 1.35,
       padding: '0 4px',

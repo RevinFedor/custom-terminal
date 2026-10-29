@@ -9,7 +9,13 @@ const ast = ts.createSourceFile('Timeline.tsx', source, ts.ScriptTarget.Latest, 
 let modifier;
 function visit(node) {
   if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(ast) === 'TimelineSegmentRow') {
-    modifier = node.attributes.properties.find(prop => ['isCmdHeld', 'forkCmdHeld'].includes(prop.name?.getText(ast)))?.initializer?.expression;
+    const expression = node.attributes.properties.find(prop => ['isCmdHeld', 'forkCmdHeld'].includes(prop.name?.getText(ast)))?.initializer?.expression;
+    // The root adapter also renders this row through a props spread. It is
+    // not the ordinary cursor projection and must not erase its explicit prop.
+    if (expression) {
+      assert.equal(modifier, undefined, 'ordinary modifier projection must be unique');
+      modifier = expression;
+    }
   }
   ts.forEachChild(node, visit);
 }

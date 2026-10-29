@@ -13,7 +13,7 @@ const fingerprint = (text: string) => window.require('node:crypto').createHash('
 type Props = {
   entry: any; toolType: string; expanded: boolean; responseLines: number; fontSize: number;
   compact?: { text: string; loading: boolean; encrypted: boolean; postTokens?: number };
-  group?: { kind: 'orchestration' | 'subagent'; entries: any[] };
+  group?: { kind: 'orchestration' | 'subagent'; entries?: any[]; aggregate?: { count: number; failed: number | null; mcp: number; sc: number; editedCount: number; searchedCount: number } };
   tokenChip?: React.ReactNode; note?: React.ReactNode; researchModel?: any;
   onExpand: () => void; onNavigatePrompt: () => void; onNavigateAnswer: () => void;
   onSourceNavigate: () => void; onCopy: (text: string) => void;
@@ -94,7 +94,7 @@ export function TimelineEntryPreview(props: Props) {
     ? fullResponse.text : preview?.content || '';
   const responseError = fullResponse?.key === descriptorKey ? fullResponse.error : null;
   const responseLoading = expanded && preview?.truncated && fullResponse?.key !== descriptorKey;
-  const docs = group ? timelineGroupPreview(group.entries, group.kind).docs
+  const docs = group ? group.aggregate ? null : timelineGroupPreview(group.entries, group.kind).docs
     : { edited: Array.from(new Set<string>(entry.docsEdited || [])), searched: Array.from(new Set<string>(entry.docsSearchQueries || [])) };
 
   useLayoutEffect(() => {
@@ -151,14 +151,15 @@ export function TimelineEntryPreview(props: Props) {
   const canExpand = showBody && (!!prompt.research?.needsDisclosure || !!preview || prompt.text.length > 80 || attachmentParts.length > 0 || !!compact?.text);
 
   if (group) {
-    const aggregate = timelineGroupPreview(group.entries, group.kind);
+    const aggregate = group.aggregate || timelineGroupPreview(group.entries, group.kind);
     return <div className="timeline-entry-preview timeline-entry-preview--group" data-timeline-preview="group" style={{ fontSize: props.fontSize }}>
       <div className="timeline-preview-group-counters">
-        {group.kind === 'subagent' ? <><Bot size={12} /><span>Agents · {aggregate.count - aggregate.failed}</span>
-          {aggregate.failed > 0 && <span className="timeline-preview-timeout">Timeout · {aggregate.failed}</span>}</>
+        {group.kind === 'subagent' ? <><Bot size={12} /><span>Agents · {aggregate.failed === null ? '?' : aggregate.count - aggregate.failed}</span>
+          {aggregate.failed === null && <span className="timeline-preview-timeout">Timeout · ?</span>}
+          {aggregate.failed !== null && aggregate.failed > 0 && <span className="timeline-preview-timeout">Timeout · {aggregate.failed}</span>}</>
           : <>{aggregate.mcp > 0 && <><Layers size={12} /><span>Terminal MCP · {aggregate.mcp}</span></>}
             {aggregate.sc > 0 && <><img src={scDesktopIcon} alt="" width={14} height={14} /><span>SC · {aggregate.sc}</span></>}</>}
-        <DocsCounters docs={docs} />
+        <DocsCounters docs={docs} counts={group.aggregate ? { edited: group.aggregate.editedCount, searched: group.aggregate.searchedCount } : undefined} />
       </div>
     </div>;
   }
@@ -252,13 +253,13 @@ export function TimelineEntryPreview(props: Props) {
   </div>;
 }
 
-function DocsCounters({ docs, onToggle }: { docs: { edited: string[]; searched: string[] }; onToggle?: (kind: 'edited' | 'searched') => void }) {
+function DocsCounters({ docs, counts, onToggle }: { docs?: { edited: string[]; searched: string[] } | null; counts?: { edited: number; searched: number }; onToggle?: (kind: 'edited' | 'searched') => void }) {
   return <span className="timeline-preview-doc-counters">
-    {(['edited', 'searched'] as const).map(kind => docs[kind].length > 0 && <button type="button" key={kind}
+    {(['edited', 'searched'] as const).map(kind => (counts?.[kind] ?? docs?.[kind].length ?? 0) > 0 && <button type="button" key={kind}
       className={`timeline-preview-doc-counter timeline-preview-doc-counter--${kind}`}
-      title={docs[kind].join('\n')} aria-label={`${kind === 'edited' ? 'Изменённые документы' : 'Поиск документов'}: ${docs[kind].length}`}
+      title={docs?.[kind].join('\n')} aria-label={`${kind === 'edited' ? 'Изменённые документы' : 'Поиск документов'}: ${counts?.[kind] ?? docs?.[kind].length ?? 0}`}
       onClick={onToggle ? () => onToggle(kind) : undefined} style={{ cursor: onToggle ? 'pointer' : 'default' }}>
-      <Pencil size={11} /><span>{docs[kind].length}</span>
+      <Pencil size={11} /><span>{counts?.[kind] ?? docs?.[kind].length ?? 0}</span>
     </button>)}
   </span>;
 }

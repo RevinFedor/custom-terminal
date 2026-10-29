@@ -6,7 +6,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const policy = require('./codex-resume-goal-prompt');
 const { selectCodexCurrentInteractiveFrameText } = require('./codex-tui-readiness');
-const { inspectCodexInputReadyTextCore, parseCodexVerifiedComposerFooter } = require('./codex-tui-readiness');
+const { inspectCodexInputReadyTextCore, parseCodexVerifiedComposerFooter,
+  hasCodexComposerStatusFooter } = require('./codex-tui-readiness');
 const runtimePolicies = require('./codex-runtime-policies');
 const { createCodexLiveSettingsObserver } = require('./codex-live-settings');
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -59,7 +60,8 @@ function harness({ configured = true, override, screen = menu, usagePolicy } = {
     captureCodexFrame: async () => ({}),
     inspectCodexInputReadyVisibleText: (_text, source, { lines }) => inspectCodexInputReadyTextCore(
       selectCodexCurrentInteractiveFrameText(lines), '', { requireSyncMarker: false, requireInitializedComposer: true, source }),
-    parseCodexVerifiedComposerFooter,
+    parseCodexVerifiedComposerFooter, hasCodexComposerStatusFooter,
+    getCodexModelIdentityCatalog: () => [],
     publishCodexRuntimeProjection: () => ({ sessionStatus: 'starting' }), _webBroadcast() {},
     captureTerminalHistoryPreviewDiagnostic: async () => ({ incidentId: 'controlled-goal-diagnostic' }),
     scheduleProjectActivityBroadcast() {}, emitAgentReadinessChanged() {}, mainWindow: null,

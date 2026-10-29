@@ -109,6 +109,7 @@ test('real Project send rejects a destination that changes while preparation is 
   let target = { toolType: 'codex', sessionId: 'A' };
   const calls = [];
   const context = vm.createContext({
+    ...require('./agent-send-preparation'),
     agentSendBridgeTimeoutMs: 1000,
     agentSendReceiptStartupReady: Promise.resolve(),
     promptAuditFingerprint: () => 'prompt-hash',

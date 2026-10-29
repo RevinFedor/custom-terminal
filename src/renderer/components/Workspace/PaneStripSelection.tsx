@@ -2,14 +2,14 @@ import React,{createContext,useContext,useEffect,useMemo,useRef,useState} from '
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {prunePaneStripSelection,selectPaneStripTab,paneStripSelectionEntries} from '../../utils/paneStripSelectionModel.mjs';
 import type {StripEntry} from './PaneTabStrip';
-import {readPaneStripOwnerEntries,capturePaneStripGroupDrag} from '../../utils/paneStripGroupsModel.mjs';
+import {readPaneStripOwnerEntries,capturePaneStripGroupDrag,paneStripSelectionMembershipCurrent} from '../../utils/paneStripGroupsModel.mjs';
 import {registerPaneStripOutsideSelection} from '../../utils/paneStripOutsideSelection.mjs';
 import {getPaneTabDragSnapshot,subscribePaneTabDrag} from '../../utils/paneTabDragBridge';
 import {getPaneTabPointerSnapshot,subscribePaneTabPointer} from '../../utils/paneTabPointerBridge';
 
 export type PaneStripSelectionLease={
   version:1;workflowId:string;windowId:string|null;paneIndex:number|null;
-  entries:StripEntry[];isCurrent:()=>boolean;
+  entries:StripEntry[];isCurrent:()=>boolean;isGroupCurrent?:()=>boolean;
 };
 type Controller={
   selected:(tabId:string)=>boolean;
@@ -67,15 +67,21 @@ export function usePaneStripSelectionController({workflowId,windowId,paneIndex,e
       const captured=paneStripSelectionEntries(live.selection,live.entries,id).map(entry=>({...entry}));
       const generation=live.generation,key=live.ownerKey;
       const navigationRevision=useWorkspaceStore.getState().navigationRevision;
-      return {version:1,workflowId,windowId,paneIndex,entries:captured,isCurrent:()=>{
+      const isCurrent=(groupSettings=false)=>{
         if(latest.current.ownerKey!==key||latest.current.generation!==generation||!latest.current.presented)return false;
         const state=useWorkspaceStore.getState();
         if(state.activeSpaceId!==workflowId || state.navigationRevision!==navigationRevision)return false;
         const strip=readPaneStripOwnerEntries(state,{workflowId,windowId,paneIndex});
         return !!strip&&captured.every(entry=>strip.some(item=>item.tabId===entry.tabId&&item.projectId===entry.projectId)
-          &&state.openProjects.get(entry.projectId)?.tabs.has(entry.tabId)
-          &&(!state.organizationReady||state.tabWorkflowMembership[entry.tabId]?.workflowId===workflowId));
-      }};
+          &&state.openProjects.get(entry.projectId)?.tabs.has(entry.tabId))
+          &&(!state.organizationReady||(groupSettings
+            ?paneStripSelectionMembershipCurrent(state,{workflowId,windowId,paneIndex},captured)
+            :captured.every(entry=>state.tabWorkflowMembership[entry.tabId]?.workflowId===workflowId)));
+      };
+      // Group settings can follow the released presentation before its ACK.
+      // Original execution commands retain their canonical admission lease.
+      return {version:1,workflowId,windowId,paneIndex,entries:captured,
+        isCurrent:()=>isCurrent(),isGroupCurrent:()=>isCurrent(true)};
     },
   }),[ownerKey,paneIndex,selection,orderKey]);
 }

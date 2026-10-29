@@ -16,8 +16,11 @@ export function mergeBuildInstallJobs(previous = [], incoming = [], tabId) {
 }
 export function buildInstallPresentation(job, stale = false) {
   if (stale) return { label: 'Связь не подтверждена', color: '#fbbf24', spinning: false };
+  if (job.requestCancelledAt) return { label: job.running ? 'Отмена запроса…' : 'Запрос отменён', color: '#a3a3a3', spinning: false };
   if (activity.pending(job.continuation) && job.continuation.inheritedActive === false) {
-    return { label: 'Ожидание подтверждения продолжения', color: '#fbbf24', spinning: false };
+    return { label: job.callback?.status === 'sent'
+      ? (job.ok === true ? 'Установлено · ждём завершения ответа' : 'Ждём завершения ответа на уведомление')
+      : 'Проверка возврата в сессию', color: '#fbbf24', spinning: false };
   }
   if (job.installOutcomeUnknown) return { label: 'Исход установки неизвестен', color: '#fbbf24', spinning: false };
   if (job.cancelled) return { label: job.running ? 'Отмена…' : 'Отменено', color: '#a3a3a3', spinning: false };
@@ -35,6 +38,7 @@ export function buildInstallPresentation(job, stale = false) {
   return { label: job.ok ? 'Установлено' : 'Остановлено', color: job.ok ? '#4ade80' : '#a3a3a3', spinning: false };
 }
 export function buildInstallVisibleInDock(job) {
+  if (job.requestCancelledAt && !job.running) return false;
   return activity.pending(job.continuation) || job.running || job.ok === false || job.installOutcomeUnknown
     || ['pending', 'waiting', 'sending', 'confirming', 'sent_unverified', 'failed', 'blocked'].includes(job.callback?.status);
 }

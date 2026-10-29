@@ -189,8 +189,9 @@ test('actual HTTP Send + registry carries done fact once; GET status stays done 
   const sent = [], transportResults = []; let resultReads = 0;
   const sendJson = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const target = { tabId: 'T', sessionId: 'S', toolType: 'codex', projectId: 'P', tabType: 'terminal' };
-  const env = vm.createContext({ crypto, console, require, tabWorkContext: h.context,
+  const env = vm.createContext({ crypto, console, require, path, srcMainDir: __dirname, tabWorkContext: h.context,
     promptAuditFingerprint, fingerprintAgentSendRequest, withPromptOriginPresentation,
+    withTerminalMcpPromptSource: require('./terminal-mcp-prompt-source').withTerminalMcpPromptSource,
     prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation, agentSendTargetPreconditionFailure,
     classifyAgentSendReceipt, isAgentSendProviderQueueAccepted, AGENT_SEND_RECEIPT_STATES: RECEIPT_STATES,
     agentSendReceiptRegistry: createAgentSendReceiptRegistry(), agentSendReceiptStore: null,

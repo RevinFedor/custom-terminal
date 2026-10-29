@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const { runBuildContinue, ENDPOINT } = require('./build-and-continue-immediate.cjs');
+const { runBuildContinue, ENDPOINT, restorationSummary } = require('./build-and-continue-immediate.cjs');
 function fixture() {
   const events = [], operationId = 'test-operation-one';
   let closed = false;
@@ -12,7 +12,7 @@ function fixture() {
       if (request.requestPath === '/api/me') return { statusCode: 200, body: { ok: true, capabilities: { buildContinue: { version: 2, proofRevision: 2 } } } };
       if (request.requestPath === ENDPOINT) closed = true;
       return { statusCode: request.requestPath.endsWith('/restore') ? 202 : 200,
-        body: { ok: true, operation: { id: operationId, sourceMainPid: 11, capturedAt: 123 }, reportUrl: 'exact-report' } };
+        body: { ok: true, operation: { id: operationId, sourceMainPid: 11, capturedAt: 123, targets: [], unresolved: [] }, reportUrl: 'exact-report' } };
     }, maintenance: { installScope: id => { events.push({ quietOperation: id }); return { operationId: id }; } },
     install: async args => { assert.equal(args.quitBeforePrepare, true); await args.beforeQuit();
       events.push({ compiler: true }); await args.beforeReplace(); return { ok: true }; } };
@@ -57,4 +57,38 @@ test('a newly opened or unknown app during compilation prevents replacing that n
   h.options.inspect = () => ({ status: 'found', server: { pid: ++reads === 1 ? 11 : 99, port: 1 } });
   await assert.rejects(runBuildContinue(h.options), /during build/);
   assert.equal(h.events.filter(e => e.requestPath?.endsWith('/restore')).length, 0);
+});
+
+test('pending capture error preserves the blocking operation ID and prints its exact report', async () => {
+  const h = fixture(), call = h.options.request, logs = [];
+  h.options.log = message => logs.push(message);
+  h.options.request = request => request.requestPath === ENDPOINT ? Promise.resolve({ statusCode: 409,
+    body: { ok: false, code: 'build_continue_operation_pending', error: 'build_continue_operation_pending', operationId: 'original-pending-capture' } }) : call(request);
+  await assert.rejects(runBuildContinue(h.options), error => error.operationId === 'original-pending-capture' && error.quitRequested === false);
+  assert(logs.some(message => message.includes(ENDPOINT + '/original-pending-capture')));
+  assert.equal(h.events.some(event => event.compiler), false);
+});
+
+test('successful install with refused continuations reports overall failure without undoing the installed app', async () => {
+  const h = fixture(), request = h.options.request, logs = [];
+  h.options.log = value => logs.push(value);
+  h.options.request = async value => {
+    const result = await request(value);
+    if (value.requestPath.endsWith('/restore')) result.body.operation = { id: h.options.operationId, phase: 'settled',
+      targets: [{ tabId: 'same-source', state: 'superseded', reason: 'build_continue_owner_changed' }], unresolved: [] };
+    return result;
+  };
+  const result = await runBuildContinue(h.options);
+  assert.equal(result.ok, false); assert.equal(result.install.ok, true);
+  assert.equal(result.restoration.confirmed, 0); assert.equal(result.restoration.refused, 1);
+  assert(logs.some(line => line.includes('not continued tab=same-source')));
+  assert.equal(h.events.filter(event => event.compiler).length, 1, 'continuation refusal never repeats installation');
+});
+
+test('restoration summary separates canonical confirmed input, existing work, pending and refused', () => {
+  const s = restorationSummary({ phase: 'restoring', targets: ['confirmed', 'already-working', 'result-ready', 'accepted', 'unknown', 'superseded']
+    .map(state => ({ state })), unresolved: [], carriedTargets: [{ operationId: 'older' }] });
+  assert.deepEqual([s.confirmed, s.alreadyWorking, s.resultReady, s.pending, s.refused, s.carried], [1, 1, 1, 2, 1, 1]);
+  assert.equal(s.needsAttention, true);
+  assert.equal(restorationSummary(null).known, false);
 });

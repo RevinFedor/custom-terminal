@@ -39,7 +39,9 @@ function initializeDelivery(run, { legacy = false } = {}) {
   if (run.externalResearchDelivery || run.runKind !== 'external-research'
     || (legacy ? !['completed', 'failed'].includes(run.status) || run.sourceFollowupStartedAt
       : run.resultComplete !== true)
-    || (!legacy && (run.externalResearchStatus !== 'done' || run.notificationAttemptedAt || run.notificationPromptHash || run.notificationAttempt))) return;
+    || (!legacy && (!['done', 'error'].includes(run.externalResearchStatus) && run.externalResearchLocalOutcome?.state !== 'failed'
+      || run.notificationAttemptedAt || run.notificationPromptHash || run.notificationAttempt
+      || run.notificationStatus && run.notificationStatus !== 'pending'))) return;
   const owner = run.externalResearchDeliveryBirth?.identity || birthIdentity(run);
   // SC done proves a result, not the history of Noted input. A loaded ACTIVE
   // legacy row stays observational even when this is its first local done.
@@ -64,6 +66,8 @@ function sameOwner(run, delivery) {
 }
 function authorized(run, delivery = run?.externalResearchDelivery) {
   return sameOwner(run, delivery) && (run.status === 'completed' && run.resultComplete === true
+    || run.status === 'failed' && run.resultComplete === true
+      && (run.externalResearchStatus === 'error' || run.externalResearchLocalOutcome?.version === 1 && run.externalResearchLocalOutcome.state === 'failed') && canAdmit(run, delivery)
     || delivery.legacy === true && run.status === 'failed')
     && run.notifySource !== false && !run.notificationSuppressed && !run.notificationCancelRequestedAt
     && !['suppressed', 'source-closed'].includes(run.notificationStatus);

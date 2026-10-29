@@ -31,6 +31,15 @@ const projects = new Map(['a', 'b'].map(id => ['p' + id, {
 }]));
 useWorkspaceStore.setState({
   openProjects: projects,
+  openTabById: async (tabId: string, options: unknown) => {
+    f.navigationRequests ||= [];
+    f.navigationRequests.push({ tabId, options });
+    if (f.rejectNavigation) return false;
+    const owners = [...useWorkspaceStore.getState().openProjects.values()].filter(workspace => workspace.tabs.has(tabId));
+    if (owners.length !== 1) return false;
+    f.navigation.push({ projectId: owners[0].projectId, tabId });
+    return true;
+  },
   activateCenterTab: (projectId: string, tabId: string) => f.navigation.push({ projectId, tabId }),
   placeTab: (projectId: string, tabId: string) => f.navigation.push({ projectId, tabId }),
 } as any);

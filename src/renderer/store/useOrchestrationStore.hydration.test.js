@@ -18,6 +18,8 @@ async function fixture(t) {
   const ipcRenderer = {
     on: (channel, callback) => listeners.set(channel, callback),
     invoke: channel => {
+      // The separate install owner is known/empty in this registry hydration test.
+      if (channel === 'build-install:list-continuations') return Promise.resolve({ version: 1, known: true, entries: [] });
       assert.equal(channel, 'orchestration:list-active');
       assert.ok(listeners.has('orchestration:changed'));
       reads++;
