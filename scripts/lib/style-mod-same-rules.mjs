@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { mappedReplacements } from './perf-build-provenance.mjs';
 
 export const STYLE_MOD_VERSION = '4.1.3';
 export const STYLE_MOD_UPSTREAM_SHA256 = '43690e452046d6a355a1a9211c1b48aab605613ab63c0aff13f585e742e66c83';
@@ -28,7 +29,13 @@ export function styleModSameRulesVitePlugin() {
     config() { return { optimizeDeps: { exclude: ['style-mod'] } }; },
     transform(source, id) {
       if (id.startsWith('\0') || !modulePath.test(id.split('?', 1)[0])) return null;
-      return { code: patchStyleModSameRules(source), map: null };
+      const code = patchStyleModSameRules(source);
+      const after = `      ${STYLE_MOD_PATCH_MARKER}
+      if (this.styleTag.textContent !== text) this.styleTag.textContent = text
+`;
+      const mapped = mappedReplacements(source, [[assignment, after]], id.split('?', 1)[0]);
+      if (mapped.code !== code) throw new Error('[style-mod-same-rules] mapped patch differs from guarded patch');
+      return mapped;
     },
   };
 }

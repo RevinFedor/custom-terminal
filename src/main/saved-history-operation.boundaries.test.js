@@ -75,6 +75,8 @@ test('actual Codex write callback revalidates the operation after awaited shell 
       sessionId: 'child', launchId: 'launch', launchRunSeq: 4, ownsMcpStartupRecoveryHandoff: false,
       reserveReturn: null, normalizedCommand: 'codex-c', termCwd: '/private/test',
       effectiveModel: 'fixture-model', effectiveEffort: 'high', sourceSettingsProof: {},
+      providerStates: new Map([['real-tab', { codexFastIntent: false, codexFastIntentRevision: 1 }]]),
+      codexLastRunCommandPayload: new Map(),
       developerInstructions: '', profile: null, codexAuthProfileRoute: null,
       buildCodexCommand: () => 'codex resume child',
       providerProxyBaseUrl: null, cmdLine: 'codex resume child', startedAt: 0,
@@ -84,7 +86,10 @@ test('actual Codex write callback revalidates the operation after awaited shell 
         events.push('operation-proof'); if (stale) throw Error('stale');
       } }), rebaseCodexLaunchObservationAtWrite: () => {}, disarmCodexProviderSemanticSource: () => {},
       writeAgentLaunchCommandToIdleShell: () => events.push('write') };
-    const run = vm.runInNewContext('(' + callback.getText(tree) + ')', context);
+    const sandbox = vm.createContext(context);
+    vm.runInContext(['getCodexFastIntentRecord', 'ensureCodexFastLaunchIntent'].map(name =>
+      find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(tree)).join('\n'), sandbox);
+    const run = vm.runInContext('(' + callback.getText(tree) + ')', sandbox);
     if (stale) await assert.rejects(run, /stale/); else assert.equal((await run()).written, true);
     assert.deepEqual(events, stale ? ['proof', 'operation-proof'] : ['proof', 'operation-proof', 'write']);
   }
@@ -101,6 +106,7 @@ test('actual web startup adapter registers one IPC owner and resolves source mod
   visit(parsed); assert.ok(selected);
   const handlers = new Map();
   const context = { path, __dirname, savedHistoryRuntime: {}, transcriptService: {}, savedHistoryIpcRegistered: false,
+    tabWorkContext: null, agentSendReceiptStore: null, agentSendQueue: null, historyMutationInput: null,
     codexDataApi: {}, claudeDataApi: null, app: { getPath: () => '/private/test-user-data' },
     buildCodexTimeline: () => [], resolveHistorySessionInfo: () => ({}),
     findOrchestrationTabDescriptor: () => null, bridgeRequest: () => {}, webBroadcast: () => {},
@@ -113,7 +119,13 @@ test('actual web startup adapter registers one IPC owner and resolves source mod
   vm.runInContext(declaration.getText(parsed), sandbox);
   vm.runInContext(selected.getText(parsed), sandbox);
   vm.runInContext(selected.getText(parsed), sandbox);
-  assert.deepEqual([...handlers.keys()], ['saved-history:step', 'saved-history:get']);
+  assert.deepEqual([...handlers.keys()], ['saved-history:step', 'saved-history:get', 'self-rewind:list', 'self-rewind:dismiss', 'self-rewind:details']);
+  assert.equal(sandbox.savedHistoryOperations.selfRewind, null, 'no self capability without its existing owners');
+  Object.assign(sandbox, { tabWorkContext: {}, agentSendReceiptStore: {}, agentSendQueue: {}, historyMutationInput: {}, savedHistoryRuntime: { owner: {} } });
+  vm.runInContext(selected.getText(parsed), sandbox);
+  assert.equal(sandbox.savedHistoryOperations.selfRewind.context, sandbox.tabWorkContext);
+  assert.equal(typeof sandbox.savedHistoryOperations.selfRewind.send, 'function');
+  assert.equal(handlers.size, 5, 'reinitializing the factory never adds a duplicate IPC owner');
 });
 
 test('real SQLite receipt survives reopen; unknown work cannot become a blind retry', async t => {

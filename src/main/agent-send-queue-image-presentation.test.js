@@ -83,7 +83,9 @@ test('actual bounded list IPC and live publication carry identical proven image 
     // This project-API image fixture has no desktop return registration. The
     // separate return IPC/SQLite suite exercises its real durable controller.
     historySendReturnControl:()=>({read:()=>null}),
-    require:()=>({projectQueuedSendReceipt:x=>x,applicationQueueInfo:()=>r.applicationQueue})});
+    require:id=>id.endsWith('compact-send-delivery.cjs')
+      ? require(id)
+      : ({projectQueuedSendReceipt:x=>x,applicationQueueInfo:()=>r.applicationQueue})});
   const listed=await handler(null,{tabId:r.tabId});let live;
   livePublisher(value=>{live=value;}).publish(r);
   assert.deepEqual(clone(listed.records[0].imagePresentation),live.imagePresentation);

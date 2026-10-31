@@ -90,6 +90,25 @@ test('observed Codex 0.156.1 capitalized model footer remains a committed ready 
   }).ready, true);
 });
 
+test('incident ab3849ff: native default effort is ready chrome, never a concrete settings proof', () => {
+  const current = selectCodexCurrentInteractiveFrameText([
+    '  >_ OpenAI Codex (v0.166.0)', '', '› Ask Codex to do anything', '',
+    '  GPT-6.1-Sol default · /private/tmp/own-fixture  ⚠ 1 warning · f2 to view',
+  ].join('\n'));
+  assert.equal(inspectCodexInputReadyTextCore(current, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true);
+  assert.equal(parseCodexVerifiedComposerFooter(current), null, 'default must not be persisted as low or a native applied pair');
+  assert.equal(inspectCodexInputReadyTextCore(current, '', {
+    requireSyncMarker: false, requireInitializedComposer: true, blockers: ['auth-required'],
+  }).ready, false);
+  for (const text of ['GPT-6.1-Sol default · /own', '› Ask Codex to do anything\nmodel: loading', '› Example\nordinary default · prose']) {
+    assert.equal(inspectCodexInputReadyTextCore(text, '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    }).ready, false, text);
+  }
+});
+
 test('observed Codex 0.156.1 Luna Reserve footer maps its display name to the existing reserve model ID', () => {
   const current = selectCodexCurrentInteractiveFrameText([
     '› Ask Codex to do anything',

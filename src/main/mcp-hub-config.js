@@ -127,7 +127,8 @@ function resolveHubConfiguration(source = process.env, { home = source.HOME || o
             ? { reapMarker: source.NOTED_SC_DESKTOP_MCP_REAP_MARKER } : {}),
           env: name === 'knowledge' ? {
             KNOWLEDGE_DISABLE_GEMINI: 'true', KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
-            KNOWLEDGE_ROUTER_PROVIDER: 'codex', KNOWLEDGE_CODEX_MODEL: source.KNOWLEDGE_CODEX_MODEL || 'gpt-5.6-luna',
+            KNOWLEDGE_ROUTER_PROVIDER: 'codex',
+            ...(source.KNOWLEDGE_CODEX_MODEL ? { KNOWLEDGE_CODEX_MODEL: source.KNOWLEDGE_CODEX_MODEL } : {}),
             KNOWLEDGE_CODEX_EFFORT: 'low', KNOWLEDGE_INDEX_PROVIDER: 'codex',
           } : {},
         });

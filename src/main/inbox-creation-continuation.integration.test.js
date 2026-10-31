@@ -81,7 +81,9 @@ async function harness(t, { startupFailure = false, queued = false } = {}) {
     },
     decId: decodeURIComponent,
   };
-  vm.createContext(context); vm.runInContext(functions.map(fn).join('\n'), context);
+  vm.createContext(context);
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, ast);
+  vm.runInContext(functions.map(fn).join('\n'), context);
   context.registerBridgeReplyHandler();
   contents.send = (_channel, request) => {
     bridges.push(request);

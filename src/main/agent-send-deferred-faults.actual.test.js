@@ -94,7 +94,9 @@ function fixture(t) {
         return { success: null, submitted: true, auditPending: true, status: 'audit-pending' };
       },
     });
+    require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, tree);
     vm.runInContext(webCode, context);
+    const buildContinueAdmission = vm.runInContext('BUILD_CONTINUE_ADMISSION', context);
     const makeQueue = () => {
       const q = new AgentSendQueue({ store, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
         ready: () => control.queueReady,
@@ -102,6 +104,10 @@ function fixture(t) {
         publish: record => control.onPublication?.(record),
         execute: (req, scope) => context.runPreparedAgentSendScenario({ ...req,
           applicationQueueExecution: true, sendRequestFingerprint: scope.requestFingerprint,
+          // Match the real startup executor: a JSON-restored Build request
+          // receives its exact private capability again, not a public flag.
+          ...(String(req.source || '').startsWith('build-install-continue:')
+            ? { [buildContinueAdmission]: true } : {}),
           prepareSend: () => context.prepareQueuedBuildContinueInput(req, 'operation') }) });
       queues.push(q); context.agentSendQueue = q; return q;
     };
@@ -262,7 +268,7 @@ test('cancellation committed before a crash defeats recovery of dispatching pre-
   assert.deepEqual(h.calls.producers, []); assert.deepEqual(h.calls.bridges, []);
 });
 
-test('SQLite reopen recovers only the original dispatching/preparing/no-attempt head and FIFO position', async t => {
+test('SQLite reopen keeps an unrecorded completed capture parked under its original FIFO position', async t => {
   const h = fixture(t); let locked;
   h.control.onAdmission = async () => { locked = h.lock(); return false; };
   h.add('head'); h.add('follower'); await flush();
@@ -274,6 +280,23 @@ test('SQLite reopen recovers only the original dispatching/preparing/no-attempt 
   assert.deepEqual(snapshot(h, 'head'), original);
   assert.deepEqual(snapshot(h, 'follower'), follower);
   assert.deepEqual(h.calls.bridges, []);
+  h.control.ready = true; h.queue.notifyRuntime('T'); await flush();
+  assert.ok(h.store.get(original.operationKey).receipt.continuationInputCapture);
+  assert.equal(h.store.get(original.operationKey).receipt.continuationInputHold, undefined);
+  assert.deepEqual(h.calls.bridges, [], 'after reopen the marker cannot prove which capture returned');
+  assert.equal(h.queue.item(original.operationKey).id, original.id);
+  assert.equal(h.queue.item(follower.operationKey).state, 'waiting');
+});
+
+test('SQLite reopen retries a completed no-proof preparation whose marker was durably cleared', async t => {
+  const h = fixture(t);
+  h.add('head'); h.add('follower'); await flush();
+  const original = snapshot(h, 'head'), follower = snapshot(h, 'follower');
+  assert.equal(h.queue.item(original.operationKey).state, 'waiting');
+  assert.equal(h.store.get(original.operationKey).receipt.continuationInputCapture, undefined);
+  assert.deepEqual(h.calls.producers, []); assert.deepEqual(h.calls.bridges, []);
+  h.reopen().resume(); await flush();
+  assert.deepEqual(snapshot(h, 'head'), original); assert.deepEqual(snapshot(h, 'follower'), follower);
   h.control.ready = true; h.queue.notifyRuntime('T'); await flush();
   assert.deepEqual(h.calls.bridges.map(row => row.handoffId), ['head']);
   assert.equal(h.queue.item(original.operationKey).id, original.id);

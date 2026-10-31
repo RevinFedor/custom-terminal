@@ -168,13 +168,17 @@ try {
   });
   let causalAckPending = 0;
   if (flight) causalJournal = createCausalJournal({ artifacts: flight.artifacts, now: watchdogAbs, log: wdLog,
-    onPersisted: ack => {
+    onPersisted: (ack, reportFailure) => {
       if (!process.connected || causalAckPending >= 8) return false;
       causalAckPending++;
       let settled = false;
-      const finish = () => { if (!settled) { settled = true; causalAckPending--; } };
+      const finish = error => {
+        if (settled) return;
+        settled = true; causalAckPending--;
+        if (error) { try { reportFailure(error); } catch {} }
+      };
       try { process.send({ t: 'causal-ack', ...ack }, finish); return true; }
-      catch { finish(); return false; }
+      catch (error) { finish(error); return false; }
     },
   });
   if (flight) stallSampler = createNativeStallSampler({ artifacts: flight.artifacts, log: wdLog,

@@ -66,6 +66,8 @@ const { userNotificationCapability, userNotificationRequest, readUserNotificatio
 const { codexGoalCapability, codexGoalActionRequest } = require(path.join(srcMainDir, 'codex-goal-action-api'));
 const { HistoryFreshness, historyFreshnessScopeKey } = require(path.join(srcMainDir, 'history-freshness'));
 const { isLocalSlashCommandPrompt } = require(path.join(srcMainDir, 'agent-history-send-receipt'));
+const { isDesktopCodexCompactQueueRequest } = require(path.join(srcMainDir, '../shared/agent-local-command.cjs'));
+const DESKTOP_COMPACT_ADMISSION = Symbol('desktop-compact-fifo-admission');
 const { TabMessageService, formatTabMessagePrompt } = require(path.join(srcMainDir, 'tab-messages'));
 const { resolveTabMessageSourceLocation } = require(path.join(srcMainDir, 'tab-message-source-location'));
 const { handleTerminalMessageOpen } = require(path.join(srcMainDir, 'terminal-message-navigation'));
@@ -183,6 +185,7 @@ const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
 const { compactSendReceiptPresentation } = require(path.join(srcMainDir, 'compact-send-settlement'));
+const { compactSendDeliveryIdentity } = require(path.join(srcMainDir, '../shared/compact-send-delivery.cjs'));
 const { PREPARATION_MS, COLD_PREPARATION_MS, selectSendPreparationMode,
   createSendPreparationScope, deferSendPreparation, isSendPreparationDeferred } = require(path.join(srcMainDir, 'agent-send-preparation'));
 const {
@@ -430,6 +433,7 @@ let readMessageReturnProof = null;
 const MESSAGE_OUTCOME_ADMISSION = Symbol('message-outcome-admission');
 let buildContinueOperations = null;
 const BUILD_CONTINUE_ADMISSION = Symbol('build-continue-admission');
+const SELF_REWIND_ADMISSION = Symbol('self-rewind-admission');
 let releaseLoopReceipt = null;
 let loopMessageStartupReady = null;
 const loopNaturalEvidence = new Map();
@@ -1113,6 +1117,7 @@ let getAgentResponseState = null;
 let captureTabInspection = null;
 let readTabInspectionResponse = null;
 let readAgentObservedResponse = null;
+let readMiniOrchestratorSendAdmission = null;
 let orchestrationContinuationService = null;
 let readAgentSendDestination = null;
 let readAgentContinuationOriginalProof = null;
@@ -4203,7 +4208,8 @@ function publicAgentSendReceipt(record) {
     attemptId: record.attemptId || null,
   });
   const serviceCommand = compactSendReceiptPresentation(record);
-  const { serviceCommand: _storedPresentation, ...delivery } = replay;
+  const compactStartIdentity = compactSendDeliveryIdentity(record);
+  const { serviceCommand: _storedPresentation, compactStartIdentity: _storedCompactStart, ...delivery } = replay;
   return {
     ...delivery,
     operationKey: record.operationKey,
@@ -4222,7 +4228,9 @@ function publicAgentSendReceipt(record) {
     updatedAt: record.updatedAt,
     settledAt: record.settledAt || null,
     ...(record.applicationQueue ? { applicationQueue: record.applicationQueue } : {}),
-    exactAuditConfirmed: record.state === 'confirmed',
+    exactAuditConfirmed: record.state === 'confirmed' && !serviceCommand,
+    ...(compactStartIdentity ? { compactStartIdentity,
+      promptHash: record.promptHash, promptLength: record.promptLength } : {}),
     entryUuid: record.auditIdentity?.entryUuid || null,
     auditEntryUuid: record.auditIdentity?.entryUuid || null,
     sourceIdentity: record.auditIdentity?.sourceIdentity || null,
@@ -4290,6 +4298,9 @@ function projectCardsSnapshot(projectId, tabs) {
 }
 
 async function runAgentSendScenario(args) {
+  if ((args.selfRewindRef || String(args.source || '').startsWith('self-rewind:'))
+    && args[SELF_REWIND_ADMISSION] !== true) throw Object.assign(Error('Self Rewind continuation is server-owned'),
+    { code: 'self_rewind_admission_required', submitted: false, statusCode: 403 });
   if ((args.messageOutcomeRef || String(args.source || '').startsWith('tab-message-outcome:'))
     && args[MESSAGE_OUTCOME_ADMISSION] !== true) throw Object.assign(Error('Message outcome is server-owned'),
     { code: 'message_outcome_admission_required', submitted: false, statusCode: 403 });
@@ -4370,6 +4381,9 @@ async function runAgentSendScenario(args) {
 }
 
 async function runPreparedAgentSendScenario(args) {
+  if ((args.selfRewindRef || String(args.source || '').startsWith('self-rewind:'))
+    && args[SELF_REWIND_ADMISSION] !== true) throw Object.assign(Error('Self Rewind continuation is server-owned'),
+    { code: 'self_rewind_admission_required', submitted: false, statusCode: 403 });
   if (args.messageOutcomeRef || String(args.source || '').startsWith('tab-message-outcome:')) {
     args = { ...args, ...(await resolveMessageWaitOutcome(args)) };
   }
@@ -4467,7 +4481,9 @@ async function runPreparedAgentSendScenario(args) {
 
   if (durableIdentity) {
     if (typeof agentSendQueue !== 'undefined' && agentSendQueue && !applicationQueueExecution
-      && ['claude', 'codex'].includes(provider) && !isLocalSlashCommandPrompt(prompt)
+      && ['claude', 'codex'].includes(provider)
+      && (!isLocalSlashCommandPrompt(prompt) || args[DESKTOP_COMPACT_ADMISSION] === true
+        && isDesktopCodexCompactQueueRequest(args))
       && findOrchestrationTabDescriptor(tabId)?.tabType !== 'claude-sdk') {
       if (!agentSendReceiptStore.get(sendOperationKey) && !agentSendQueue.item(sendOperationKey)
         && typeof captureTabInspection === 'function' && runAfterCapacityBlocksNewSend(args)) {
@@ -4485,6 +4501,10 @@ async function runPreparedAgentSendScenario(args) {
         };
       }
       const { prepareSend: _prepare, onLateReceipt: _late, retryNoInputAttemptId: _retry, retryCompletionNoInput: _completionRetry, ...request } = args;
+      if (args.selfRewindRef && !agentSendQueue.item(sendOperationKey)) {
+        try { savedHistoryOperations.validateSelfReservation(args); }
+        catch (error) { throw Object.assign(error, { submitted: false, pasteWritten: false, enterWritten: false }); }
+      }
       if (source === 'prompt-loop') console.log('[AgentSendAdmission] ' + JSON.stringify({
         tabId, handoffId, operationKey: sendOperationKey, requestHash: fingerprintAgentSendRequest(request),
         stage: 'reservation-start', at: Date.now() }));
@@ -4531,6 +4551,9 @@ async function runPreparedAgentSendScenario(args) {
   let deferredPreparation = null;
   let rendererBoundaryCrossed = false;
   const executeSend = async () => {
+    const miniFailure = typeof readMiniOrchestratorSendAdmission === 'function'
+      ? readMiniOrchestratorSendAdmission({ tabId, handoffId }) : null;
+    if (miniFailure) return miniFailure;
     let preparationStartedAt = Date.now(); // Active HEAD, never enqueue/FIFO residence.
     // The retained birth belongs only to preparation BEFORE the first attempt.
     // A certified automatic no-write A1 may later acquire A2 through its
@@ -4556,7 +4579,56 @@ async function runPreparedAgentSendScenario(args) {
     let preflightScope = null;
     let result;
     let preparedTarget = null;
+    let continuationAdmission = null;
+    let continuationHold = headRecord?.receipt?.continuationInputHold || null;
+    let continuationCapture = headRecord?.receipt?.continuationInputCapture || null;
+    const continuationSource = String(source || '').replace(/^codex-/, '');
+    const ownQueuedContinuation = applicationQueueExecution && durableIdentity && provider === 'codex'
+      && (continuationSource.startsWith('build-install-continue:') && args[BUILD_CONTINUE_ADMISSION] === true
+        || continuationSource.startsWith('orchestration-continue:'));
+    const captureScope = (record, item) => {
+      const head = record && require(path.join(srcMainDir, 'agent-send-preparation')).activeHeadPreparation(record);
+      return head && item?.state === 'dispatching' ? { operationKey: sendOperationKey, tabId, handoffId,
+        requestFingerprint, queueId: item.id, requestHash: item.request_hash, requestJson: item.request_json,
+        startedAt: head.startedAt, deadlineAt: head.deadlineAt } : null;
+    };
+    let continuationScope = captureScope(headRecord, queuedHead);
     let admittedExpectedTarget = expectedTarget;
+    const continuationVerdict = (admission, fence = null) => {
+      if (admission?.version !== 1 || admission.kind !== 'codex-continuation-input'
+        || admission.ready !== true || typeof admission.recheck !== 'function') {
+        return { status: 'hard', reason: 'private_admission_invalid' };
+      }
+      try {
+        const value = admission.recheck(fence);
+        return ['current', 'pending', 'hard'].includes(value?.status)
+          ? { status: value.status, reason: /^[a-zA-Z0-9_-]{1,80}$/.test(value.reason || '') ? value.reason : 'unspecified' }
+          : { status: 'pending', reason: 'recheck_unknown' };
+      } catch { return { status: 'pending', reason: 'recheck_unavailable' }; }
+    };
+    const logContinuationVerdict = (stage, verdict) => console.warn('[AgentSendContinuationInput] tab='
+      + String(tabId).slice(-12) + ' stage=' + stage + ' class=' + verdict.status + ' reason=' + verdict.reason);
+    const continuationFailure = verdict => Object.assign(new Error('Continuation input changed during preparation'), {
+      code: 'agent_send_continuation_input_changed', continuationInputClass: verdict.status,
+      continuationInputReason: verdict.reason });
+    const continuationUnattempted = record => {
+      const item = agentSendQueue?.item(sendOperationKey);
+      if (!record || record.operationKey !== sendOperationKey || record.tabId !== tabId || record.handoffId !== handoffId
+        || record.requestFingerprint !== requestFingerprint || record.attemptId || Number(record.attempt || 0) !== 0
+        || !['reserved', 'preparing'].includes(record.state) || record.deliveryControl?.cancelledAt
+        || record.receipt?.submitted === true || record.receipt?.pasteWritten === true
+        || record.receipt?.enterWritten === true || record.receipt?.deliveryUnknown === true
+        || item?.state !== 'dispatching' || item.tab_id !== tabId) return false;
+      try { return item.request_hash === fingerprintAgentSendRequest(JSON.parse(item.request_json)); }
+      catch { return false; }
+    };
+    const parkUnknownContinuation = (reason = 'receipt_or_head_unproven') => {
+      const bounded = /^[a-zA-Z0-9_-]{1,80}$/.test(reason || '') ? reason : 'receipt_or_head_unproven';
+      logContinuationVerdict('receipt', { status: 'pending', reason: bounded });
+      deferredPreparation = deferSendPreparation('agent_send_continuation_input_pending', bounded);
+      return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+        status: 'not-submitted', code: deferredPreparation.code };
+    };
     const returnedBeforeInput = () => handoffId && agentSendReceiptStore
       && require(path.join(srcMainDir, 'history-send-return')).historySendReturnControl(agentSendReceiptStore).isReturned(tabId, handoffId);
     const returnedResult = () => ({ success: false, accepted: false, submitted: false,
@@ -4583,7 +4655,97 @@ async function runPreparedAgentSendScenario(args) {
         if (Date.now() >= preparationStartedAt + preparationDurationMs) {
           throw Object.assign(new Error('agent_send_preparation_expired'), { code: 'agent_send_preparation_expired' });
         }
-        preparedTarget = await prepareSend();
+        let capturing = false;
+        if (ownQueuedContinuation) {
+          continuationScope = captureScope(agentSendReceiptStore.get(sendOperationKey), agentSendQueue?.item(sendOperationKey));
+          if (!continuationScope) return parkUnknownContinuation('capture_scope_unproven');
+          const capture = agentSendReceiptStore.beginContinuationInputCapture(continuationScope);
+          if (!capture.ok) return parkUnknownContinuation(capture.reason);
+          continuationCapture = capture.marker;
+          continuationHold = capture.hold || null;
+          if (capture.state === 'captured') {
+            const retained = agentSendReceiptStore.retainContinuationInputHold(continuationScope, capture.marker, capture.hold);
+            if (!retained.ok) return parkUnknownContinuation(retained.reason);
+            continuationHold = retained.record.receipt.continuationInputHold;
+          } else if (capture.state === 'ready') {
+            if (!agentSendReceiptStore.startContinuationInputCapture(continuationScope, capture.marker)) return parkUnknownContinuation('capture_owner_changed');
+            capturing = true;
+          }
+        }
+        try { preparedTarget = await prepareSend(); }
+        catch (error) {
+          if (capturing) {
+            const cleared = agentSendReceiptStore.finishContinuationInputCaptureWithoutHold(continuationScope, continuationCapture);
+            capturing = false;
+            if (!cleared.ok) return parkUnknownContinuation(cleared.reason);
+            continuationCapture = null;
+          }
+          throw error;
+        }
+        continuationAdmission = preparedTarget?.continuationInputAdmission || null;
+        if (capturing) {
+          if (continuationAdmission) {
+            const hold = { version: 1, operationKey: sendOperationKey, tabId, handoffId, requestFingerprint,
+              startedAt: preparationStartedAt, deadlineAt: preparationStartedAt + preparationDurationMs,
+              fence: continuationAdmission.fence };
+            const retained = agentSendReceiptStore.retainContinuationInputHold(continuationScope, continuationCapture, hold);
+            if (!retained.ok) return parkUnknownContinuation(retained.reason);
+            continuationHold = retained.record.receipt.continuationInputHold;
+          } else {
+            const cleared = agentSendReceiptStore.finishContinuationInputCaptureWithoutHold(continuationScope, continuationCapture);
+            if (!cleared.ok) return parkUnknownContinuation(cleared.reason);
+            continuationCapture = null;
+          }
+        }
+        if (applicationQueueExecution && durableIdentity) {
+          // Freeze the first Main-issued hard fence before ANY later await.
+          // It belongs to this exact no-attempt H/O and retained HEAD clock;
+          // the saved value is a constraint, never fresh input authority.
+          const record = agentSendReceiptStore.get(sendOperationKey);
+          continuationHold = record?.receipt?.continuationInputHold || null;
+          continuationCapture = record?.receipt?.continuationInputCapture || null;
+          continuationScope ||= captureScope(record, agentSendQueue?.item(sendOperationKey));
+          if ((continuationAdmission || continuationHold) && (record?.deliveryControl?.cancelledAt || record?.attemptId
+            || !['reserved', 'preparing'].includes(record?.state))) {
+            return durableAgentSendReplay(record, { operationKey: sendOperationKey, tabId, handoffId });
+          }
+          if ((continuationAdmission || continuationHold) && !continuationUnattempted(record)) return parkUnknownContinuation();
+          if (continuationAdmission && !continuationHold) {
+            const initial = continuationVerdict(continuationAdmission);
+            if (initial.status === 'hard') { logContinuationVerdict('capture', initial); throw continuationFailure(initial); }
+            const hold = { version: 1, operationKey: sendOperationKey, tabId, handoffId, requestFingerprint,
+              startedAt: preparationStartedAt, deadlineAt: preparationStartedAt + preparationDurationMs,
+              fence: continuationAdmission.fence };
+            const staged = agentSendReceiptStore.stageQueuedRequest(sendOperationKey, { continuationInputHold: hold });
+            const persisted = staged?.record;
+            if (persisted?.deliveryControl?.cancelledAt || persisted?.attemptId
+              || !['reserved', 'preparing'].includes(persisted?.state)) {
+              return durableAgentSendReplay(persisted, { operationKey: sendOperationKey, tabId, handoffId });
+            }
+            if (!continuationUnattempted(persisted)) return parkUnknownContinuation();
+            if (staged?.ok !== true || JSON.stringify(persisted?.receipt?.continuationInputHold) !== JSON.stringify(hold)) {
+              throw deferSendPreparation('agent_send_continuation_input_pending', 'hold_storage_unproven');
+            }
+            continuationHold = persisted.receipt.continuationInputHold;
+          }
+          if (continuationHold) {
+            if (continuationHold.version !== 1 || continuationHold.operationKey !== sendOperationKey
+              || continuationHold.tabId !== tabId || continuationHold.handoffId !== handoffId
+              || continuationHold.requestFingerprint !== requestFingerprint
+              || continuationHold.startedAt !== preparationStartedAt
+              || continuationHold.deadlineAt !== preparationStartedAt + preparationDurationMs) {
+              const verdict = { status: 'hard', reason: 'hold_identity_changed' };
+              logContinuationVerdict('capture', verdict); throw continuationFailure(verdict);
+            }
+            const verdict = continuationAdmission ? continuationVerdict(continuationAdmission, continuationHold.fence)
+              : { status: 'pending', reason: 'fresh_admission_unavailable' };
+            if (verdict.status !== 'current') {
+              logContinuationVerdict('capture', verdict);
+              if (verdict.status === 'pending') throw deferSendPreparation('agent_send_continuation_input_pending', verdict.reason);
+              throw continuationFailure(verdict);
+            }
+          }
+        }
       } catch (error) {
         if (applicationQueueExecution && /^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
         if (applicationQueueExecution && isSendPreparationDeferred(error)
@@ -4605,6 +4767,8 @@ async function runPreparedAgentSendScenario(args) {
           status: 'not-submitted',
           code: error?.code || 'agent_send_prepare_failed',
           error: error?.message || String(error),
+          ...(error?.continuationInputClass ? { continuationInputClass: error.continuationInputClass,
+            continuationInputReason: error.continuationInputReason } : {}),
           httpStatus: Number(error?.statusCode) || undefined,
           handoffId: handoffId || null,
           tabId,
@@ -4619,6 +4783,17 @@ async function runPreparedAgentSendScenario(args) {
       try {
         const currentTarget = typeof readAgentRuntimeSnapshot === 'function'
           ? await readScenarioDestination(tabId) : findOrchestrationTabDescriptor(tabId);
+        if (continuationHold) {
+          const fields = ['toolType', 'terminalInstanceId', 'launchId', 'lifecycleGeneration', 'turnId'];
+          const missing = fields.some(field => expectedTarget[field] && !currentTarget?.[field]);
+          const mismatch = fields.some(field => expectedTarget[field] && currentTarget?.[field]
+            && expectedTarget[field] !== currentTarget[field])
+            || expectedTarget.sessionId && currentTarget?.sessionId
+              && expectedTarget.sessionId !== currentTarget.sessionId
+              && expectedTarget.sessionId !== currentTarget.acceptedResumeSourceSessionId;
+          if (missing && !mismatch) throw Object.assign(new Error('continuation destination unknown'),
+            { code: 'continuation_destination_unavailable' });
+        }
         // A first-turn/Resume launch can be input-ready before its writer SID
         // exists. The common readiness + physical boundary prove the original
         // SID later; an early null is not evidence of a different conversation.
@@ -4636,7 +4811,21 @@ async function runPreparedAgentSendScenario(args) {
             launchId: expectedTarget.launchId || currentTarget.launchId });
         }
       } catch (error) {
-        result = { success: false, accepted: false, submitted: false, status: 'not-submitted',
+        if (continuationHold && continuationAdmission && applicationQueueExecution) {
+          const current = continuationVerdict(continuationAdmission, continuationHold.fence);
+          const verdict = current.status === 'hard' ? current : { status: 'pending', reason: 'destination_unavailable' };
+          logContinuationVerdict('destination', verdict);
+          if (verdict.status === 'pending' && Date.now() < preparationStartedAt + preparationDurationMs) {
+            deferredPreparation = deferSendPreparation('agent_send_continuation_input_pending', verdict.reason);
+            return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+              status: 'not-submitted', code: deferredPreparation.code };
+          }
+          const expired = verdict.status === 'pending';
+          result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+            status: 'not-submitted', code: expired ? 'agent_send_preparation_expired' : 'agent_send_continuation_input_changed',
+            error: expired ? 'agent_send_preparation_expired' : 'Continuation input changed during preparation',
+            continuationInputClass: verdict.status, continuationInputReason: verdict.reason };
+        } else result = { success: false, accepted: false, submitted: false, status: 'not-submitted',
           code: error.code || 'agent_send_target_unavailable', error: error.message, httpStatus: 503 };
       }
     }
@@ -4645,12 +4834,30 @@ async function runPreparedAgentSendScenario(args) {
       catch (error) { result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
         status: 'not-submitted', code: error.code || 'external_completion_revoked', error: error.message }; }
     }
-    const continuationAdmission = preparedTarget?.continuationInputAdmission;
-    if (!result && continuationAdmission && (continuationAdmission.version !== 1
-      || continuationAdmission.kind !== 'codex-continuation-input' || continuationAdmission.ready !== true
-      || continuationAdmission.isCurrent?.() !== true)) {
-      result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
-        status: 'not-submitted', code: 'agent_send_continuation_input_changed', error: 'Continuation input changed during preparation' };
+    if (!result && continuationHold) {
+      const record = agentSendReceiptStore.get(sendOperationKey);
+      if (record?.deliveryControl?.cancelledAt || record?.attemptId
+        || !['reserved', 'preparing'].includes(record?.state)) {
+        return durableAgentSendReplay(record, { operationKey: sendOperationKey, tabId, handoffId });
+      }
+      if (!continuationUnattempted(record)) return parkUnknownContinuation();
+    }
+    if (!result && continuationAdmission) {
+      const verdict = continuationVerdict(continuationAdmission, continuationHold?.fence || null);
+      if (verdict.status !== 'current') {
+        logContinuationVerdict('post-await', verdict);
+        if (verdict.status === 'pending' && applicationQueueExecution && durableIdentity
+          && Date.now() < preparationStartedAt + preparationDurationMs) {
+          deferredPreparation = deferSendPreparation('agent_send_continuation_input_pending', verdict.reason);
+          return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+            status: 'not-submitted', code: deferredPreparation.code };
+        }
+        const expired = verdict.status === 'pending' && Date.now() >= preparationStartedAt + preparationDurationMs;
+        result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+          status: 'not-submitted', code: expired ? 'agent_send_preparation_expired' : 'agent_send_continuation_input_changed',
+          error: expired ? 'agent_send_preparation_expired' : 'Continuation input changed during preparation',
+          continuationInputClass: verdict.status, continuationInputReason: verdict.reason };
+      }
     }
     if (!result && durableIdentity && ['codex', 'claude'].includes(provider)
       && Date.now() >= preparationStartedAt + preparationDurationMs) {
@@ -4665,8 +4872,12 @@ async function runPreparedAgentSendScenario(args) {
         return durableAgentSendReplay(agentSendReceiptStore.get(sendOperationKey),
           { operationKey: sendOperationKey, tabId, handoffId });
       }
-      const begun = agentSendReceiptStore.beginAttempt(durableIdentity);
+      const continuationGuard = continuationHold ? { scope: continuationScope, hold: continuationHold,
+        capture: continuationCapture } : null;
+      if (continuationGuard && !continuationScope) return parkUnknownContinuation('attempt_scope_unproven');
+      const begun = agentSendReceiptStore.beginAttempt(durableIdentity, continuationGuard);
       if (!begun?.ok) {
+        if (continuationGuard) return parkUnknownContinuation(begun.reason);
         return durableAgentSendFailure(begun, { tabId, handoffId, operationKey: sendOperationKey, provider });
       }
       if (begun.action !== 'attempt-started') {
@@ -4683,11 +4894,14 @@ async function runPreparedAgentSendScenario(args) {
           operationKey: sendOperationKey,
           attemptId: durableAttemptId, tabId, handoffId, provider,
         }, preparationStartedAt, preparationMode),
-        ...(continuationAdmission ? { continuationInputFence: continuationAdmission.fence } : {}) });
+        ...(continuationAdmission ? { continuationInputFence: continuationAdmission.fence,
+          ...(continuationHold ? { continuationInputOriginalFence: continuationHold.fence } : {}) } : {}) });
         if (expectedTarget || ownedAttachments || preflightScope) {
           // Issue one driver scope only after this caller began the attempt.
           // Replay/old renderer replies cannot borrow it to negate prior input.
           const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, {
+            ...(isDesktopCodexCompactQueueRequest(args) ? { promptText: prompt,
+              presentationSnapshot, authoringSnapshot: args.authoringSnapshot || null, source } : {}),
             ...(expectedTarget ? { expectedTarget: admittedExpectedTarget } : {}),
             ...(ownedAttachments ? { ownedAttachments } : {}),
             ...(preflightScope ? { preflightScope } : {}),
@@ -4908,7 +5122,13 @@ async function runPreparedAgentSendScenario(args) {
       // This branch has not begun an attempt or crossed the renderer bridge.
       // Persist its explicit refusal on the same receipt instead of leaving
       // a failed local command in preparing/delivery-unknown after restart.
-      agentSendReceiptStore.settleQueuedNoWrite(sendOperationKey, result);
+      const current = agentSendReceiptStore.get(sendOperationKey);
+      if (continuationHold || continuationCapture || current?.receipt?.continuationInputHold
+        || current?.receipt?.continuationInputCapture) {
+        if (!continuationScope) return parkUnknownContinuation('settlement_scope_unproven');
+        const settled = agentSendReceiptStore.settleContinuationNoWrite(continuationScope, continuationHold, continuationCapture, result);
+        if (!settled.ok) return parkUnknownContinuation(settled.reason);
+      } else agentSendReceiptStore.settleQueuedNoWrite(sendOperationKey, result);
     }
     const finalRecord = durableIdentity && agentSendReceiptStore.get(sendOperationKey);
     if (finalRecord?.deliveryControl?.cancelledAt) return durableAgentSendReplay(finalRecord);
@@ -5030,7 +5250,7 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
   const sendReceipt = classifyAgentSendReceipt(sendResult);
   if (sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
     // Physical Enter is only a transport fact. An exact post-Enter composer
-    // proof may still show that Claude never created the provider turn. A
+    // proof may still show that the provider never created a turn. A
     // positive transcript proof wins a race; transport acceptance alone does
     // not turn this terminal negative receipt back into audit-pending.
     if (current.targetPromptProofAt) {
@@ -5040,6 +5260,9 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
       return { kind: 'accepted', receiptState: 'confirmed', run: await store.get(runId) };
     }
     const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
+    const inputFailure = sendResult?.code === 'codex_message_too_large'
+      ? require(path.join(srcMainDir, 'agent-provider-input-limit')).publicInputLimitFailure(sendResult) : null;
+    if (inputFailure) await store.patch(runId, { deliveryFailure: inputFailure, errorCode: inputFailure.code });
     console.warn('[OrchestrationDelivery] exact provider-not-accepted after Enter run=' + runId
       + ' late=' + late
       + ' target=' + String(current.targetTabId || '').slice(-12)
@@ -5087,6 +5310,9 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
       await finalizeSettledOrchestrations(cancelled.settled, reason + '-send-cancelled');
       return { kind: 'send-cancelled', receiptState: sendReceipt.state, run: await store.get(runId) };
     }
+    const inputFailure = sendResult?.code === 'codex_message_too_large'
+      ? require(path.join(srcMainDir, 'agent-provider-input-limit')).publicInputLimitFailure(sendResult) : null;
+    if (inputFailure) await store.patch(runId, { deliveryFailure: inputFailure, errorCode: inputFailure.code });
     if (recoveryPolicy.provenNotSent) {
       await store.resetDeferredDelivery(runId, 'send-refused-before-submit');
       console.warn('[OrchestrationDelivery] exact pre-submit failure run=' + runId
@@ -6569,6 +6795,21 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     || durableCandidates.length > 0
   );
   const durableIdentityComplete = !!durableOperationKey && !!durableAttemptId;
+  if (detail?.code === 'codex_message_too_large' && detail.success !== true && durableIdentityComplete
+    && durableRecordForAudit?.state === 'provider-not-accepted' && durableRecordForAudit.provider === 'codex'
+    && durableRecordForAudit.attemptId === durableAttemptId && durableRecordForAudit.tabId === durableAuditTabId
+    && durableRecordForAudit.handoffId === durableAuditHandoffId
+    && require(path.join(srcMainDir, 'codex-input-rejection')).isExactCodexInputRejectionReceipt(durableRecordForAudit.receipt)) {
+    // The callback is only a wake; the existing Main receipt owns the refusal.
+    const record = durableRecordForAudit;
+    if (record.surface === 'orchestration' && record.runId && record.operationKey === 'orchestration-target:' + record.runId
+      && record.handoffId === 'orchestration:' + record.runId) {
+      const run = await getOrchestrationRunStore().getInternal(record.runId);
+      if (!run || run.targetTabId !== record.tabId) return { matched: false, reason: 'input-rejection-run-mismatch' };
+      const applied = await applyOrchestrationTargetSendReceipt(record.runId, record.receipt, { reason: 'exact-input-rejection', late: true });
+      return { matched: true, confirmed: false, failed: applied.kind === 'send-failed', kind: 'provider-not-accepted', run: applied.run };
+    }
+  }
   let durablePromotion = null;
   if (durableIdentityRequired && !durableIdentityComplete) {
     durablePromotion = {
@@ -9371,7 +9612,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
           receipts: true, structuredDraft: true, nativeRewindUnchanged: true,
-          codexPhysicalSuffix: true, repairOfOperationId: !!savedHistoryOperations.inspectRepair } } : {}),
+          codexPhysicalSuffix: true, repairOfOperationId: !!savedHistoryOperations.inspectRepair,
+          ...(savedHistoryOperations.selfRewind ? { selfRewind: { version: 1, retainedContext: true, queuedFollowup: true } } : {}) } } : {}),
         ...(workingDirectoryOperations ? { workingDirectory: require(path.join(srcMainDir, 'working-directory-operation-api')).WORKING_DIRECTORY_CAPABILITY } : {}),
         ...(conversationOwners ? { conversationOwner: { version: 1, providers: ['codex', 'claude'],
           applicability: '/api/terminal-tabs/:tabId/history-operations/:operationId/applicability',
@@ -10636,6 +10878,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
               });
               idempotentRun = delivery.run || await getOrchestrationRunStore().get(idempotentRun.runId);
             }
+          }
+        }
+        if (idempotentRun.errorCode === 'codex_message_too_large' && isTerminalStatus(idempotentRun.status)) {
+          const previousReceipt = agentSendReceiptStore?.get('orchestration-target:' + idempotentRun.runId);
+          if (previousReceipt?.runId === idempotentRun.runId && previousReceipt.tabId === idempotentRun.targetTabId
+            && previousReceipt.handoffId === 'orchestration:' + idempotentRun.runId
+            && ['not-submitted', 'provider-not-accepted'].includes(previousReceipt.state)
+            && previousReceipt.receipt?.code === 'codex_message_too_large') {
+            return sendSendFailure(res, durableAgentSendReplay(previousReceipt), { runId: idempotentRun.runId,
+              run: withOrchestrationUrls(idempotentRun), idempotent: true });
           }
         }
         return sendJson(res, 200, {
@@ -14321,6 +14573,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (error) { return sendJson(res, error.statusCode || 500, { ok: false, error: error.code || error.message }); }
   }
 
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/self-rewind$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    let body, accepting = false;
+    try {
+      if (!savedHistoryOperations?.selfRewind) return sendJson(res, 503, { ok: false, error: 'self_rewind_unavailable' });
+      body = await readBody(req); accepting = true;
+      const operation = savedHistoryOperations.acceptSelf(tabId, body);
+      return sendJson(res, operation.pending ? 202 : operation.success ? 200 : 409,
+        { ok: true, operation: savedHistoryOperations.publicSelf(operation) });
+    } catch (error) {
+      let operation, known = !accepting;
+      try { if (body?.operationId) { operation = savedHistoryOperations.read(tabId, body.operationId); known = true; } }
+      catch { known = false; }
+      return sendJson(res, error.statusCode || 500, { ok: false, code: error.code || error.message,
+        error: error.message, mutationAttempted: operation ? true : known ? false : null,
+        ...(operation ? { operation: savedHistoryOperations.publicSelf(operation) } : {}) });
+    }
+  }
+
   // Additive saved-history scenario. Never reinterpret legacy /rewind mode.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history-operations(?:\/([^/]+))?$/);
   if (m && (req.method === 'POST' || req.method === 'GET')) {
@@ -15806,6 +16078,9 @@ function start({
   readTabInspectionResponse: readTabInspectionResponseFn,
   readMessageReturnProof: readMessageReturnProofFn,
   readAgentObservedResponse: readAgentObservedResponseFn,
+  readMiniOrchestratorSendAdmission: readMiniOrchestratorSendAdmissionFn,
+  onMiniOrchestratorInputAccepted,
+  onMiniOrchestratorSendReceipt,
   onAgentResponseCompletion,
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
@@ -15856,6 +16131,7 @@ function start({
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
   releaseBuildInstallReceipt?.();
   releaseBuildInstallReceipt = agentSendReceiptStore?.subscribe?.(record => {
+    onMiniOrchestratorSendReceipt?.(record);
     if (String(record.handoffId || '').startsWith('build-install-return:')) wakeBuildInstallContinuations(record.tabId);
     buildContinueOperations?.wake(record.tabId);
   }) || null;
@@ -15865,6 +16141,7 @@ function start({
   sendQueueRecoveryReady = false;
   if (agentSendReceiptStore?.subscribe) {
     agentSendQueue = new AgentSendQueue({ store: agentSendReceiptStore,
+      onAccepted: onMiniOrchestratorInputAccepted,
       capturePreparationMode: request => selectSendPreparationMode(request.provider, captureTabInspection?.(request.tabId)),
       readRecoveryRelease: readRunAfterCapacityRecoveryRelease,
       captureRecoveryOwner: request => captureTabInspection?.(request.tabId),
@@ -15903,6 +16180,7 @@ function start({
         const buildContinueId = String(request.source || '').startsWith('build-install-continue:')
           ? request.source.slice('build-install-continue:'.length) : null;
         const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
+          ...(request.selfRewindRef ? { [SELF_REWIND_ADMISSION]: true } : {}),
           ...(operational ? { [OPERATIONAL_ADMISSION]: true } : {}),
           ...(buildContinueId ? { [BUILD_CONTINUE_ADMISSION]: true,
             prepareSend: () => prepareQueuedBuildContinueInput(request, buildContinueId) } : {}),
@@ -15925,6 +16203,9 @@ function start({
         return receipt;
       },
       publish: record => {
+        if (record.surface === 'self-rewind' && savedHistoryOperations) {
+          savedHistoryOperations.observeSelfFollowup(record);
+        }
         if (String(record.handoffId || '').startsWith('orchestration-complete:')) {
           const id = record.handoffId.slice('orchestration-complete:'.length);
           getExternalResearchCoordinator().wakeDelivery(id, 'completion-receipt');
@@ -16033,7 +16314,29 @@ function start({
       inspectRepair: params => codexDataApi.inspectCodexSavedRewindRepair(params),
       hashRecords: codexDataApi.codexRepairRecordsHash,
       buildTimeline: buildCodexTimeline,
-      broadcast: webBroadcast,
+      selfRewind: tabWorkContext && agentSendReceiptStore && agentSendQueue && historyMutationInput && conversationOwners ? {
+        context: tabWorkContext,
+        send: operation => runAgentSendScenario({ tabId: operation.tabId,
+          prompt: operation.request.selfRewind.nextPrompt, cwd: findOrchestrationTabDescriptor(operation.tabId)?.cwd,
+          authoringSnapshot: { editorText: operation.request.selfRewind.nextPrompt, chips: [], imagePaths: [] },
+          source: operation.followup.handoffId, handoffId: operation.followup.handoffId,
+          sendOperationKey: operation.followup.operationKey, sendSurface: 'self-rewind',
+          provider: operation.toolType, sessionId: operation.followup.expectedTarget.sessionId || null,
+          expectedTarget: operation.followup.expectedTarget, ownership: 'project', queue: true,
+          applicationQueueAcceptedResponse: true,
+          selfRewindRef: { tabId: operation.tabId, operationId: operation.operationId },
+          [SELF_REWIND_ADMISSION]: true,
+        }),
+      } : null,
+      broadcast: (tabId, event) => {
+        webBroadcast(tabId, event);
+        if (event.operation?.origin?.kind === 'self-rewind') for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            try { win.webContents.send('self-rewind:changed', event.operation); }
+            catch (error) { console.warn('[SelfRewind] publication failed: ' + error.message); }
+          }
+        }
+      },
     });
     const { InboxSavedHistoryOperations } = require(path.join(srcMainDir, 'inbox-saved-history-operation'));
     inboxSavedHistoryOperations = new InboxSavedHistoryOperations({
@@ -16048,6 +16351,15 @@ function start({
     if (!savedHistoryIpcRegistered) {
       ipcMain.handle('saved-history:step', (_event, request) => savedHistoryOperations.step(request));
       ipcMain.handle('saved-history:get', (_event, request) => savedHistoryOperations.read(request.tabId, request.operationId));
+      ipcMain.handle('self-rewind:list', (_event, tabId) => savedHistoryOperations.listSelf(tabId));
+      ipcMain.handle('self-rewind:dismiss', (_event, request) => savedHistoryOperations.dismissSelf(request.tabId, request.operationId));
+      ipcMain.handle('self-rewind:details', (_event, request) => {
+        const operation = savedHistoryOperations.read(request.tabId, request.operationId);
+        if (!operation?.request.selfRewind) return null;
+        return { ...savedHistoryOperations.publicSelf(operation),
+          retainedContext: operation.request.selfRewind.retainedContext,
+          nextPromptPreview: operation.request.selfRewind.nextPrompt?.slice(0, 2000) || null };
+      });
       savedHistoryIpcRegistered = true;
     }
   }
@@ -16067,6 +16379,7 @@ function start({
   readTabInspectionResponse = readTabInspectionResponseFn || null;
   readMessageReturnProof = readMessageReturnProofFn || null;
   readAgentObservedResponse = readAgentObservedResponseFn || null;
+  readMiniOrchestratorSendAdmission = readMiniOrchestratorSendAdmissionFn || null;
   readAgentSendDestination = readAgentSendDestinationFn || null;
   orchestrationContinuationService = null;
   if (typeof onAgentResponseCompletion === 'function') {
@@ -16533,7 +16846,70 @@ async function prepareQueuedBuildContinueInput(request, operationId) {
   return owner.prepareInput(operationId, request.tabId, request.expectedTarget);
 }
 
+function readQueuedContinuationHardFence(request) {
+  const source = String(request.source || '').replace(/^codex-/, '');
+  if (!source.startsWith('build-install-continue:') && !source.startsWith('orchestration-continue:')) return true;
+  const record = request.sendOperationKey && agentSendReceiptStore?.get(request.sendOperationKey);
+  const hold = record?.receipt?.continuationInputHold;
+  if (!hold) return true; // Existing/no-fence requests retain their old admission.
+  const item = agentSendQueue?.item(request.sendOperationKey);
+  const head = require(path.join(srcMainDir, 'agent-send-preparation')).activeHeadPreparation(record);
+  if (hold.version !== 1 || record.attemptId || Number(record.attempt || 0) !== 0
+    || !['reserved', 'preparing'].includes(record.state) || record.deliveryControl?.cancelledAt
+    || record.receipt?.submitted === true || record.receipt?.pasteWritten === true
+    || record.receipt?.enterWritten === true || record.receipt?.deliveryUnknown === true
+    || hold.operationKey !== request.sendOperationKey || hold.operationKey !== record.operationKey
+    || hold.tabId !== request.tabId || hold.tabId !== record.tabId
+    || hold.handoffId !== request.handoffId || hold.handoffId !== record.handoffId
+    || hold.requestFingerprint !== record.requestFingerprint || hold.startedAt !== head?.startedAt
+    || hold.deadlineAt !== head?.deadlineAt || item?.state !== 'waiting' || item.tab_id !== request.tabId) return false;
+  try {
+    if (item.request_hash !== fingerprintAgentSendRequest(JSON.parse(item.request_json))
+      || item.request_hash !== fingerprintAgentSendRequest(request)) return false;
+  } catch { return false; }
+  if (typeof readAgentContinuationInputAdmission !== 'function') return false;
+  const classify = proof => {
+    // No await is allowed to turn a newer UNKNOWN or a replaced FIFO item
+    // into the negative receipt used by the cancellation owner.
+    let latest, currentItem;
+    try { latest = agentSendReceiptStore.get(request.sendOperationKey); currentItem = agentSendQueue?.item(request.sendOperationKey); }
+    catch { return false; }
+    if (!latest || latest.attemptId || Number(latest.attempt || 0) !== 0
+      || !['reserved', 'preparing'].includes(latest.state) || latest.deliveryControl?.cancelledAt
+      || latest.operationKey !== record.operationKey || latest.tabId !== record.tabId || latest.handoffId !== record.handoffId
+      || latest.requestFingerprint !== record.requestFingerprint
+      || latest.receipt?.submitted === true || latest.receipt?.pasteWritten === true
+      || latest.receipt?.enterWritten === true || latest.receipt?.deliveryUnknown === true
+      || JSON.stringify(latest.receipt?.continuationInputHold) !== JSON.stringify(hold)
+      || currentItem?.state !== 'waiting' || currentItem.id !== item.id || currentItem.request_hash !== item.request_hash
+      || currentItem.request_json !== item.request_json) return false;
+    if (proof?.version !== 1 || proof.kind !== 'codex-continuation-fence-check') return false;
+    if (proof.status === 'same') return true; // Not readiness or input authority.
+    if (proof.status !== 'hard') return false;
+    const reason = /^[a-zA-Z0-9_-]{1,80}$/.test(proof.reason || '') ? proof.reason : 'unclassified';
+    console.warn('[AgentSendContinuationInput] tab=' + String(request.tabId).slice(-12)
+      + ' stage=queued class=hard reason=' + reason);
+    return { cancel: true, continuationFenceHard: true, reason: 'agent_send_continuation_input_changed:' + reason };
+  };
+  let proof;
+  try { proof = readAgentContinuationInputAdmission(request.tabId, {
+    retainedFenceOnly: true, retainedFence: hold.fence,
+  }); } catch { return false; }
+  return typeof proof?.then === 'function' ? proof.then(classify, () => false) : classify(proof);
+}
+
 async function admitQueuedAgentSend(request) {
+  if (request.selfRewindRef || String(request.source || '').startsWith('self-rewind:')) {
+    if (!savedHistoryOperations) return false;
+    const selfAdmission = savedHistoryOperations.admitSelfFollowup(request);
+    if (selfAdmission !== true) return selfAdmission;
+  }
+  const miniFailure = typeof readMiniOrchestratorSendAdmission === 'function'
+    ? readMiniOrchestratorSendAdmission(request) : null;
+  if (miniFailure) return { cancel: true, reason: miniFailure.code };
+  let continuationFence = readQueuedContinuationHardFence(request);
+  if (typeof continuationFence?.then === 'function') continuationFence = await continuationFence;
+  if (continuationFence !== true) return continuationFence;
   try { if (getBuildContinueOperations().capturing(request.tabId)) return false; }
   catch (error) { if (String(error.code || '').startsWith('build_continue_')) return false; throw error; }
   if (request.messageOutcomeRef || String(request.source || '').startsWith('tab-message-outcome:')) {
@@ -16763,6 +17139,7 @@ module.exports = {
     }
     const settings = input.settingsIntent?.kind === 'explicit-change' ? input.settingsIntent : {};
     return runAgentSendScenario({ ...input, provider: input.toolType,
+      [DESKTOP_COMPACT_ADMISSION]: isDesktopCodexCompactQueueRequest(input),
       model: settings.model, effort: settings.effort, thinking: settings.thinking,
       expectedTarget: input.expectedTarget || (input.sessionId
         ? { toolType: input.toolType, sessionId: input.sessionId } : null),

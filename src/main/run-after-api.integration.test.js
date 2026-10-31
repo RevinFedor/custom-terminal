@@ -18,6 +18,7 @@ const { collectReferencedAssetIds } = require('./prompt-queue-assets');
 const { importMobileUploads } = require('./owned-mobile-attachments');
 const { createSystemPromptService } = require('./system-prompt-service');
 const { frameKey: switcherFrameKey } = require('./workspace-switcher-api');
+const { createHttpReadDiagnostics, beginHttpReadDependency } = require('./http-read-diagnostics');
 let fixtureRoot;
 const electronPath = require.resolve('electron'), oldElectron = require.cache[electronPath];
 require.cache[electronPath] = { id: electronPath, filename: electronPath, loaded: true,
@@ -152,6 +153,7 @@ async function fixture(t) {
   remote = createRemote(ports);
   helpers.remote = remote;
   webContext = vm.createContext({ console: quiet, Date, JSON, Map, Set, fs, path,
+    beginHttpReadDependency, httpReadDiagnostics: createHttpReadDiagnostics({ serviceId: 'private-test', enabled: false }),
     require: name => name === './project-manager' ? pm : require(name),
     runAfterApi: null, RunAfterApplicationAPI, RUN_AFTER_CAPABILITY, runAfterError, fingerprintAgentSendRequest,
     systemPromptService, mobileAttachmentAssetStore: assetStore, importMobileUploads,

@@ -34,6 +34,9 @@ function fixture({primary=false, existing=true, attempt='A', handoff='H'}={}) {
     rawServerEntriesRef:{current:[]},committedHistoryEntriesRef:{current:{ownerKey:'cold-owner',entries:[]}},
     useUIStore:{getState:()=>owner,subscribe:()=>()=>{}},setReceiptPresentationRevision(){},historyDiag(){},
     setHistoryPromptDraft(){throw Error('must not change draft');},flushHistoryComposerDrafts(){throw Error('must not save draft');},
+    // These are ordinary user receipts, never Compact delivery. Bind the new
+    // effect dependency but fail if it tries to enter the local-command path.
+    captureLocalPromptRemoval(){throw Error('ordinary receipt must not capture Compact card removal');},
     removeLocalPromptEntry(){throw Error('must not remove card without canonical publication');},
     consumeLocalPromptEntry(){throw Error('must not consume card without canonical publication');},
     acknowledgeMaterializedHistoryReceipt(){throw Error('no canonical ACK from a delivery receipt');},

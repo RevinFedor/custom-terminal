@@ -26,7 +26,12 @@ const CAUSAL_NORMAL_BYTES = 2 * 1024 * 1024;
 const RETENTION_LEDGER = 'retention-ledger.json';
 const LEDGER_BYTES = 16384;
 const LEDGER_ENTRIES = 32;
-const OWN_FILE = /^(?:(?:cpu|causal)-\d{10}\.ndjson|stall-\d+-\d+-\d+\.(?:sample\.txt|sample\.json|sample-capture\.json)|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
+const OWN_FILE = /^(?:(?:cpu|causal)-\d{10}\.ndjson|stall-\d+-\d+-\d+\.(?:sample\.txt|sample\.json|sample-capture\.json)|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json|\.input\.json))$/;
+const INPUT_SNAPSHOT = /^incident-\d+-\d+\.input\.json$/;
+const causalArtifact = name => name.startsWith('causal-') || INPUT_SNAPSHOT.test(name);
+// An invalid oversized input file must not pin the shared disk budget. The
+// input writer's256KiB cap does not alter any old artifact/receipt limits.
+const causalProtectionEligible = e => !INPUT_SNAPSHOT.test(e.name) || e.size <= 256 * 1024;
 const NATIVE_RECEIPT = /^stall-(\d+)-\d+-\d+\.sample-capture\.json$/;
 const NATIVE_SAMPLE = /^stall-\d+-\d+-\d+\.sample\.txt$/;
 const HEAVY_RECEIPT = /^incident-\d+-\d+\.capture\.json$/;
@@ -271,7 +276,7 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
       let bytes = all.reduce((sum, e) => sum + e.size, 0) + ledgerSize;
       // Reserve the ledger's maximum growth inside the SAME five GiB cap.
       const pruneCap = DISK_CAP - (LEDGER_BYTES - ledgerSize);
-      let causalBytes = all.filter(e => e.name.startsWith('causal-')).reduce((sum, e) => sum + e.size, 0);
+      let causalBytes = all.filter(e => causalArtifact(e.name)).reduce((sum, e) => sum + e.size, 0);
       let nativeSampleBytes = all.filter(e => NATIVE_SAMPLE.test(e.name)).reduce((sum, e) => sum + e.size, 0);
       let removed = 0, removedNative = 0, removedExpired = 0, removedHeavyExpired = 0, removedBudget = 0;
       const nativeAt = e => Math.max(e.at, Number(NATIVE_RECEIPT.exec(e.name)?.[1]) || 0);
@@ -279,6 +284,16 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
       const retention = e => heavy(e) ? HEAVY_RETENTION_MS
         : e.name.startsWith('cpu-') ? RETENTION_MS : DETAIL_RETENTION_MS;
       const expired = e => now - (NATIVE_RECEIPT.test(e.name) ? nativeAt(e) : e.at) >= retention(e);
+      // The SAME causal share protects actual recent payloads, including input
+      // snapshots. Otherwise a small new snapshot can be the only deletable
+      // remainder above64MiB while older4MiB buckets straddle the floor.
+      const protectedCausal = new Set(); let protectedCausalBytes = 0;
+      for (const e of [...all].reverse()) {
+        if (protectedCausalBytes >= CAUSAL_PROTECTED_BYTES) break;
+        if (causalArtifact(e.name) && causalProtectionEligible(e) && !expired(e) && e.size <= DISK_CAP) {
+          protectedCausal.add(e.name); protectedCausalBytes += e.size;
+        }
+      }
       // Heavy profiles remain lower-priority than historical CPU evidence.
       // Independent native stacks have their own bounded tier; old metadata
       // must make room instead of immediately destroying their diagnostic value.
@@ -288,7 +303,7 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         ...all.filter(e => !expired(e) && !heavy(e)),
       ];
       try { for (const e of ordered) {
-        const causal = e.name.startsWith('causal-');
+        const causal = causalArtifact(e.name);
         const nativeSample = NATIVE_SAMPLE.test(e.name);
         // Native and heavy receipts are independent, small, and non-evictable
         // during their quota window, even if their large artifacts are gone.
@@ -297,7 +312,8 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         if (!causal && now - e.at < 120000) continue;
         if (!expired(e) && bytes <= pruneCap) continue;
         if (nativeSample && !expired(e) && e.size <= DISK_CAP && nativeSampleBytes - e.size < NATIVE_SAMPLE_PROTECTED_BYTES) continue;
-        if (causal && !expired(e) && e.size <= DISK_CAP && causalBytes - e.size < CAUSAL_PROTECTED_BYTES) continue;
+        if (causal && causalProtectionEligible(e) && !expired(e) && e.size <= DISK_CAP
+          && (protectedCausal.has(e.name) || causalBytes - e.size < CAUSAL_PROTECTED_BYTES)) continue;
         try {
           const current = fs.lstatSync(file(e.name));
           if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.ino !== e.ino || current.dev !== e.dev ||

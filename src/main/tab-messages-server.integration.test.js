@@ -288,6 +288,73 @@ async function acceptanceInChild(root) {
     };
 
     const scenario = async () => {
+      // Exercise the real MCP dispatcher against this real, isolated HTTP server.
+      // Only discovery and the HTTP transport adapter are scoped to the fixture.
+      const vm = require('node:vm');
+      const { AsyncLocalStorage } = require('node:async_hooks');
+      const { promisify } = require('node:util');
+      const mcpSource = fs.readFileSync(path.join(__dirname, '../../mcp/terminal-server.mjs'), 'utf8');
+      const mcp = vm.createContext({ AsyncLocalStorage, Buffer, URL, URLSearchParams, randomUUID,
+        basename: path.basename, join: path.join, resolve: path.resolve, promisify,
+        execFile: subprocess.execFile, homedir: () => process.env.HOME,
+        process: { env: {}, argv: ['node', 'terminal-server.mjs'], cwd: () => root, stderr: { write() {} } },
+        fixtureInstance: () => ({ port: privatePort }), fixtureToken: () => auth,
+        fetch: async (url, options = {}) => {
+          const parsed = new URL(url);
+          assert.equal(parsed.hostname, '127.0.0.1'); assert.equal(Number(parsed.port), privatePort);
+          assert.equal(options.headers.Authorization, 'Bearer ' + auth);
+          const response = await request(parsed.pathname + parsed.search, {
+            method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : undefined,
+          });
+          return { ok: response.status >= 200 && response.status < 300, status: response.status,
+            text: async () => JSON.stringify(response.body) };
+        },
+      });
+      vm.runInContext(mcpSource.slice(0, mcpSource.lastIndexOf('// stdio transport')).replace(/^import .*;\n/gm, '')
+        + '\npickWebInstance = fixtureInstance; readSharedToken = fixtureToken; globalThis.dispatch = handleRequest;', mcp);
+      const files = Array.from({ length: 3 }, (_, i) => {
+        const file = path.join(root, 'oversized-part-' + i + '.md');
+        fs.writeFileSync(file, 'x'.repeat(400000));
+        return { path: file, role: 'source' };
+      });
+      const busyC = statuses.get('C');
+      statuses.set('C', { ...busyC, status: 'active', sessionStatus: 'active', busy: false });
+      const invoke = async () => JSON.parse(await mcp.dispatch({ id: 1, method: 'tools/call', params: {
+        name: 'delegate_to_session', arguments: { runId: 'oversized-private', targetTabId: 'C',
+          prompt: 'Read the supplied files.', files, notifySource: false },
+        _meta: { noted: { tabId: 'A', projectId: project.id, cwd: process.env.NOTED_INBOX_CWD } },
+      } })).result;
+      const refusal = await invoke();
+      assert.equal(refusal.isError, true, JSON.stringify(refusal));
+      assert.equal(refusal.structuredContent.code, 'codex_message_too_large', JSON.stringify(refusal));
+      assert.equal(refusal.structuredContent.provider, 'codex');
+      assert.equal(refusal.structuredContent.inputLimit.max, 1048576);
+      assert.equal(refusal.structuredContent.inputLimit.unit, 'unicode-scalars');
+      assert.ok(refusal.structuredContent.inputLimit.actual > 1200000);
+      assert.equal(refusal.structuredContent.submitted, false);
+      assert.equal(refusal.structuredContent.runId, 'oversized-private');
+      assert.match(refusal.content[0].text, /file paths/i);
+      assert.ok(refusal.content[0].text.length < 2000, 'the error must not echo the large input');
+      const failedRun = (await request('/api/orchestrations/oversized-private')).body.run;
+      assert.equal(failedRun.status, 'failed', JSON.stringify(failedRun));
+      assert.equal(failedRun.errorCode, 'codex_message_too_large');
+      assert.deepEqual(failedRun.deliveryFailure.inputLimit, refusal.structuredContent.inputLimit);
+      assert.equal(failedRun.deliveryAcceptedAt ?? null, null);
+      assert.equal(failedRun.targetPromptProofAt ?? null, null);
+      assert.equal(failedRun.recoveryDeadlineAt ?? null, null);
+      assert.match(failedRun.error, /maximum 1048576/);
+      const failedReceipt = receipts.get('orchestration-target:oversized-private');
+      assert.equal(failedReceipt.state, 'not-submitted'); assert.equal(failedReceipt.attemptId, null);
+      assert.equal(failedReceipt.receipt.submitted, false);
+      assert.equal(failedReceipt.receipt.pasteWritten, false); assert.equal(failedReceipt.receipt.enterWritten, false);
+      assert.ok(failedReceipt.receipt.promptText.includes('Read the supplied files.'));
+      for (const file of files) assert.ok(failedReceipt.receipt.promptText.includes(file.path));
+      assert.equal(sends.length, 0, 'oversized delegation cannot reach the physical bridge');
+      const retry = await invoke();
+      assert.equal(retry.structuredContent.code, 'codex_message_too_large');
+      assert.equal(receipts.get('orchestration-target:oversized-private').attemptId, null);
+      assert.equal(sends.length, 0, 'an immutable retry cannot produce another input');
+      statuses.set('C', busyC);
       for (const pathname of ['/api/me', '/api/tab-messages?tabId=B']) {
         assert.equal((await request(pathname, { authenticated: false })).status, 401);
       }
@@ -352,7 +419,9 @@ async function acceptanceInChild(root) {
       await waitState(c, 'queued');
       assert.equal(receipts.get(secondSend.payload.sendOperationKey).state, 'audit-pending');
       await audit(secondSend);
-      assert.equal(db.prepare('SELECT count(*) n FROM agent_send_receipt_pins').get().n, 0);
+      assert.equal(db.prepare("SELECT count(*) n FROM agent_send_receipt_pins WHERE operation_key != 'orchestration-target:oversized-private'").get().n, 0);
+      assert.equal(db.prepare("SELECT count(*) n FROM agent_send_receipt_pins WHERE operation_key = 'orchestration-target:oversized-private'").get().n, 1,
+        'failed input retains its authoring pin independently of delivered message pins');
 
       assert.equal((await answer(a, 'foreign reply', 'foreign', 'C')).status, 403);
       const spoof = await request(`/api/tab-messages/${a}/replies`, { method: 'POST',
@@ -409,7 +478,7 @@ async function acceptanceInChild(root) {
       assert.equal((await answer(a, fullAnswer, 'answer-A')).body.deduplicated, true);
       assert.equal(sends.length, 4);
       assert.equal((await web.listActiveOrchestrationRuns()).length, 0);
-      assert.equal(db.prepare('SELECT count(*) n FROM agent_send_receipt_pins').get().n, 0);
+      assert.equal(db.prepare("SELECT count(*) n FROM agent_send_receipt_pins WHERE operation_key != 'orchestration-target:oversized-private'").get().n, 0);
       assert.equal(context.get('B').pendingCount, 0);
 
       await web.stop();
@@ -486,7 +555,7 @@ async function acceptanceInChild(root) {
       return { checks: ['private-root-and-loopback', 'actual-http-authentication', 'durable-before-held-provider-ack',
         'two-callers-serial-delivery', 'out-of-order-addressed-replies', 'compact-list-and-full-get',
         'frozen-context-and-trusted-offsets', 'exact-audit-and-pin-release', 'actual-server-restart',
-        'idempotent-drift-and-closed-retries'], sends: sends.length };
+        'idempotent-drift-and-closed-retries', 'mcp-expanded-codex-limit-terminal-no-input'], sends: sends.length };
     };
     return await Promise.race([scenario(), fatal.promise]);
   } finally {
@@ -539,6 +608,6 @@ if (process.env.TAB_MESSAGES_HTTP_CHILD === '1') {
       assert.equal(code, 0, result?.error || stderr || 'isolated HTTP child failed');
       assert.equal(result?.ok, true);
       assert.equal(result.report.sends, 7);
-      assert.equal(result.report.checks.length, 10);
+      assert.equal(result.report.checks.length, 11);
     });
 }

@@ -14,7 +14,11 @@ const { createCodexResumeReadIdentityLease, resolveCodexReadIdentity } = require
 const { isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey } = require('../shared/prompt-queue-send-intent.cjs');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const ast = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
-const admitSource = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'admitQueuedAgentSend').getText(ast);
+const admitSource = ['readQueuedContinuationHardFence', 'admitQueuedAgentSend'].map(name => {
+  const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
+  assert.ok(node, name);
+  return node.getText(ast);
+}).join('\n');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const storeSource = fs.readFileSync(path.join(__dirname, '../renderer/store/usePromptQueueStore.ts'), 'utf8');
 const storeAst = ts.createSourceFile('store.ts', storeSource, ts.ScriptTarget.Latest, true);

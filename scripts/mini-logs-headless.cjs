@@ -1,0 +1,55 @@
+'use strict';
+// One explicitly authorized isolated historical replay; never touch source writer.
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const os = require('node:os');
+const { spawn } = require('node:child_process');
+const { _api } = require('../src/main/ipc/codex-data');
+const base = path.resolve(__dirname, '../docs/tmp/мини-оркестратор-20261030/replay/logs-readonly-v2');
+const source = '/Users/fedor/.codex/sessions/2026/10/30/rollout-2026-10-30T12-48-00-aaac34fa-9e3e-43eb-a39e-c65e8a0eb939.jsonl';
+const originalId = 'aaac34fa-9e3e-43eb-a39e-c65e8a0eb939';
+const question = 'Посмотри логи: сколько памяти добавляет очередь\n     и освобождается ли она после Stop? на текущий момент проверь много ли озу занимает яндекс браузер наш';
+const sha = b => crypto.createHash('sha256').update(b).digest('hex');
+const write = (p, data) => fs.writeFileSync(p, data, { mode: 0o600, flag: 'wx' });
+function run() {
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const resultDir = fs.mkdtempSync(path.join(base, 'trial-'));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mini-logs-fixture-')));
+  const cwd = path.join(root, 'fixture'), home = path.join(root, 'codex');
+  fs.mkdirSync(cwd, { mode: 0o700 }); fs.mkdirSync(home, { mode: 0o700 });
+  const s = fs.statSync(source); if (!s.isFile() || s.size > 8 * 1024 * 1024) throw Error('source_size');
+  const raw = fs.readFileSync(source), s2 = fs.statSync(source);
+  if (s.ino !== s2.ino || s.size !== s2.size || s.mtimeMs !== s2.mtimeMs) throw Error('source_changed');
+  const lines = raw.toString('utf8').trimEnd().split('\n'), records = lines.map(JSON.parse);
+  const target = records[710], response = records[709], preamble = records[705];
+  if (target.payload?.message !== question || target.timestamp !== '2026-10-30T12:48:20.786Z' || response.payload?.content?.[0]?.text !== question || preamble.payload?.type !== 'task_started') throw Error('exact_boundary_mismatch');
+  if (records.slice(0, 705).some(x => x.type === 'compacted')) throw Error('choose_compact_boundary');
+  const retained = records.slice(0, 704); // Remove settings at 704 and the whole original turn/preamble.
+  const world = retained.findLast(x => x.type === 'world_state' && x.payload?.state?.agents_md?.text);
+  if (!world) throw Error('no_historical_agents');
+  const policy = world.payload.state.agents_md.text;
+  write(path.join(cwd, 'AGENTS.md'), policy);
+  world.payload.state.agents_md.directory = cwd;
+  const id = crypto.randomUUID(), now = new Date().toISOString();
+  _api.rewriteCodexEditedForkMetadata(records, originalId, cwd, retained, id, now);
+  const dir = path.join(home, 'sessions', ...now.slice(0, 10).split('-')); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const session = path.join(dir, `rollout-${now.slice(0,19).replace(/:/g,'-')}-${id}.jsonl`);
+  const copy = retained.map(x => JSON.stringify(x)).join('\n') + '\n'; write(session, copy);
+  for (const f of ['auth.json', 'models_cache.json']) fs.copyFileSync(path.join('/Users/fedor/.codex', f), path.join(home, f), fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(path.join(home, 'auth.json'), 0o600);
+  write(path.join(resultDir, 'REQUEST.txt'), question);
+  const info = { resultDir, source: { sessionId: originalId, path: source, bytes: raw.length, sha256: sha(raw), sourceRecordCount: records.length, priorCompact: null }, originalRef: { turnIndex: 7, userUuid: `codex-user-${originalId}-710`, timestamp: target.timestamp, textHash: 'f66a0bbfbbf72c017682f4b5a532898f22d2ad44d1a3b22a5921ca10b2196b44', turnId: preamble.payload.turn_id, images: target.payload.images, localImages: target.payload.local_images, textElements: target.payload.text_elements }, historical: { model:'gpt-6.1-sol', effort:'max' }, trial: { id, root, cwd, session, model:'gpt-6.1-sol', effort:'low', deadlineMs:180000, shellDisabled:true, unifiedExecDisabled:true, mcp:'none', priorWorldStateTimestamp:world.timestamp, agentsSha256:sha(policy), copySha256:sha(copy), retainedRecords:retained.length, originalTurnPreambleRemoved:true, version:'0.166.0' } };
+  write(path.join(resultDir,'CASE.json'), JSON.stringify(info,null,2)+'\n');
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(NOTED_|CLAUDE|GEMINI|OPENAI|ANTHROPIC|CODEX_)/i.test(k)));
+  env.CODEX_HOME = home;
+  const out = fs.openSync(path.join(resultDir,'EVENTS.jsonl'), 'wx',0o600), err = fs.openSync(path.join(resultDir,'STDERR.txt'), 'wx',0o600);
+  const args = ['-C',cwd,'-s','read-only','-a','never','exec','resume','--model','gpt-6.1-sol','--json','--skip-git-repo-check','--disable','shell_tool','--disable','unified_exec','--disable','computer_use','--disable','browser_use','--disable','apps','--disable','multi_agent','-c','model_reasoning_effort="low"','-c','model_auto_compact_token_limit=490000','-c','project_doc_max_bytes=200000','-o',path.join(resultDir,'ANSWER.txt'),id,'-'];
+  const proc = spawn('codex',args,{env,stdio:['pipe',out,err]});
+  let timedOut = false; const start = Date.now();
+  const timer = setTimeout(() => { timedOut=true; proc.kill('SIGTERM'); }, 180000);
+  proc.stdin.end(question);
+  proc.on('error', e => { clearTimeout(timer); fs.writeFileSync(path.join(resultDir,'EXIT.json'),JSON.stringify({error:e.message,timedOut},null,2)); });
+  proc.on('exit',(code,signal) => { clearTimeout(timer); fs.closeSync(out);fs.closeSync(err);fs.writeFileSync(path.join(resultDir,'EXIT.json'),JSON.stringify({code,signal,timedOut,elapsedMs:Date.now()-start},null,2));console.log(JSON.stringify({resultDir,root,id,session,code,signal,timedOut,elapsedMs:Date.now()-start})); });
+}
+run();

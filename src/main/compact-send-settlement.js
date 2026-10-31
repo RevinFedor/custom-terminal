@@ -1,5 +1,7 @@
 'use strict';
 
+const { compactSendDeliveryIdentity } = require('../shared/compact-send-delivery.cjs');
+
 const OWNER_FIELDS = ['operationId', 'tabId', 'handoffId', 'provider', 'sessionId',
   'generation', 'promptGeneration', 'sourceByteOffset', 'causalBoundaryEventSequence',
   'sendOperationKey', 'sendAttemptId'];
@@ -104,4 +106,5 @@ function compactSendReceiptPresentation(record) {
 }
 
 module.exports = { compactSendOwner, compactSendOwnerMatches,
-  compactSendStartProven, compactSendTerminalSettlement, compactSendReceiptPresentation };
+  compactSendStartProven, compactSendTerminalSettlement, compactSendReceiptPresentation,
+  compactSendDeliveryIdentity };

@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { transformSync } from 'esbuild';
+import syncWork from '../../shared/perf-sync-work.cjs';
 
 // Compile the actual three modules. Only browser/Electron/socket participants
 // are substituted: no UI dispatch, real timers, IPC, profiling or network.
-const compiled = new Map(['uiPerformanceDiagnostics.mjs', 'perfIncidentChannel.ts', 'perfFreezeProbe.ts'].map(name => [name,
+const compiled = new Map(['uiPerformanceDiagnostics.mjs', 'perfIncidentChannel.ts', 'perfFreezeProbe.ts', 'perfSyncWork.mjs'].map(name => [name,
   transformSync(readFileSync(new URL(name, import.meta.url), 'utf8'), { loader: name.endsWith('.ts') ? 'ts' : 'js',
     format: 'cjs', target: 'node18', define: { 'import.meta.env.DEV': 'true' } }).code]));
 
@@ -72,6 +73,7 @@ function harness() {
   const ui = load('uiPerformanceDiagnostics.mjs', {});
   const channel = load('perfIncidentChannel.ts', { './uiPerformanceDiagnostics.mjs': ui });
   const probe = load('perfFreezeProbe.ts', {
+    './perfSyncWork.mjs': load('perfSyncWork.mjs', { '../../shared/perf-sync-work.cjs': syncWork }),
     './uiPerformanceDiagnostics.mjs': ui, './perfIncidentChannel': channel,
     '../store/useWorkspaceStore': { useWorkspaceStore: { getState: () => ({ view: 'workspace', openProjects: new Map() }) } },
     './rendererActivityTrail': { attributeFreeze: () => '', recentRendererActivities: () => '', markRendererActivity: () => {} },
@@ -92,7 +94,7 @@ test('actual probe emits safe Meta down/up, printable-key and slow-input summari
   ]) {
     h.time(at); const target = new h.Element();
     h.listeners.get(type).callback({ type, key, metaKey: meta, ctrlKey: true, altKey: false, shiftKey: true,
-      repeat: type === 'keydown', timeStamp: at - 10, target,
+      repeat: type === 'keydown', timeStamp: at - 10, target, isTrusted: true,
       get code() { throw Error('no printable code'); }, get text() { throw Error('no printable text'); } });
     target.isConnected = false;
     timing.callback({ getEntries: () => [{ name: type, startTime: at - 10, duration: 200,
@@ -113,7 +115,13 @@ test('actual probe emits safe Meta down/up, printable-key and slow-input summari
     assert.equal(actionLog.id, incident.actionId); assert.equal(actionLog.keyClass, expected);
     assert.equal(h.native.at(-1).channel, 'perf:ui-summary');
     assert.equal(h.native.at(-1).payload.id, incident.actionId);
-    assert.deepEqual(Object.keys(h.native.at(-1).payload).sort(), ['durationMs', 'event', 'id', 'startAbs']);
+    const native = h.native.at(-1).payload;
+    assert.deepEqual(Object.keys(native).sort(), ['documentTimeOriginMs','durationMs','event','id',
+      'inputDelayMs','kind','nativeOriginal','startAbs']);
+    assert.equal(native.inputDelayMs, 10); assert.equal(native.kind, 'event-timing');
+    assert.equal(native.documentTimeOriginMs + native.nativeOriginal.timeStampMs, native.startAbs);
+    assert.equal(native.nativeOriginal.type, type);
+    assert.deepEqual(Object.keys(native.nativeOriginal).sort(), ['timeStampMs','type']);
   }
   h.time(4600);
   h.listeners.get('keyup').callback({ type: 'keyup', key: 'Meta', metaKey: false, timeStamp: 4100, target: new h.Element() });

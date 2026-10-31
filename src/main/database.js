@@ -6587,19 +6587,27 @@ class DatabaseManager {
   }
 
   getHistoryPromptPresentationAssetIds() {
+    const { readHistoryInventory, inventoryDiagnostic } = require('./gc-asset-inventory-cache');
+    let rowsRead = null;
+    const scan = () => {
     const assetIdPattern = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
     const assetIds = new Set();
-    const rows = this.db.prepare(`
+    const statement = causal.sql('gc.history-assets', 'prepare', () => this.db.prepare(`
       SELECT chips_json
       FROM history_prompt_presentations
       WHERE schema_version >= 3
-    `).all();
-    for (const row of rows) {
+    `));
+    rowsRead = 0;
+    // Do not retain all chip bodies together on a cold inventory read.
+    for (const row of statement.iterate()) {
+      rowsRead++;
       let items;
       try {
         items = JSON.parse(row.chips_json || '[]');
       } catch {
-        continue;
+        // A damaged sidecar may still contain a managed ref. Never turn an
+        // unreadable owner into an empty GC inventory.
+        throw new Error('history_asset_inventory_unreadable');
       }
       if (!Array.isArray(items)) continue;
       for (const item of items) {
@@ -6625,6 +6633,16 @@ class DatabaseManager {
       }
     }
     return [...assetIds];
+    };
+    return inventoryDiagnostic('history-presentations', metadata => causal.syncWork('gc.history-assets', {}, () => {
+      const result = readHistoryInventory(this.db, scan);
+      causal.count(result.reason === 'hit' ? 'historyCacheHit' : 'historyCacheMiss');
+      metadata.rows = result.reason === 'hit' ? 0 : rowsRead;
+      if (metadata.rows !== null) causal.count('historyRows', metadata.rows);
+      metadata.ids = result.value.length;
+      metadata.reason = result.reason;
+      return result.value;
+    }));
   }
 
   saveHistoryPromptPresentation(presentation) {

@@ -283,6 +283,9 @@ test('public model catalog keeps Settings order and hides unchecked provider row
     model: 'gpt-5.6-sol',
     effort: 'max',
   });
+  assert.deepEqual(resolveConfiguredAgentDefaultPair('gpt-5.6-sol', 'none', projected), {
+    model: 'gpt-5.6-sol', effort: 'low',
+  });
   assert.equal(resolveConfiguredAgentDefaultPair('none', 'xhigh', projected), null);
 });
 

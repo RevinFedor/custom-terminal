@@ -54,7 +54,7 @@ function isPathInside(rootDir, candidate) {
 function collectReferencedAssetIds(queueState) {
   let parsed = queueState;
   if (typeof parsed === 'string') {
-    try { parsed = JSON.parse(parsed); } catch { return new Set(); }
+    try { parsed = JSON.parse(parsed); } catch { throw new Error('queue_asset_inventory_unreadable'); }
   }
   const out = new Set();
   if (!parsed || typeof parsed !== 'object') return out;
@@ -74,7 +74,7 @@ function collectReferencedAssetIds(queueState) {
 function collectComposerDraftAssetIds(draftState) {
   let parsed = draftState;
   if (typeof parsed === 'string') {
-    try { parsed = JSON.parse(parsed); } catch { return new Set(); }
+    try { parsed = JSON.parse(parsed); } catch { throw new Error('draft_asset_inventory_unreadable'); }
   }
   const out = new Set();
   if (!parsed || typeof parsed !== 'object') return out;
@@ -371,16 +371,25 @@ class PromptQueueAssetStore {
 
   async garbageCollect(referencedAssetIds, { minAgeMs = 30 * 24 * 60 * 60 * 1000 } = {}) {
     const leaseRevision = this.leaseRevision;
-    await this.ensureRoot();
+    if (!(referencedAssetIds instanceof Set) && !Array.isArray(referencedAssetIds)) {
+      throw new Error('prompt_queue_asset_inventory_unreadable');
+    }
     const referenced = referencedAssetIds instanceof Set
       ? referencedAssetIds
-      : new Set(Array.isArray(referencedAssetIds) ? referencedAssetIds : []);
+      : new Set(referencedAssetIds);
+    const normalizedReferences = new Set();
+    for (const id of referenced) {
+      const normalized = normalizeStoredAssetId(id);
+      if (!normalized) throw new Error('prompt_queue_asset_inventory_unreadable');
+      normalizedReferences.add(normalized);
+    }
+    await this.ensureRoot();
     const entries = await fs.promises.readdir(this.rootDir, { withFileTypes: true }).catch(() => []);
     const removed = [];
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       const assetId = normalizeStoredAssetId(entry.name);
-      if (!assetId || referenced.has(assetId) || this.pendingLeases.has(assetId)) continue;
+      if (!assetId || referenced.has(assetId) || normalizedReferences.has(assetId) || this.pendingLeases.has(assetId)) continue;
       const filePath = path.join(this.rootDir, entry.name);
       const stat = await fs.promises.stat(filePath).catch(() => null);
       if (!stat || this.now() - stat.mtimeMs < minAgeMs) continue;

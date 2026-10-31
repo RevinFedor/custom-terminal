@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { RefreshCw, SquareTerminal } from 'lucide-react';
+import { History, RefreshCw, SquareTerminal } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import { buildPromptChipWrapper } from '../../utils/composerChips.mjs';
 import { useUIStore } from '../../store/useUIStore';
@@ -30,6 +30,11 @@ export const contextUpdateChipProps = {
   className: 'hp-context-update-chip',
   leading: <RefreshCw size={13} aria-hidden="true" />,
   title: 'Обновление рабочего состояния',
+};
+export const rewindContextChipProps = {
+  className: 'hp-context-update-chip hp-context-update-chip--rewind',
+  leading: <History size={13} aria-hidden="true" />,
+  title: 'Контекст после отката',
 };
 
 function ContextSourceTabChip({ source, onNavigate }: {
@@ -256,6 +261,7 @@ export function TabContextUpdateChip({
       label: update.title,
       text: update.text,
       contextUpdateId: update.id,
+      ...(update.kind === 'rewind' ? { contextUpdateKind: 'rewind' } : {}),
     });
     if (!draft.includes('context-update-id="' + update.id + '"')) {
       store.setHistoryPromptDraft(
@@ -273,6 +279,7 @@ export function TabContextUpdateChip({
       onMouseDown={(event) => { if (event.button === 1) event.preventDefault(); }}
       onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); }}>
       <ComposerChip kind="prompt" label={update.title} {...contextUpdateChipProps}
+        {...(update.kind === 'rewind' ? rewindContextChipProps : {})}
         title={[update.title, update.path].filter(Boolean).join('\n') || 'Обновление рабочего состояния'}
         style={{ opacity: busy ? 0.55 : 1, transition: 'opacity 120ms ease' }}
         onClick={() => setOpen(!open)} />

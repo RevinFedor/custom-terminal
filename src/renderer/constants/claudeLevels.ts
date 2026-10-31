@@ -21,8 +21,8 @@ export type ClaudeEffortLevel = typeof CLAUDE_EFFORT_LEVELS[number];
 // enum rejects 'ultracode').
 export const CLAUDE_ULTRACODE: ClaudeEffortLevel = 'ultracode';
 
-// 'none' is our own UI sentinel meaning "don't auto-inject /effort at all".
-// Stored in user prefs alongside real levels.
+// Legacy persisted sentinel; not offered by the global defaults UI anymore.
+// Unset global preferences are normalized to low at the launch boundary.
 export const CLAUDE_EFFORT_LEVELS_WITH_NONE = ['none', ...CLAUDE_EFFORT_LEVELS] as const;
 export type DefaultClaudeEffort = string;
 

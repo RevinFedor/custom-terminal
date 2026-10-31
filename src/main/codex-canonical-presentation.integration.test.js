@@ -18,7 +18,7 @@ const outcomes = require('./codex-turn-outcome');
 const mainPath = process.env.CANONICAL_PRESENTATION_BASELINE_MAIN || path.join(__dirname, 'main.js');
 const tree = ts.createSourceFile(mainPath, fs.readFileSync(mainPath, 'utf8'), ts.ScriptTarget.Latest, true);
 const declarations = new Map(tree.statements.filter(ts.isFunctionDeclaration).map(n => [n.name?.text, n.getText(tree)]));
-const names = ['observeCodexProviderPreviewRawRecord', 'handleCodexProviderSemanticEvent',
+const names = ['observeCodexProviderPreviewRawRecord', 'observeCodexProviderCompactionPhase', 'handleCodexProviderSemanticEvent',
   'codexCanonicalPresentationScope', 'currentCodexProviderSemanticOwnerContext',
   'getCodexWriterProofSnapshot', 'codexEventType', 'codexLiveUuid', 'codexLiveSourceIdentity',
   'extractCodexLiveText', 'buildCodexLiveRawMessage', 'codexLiveUserCarrierKind',
@@ -48,7 +48,7 @@ async function fixture(t, { maxEntries, maxBytes, verify } = {}) {
     codexLastRunCommandPayload: new Map([['T', { launchId: 'L' }]]),
     codexProviderSemanticSources: new Map([['T', owner]]), codexTurnWatchers: new Map([['T', state]]),
     codexKnownSessions: new Map(), codexWriterProofs: new Map(), codexWatchers: new Map(),
-    stopRevision: 0, getTerminalStopRevision: () => context.stopRevision,
+    stopRevision: 0, getTerminalStopRevision: () => context.stopRevision, transcriptService: null,
     getTerminalLifecycleGeneration: () => 'G', terminalHistoryStreamingEnabled: true,
     readTerminalHistoryPreviewFrame: () => ({ status: 'unknown' }),
     emitTerminalHistoryPreview: detail => { frames.push(detail);
@@ -58,7 +58,7 @@ async function fixture(t, { maxEntries, maxBytes, verify } = {}) {
     ...previewGuards, ...outcomes,
     safelyObserveProviderSemantic: (_action, fn) => fn(),
     publishCodexProviderTurnActivity: detail => { owner.turnId = detail.turnId; owner.turnActive = detail.active; },
-    compactOperations: { getActive: () => null },
+    compactOperations: require('./compact-operation-state').createCompactOperationRegistry(), aiStoppingTabs: new Map(),
     mainWindow: { isDestroyed: () => false, webContents: { send: (channel, detail) => {
       rows.push({ channel, detail }); transport.push({ channel, detail: structuredClone(detail) }); } } },
     _webBroadcast: (_tab, envelope) => web.push(envelope),
@@ -380,7 +380,7 @@ test('actual append scan completes presentation before resolved and without anot
   let reads = 0;
   f.context.readCodexTurnAppend = async options => { reads++; return readCodexTurnAppend(options); };
   await f.release({ scan: true });
-  assert.equal(reads, 1); assert.equal(f.rows.length, 1);
+  assert.equal(reads, 1); assert.equal(f.rows.length, 1, f.logs.join('\n'));
   assert.equal(f.runtime.find(x => x.kind === 'resolved').rowCount, 1);
 });
 

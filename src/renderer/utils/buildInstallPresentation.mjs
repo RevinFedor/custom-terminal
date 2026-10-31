@@ -17,22 +17,22 @@ export function mergeBuildInstallJobs(previous = [], incoming = [], tabId) {
 export function buildInstallPresentation(job, stale = false) {
   if (stale) return { label: 'Связь не подтверждена', color: '#fbbf24', spinning: false };
   if (job.requestCancelledAt) return { label: job.running ? 'Отмена запроса…' : 'Запрос отменён', color: '#a3a3a3', spinning: false };
-  if (activity.pending(job.continuation) && job.continuation.inheritedActive === false) {
-    return { label: job.callback?.status === 'sent'
-      ? (job.ok === true ? 'Установлено · ждём завершения ответа' : 'Ждём завершения ответа на уведомление')
-      : 'Проверка возврата в сессию', color: '#fbbf24', spinning: false };
-  }
   if (job.installOutcomeUnknown) return { label: 'Исход установки неизвестен', color: '#fbbf24', spinning: false };
-  if (job.cancelled) return { label: job.running ? 'Отмена…' : 'Отменено', color: '#a3a3a3', spinning: false };
+  if (job.cancelled && !activity.pending(job.continuation)) return { label: job.running ? 'Отмена…' : 'Отменено', color: '#a3a3a3', spinning: false };
   if (job.running) {
     const labels = { preparing: 'Сборка', validating: 'Проверка', 'awaiting-owner': 'Перед обновлением',
       quitting: 'Закрытие приложения', installing: 'Установка', launching: 'Запуск', verifying: 'Проверка связи' };
     return { label: job.phase === 'observing' ? 'Ожидание' : labels[job.stage] || (job.phase === 'building' ? 'Сборка' : 'Подготовка'),
-      color: '#a78bfa', spinning: true };
+      color: '#60a5fa', spinning: true };
   }
   if (job.ok === false) return { label: 'Ошибка установки', color: '#f87171', spinning: false };
-  if (['failed', 'blocked'].includes(job.callback?.status)) return { label: 'Возврат не подтверждён', color: '#fbbf24', spinning: false };
+  if (['failed', 'blocked'].includes(job.callback?.status)) return { label: 'Ошибка доставки уведомления', color: '#f87171', spinning: false };
   if (['pending', 'waiting', 'sending', 'confirming', 'sent_unverified'].includes(job.callback?.status)) {
+    return { label: 'Возврат в сессию', color: '#60a5fa', spinning: true };
+  }
+  if (activity.pending(job.continuation)) {
+    if (job.callback?.status === 'sent') return { label: job.ok === true
+      ? 'Установлено · уведомление доставлено' : 'Уведомление доставлено', color: '#4ade80', spinning: false };
     return { label: 'Возврат в сессию', color: '#60a5fa', spinning: true };
   }
   return { label: job.ok ? 'Установлено' : 'Остановлено', color: job.ok ? '#4ade80' : '#a3a3a3', spinning: false };

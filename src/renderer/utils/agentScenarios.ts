@@ -28,7 +28,7 @@ import {
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
 import { prepareTabWorkContext, settleTabWorkContext, activateTabWorkContext } from './tabWorkContext';
-import { isStandaloneAgentLocalCommand } from './agentLocalCommand.mjs';
+import { isStandaloneAgentLocalCommand, isDesktopCodexCompactQueueRequest } from './agentLocalCommand.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -349,11 +349,13 @@ export function sendAgentPromptScenario(
   args: SendAgentPromptScenarioArgs,
 ): Promise<any> {
   if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
-  if (!args.sendOperationKey && !args.recordWithoutReply && !isStandaloneAgentLocalCommand({ prompt: args.prompt })) {
+  if (!args.sendOperationKey && !args.recordWithoutReply
+    && (!isStandaloneAgentLocalCommand({ prompt: args.prompt }) || isDesktopCodexCompactQueueRequest(args))) {
     const contractError = agentSendSettingsContractError(args);
     if (contractError) return { success: false, accepted: false, submitted: false,
       pasteWritten: false, code: 'agent_send_settings_contract_invalid', error: contractError };
-    // Admission returns independently of the physical send. Main persists the
+    // Admission returns independently of the physical send, including the
+    // supported desktop Compact command. Main persists the
     // immutable request and re-enters this SAME scenario through the existing
     // bridge with its operation/attempt identity only when this tab is at head.
     const request = {

@@ -11,7 +11,7 @@ import {
   getCodexHistoryMutationSettingsProof,
 } from './codexLaunch';
 import { stopClaudePtyProcess } from './claudePtyActions';
-import { restoreComposerDraftFromHistoryPresentation } from './composerChips.mjs';
+import { restoreComposerDraftFromHistoryPresentation, removeRewindCoveredDraftContext } from './composerChips.mjs';
 import { mergeFailedHistoryAuthoringSnapshot } from './historyDraftOwnership.mjs';
 import { beginHistoryOperationActivity } from './historyOperationActivity.mjs';
 
@@ -213,6 +213,8 @@ export async function executeHistoryRewriteRewindScenario({
   let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   let incumbentSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   let historyInput: any = null;
+  let selfRewind = false;
+  let coveredDraftContexts: Array<{ id: string; textHash: string }> = [];
   let ownsInputReservation = false;
   try {
     if (operation) {
@@ -225,6 +227,8 @@ export async function executeHistoryRewriteRewindScenario({
       preparedMutationSessionId = prepared.mutationSessionId || null;
       preparedIncumbentSettingsProof = prepared.incumbentCodexSettingsProof || null;
       historyInput = prepared.historyInput || null;
+      selfRewind = prepared.selfRewind === true;
+      coveredDraftContexts = prepared.coveredDraftContexts || [];
     }
     if (!historyInput) {
       historyInput = await ipcRenderer.invoke('history-mutation:begin', {
@@ -247,6 +251,7 @@ export async function executeHistoryRewriteRewindScenario({
           chips: range.promptChips,
           imagePaths: range.imagePaths,
           includeAuthoring: !!operation,
+          omitContextUpdates: selfRewind,
         })
       : null;
 
@@ -337,6 +342,14 @@ export async function executeHistoryRewriteRewindScenario({
     // current composer only after the mutation commits and prepend the restored
     // prompt instead of overwriting newer text, chips or images.
     const applyRestoredDraft = () => {
+      if (selfRewind && coveredDraftContexts.length) {
+        const current = useUIStore.getState();
+        const draft = { text: current.historyPromptDrafts[tabId] || '', chips: current.historyPromptDraftChips[tabId] || [] };
+        const fingerprint = (value: string) => window.require('crypto').createHash('sha256').update(value).digest('hex');
+        const clean = removeRewindCoveredDraftContext(draft, coveredDraftContexts, fingerprint);
+        if (clean.text !== draft.text || clean.chips.length !== draft.chips.length) current.setHistoryPromptDraft(tabId, clean.text,
+          { chips: clean.chips, images: current.historyPromptDraftImages[tabId] || [] });
+      }
       if (restoredDraft && restoreDraft) {
         const uiState = useUIStore.getState();
         const currentText = uiState.historyPromptDrafts[tabId] || '';

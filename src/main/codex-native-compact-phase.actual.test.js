@@ -17,6 +17,7 @@ function fixture() {
   const context = vm.createContext({ console: { log() {}, warn() {} }, Date,
     codexCanonicalPresentation: null,
     codexProviderSemanticSources: new Map([['T', owner]]), codexTurnWatchers: new Map([['T', watcher]]),
+    aiStoppingTabs: new Map(), getTerminalStopRevision: () => 0,
     codexPromptGeneration: new Map([['T', 1]]), compactOperations: registry, codexProviderPreviewOwnerVerdict,
     currentCodexProviderSemanticOwnerContext: () => ({ terminalToken: term, runSeq: 1, lifecycleGeneration: generation, launchId: 'L' }),
     getCodexWriterProofSnapshot: () => ({ sessionId: session }),
@@ -24,8 +25,12 @@ function fixture() {
     publishCodexProviderTurnActivity: detail => { busy.push(detail); owner.turnActive = detail.active; },
     terminalHistoryPreviewController: { observeSemanticEvent: detail => { previews.push(detail); return true; } },
   });
-  const handler = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'handleCodexProviderSemanticEvent');
-  assert.ok(handler); vm.runInContext(handler.getText(ast), context);
+  const handlerNames = ['captureCodexProviderCompactionBoundary', 'observeCodexProviderCompactionPhase',
+    'bindCodexProviderCompactionEvidence', 'finishCodexProviderCompactionObservation', 'handleCodexProviderSemanticEvent'];
+  const handlers = handlerNames.map(name => ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name))
+    .filter(Boolean);
+  assert.ok(handlers.some(node => node.name.text === 'handleCodexProviderSemanticEvent'));
+  vm.runInContext(handlers.map(node => node.getText(ast)).join('\n'), context);
   const shadow = createProviderSemanticShadow({ now: () => now, log: { log() {}, warn() {} },
     authorizeCodexMainRequest: () => ({ allowed: true, reason: 'fixture-exact-causal-writer' }),
     onCodexSemanticEvent: context.handleCodexProviderSemanticEvent });
@@ -78,7 +83,7 @@ test('explicit /compact retains its original causal start, handoff and completio
   assert.ok(h.registry.getActive('T'), 'explicit command still waits for canonical task completion');
 });
 
-test('side/prewarm/ordinary traffic and unproven/replaced writers cannot invent a compact phase', () => {
+test('side/prewarm/ordinary traffic and known foreign/replaced writers cannot invent a compact phase', () => {
   for (const kind of ['turn', 'prewarm', 'recap']) { const h = fixture(); h.request(kind); assert.equal(h.registry.getActive('T'), null); }
   for (const changed of ['session', 'generation']) {
     const h = fixture(); if (changed === 'session') h.writer('foreign'); else h.generation('G2');
@@ -92,7 +97,7 @@ test('pending explicit intent is not promoted by transport metadata; native phas
   assert.equal(contract.createCompactOperationRegistry().snapshot('T').active, null);
 });
 
-test('native observed start requires actual exclusive EOF, not an unread watcher offset after stat failure', () => {
+test('confirmed-writer boundary requires actual exclusive EOF; explicit legacy fallback remains unchanged', () => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'captureCodexManualCompactBoundary');
   let fails = true;
   const c = vm.createContext({ codexTurnWatchers: new Map([['T', { filePath: '/synthetic', offset: 10 }]]),

@@ -32,7 +32,7 @@ const richText = '<saved_prompt name="Rules" context-update-id="update-exact">Ke
   + '<context_file name="Design" path="/fixture/design.md" role="source" sha256="' + 'a'.repeat(64) + '" bytes="4">plan</context_file>\n'
   + '<pasted_content>' + 'pasted text '.repeat(100) + '</pasted_content>\nordinary [Image #1]';
 
-async function makeSource({ busy = false, onlyTurn = false, afterCompactTail = false } = {}) {
+async function makeSource({ busy = false, onlyTurn = false, afterCompactTail = false, projectInstructions = null } = {}) {
   const sessionId = crypto.randomUUID();
   const dir = path.join(fixtureHome, 'sessions', '2026', '09', '13');
   await fs.promises.mkdir(dir, { recursive: true });
@@ -41,6 +41,15 @@ async function makeSource({ busy = false, onlyTurn = false, afterCompactTail = f
   const records = [{ type: 'session_meta', payload: { id: sessionId, session_id: sessionId, cwd: '/fixture' } },
     { type: 'turn_context', payload: { model: 'gpt-5.6-luna', effort: 'medium' } }];
   for (const text of onlyTurn ? [richText] : ['keep', richText, 'later']) {
+    if (projectInstructions) {
+      const version = projectInstructions === 'same' || text === 'keep' ? 'A' : text === richText ? 'B' : 'C';
+      const rules = 'rules ' + version;
+      records.push({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{
+        type: 'input_text', text: '# AGENTS.md instructions for /fixture\n\n<INSTRUCTIONS>\n' + rules + '\n</INSTRUCTIONS>',
+      }] } }, { type: 'world_state', payload: {
+        full: text === 'keep', state: { agents_md: { directory: '/fixture', text: rules } },
+      } });
+    }
     records.push({ type: 'event_msg', payload: { type: 'task_started' } },
       { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } },
       { type: 'event_msg', payload: { type: 'user_message', message: text,
@@ -359,6 +368,37 @@ test('actual HTTP/executor/COW removes orphan future after compact and retains t
     assert.equal(h.events.filter(event => event[0] === 'dispatch').length, 1);
   } finally { await h.close(); }
 });
+
+for (const projectInstructions of ['same', 'changed']) {
+  test('actual HTTP Rewind removes owned AGENTS and checkpoint, keeps earlier rules: ' + projectInstructions, async () => {
+    const h = await harness({ projectInstructions, stopped: true });
+    try {
+      assert.equal((await h.post()).status, 202);
+      await h.done;
+      const reply = await h.get();
+      assert.equal(reply.status, 200, JSON.stringify(reply));
+      assert.equal(reply.operation.bindingCommitted, true);
+      const child = await codex.loadSessionRecords(reply.operation.newSessionId, '/fixture');
+      assert.equal(child.success, true, child.error);
+      const rules = child.records.filter(record => record.type === 'world_state');
+      assert.equal(rules.length, 1, 'only the retained iteration owns a checkpoint');
+      assert.deepEqual(rules[0].payload, { full: true, state: {
+        agents_md: { directory: '/fixture', text: 'rules A' },
+      } });
+      const entries = codex.buildCodexFullHistory(child.records, reply.operation.newSessionId);
+      const instructions = entries.filter(entry => entry.serviceCarrier === 'project-instructions');
+      assert.equal(instructions.length, 1, 'no orphan from the deleted iteration');
+      assert.match(instructions[0].content, /rules A/);
+      assert.deepEqual(codex.buildCodexTimeline(child.records, reply.operation.newSessionId)
+        .filter(entry => entry.type === 'user').map(entry => entry.content), ['keep']);
+      assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes, 'original is unchanged');
+      assert.equal(h.events.some(event => /paste|send-prompt|rewind-native/.test(event[0])), false);
+      assert.equal((await h.post()).operation.idempotent, true);
+      assert.equal(h.events.filter(event => event[0] === 'dispatch').length, 1);
+      assert.equal(h.events.filter(event => event[0] === 'launch-write').length, 1);
+    } finally { await h.close(); }
+  });
+}
 
 test('repairOfOperationId repairs one legacy-shaped completed COW through the same executor without rewriting its receipt/source/child', async () => {
   const options = { afterCompactTail: true, legacySuffix: true };

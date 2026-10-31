@@ -33,11 +33,15 @@ import { isOrchestrationResultProofPending, mergeOrchestrationRuns } from '../..
 import { orchestrationRequestTime, orchestrationDetailRows, orchestrationLinkedName } from '../../utils/orchestrationDetails.mjs';
 import { useBuildInstallStatus } from '../../hooks/useBuildInstallStatus';
 import { buildInstallVisibleInDock } from '../../utils/buildInstallPresentation.mjs';
-import { BuildInstallTracker } from './BuildInstallTracker';
+import { BuildInstallTracker, BuildInstallPreview } from './BuildInstallTracker';
+import type { BuildInstallSelection } from './BuildInstallTracker';
 import { useBuildContinueStatus } from '../../hooks/useBuildContinueStatus';
 import { BuildContinueTracker, BuildContinuePreview, buildContinueVisible } from './BuildContinueTracker';
 import type { BuildContinueSelection } from './BuildContinueTracker';
 import { ResearchSourceAction } from './TabMessageSourceChip';
+import { useSelfRewinds } from '../../hooks/useSelfRewinds';
+import { SelfRewindTracker, SelfRewindPreview, selfRewindVisible } from './SelfRewindTracker';
+import type { SelfRewindSelection } from './SelfRewindTracker';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -56,6 +60,7 @@ type Props = {
   panelOpen: boolean;
   effectiveWidth: number;
   queueVisible?: boolean;
+  miniOrchestrator?: import('./MiniOrchestratorControl').MiniController;
 };
 
 const ACTIVE = new Set<OrchestrationStatus>([
@@ -70,6 +75,9 @@ const ACTIVE = new Set<OrchestrationStatus>([
 ]);
 
 const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed', 'unconfirmed']);
+const MINI_SEND_LABEL: Record<string, string> = {
+  sending: 'MCP-отправка', queued: 'в очереди', sent: 'доставлено', unknown: 'не подтверждено', refused: 'не отправлено',
+};
 
 const STATUS_LABEL: Record<OrchestrationStatus, string> = {
   creating: 'Создание',
@@ -316,7 +324,7 @@ function minutes(ms: number): number {
   return Math.round(Math.max(0, ms) / 60_000);
 }
 
-export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queueVisible = panelOpen }: Props) {
+export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queueVisible = panelOpen, miniOrchestrator }: Props) {
   const [runs, setRuns] = useState<OrchestrationRun[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
@@ -334,21 +342,46 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const messages = useTabMessages(tabId);
   const installs = useBuildInstallStatus(tabId);
   const recovery = useBuildContinueStatus(tabId);
+  const rewinds = useSelfRewinds(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
   const [selectedRecovery, setSelectedRecovery] = useState<BuildContinueSelection | null>(null);
+  const [selectedInstall, setSelectedInstall] = useState<BuildInstallSelection | null>(null);
+  const [selectedRewind, setSelectedRewind] = useState<SelfRewindSelection | null>(null);
+  const selectedRewindOperation = rewinds.rows.find(row => row.operationId === selectedRewind?.operationId);
+  const selectedInstallJob = installs.jobs.find(job => job.id === selectedInstall?.jobId && job.requestId === selectedInstall.requestId);
   const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
   const selectedRecoveryTarget = recovery.targets.find(target => target.operationKey === selectedRecovery?.operationKey);
-  const closeMessage = useCallback(() => { setSelectedMessage(null); setSelectedRecovery(null); }, []);
+  const closeMessage = useCallback(() => { setSelectedMessage(null); setSelectedRecovery(null); setSelectedInstall(null); setSelectedRewind(null); }, []);
   const openMessage = useCallback((selection: MessageSelection) => {
     setSettingsOpen(false);
     setSelectedRecovery(null);
+    setSelectedInstall(null);
+    setSelectedRewind(null);
     setSelectedMessage(current => current?.messageId === selection.messageId ? null : selection);
   }, []);
   const openRecovery = useCallback((selection: BuildContinueSelection) => {
-    setSettingsOpen(false); setSelectedMessage(null);
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedInstall(null); setSelectedRewind(null);
     setSelectedRecovery(current => current?.operationKey === selection.operationKey ? null : selection);
   }, []);
+  const openInstall = useCallback((selection: BuildInstallSelection) => {
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedRewind(null);
+    setSelectedInstall(current => current?.jobId === selection.jobId && current.requestId === selection.requestId ? null : selection);
+  }, []);
+  const openRewind = useCallback((selection: SelfRewindSelection) => {
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedInstall(null);
+    setSelectedRewind(current => current?.operationId === selection.operationId ? null : selection);
+  }, []);
+  useEffect(() => {
+    if (selectedRewind && (!selectedRewindOperation || !selectedRewind.history && !selfRewindVisible(selectedRewindOperation))) {
+      setSelectedRewind(null);
+    }
+  }, [selectedRewind, selectedRewindOperation]);
   useEffect(() => { closeMessage(); }, [tabId, closeMessage]);
+  useEffect(() => {
+    if (selectedInstall && (!selectedInstallJob || !selectedInstall.history && !buildInstallVisibleInDock(selectedInstallJob))) {
+      setSelectedInstall(null);
+    }
+  }, [selectedInstall, selectedInstallJob]);
   useEffect(() => {
     if (selectedRecovery && (!selectedRecoveryTarget || !selectedRecovery.history && !buildContinueVisible(selectedRecoveryTarget))) {
       setSelectedRecovery(null);
@@ -439,14 +472,19 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     ...installs.jobs.map(job => ({ kind: 'install' as const, job, at: job.startedAt, id: 'install:' + job.id })),
     ...recovery.targets.filter(target => target.route.kind !== 'install-callback').map(target => ({ kind: 'continuation' as const, target,
       at: target.capturedAt, id: 'continuation:' + target.operationId })),
-  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs, recovery.targets]);
+    ...rewinds.rows.map(operation => ({ kind: 'self-rewind' as const, operation,
+      at: operation.createdAt, id: 'self-rewind:' + operation.operationId })),
+  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs, recovery.targets, rewinds.rows]);
   const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
   const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
   const statusInstalls = installs.jobs.filter(buildInstallVisibleInDock);
   const statusRecovery = recovery.targets.filter(buildContinueVisible);
-  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || hasVisibleMessages || Boolean(messages.listError);
+  const statusRewinds = rewinds.rows.filter(selfRewindVisible);
+  const miniFeedback = miniOrchestrator?.snapshot?.entries.filter(entry => entry.type === 'tool').at(-1);
+  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || statusRewinds.length > 0
+    || hasVisibleMessages || Boolean(messages.listError) || Boolean(rewinds.error) || !!miniFeedback;
   const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
-    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null || selectedRecovery !== null);
+    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null || selectedRecovery !== null || selectedInstall !== null || selectedRewind !== null);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     if (openingLinkedRuns.current.has(run.runId)) return;
@@ -689,12 +727,16 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       </div>
       <div data-request-history-list className="scrollbar-thin" style={{ minHeight: 0, overflowY: 'auto' }}>
         {messages.listError && <div role="alert" style={{ padding: 8, fontSize: 10, color: '#fbbf24' }}>Сообщения недоступны: {messages.listError}</div>}
-        {!historyEntries.length && !messages.listError && <div style={{ padding: 10, fontSize: 11, color: '#888' }}>Запросов пока нет</div>}
+        {rewinds.error && <div role="alert" style={{ padding: 8, fontSize: 10, color: '#fbbf24' }}>Откаты недоступны: {rewinds.error}</div>}
+        {!historyEntries.length && !messages.listError && !rewinds.error && <div style={{ padding: 10, fontSize: 11, color: '#888' }}>Запросов пока нет</div>}
         {historyEntries.map((entry) => {
+          if (entry.kind === 'self-rewind') return <SelfRewindTracker key={entry.id} operation={entry.operation} history
+            onOpen={openRewind} onDismiss={rewinds.dismiss} selected={selectedRewind?.operationId === entry.operation.operationId} />;
           if (entry.kind === 'continuation') return <BuildContinueTracker key={entry.id} target={entry.target} error={recovery.error} history
             onOpen={openRecovery} selected={selectedRecovery?.operationKey === entry.target.operationKey} onCancel={recovery.cancel} />;
           if (entry.kind === 'install') return <BuildInstallTracker key={entry.id} job={entry.job} stale={installs.stale}
-            error={installs.error} history onCancel={installs.cancel} />;
+            error={installs.error} history onCancel={installs.cancel} onOpen={openInstall}
+            selected={selectedInstall?.jobId === entry.job.id} />;
           if (entry.kind === 'message') return <TabMessageRow key={entry.id} thread={entry.thread} tabId={tabId}
             history selected={selectedMessage?.messageId === entry.thread.question.messageId}
             onOpen={openMessage} onDismiss={cancelMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
@@ -781,6 +823,10 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         <button type="button" aria-label="Закрыть" onClick={() => setSettingsOpen(false)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}><X size={14} /></button>
       </div>
       <div data-orchestration-settings-body className="scrollbar-thin" style={{ padding: 10, minHeight: 0, overflowY: 'auto', display: 'grid', gap: 9, fontSize: 11 }}>
+        {miniOrchestrator && <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#aaa' }}>
+          <input type="checkbox" checked={miniOrchestrator.snapshot?.enabled ?? false} disabled={!miniOrchestrator.snapshot} onChange={(event) => void miniOrchestrator.setEnabled(event.target.checked)} />
+          Мини-оркестратор {miniOrchestrator.snapshot?.enabled ? 'Active' : 'Inactive'}
+        </label>}
         <label style={{ display: 'grid', gridTemplateColumns: '1fr 64px', alignItems: 'center', gap: 8, color: '#aaa' }}>
           Передать ошибку через, мин
           <input type="number" min={0} max={10080} value={minutes(settings.failureGraceMs)} onChange={(event) => void saveSettings({ failureGraceMs: Number(event.target.value) * 60_000 })} style={{ width: 64, background: '#1d1d1d', color: '#ddd', border: '1px solid #3b3b3b', borderRadius: 4, padding: '4px 6px' }} />
@@ -849,9 +895,21 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           display: dock.visible && hasDockEntries ? 'flex' : 'none', flexDirection: 'column',
           border: '1px solid #444', borderRadius: 5, background: '#171717', boxSizing: 'border-box',
           boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
-          overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
+          overflowY: 'auto', overflowX: 'hidden', scrollbarGutter: 'stable', pointerEvents: 'auto' }}>
       <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} />
-      {statusInstalls.map(job => <BuildInstallTracker key={job.id} job={job} stale={installs.stale} error={installs.error} onCancel={installs.cancel} />)}
+      {statusRewinds.map(operation => <SelfRewindTracker key={operation.operationId} operation={operation}
+        selected={selectedRewind?.operationId === operation.operationId} onOpen={openRewind} onDismiss={rewinds.dismiss} />)}
+      {miniFeedback && <RequestTrackerRow data-mini-orchestrator-send={miniFeedback.id}>
+        <button type="button" style={requestRowLinkStyle}
+          title="Корректирующая отправка Terminal MCP — без ожидания Reply"
+          onClick={() => window.dispatchEvent(new CustomEvent('mini-orchestrator:open', { detail: { tabId } }))}>
+          <RequestTrackerStatus><Send size={12} color={miniFeedback.receipt?.status === 'sent' ? '#4ade80'
+            : miniFeedback.receipt?.status === 'unknown' ? '#f59e0b' : '#999'} /></RequestTrackerStatus>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Рецензент · {MINI_SEND_LABEL[miniFeedback.receipt?.status || miniFeedback.status || 'unknown'] || 'не подтверждено'}</span>
+        </button>
+      </RequestTrackerRow>}
+      {statusInstalls.map(job => <BuildInstallTracker key={job.id} job={job} stale={installs.stale} error={installs.error} onCancel={installs.cancel}
+        disabled={!dock.visible || historyOpen || settingsOpen} onOpen={openInstall} selected={selectedInstall?.jobId === job.id} />)}
       {statusRecovery.map(target => <BuildContinueTracker key={target.operationKey} target={target} error={recovery.error}
         disabled={!dock.visible || historyOpen || settingsOpen} onOpen={openRecovery}
         selected={selectedRecovery?.operationKey === target.operationKey} onCancel={recovery.cancel} />)}
@@ -894,7 +952,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                 side="left"
                 align="start"
                 boundarySelector="[data-split-pane-queue-host], [data-workspace-prompt-queue-host]"
-                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage) || Boolean(selectedRecovery)}
+                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage) || Boolean(selectedRecovery) || Boolean(selectedInstall) || Boolean(selectedRewind)}
                 always
               >
                 <RequestTrackerRow data-orchestration-active-run={run.runId}
@@ -975,7 +1033,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         type="button"
         data-orchestration-settings-button
         data-active={settingsOpen ? 'true' : undefined}
-        onClick={() => { setSettingsOpen((open) => !open); setHistoryOpen(false); closeMessage(); }}
+        onClick={() => { miniOrchestrator?.ensureLoaded(); setSettingsOpen((open) => !open); setHistoryOpen(false); closeMessage(); }}
         aria-label="Настройки запросов"
         aria-expanded={settingsOpen}
         title="Настройки запросов"
@@ -1010,6 +1068,10 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         selection={selectedMessage} thread={selectedThread} controller={messages} onClose={closeMessage} previewRef={messagePreviewRef} />}
       {selectedRecovery && selectedRecoveryTarget && <BuildContinuePreview key={tabId + ':' + selectedRecovery.operationKey}
         selection={selectedRecovery} target={selectedRecoveryTarget} error={recovery.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
+      {selectedInstall && selectedInstallJob && <BuildInstallPreview key={tabId + ':' + selectedInstall.requestId}
+        selection={selectedInstall} job={selectedInstallJob} stale={installs.stale} error={installs.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
+      {selectedRewind && selectedRewindOperation && <SelfRewindPreview key={tabId + ':' + selectedRewind.operationId}
+        selection={selectedRewind} operation={selectedRewindOperation} onClose={closeMessage} previewRef={messagePreviewRef} />}
     </div>
   );
 }

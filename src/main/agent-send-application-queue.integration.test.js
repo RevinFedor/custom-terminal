@@ -148,6 +148,7 @@ function harness(t, provider, options = {}) {
         queued: true, providerQueueAccepted: true, auditPending: true };
     },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, ast);
   vm.runInContext(['durableRecordHasProviderQueueAcceptance','durableAgentSendReplay','publicAgentSendReceipt',
     'durableAgentSendFailure','runPreparedAgentSendScenario','runAgentSendScenario','runAfterCapacityBlocksNewSend','readScenarioDestination'].map(declaration).join('\n'), context);
   vm.runInContext('var enqueueDesktopAgentPrompt = ' + exported('enqueueDesktopAgentPrompt'), context);
@@ -183,6 +184,45 @@ function harness(t, provider, options = {}) {
     setTarget: value => { targetSession = value; } };
 }
 
+test('self Rewind continuation uses the actual Web FIFO reservation and typed provenance before dispatch', async t => {
+  const h = harness(t, 'codex');
+  let allowed = false, validations = 0;
+  h.queue.admit = () => allowed;
+  h.context.withPromptOriginPresentation = require('../shared/prompt-origin.cjs').withPromptOriginPresentation;
+  h.context.savedHistoryOperations = { validateSelfReservation: () => { validations++; } };
+  h.context.selfArgs = { tabId: 'T', prompt: 'New task after Rewind', provider: 'codex', sessionId: 'S',
+    handoffId: 'self-rewind:operation', sendOperationKey: 'self-rewind:T:operation', sendSurface: 'self-rewind',
+    source: 'self-rewind:operation', queue: true, ownership: 'project', applicationQueueAcceptedResponse: true,
+    expectedTarget: { toolType: 'codex', sessionId: 'S' }, selfRewindRef: { tabId: 'T', operationId: 'operation' } };
+  h.queue.execute = request => {
+    h.context.selfFrozen = request;
+    return vm.runInContext('runPreparedAgentSendScenario({ ...selfFrozen, applicationQueueExecution: true, [SELF_REWIND_ADMISSION]: true })', h.context);
+  };
+  const accepted = await vm.runInContext('runAgentSendScenario({ ...selfArgs, [SELF_REWIND_ADMISSION]: true })', h.context);
+  assert.equal(accepted.applicationQueued, true); assert.equal(validations, 1); assert.equal(h.writes.length, 0);
+  const frozen = h.queue.item('self-rewind:T:operation').request_json;
+  allowed = true; h.queue.notifyRuntime('T'); await h.queue.result('self-rewind:T:operation');
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].presentationSnapshot.semanticTags[0].selfRewindOperationId, 'operation');
+  assert.equal(h.queue.item('self-rewind:T:operation').request_json, frozen);
+});
+
+test('self Rewind pre-reservation scope rejection releases prepared context and cannot reach a sender', async t => {
+  const h = harness(t, 'codex'); let released = 0;
+  h.context.tabWorkContext.release = () => { released++; };
+  h.context.savedHistoryOperations = { validateSelfReservation: () => { throw Object.assign(Error('scope changed'), { code: 'self_rewind_owner_changed' }); } };
+  h.context.selfArgs = { tabId: 'T', prompt: 'New task', provider: 'codex', sessionId: 'S',
+    handoffId: 'self-rewind:reject', sendOperationKey: 'self-rewind:T:reject', sendSurface: 'self-rewind',
+    source: 'self-rewind:reject', applicationQueueAcceptedResponse: true,
+    selfRewindRef: { tabId: 'T', operationId: 'reject' }, expectedTarget: { toolType: 'codex', sessionId: 'S' } };
+  await assert.rejects(vm.runInContext('runAgentSendScenario({ ...selfArgs, [SELF_REWIND_ADMISSION]: true })', h.context),
+    error => error.code === 'self_rewind_owner_changed' && error.submitted === false && error.enterWritten === false);
+  assert.equal(released, 1); assert.equal(h.writes.length, 0); assert.equal(h.store.get('self-rewind:T:reject'), null);
+  await assert.rejects(h.context.runAgentSendScenario({ ...h.context.selfArgs, selfRewindAdmission: true }),
+    error => error.code === 'self_rewind_admission_required');
+  assert.equal(h.writes.length, 0);
+});
+
 for (const process of ['found', 'unknown']) test('snapshot completion: exact FIFO follower survives predecessor writer adoption during ' + process + ' lookup', async t => {
   const h = harness(t, 'codex');
   await h.send('head');
@@ -209,8 +249,7 @@ for (const process of ['found', 'unknown']) test('snapshot completion: exact FIF
 });
 
 test('actual post-context reservation gate defers Continue before enqueue; the captured Reply keeps its earlier FIFO slot', { timeout: 5000 }, async t => {
-  const h = harness(t, 'codex'), token = Symbol('private-build-continue');
-  h.context.BUILD_CONTINUE_ADMISSION = token;
+  const h = harness(t, 'codex'), token = vm.runInContext('BUILD_CONTINUE_ADMISSION', h.context);
   let replyReady = false, replyReserved = false;
   h.context.tabWorkContext.prepare = async (_tab, _handoff, prompt) => { replyReady = true; return { prompt }; };
   h.context.buildContinueOperations = { prepareReservation: async () => ({ ready: !replyReady || replyReserved,

@@ -78,6 +78,7 @@ export function buildPromptChipWrapper(chip) {
   const attrs = [
     ...(label ? [`name="${label}"`] : []),
     ...(chip?.contextUpdateId ? [`context-update-id="${escapePromptChipLabel(chip.contextUpdateId)}"`] : []),
+    ...(chip?.contextUpdateId && chip.contextUpdateKind === 'rewind' ? ['context-update-kind="rewind"'] : []),
     ...(depth > 0 ? [`inheritance-depth="${depth}"`] : []),
     ...(depth > 0 && parentLabel ? [`inheritance-parent="${parentLabel}"`] : []),
   ];
@@ -384,6 +385,7 @@ export function haveSameComposerChips(left, right) {
       && chip.sha256 === other.sha256
       && chip.bytes === other.bytes
       && chip.contextUpdateId === other.contextUpdateId
+      && chip.contextUpdateKind === other.contextUpdateKind
       && chip.messageReference?.referenceId === other.messageReference?.referenceId
       && JSON.stringify(chip.messageReference?.source || null) === JSON.stringify(other.messageReference?.source || null);
   });
@@ -606,7 +608,7 @@ export function splitPromptChipPresentation({ text = '', chips = [] } = {}) {
  * Prompt-chip presentation is attached by durable entry UUID outside the
  * transport text.
  */
-export function parsePastedContentParts(value, { includePasteIdentity = false } = {}) {
+export function parsePastedContentParts(value, { includePasteIdentity = false, includeSourceRanges = false } = {}) {
   const text = String(value || '');
   const parts = [];
   let cursor = 0;
@@ -703,12 +705,15 @@ export function parsePastedContentParts(value, { includePasteIdentity = false } 
     }
     const depthMatch = attrs.match(/\binheritance-depth="(\d+)"/);
     const contextUpdateMatch = attrs.match(/\bcontext-update-id="([^"]+)"/);
+    const rewindContext = contextUpdateMatch && /\bcontext-update-kind="rewind"/.test(attrs);
     const parentMatch = attrs.match(/\binheritance-parent="([^"]*)"/);
     const inheritanceDepth = promptInheritanceDepth(depthMatch?.[1]);
     parts.push({
       kind: 'prompt-wrapper',
+      ...(includeSourceRanges ? { sourceRange: { start: next.at, end: closeAt + closeMarker.length } } : {}),
       label: nameMatch ? unescapePromptChipLabel(nameMatch[1]) : '',
       ...(contextUpdateMatch ? { contextUpdateId: unescapePromptChipLabel(contextUpdateMatch[1]) } : {}),
+      ...(rewindContext ? { contextUpdateKind: 'rewind' } : {}),
       ...(inheritanceDepth > 0 ? { inheritanceDepth } : {}),
       ...(inheritanceDepth > 0 && parentMatch
         ? { inheritanceParentLabel: unescapePromptChipLabel(parentMatch[1]) }
@@ -761,6 +766,7 @@ export function buildClaudeRewindPromptProjection(value) {
           inheritanceDepth: part.inheritanceDepth,
           inheritanceParentLabel: part.inheritanceParentLabel,
           contextUpdateId: part.contextUpdateId,
+          contextUpdateKind: part.contextUpdateKind,
         })
       : part.kind === 'context-file-wrapper'
         ? buildContextFileWrapper({
@@ -934,6 +940,7 @@ export function buildHistoryComposerPresentationParts({
             label: part.label || 'PROMPT',
             text: part.text,
             ...(part.contextUpdateId ? { contextUpdateId: part.contextUpdateId } : {}),
+            ...(part.contextUpdateKind === 'rewind' ? { contextUpdateKind: 'rewind' } : {}),
             ...(part.inheritanceDepth ? { inheritanceDepth: part.inheritanceDepth } : {}),
             ...(part.inheritanceParentLabel
               ? { inheritanceParentLabel: part.inheritanceParentLabel }
@@ -1007,6 +1014,7 @@ export function restoreComposerDraftFromHistoryPresentation({
   chips = [],
   imagePaths = [],
   includeAuthoring = false,
+  omitContextUpdates = false,
 } = {}) {
   const presentation = buildHistoryComposerPresentationParts({
     text,
@@ -1045,7 +1053,7 @@ export function restoreComposerDraftFromHistoryPresentation({
   while (cursor < parts.length) {
     const part = parts[cursor];
     if (part?.kind === 'prompt') {
-      restoredChips.push(restorePromptChipMetadata(part.chip));
+      if (!omitContextUpdates || !part.chip.contextUpdateId) restoredChips.push(restorePromptChipMetadata(part.chip));
       foundLeadingPrompt = true;
       cursor += 1;
       continue;
@@ -1118,6 +1126,20 @@ export function restoreComposerDraftFromHistoryPresentation({
       imagePaths: [...restoredImagesById.values()],
     } } : {}),
   };
+}
+
+/** Remove only the exact context versions covered by an accepted self Rewind.
+ * Use the existing envelope parser so nested paste bodies and unrelated bytes
+ * remain untouched; this never reserializes or normalizes the user's draft. */
+export function removeRewindCoveredDraftContext({ text = '', chips = [] }, covered, fingerprint) {
+  const versions = new Map((covered || []).map(member => [member.id, member.textHash]));
+  const matches = (id, body) => !!id && !!versions.get(id) && fingerprint(body) === versions.get(id);
+  const ranges = parsePastedContentParts(text, { includeSourceRanges: true })
+    .filter(part => part.kind === 'prompt-wrapper' && matches(part.contextUpdateId, part.text))
+    .map(part => part.sourceRange).sort((a, b) => b.start - a.start);
+  let next = text;
+  for (const range of ranges) next = next.slice(0, range.start) + next.slice(range.end);
+  return { text: next, chips: chips.filter(chip => !matches(chip.contextUpdateId, chip.text)) };
 }
 
 /**

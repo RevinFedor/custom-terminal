@@ -10,10 +10,12 @@ const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadin
 const { mergeableQueuedSend, queuedSendMergeCompatible, composeQueuedSendMerge } = require('./queued-send-merge');
 const { protectQueueAssets, releaseQueueTransferPin, adoptCompletedQueueTransfers, adoptRunAfterItemAssets } = require('./replay-asset-ownership');
 const { classifyInputSlotRetirement, sendInputSlot } = require('./agent-send-input-slot');
+const { compactSendDeliveryIdentity } = require('../shared/compact-send-delivery.cjs');
 const { hiddenSendPresentation, isTabMessageNoInputReceipt, isExternalCompletionNoInputReceipt, isExternalOperationalNoInputReceipt } = require('../shared/agent-send-receipt-control.cjs');
 const { historySendReturnControl } = require('./history-send-return');
 const { capacityRecoveryDeferredReceipt } = require('../shared/run-after-capacity-recovery.cjs');
 const { isSendPreparationDeferred, activeHeadPreparation, PREPARATION_MS, COLD_PREPARATION_MS } = require('./agent-send-preparation');
+const { earlyProviderInputLimitFailure } = require('./agent-provider-input-limit');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
@@ -21,10 +23,11 @@ const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
 // executor can still be unwinding. This is the SAME FIFO owner across queue
 // instances, not another PTY mutex or permission to repeat an input.
 const dispatchOwnersByDatabase = new WeakMap();
-const consumed = record => record?.state === 'confirmed'
+const canonicalConsumed = record => record?.state === 'confirmed'
   && record.auditIdentity?.attemptId === record.attemptId
   && !!record.auditIdentity?.sessionId
   && !!(record.auditIdentity?.entryUuid || record.auditIdentity?.sourceIdentity);
+const consumed = record => canonicalConsumed(record) || !!compactSendDeliveryIdentity(record);
 
 function exactUnattemptedDispatch(record, item) {
   if (!record || !item || item.state !== 'dispatching' || record.operationKey !== item.operation_key
@@ -82,7 +85,7 @@ function applicationQueueReceipt(record, item) {
 
 class AgentSendQueue {
   constructor({ store, execute, publish = () => {}, publishMerge = null, transferMergedContext = null,
-    ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null,
+    ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null, onAccepted = () => {},
     readInputSlot = null, projectPresentation = null, claimDispatch = null, readRecoveryRelease = null, captureRecoveryOwner = null,
     now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, capturePreparationMode = null }) {
     this.store = store;
@@ -100,6 +103,7 @@ class AgentSendQueue {
     this.ready = ready;
     this.cancelAttempt = cancelAttempt;
     this.admit = admit;
+    this.onAccepted = onAccepted;
     this.reconcile = reconcile;
     this.readInputSlot = readInputSlot;
     this.projectPresentation = projectPresentation;
@@ -578,6 +582,15 @@ class AgentSendQueue {
         ...(snapshot.ownedAttachments ? { ownedAttachments: snapshot.ownedAttachments } : {}),
       });
       adoptRunAfterItemAssets(this.db, identity, snapshot);
+      const inputFailure = earlyProviderInputLimitFailure(identity.provider, snapshot.prompt, snapshot);
+      if (inputFailure) {
+        const settled = this.store.settleQueuedNoWrite(identity.operationKey, inputFailure);
+        if (!settled.ok) throw Object.assign(new Error(settled.reason), { code: settled.reason });
+        this.finish(this.item(identity.operationKey), 'failed');
+        console.warn('[AgentSendQueue] input limit refused provider=codex actual=' + inputFailure.inputLimit.actual
+          + ' max=' + inputFailure.inputLimit.max + ' unit=' + inputFailure.inputLimit.unit
+          + ' operation=' + identity.operationKey.slice(0, 120));
+      }
       return { ok: true, item: this.item(identity.operationKey), record: this.store.get(identity.operationKey) };
     })(); } catch (error) {
       console.warn('[AgentSendQueue] admission storage failed tab=' + String(identity.tabId).slice(-12)
@@ -591,6 +604,11 @@ class AgentSendQueue {
       });
     } finally { this.admitting -= 1; }
     if (!admitted.ok || !admitted.item) return admitted;
+    if (!admitted.replayed) {
+      try { this.onAccepted({ tabId: identity.tabId, operationKey: identity.operationKey,
+        handoffId: identity.handoffId, provider: identity.provider, source: snapshot.source || null }); }
+      catch (error) { console.warn('[AgentSendQueue] accepted-input observer failed code=' + String(error?.code || 'observer-failed')); }
+    }
     if (execute && admitted.item.state === 'waiting') this.executors.set(identity.operationKey, execute);
     this.publishRecord(admitted.record);
     this.wake(identity.tabId);
@@ -737,6 +755,18 @@ class AgentSendQueue {
     if (consumed(record) || FAILED.has(record?.state)) this.resolveWaiters(item.operation_key);
   }
 
+  settleCancelledContinuation(record, item) {
+    const head = activeHeadPreparation(record);
+    if (!head || !item) return { ok: false, reason: 'cancellation-owner-unproven' };
+    const scope = { operationKey: record.operationKey, tabId: record.tabId, handoffId: record.handoffId,
+      requestFingerprint: record.requestFingerprint, queueId: item.id, queueState: item.state,
+      requestHash: item.request_hash, requestJson: item.request_json,
+      startedAt: head.startedAt, deadlineAt: head.deadlineAt, allowCancelled: true };
+    return this.store.settleContinuationNoWrite(scope, record.receipt?.continuationInputHold,
+      record.receipt?.continuationInputCapture,
+      { cancelled: true, code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+  }
+
   wake(tabId) {
     if (this.disposed || this.scheduled.has(tabId)) return;
     if (this.running.has(tabId)) { this.rerun.add(tabId); return; }
@@ -852,15 +882,21 @@ class AgentSendQueue {
     let item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
       AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
     if (!item) return;
-    const record = this.store.get(item.operation_key);
+    let record = this.store.get(item.operation_key);
     if (!record) return; // Losing a receipt is not proof that input was untouched.
     const oldDispatch = this.dispatchOwners.get(tabId);
     if (oldDispatch) { oldDispatch.waiters.add(this); this.parked.add(tabId); return; }
     if (record.deliveryControl?.cancelledAt && !record.attemptId) {
       try {
-        this.finish(item, 'cancelled');
-        this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
-          code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+        if (record.receipt?.continuationInputHold || record.receipt?.continuationInputCapture) {
+          const settled = this.settleCancelledContinuation(record, item);
+          if (!settled.ok) { this.parked.add(tabId); return; }
+          this.finish(item, 'cancelled');
+        } else {
+          this.finish(item, 'cancelled');
+          this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+            code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+        }
       } catch (error) {
         if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
         this.parked.add(tabId); return;
@@ -917,12 +953,35 @@ class AgentSendQueue {
     const runtimeRevisionAtStart = this.runtimeWakeRevisions.get(tabId) || 0;
     let parked = false;
     let executorInvoked = false, storageBlockedBeforeExecutor = false, preparationDeferredBeforeAttempt = false;
+    let unprovenDeferredHead = false;
     let releaseDispatch = null;
     try {
+      if (record.receipt?.continuationInputCapture && !record.receipt?.continuationInputHold) {
+        // Finish the exact prior capture before calling another admission.
+        // Its RAM fence only constrains this item; a marker whose outcome was
+        // lost across restart cannot authorise admission or a fresh capture.
+        const head = activeHeadPreparation(record);
+        const scope = head && { operationKey: record.operationKey, tabId: record.tabId,
+          handoffId: record.handoffId, requestFingerprint: record.requestFingerprint,
+          queueId: item.id, queueState: 'waiting', requestHash: item.request_hash, requestJson: item.request_json,
+          startedAt: head.startedAt, deadlineAt: head.deadlineAt };
+        const captured = scope && this.store.beginContinuationInputCapture(scope);
+        if (!captured?.ok) {
+          const reason = /^[a-zA-Z0-9_-]{1,80}$/.test(captured?.reason || '') ? captured.reason : 'scope-unproven';
+          console.warn('[AgentSendContinuationInput] tab=' + String(tabId).slice(-12)
+            + ' stage=queued-capture class=pending reason=' + reason);
+          parked = true; this.parked.add(tabId); return;
+        }
+        if (captured.state === 'captured') {
+          const retained = this.store.retainContinuationInputHold(scope, captured.marker, captured.hold);
+          if (!retained.ok) { parked = true; this.parked.add(tabId); return; }
+        }
+        record = this.store.get(item.operation_key);
+      }
       const predecessor = item.predecessor_key ? this.store.get(item.predecessor_key) : null;
       const pinnedLaunch = !!request.expectedTarget?.terminalInstanceId && !!request.expectedTarget?.launchId;
       const inheritedSession = !request.expectedTarget?.sessionId && !pinnedLaunch && consumed(predecessor)
-        ? predecessor.auditIdentity.sessionId : null;
+        ? predecessor.auditIdentity?.sessionId || compactSendDeliveryIdentity(predecessor)?.sessionId || null : null;
       const executionScope = { requestFingerprint: record.requestFingerprint,
         ...(inheritedSession ? { expectedTarget: { ...request.expectedTarget,
           toolType: record.provider, sessionId: inheritedSession } } : {}) };
@@ -930,6 +989,45 @@ class AgentSendQueue {
         this.parked.add(tabId);
         const admission = await this.admit(request);
         if (admission?.cancel === true) {
+          if (admission.continuationFenceHard === true || record.receipt?.continuationInputCapture) {
+            // A hard owner mismatch is a negative receipt only while this is
+            // still the exact untouched HEAD. Recheck inside the same SQLite
+            // transaction as cancellation; an UNKNOWN arriving during the
+            // async admission must not be rewritten as no-input.
+            let cancelled;
+            try { cancelled = this.db.transaction(() => {
+              const currentItem = this.item(item.operation_key), current = this.store.get(item.operation_key);
+              const hold = current?.receipt?.continuationInputHold, marker = current?.receipt?.continuationInputCapture;
+              const head = activeHeadPreparation(current);
+              if (!current || current.attemptId || Number(current.attempt || 0) !== 0
+                || !['reserved', 'preparing'].includes(current.state) || current.deliveryControl?.cancelledAt
+                || current.operationKey !== record.operationKey || current.tabId !== record.tabId
+                || current.handoffId !== record.handoffId || current.requestFingerprint !== record.requestFingerprint
+                || current.receipt?.submitted === true || current.receipt?.pasteWritten === true
+                || current.receipt?.enterWritten === true || current.receipt?.deliveryUnknown === true
+                || JSON.stringify(hold) !== JSON.stringify(record.receipt?.continuationInputHold)
+                || JSON.stringify(marker) !== JSON.stringify(record.receipt?.continuationInputCapture)
+                || !head || !hold && !marker
+                || hold && (hold.operationKey !== current.operationKey || hold.tabId !== current.tabId
+                  || hold.handoffId !== current.handoffId || hold.requestFingerprint !== current.requestFingerprint
+                  || hold.startedAt !== head.startedAt || hold.deadlineAt !== head.deadlineAt)
+                || marker && (marker.version !== 1 || !marker.generation || marker.operationKey !== current.operationKey
+                  || marker.tabId !== current.tabId || marker.handoffId !== current.handoffId
+                  || marker.requestFingerprint !== current.requestFingerprint || marker.queueId !== item.id
+                  || marker.requestHash !== item.request_hash || marker.startedAt !== head.startedAt
+                  || marker.deadlineAt !== head.deadlineAt)
+                || currentItem?.state !== 'waiting' || currentItem.id !== item.id
+                || currentItem.request_hash !== item.request_hash || currentItem.request_json !== item.request_json) return false;
+              try { if (currentItem.request_hash !== fingerprintAgentSendRequest(JSON.parse(currentItem.request_json))) return false; }
+              catch { return false; }
+              return this.cancelWaiting(tabId, record.handoffId, { reason: admission.reason }).cancelled === true;
+            })(); } catch (error) {
+              if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) throw error;
+              cancelled = false;
+            }
+            if (!cancelled) { parked = true; this.parked.add(tabId); }
+            return;
+          }
           this.cancelWaiting(tabId, record.handoffId, {
             reason: typeof admission.reason === 'string' && admission.reason
               ? admission.reason : 'automatic-admission-cancelled',
@@ -976,6 +1074,13 @@ class AgentSendQueue {
       const result = await (executor ? executor(executionScope) : this.execute(request, executionScope));
       preparationDeferredBeforeAttempt = isSendPreparationDeferred(result);
       const current = this.store.get(item.operation_key);
+      if (!current?.attemptId && current?.deliveryControl?.cancelledAt
+        && (current.receipt?.continuationInputHold || current.receipt?.continuationInputCapture)) {
+        const settled = this.settleCancelledContinuation(current, this.item(item.operation_key));
+        if (!settled.ok) { unprovenDeferredHead = true; this.parked.add(tabId); }
+        else this.finish(item, 'cancelled');
+        return;
+      }
       if (preparationDeferredBeforeAttempt && exactUnattemptedDispatch(current, this.item(item.operation_key))) {
         const changed = this.db.prepare("UPDATE agent_send_queue SET state='waiting',updated_at=? WHERE operation_key=? AND state='dispatching' AND request_hash=?")
           .run(Date.now(), item.operation_key, item.request_hash);
@@ -990,7 +1095,26 @@ class AgentSendQueue {
           return;
         }
       }
+      if (preparationDeferredBeforeAttempt && !current?.attemptId
+        && ['reserved', 'preparing'].includes(current?.state) && !current?.deliveryControl?.cancelledAt
+        && this.item(item.operation_key)?.state === 'dispatching') {
+        // The private preparation returned, but the owner can no longer prove
+        // that this is an untouched head. Keep the exact dispatch in place;
+        // an UNKNOWN receipt or changed snapshot is not a negative receipt,
+        // and its own publication must not start a self-pump/replay loop.
+        unprovenDeferredHead = true;
+        console.warn('[AgentSendQueue] deferred head unproven tab=' + String(tabId).slice(-12)
+          + ' id=' + item.id + ' attempt=none');
+        return;
+      }
       if (!current?.attemptId && result?.submitted === false) {
+        if (['reserved', 'preparing'].includes(current?.state)
+          && (current.receipt?.continuationInputHold || current.receipt?.continuationInputCapture)) {
+          // A retained continuation's negative outcome must already have been
+          // committed by its exact dispatch CAS. Never let this generic fallback
+          // turn an unproven result into a second, unguarded settlement.
+          unprovenDeferredHead = true; this.parked.add(tabId); return;
+        }
         this.store.settleQueuedNoWrite(item.operation_key, result);
       }
       if (this.item(item.operation_key)?.state === 'dispatching') {
@@ -1023,7 +1147,22 @@ class AgentSendQueue {
       // No attempt was begun: the existing executor has not crossed its durable
       // write boundary. Otherwise retain the receipt's uncertainty, never retry.
       const current = this.store.get(item.operation_key);
-      if (current && !current.attemptId) this.store.settleQueuedNoWrite(item.operation_key,
+      if (current && !current.attemptId && (current.receipt?.continuationInputHold
+        || current.receipt?.continuationInputCapture)) {
+        const head = activeHeadPreparation(record);
+        const scope = head && { operationKey: record.operationKey, tabId: record.tabId,
+          handoffId: record.handoffId, requestFingerprint: record.requestFingerprint,
+          queueId: item.id, queueState: 'waiting', requestHash: item.request_hash, requestJson: item.request_json,
+          startedAt: head.startedAt, deadlineAt: head.deadlineAt };
+        let settled;
+        try { settled = scope && this.store.settleContinuationNoWrite(scope, record.receipt?.continuationInputHold,
+          record.receipt?.continuationInputCapture,
+          { error: error.message, code: error.code || 'agent_send_queue_prepare_failed' }); }
+        catch (storageError) {
+          if (!/^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(storageError.code || ''))) throw storageError;
+        }
+        if (!settled?.ok) { unprovenDeferredHead = true; this.parked.add(tabId); }
+      } else if (current && !current.attemptId) this.store.settleQueuedNoWrite(item.operation_key,
         { error: error.message, code: error.code || 'agent_send_queue_prepare_failed' });
       else if (current) this.publishRecord(current);
       console.warn('[AgentSendQueue] dispatch failed tab=' + String(tabId).slice(-12)
@@ -1033,7 +1172,7 @@ class AgentSendQueue {
         releaseDispatch?.();
         this.running.delete(tabId);
         const rerun = this.rerun.delete(tabId);
-        if (storageBlockedBeforeExecutor) {
+        if (storageBlockedBeforeExecutor || unprovenDeferredHead) {
           this.parked.add(tabId); // No timer, SQL retry loop or global ready gate.
           if ((this.runtimeWakeRevisions.get(tabId) || 0) !== runtimeRevisionAtStart) this.wake(tabId);
         } else if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
@@ -1093,9 +1232,11 @@ class AgentSendQueue {
     if (!cancellation.ok) return { cancelled: false, durable: false, complete: false,
       operationKey: item.operation_key, reason: cancellation.reason };
     const result = { cancelled: true, durable: true, complete: true, deliveryIntentCancelled: true,
-      deliveryCancelled: !before.attemptId || before.state === 'not-submitted'
-        && before.receipt?.submitted === false && before.receipt?.enterWritten === false,
-      deliveryOutcome: before.attemptId ? before.state : 'not-submitted',
+      // Cancelling future input does not prove that an unattempted-looking
+      // receipt has no prior write evidence. Report no delivery only after
+      // the existing negative settlement actually succeeded below.
+      deliveryCancelled: false,
+      deliveryOutcome: before.attemptId ? before.state : 'delivery-unknown',
       operationKey: item.operation_key, tabId, handoffId, provider: before.provider,
       attemptId: before.attemptId, deliveryControl: cancellation.record?.deliveryControl || null,
       idempotent: cancellation.idempotent === true };
@@ -1116,7 +1257,13 @@ class AgentSendQueue {
       result.reason = error.code || 'agent_send_cancel_projection_failed';
     } finally { this.admitting -= 1; }
     try {
-      this.publishRecord(this.store.get(item.operation_key));
+      const latest = this.store.get(item.operation_key);
+      result.deliveryCancelled = latest?.state === 'not-submitted'
+        && latest.receipt?.submitted === false && latest.receipt?.enterWritten === false
+        && latest.receipt?.deliveryUnknown !== true;
+      result.deliveryOutcome = result.deliveryCancelled ? 'not-submitted'
+        : latest?.attemptId ? latest.state : 'delivery-unknown';
+      this.publishRecord(latest);
       this.resolveWaiters(item.operation_key);
       this.wake(tabId);
     } catch (error) {
@@ -1200,10 +1347,17 @@ function readQueuedSendAssetIds(db) {
   const result = new Set();
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_send_queue'").get()) return result;
   const protectedColumn = db.prepare('PRAGMA table_info(agent_send_queue)').all().some(column => column.name === 'asset_transfer_ids_json');
+  const parseInventory = value => {
+    const ids = JSON.parse(value);
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())) {
+      throw new Error('queue_asset_inventory_invalid');
+    }
+    return ids;
+  };
   for (const row of db.prepare("SELECT state,asset_ids_json" + (protectedColumn ? ',asset_transfer_ids_json' : '')
     + " FROM agent_send_queue WHERE state != 'completed'" + (protectedColumn ? " OR asset_transfer_ids_json!='[]'" : '')).iterate()) {
-    if (row.state !== 'completed') for (const id of JSON.parse(row.asset_ids_json)) result.add(id);
-    for (const id of JSON.parse(row.asset_transfer_ids_json || '[]')) result.add(id);
+    if (row.state !== 'completed') for (const id of parseInventory(row.asset_ids_json)) result.add(id);
+    if (protectedColumn) for (const id of parseInventory(row.asset_transfer_ids_json)) result.add(id);
   }
   return result;
 }
@@ -1217,4 +1371,4 @@ function forgetCollectedUploadAliases(db, assetIds) {
 }
 
 module.exports = { AgentSendQueue, applicationQueueReceipt, readQueuedSendAssetIds, forgetCollectedUploadAliases,
-  hasCanonicalSendConsumption: consumed };
+  hasCanonicalSendConsumption: canonicalConsumed, hasApplicationSendConsumption: consumed };

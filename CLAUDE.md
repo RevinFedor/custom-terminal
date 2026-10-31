@@ -226,7 +226,9 @@ UI-разделение сначала возвращает существующ
 - **Project API и Inbox API отличаются ownership input:** project/tab-клиенты управляют конкретной вкладкой и не очищают чужой TUI draft; Inbox/внешний чат владеет своим composer и может получить `draftText` наружу для rollback.
 - **Принятые обычные Send — Main FIFO, не Run After:** SQLite сохраняет неизменные текст/чипы/images до раннего application ACK. Явное ↑ в desktop History объединяет только две совместимые соседние ручные waiting/no-attempt записи: создаёт новый snapshot/ID на прежней FIFO-позиции, атомарно передаёт refs/context и сохраняет original fingerprints с durable merged tombstones; provider-owned/unknown не редактируются. Mobile upload bytes имеют отдельную проверенную границу `attachmentOwnership`: Main импортирует image/document refs прежним asset owner до ACK; legacy path-only receipt такой гарантии не получает. Один текущий physical-input slot сериализует наши попытки: `QUEUED` сам его не освобождает, exact canonical receipt освобождает без ожидания конца streaming. Остальные — `IN APP QUEUE`; timeout/unknown сами не разрешают следующий Enter. Отдельный Main proof отменённого намерения, отсутствующего процесса либо нового ready physical owner снимает старый slot без изменения delivery/submitted/payload; пустой кадр того же owner не равен такому proof. Явный user-authorized re-audit/release остаётся отдельным recovery. Отменённый handoff/follower не оживает, unknown prompt не replay'ится. X обычной Send/Reply переписки локально скрывает карточку и снимает только собственное ожидание, не отменяя доставку позднего Reply. Explicit cancel_message — отдельная отмена; старое неизвестное происхождение cancelledAt не угадывать и не снимать массово. Desktop History ↩ возвращает selected authoring до первого payload write по отдельному Main fence; после начала записи disabled, launch и другие sends не останавливает. Завершённая failed/cancelled-карточка и UNCONFIRMED вместо disabled ↩ имеют X: только скрытие presentation, без возврата в input, повторного Send или изменения delivery/JSONL. У UNCONFIRMED скрытие не отменяет намерение и не освобождает FIFO/assets. Исполняет прежний общий send scenario, не компонент History. Slash и record-without-reply сохраняют отдельные границы; raw TUI ввод прозрачен. Wire и восстановление — `fact-terminal-mcp.md::Main FIFO принятых Send`.
 - **JSONL Rewind/Delete удерживает новые программные Send в прежнем Main FIFO:** renderer activity и point binding mutex не закрывают окно Stop→rewrite→adopt. Reservation берётся до await и отпускается по свежему input-ready (busy steering допустим) либо proven inactive/absent, не по launch-written. Исходный адрес waiting item не retarget'ится; restart сохраняет лишь passive hold, не write/replay authority. Raw пользовательский Enter остаётся отдельным transparent flow.
-- **Codex submit не имеет pre-Enter ACK:** hidden renderer и PTY render marker не доказывают, что paste принят composer'ом. Для Codex external submit используй ordered PTY paste+Enter; после Enter committed `Messages to be submitted after next tool call` с приростом matching prompt доказывает native очередь (`queued`). Для обрезанного preview пользователь разрешил совпадение видимого префикса до `…`, включая разные скрытые хвосты, только при causal ownership/frame/count guards; это не полный ACK. Durable `sent` по-прежнему требует exact rollout `user_message`. До paste допустим только guard от чужого draft.
+- **Self Rewind по прямому запросу пользователя:** SOURCE30Oct `rewind_self` сохраняет factual контекст до Stop и использует тот же JSONL executor. Файлы/деплой не откатываются. Покрытые старые context chips снимаются по snapshot, поздние версии сохраняются; новый Rewind chip/шапка малиновые. Optional новая задача резервируется приложением ONE раз в прежнем FIFO, не старым/возобновлённым агентом вручную. Требуется loaded savedHistory.selfRewind v1; без неё нет fallback на raw JSONL/обычный Send. Generic self publish остаётся запрещён.
+- **Codex submit не имеет pre-Enter ACK:** hidden renderer и PTY render marker не доказывают, что paste принят composer'ом. Для Codex external submit используй ordered PTY paste+Enter; после Enter committed `Messages to be submitted after next tool call` с приростом matching prompt доказывает native очередь (`queued`). Для обрезанного preview пользователь разрешил совпадение видимого префикса до `…`, включая разные скрытые хвосты, только при causal ownership/frame/count guards; это не полный ACK. Durable `sent` по-прежнему требует exact rollout `user_message`. Отсутствие pre-Enter ACK не отменяет проверку чужого draft и допустимости input.
+- **Codex final-input limit:** SOURCE30Oct считает1 048 576 Unicode scalar values всего expanded submit, включая файлы/контекст/wrappers, отдельно от per-file byte caps. Отказ сохраняет authoring без payload/Enter; не обрезать текст, не дробить Send автоматически и не переносить cap на Claude/draft-paste. Exact TUI refusal после Enter сохраняет физический ввод; timeout и старый UNKNOWN не становятся no-submit.
 - **Одна публичная AI-поверхность = Terminal MCP.** Live-команды, долговечная оркестрация, история/контекст, безопасный Claude edit/fork, структурированный план задач и file-child находятся в одном MCP, но внутри остаются разными API/scenario boundaries. Отдельный Overseer MCP удалён; `/overseer/*` пока внутренний backend чтения истории.
 - **Дождаться уже идущей работы ≠ отправить поручение.** `wait_for_tab_response` сохраняет read-only наблюдение в orchestration registry, не пишет target prompt и не запускает/останавливает target. Ожидание и возврат ответа принадлежат приложению; модель заканчивает ход после ACK, без polling. Cancel отменяет наблюдение, не исполнение.
 - **Полноценная сессия ≠ внутренний subagent.** Встроенные Agent/subagent-инструменты Claude/Codex используй для временной декомпозиции. Terminal MCP создаёт отдельные видимые долгоживущие вкладки, которые переживают restart и доступны пользователю.
@@ -255,7 +257,12 @@ Main выдаёт Codex Send один preparation scope при ACTIVE HEAD, не
 восстанавливаемого адресата. Выбор делается один раз по Main inspection; старые
 v1 scopes остаются60s, новый cold — v2. Cold также ограничен original startup deadline.
 Start+mode до первого attempt сохраняются вместе; transient HEAD proof не
-превращает frozen Continue в новый Send. Input-only automatic gate не требует
+превращает frozen Continue в новый Send.
+Неподтверждённое сохранение первого continuation fence не разрешает повторную
+привязку к новому вводу: capture до await принадлежит тому же receipt owner;
+после restart без результата остаётся pending. Hard/pending разделены, любой
+late no-write отказ и beginAttempt повторяют exact CAS без затирания UNKNOWN.
+Input-only automatic gate не требует
 History/writer materialization, сохраняя physical owner/Stop/frame и native
 authorizers. Context condition по-прежнему требует exact read identity.
 Новый warm HEAD не наследует остаток прежнего startup clock даже до его expiry;
@@ -279,6 +286,12 @@ startup-no-state timeout до async process-ready commit; не выдаёт inpu
 choice authority и не продлевает Send. Старый owner/частичный frame не подходят.
 Поздний кадр продолжает тот же H/O/A вне PTY/settings locks. Standalone Compact сохраняет
 единственную вставку до exact-owned proof; отмена/expiry не становятся replay.
+Desktop History Codex `/compact` без аргументов/вложений принимается в тот же
+Main FIFO с ранним ACK, чтобы следующий обычный текст не блокировался запуском.
+Его private native task-start proof освобождает slot отдельно от user-message
+audit; legacy confirmed/renderer success этого права не дают. Durable Enter-arm
+предшествует записи; autocomplete сохраняет первую lease. Сбой сохранения proof
+не разрешает повторный ввод или ложный SENT. Остальные local commands прежние.
 Подробности — `fact-terminal-mcp.md::Main FIFO принятых Send` и `fact-codex.md`.
 
 Replay bytes нельзя отпускать по historical mobile manifest/JSON preview.
@@ -365,8 +378,11 @@ MCP-инструмент `docs_search` — вызови перед работо�
   успех каждой в прежнем item trigger; выполненная цель не возвращается от
   следующего turn/Stop. Ввод разрешается общим executor после всей группы и
   готовности получателя; API-клиент не присваивает себе completion proof.
-  Typed Codex compaction request даёт только отдельную операционную фазу точного
-  writer; конец сетевого segment не завершает весь turn и не создаёт Send receipt.
+  Typed Codex compaction request текущего physical source/launch/turn даёт
+  read-only фазу и до writer proof. Её снятие с UNKNOWN не является успехом:
+  canonical compact требует исходного file/EOF и точного writer. Network end
+  не завершает весь turn и не создаёт Send receipt; поздний request после
+  подтверждённого exit не оживляет прежнюю фазу.
   Для Codex `resume` аргумент source session id не равен active writer identity: CLI может либо дописать source rollout, либо создать linked child. Resume-наблюдение обязано держать оба пути до live-proof и не гасить busy при handoff source → child; не привязывай loader/Timeline/API только к id из CLI-аргумента.
   Аналогично legacy archive source tabId не равен restored runtime tabId. Адрес принимается только по durable archive commit и reread текущего owner; request identity сохраняется отдельно. Ошибка bridge после restore не доказывает отсутствие созданной вкладки и не разрешает слепой повтор.
   Native Codex Rewind — destructive writer handoff: durable exact-target journal создаётся до подтверждающего `Enter`, после него binding меняется только по exact child proof + SQLite compare-and-set. Обычный пользовательский Enter не ждёт этот flow. `Escape` не является generic cleanup: на idle composer он открывает Rewind; cleanup разрешён только после свежего proof конкретного picker/overlay.
@@ -493,6 +509,7 @@ awk -v t="$UTC_HHMM" '$1 >= t":00" && $1 <= t":59"' logs/dev.log | grep ...
 ## Claude TUI Management
 - **Model Switching:** `/model default|sonnet|opus|haiku` — переключение модели из UI. Поддерживается `default` (Opus) и явный выбор `opus`.
 - **Effort Level:** `/effort low|medium|high|xhigh|max` — контроль интенсивности размышлений. Список уровней shipping'ается Claude'ом (`auto` удалён в мае 2026, `xhigh` добавлен) — single source of truth в `src/renderer/constants/claudeLevels.ts`. Все use sites импортируют оттуда; при следующем Claude-апдейте — один edit. Локальный трекинг (не подтверждается bridge).
+- **Глобальный Effort для новых запусков Claude/Codex:** unset/legacy none/default → low; в defaults нет none и повторный клик не сбрасывает уровень. Model=none сохраняется отдельно. Это не applied proof и не замена подтверждённой пары Resume/Fork; см. `fact-settings.md`.
 - **Think Mode:** `meta+t` (Esc+t) или UI-кнопка — переключение режима размышления. При запуске управляется `alwaysThinkingEnabled` в `~/.claude/settings.json`.
 - **Rewind:** `/rewind` или UI-контекстное меню — откат к выбранному сообщению с сжатием контекста.
 - **Command Guard:** Во время отправки команд кнопки управления (Model/Effort/Think) блокируются через `isCommandRunning` для предотвращения двойных операций.

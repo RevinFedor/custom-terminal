@@ -3,6 +3,7 @@ import { HistoryRootClient, historyRootIdentity, isHistoryRootDescriptor, checke
 // processes keep their ordinary object responses. Main forwards the bytes
 // without deserializing/re-serializing the complete positional row index.
 import { currentUIActionId, uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
+import { runRendererSyncWork } from './perfSyncWork.mjs';
 let readSequence = 0;
 // WebContents can survive a renderer reload; its new module must not reuse a
 // prior request ID merely because wall-clock time or the local counter repeats.
@@ -74,7 +75,8 @@ export async function readHistoryThroughIpc(invoke, channel, payload, { signal }
     if (result?.__notedHistoryTransport === 'v8-1') {
       if (!decode || !ArrayBuffer.isView(result.data)) throw new Error('Invalid History IPC encoding');
       bytes = result.data.byteLength;
-      decoded = decode(result.data);
+      decoded = runRendererSyncWork('history.decode', { owner: payload?.tabId, readId: id,
+        actionId: diagnosticActionId, relation: diagnosticActionId ? 'temporal-only' : 'none' }, () => decode(result.data));
     }
     const end = performance.now();
     if (end - start >= 50 || end - receivedAt >= 8 || decoded?.success === false) {

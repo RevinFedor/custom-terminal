@@ -333,6 +333,7 @@ test('actual authenticated HTTP receipt/applicability/strict Send with SQLite: O
       return { success: true, accepted: true, submitted: true, status: 'audit-pending', auditPending: true };
     },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(ctx, web.ast);
   vm.runInContext(['checkAuth', 'handleApi', 'runAgentSendScenario', 'runPreparedAgentSendScenario',
     'durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay', 'durableAgentSendFailure', 'publicAgentSendReceipt'].map(web.fn).join('\n'), ctx);
   const server = http.createServer((req, res) => ctx.handleApi(req, res, url.parse(req.url, true), new Map()).catch(e => sendJson(res, 500, { error: e.message })));

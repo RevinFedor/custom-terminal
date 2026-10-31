@@ -106,23 +106,14 @@ if (process.env.NOTED_E2E_TEST === 'true') {
   });
 }
 
-// Потолок памяти главного процесса. По умолчанию движок обрывает процесс
-// примерно на 4 ГБ — и это не «утечка кончилась», а жёсткий предел: при его
-// достижении вызывается abort(), приложение просто исчезает с системным
-// сообщением о сбое (прод 17.08 19:10, 20:41, 20:47 и 18.08 03:04 — во всех
-// четырёх отчётах одна и та же вершина стека: FatalProcessOutOfMemory).
-//
-// Рабочий объём здесь законно большой: живой транскрипт сессии на 111 МБ — это
-// ~15 тысяч разобранных записей, которые обязаны лежать в памяти целиком, иначе
-// каждый запрос истории перечитывал бы файл заново. Замерено в проде: ровный
-// фон 1.6 ГБ, а любой обычный всплеск (разбор второго транскрипта, сборка
-// таймлайна) добавляет к нему ещё 1.5–2 ГБ — и упирается в предел. В машине
-// 32 ГБ, так что предел здесь искусственный.
-//
-// 8 ГБ — это НЕ разрешение течь: фон и всплески измерены и укладываются вдвое,
-// запас нужен ровно на то, чтобы одновременный всплеск не убивал процесс.
-// Если фон когда-нибудь подберётся к 8 ГБ — это уже настоящая утечка, и её
-// надо искать, а не поднимать число дальше.
+// Исторический запрос V8-флага, а не подтверждение 8 GiB для Main isolate.
+// Electron 28 с pointer compression ограничивает V8 heap примерно 4 GiB;
+// проверять фактический предел нужно через v8.getHeapStatistics().heap_size_limit.
+// Полная RAM машины и значение этого switch не являются запасом доступной кучи.
+// Большие History/SQLite reads должны ограничивать материализацию и удержание,
+// а не предполагать, что весь transcript обязан постоянно находиться в Main.
+// Сам флаг здесь сохранён; его изменение требует отдельной runtime-проверки.
+// См. docs/knowledge/логирование-оптимизации.md и electronjs.org/blog/v8-memory-cage.
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=8192');
 
 // Disable HTTP cache to ensure fresh code after updates
@@ -482,6 +473,7 @@ const {
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
   isCodexEnvironmentContextUserText,
+  isCodexGoalContinuationUserText,
   isCodexProjectInstructionsUserText,
   isCodexTurnAbortedUserText,
   normalizeCodexPromptImageSlots,
@@ -630,6 +622,182 @@ const systemPromptService = createSystemPromptService({
     }
   },
 });
+// Optional embedded reviewer. It has no PTY/session of its own and is default
+// OFF; only the explicit per-tab switch enables its bounded live capture.
+let miniOrchestratorRuntime = null;
+let miniOrchestratorHookRelease = null;
+app.once('will-quit', () => {
+  miniOrchestratorHookRelease?.();
+  miniOrchestratorRuntime?.dispose();
+});
+function readMiniOrchestratorOwner(tabId) {
+  const generation = getTerminalLifecycleGeneration(tabId);
+  if (!generation || !terminals.has(tabId) || aiStoppingTabs.has(tabId)) return null;
+  const codex = codexTurnWatchers.get(tabId);
+  if (codex?.processGeneration === generation && codex.sessionId
+    && getCodexRuntimeSessionId(tabId) === codex.sessionId) {
+    return { owner: { provider: 'codex', sessionId: codex.sessionId, generation },
+      turnId: codex.currentTurnId || codex.lastOutcomeTurnId || null,
+      ready: codex.busy === false && codex.lastOutcomeReason === 'task_complete'
+        && !codex.publicTurnStateSuppressed && !codex.catchUpPublicationsSuppressed
+        && !codex.sourceObservationLaunchId && !codex.deferredUntilComposer && !codex.manualBindingConflict
+        && codex.lastOutcomeHasFinalResult === true && codex.lastOutcomeGoalWork?.pending !== true
+        && getCombinedTabBackgroundWorkCount(tabId) === 0 };
+  }
+  const turn = taskCompletionIntents.getTurn(tabId);
+  if (turn?.provider === 'claude' && turn.sessionId
+    && bridgeKnownSessions.get(tabId) === turn.sessionId) {
+    return { owner: { provider: 'claude', sessionId: turn.sessionId, generation },
+      turnId: turn.generation ? 'claude:' + turn.generation : null,
+      ready: turn.active !== true && claudeTurnBusy.get(tabId) === false
+        && claudeHookLastEvent.get(tabId)?.event === 'Stop' && getCombinedTabBackgroundWorkCount(tabId) === 0 };
+  }
+  return null;
+}
+function getMiniOrchestratorRuntime() {
+  if (miniOrchestratorRuntime) return miniOrchestratorRuntime;
+  const { createMiniOrchestratorRuntime } = require(path.join(srcMainDir, 'mini-orchestrator-runtime'));
+  miniOrchestratorRuntime = createMiniOrchestratorRuntime({ db: projectManager.db, systemPromptService,
+    readOwner: readMiniOrchestratorOwner,
+    ...(process.env.NOTED_E2E_TEST === 'true' && process.env.NOTED_MINI_REPLAY_PROFILE ? {
+      loadPresentation: tabId => projectManager.db.getAppState('mini-orchestrator-archive:' + tabId),
+      clearPresentation: tabId => projectManager.db.setAppState('mini-orchestrator-archive:' + tabId, null),
+    } : {}),
+    endpointFor: ({ tabId, owner }) => {
+      const current = readMiniOrchestratorOwner(tabId);
+      if (!current || current.owner.sessionId !== owner.sessionId || current.owner.generation !== owner.generation)
+        throw new Error('mini_review_owner_changed');
+      const row = projectManager.db.db.prepare('SELECT COALESCE(project_id,execution_namespace) AS projectId,cwd FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId);
+      if (!row) throw new Error('mini_review_tab_missing');
+      return mcpServersViaHub({ terminal: {} }, { tabId, projectId: row.projectId, cwd: row.cwd || '' }).terminal.url;
+    },
+    publish: (tabId, snapshot) => {
+      for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed() && !win.webContents.isDestroyed())
+        win.webContents.send('mini-orchestrator:changed', { tabId, snapshot });
+    },
+    log: (action, fields) => {
+      const safe = {};
+      for (const key of ['tabId', 'phase', 'enabled', 'revision', 'jobId', 'turnId', 'reason', 'entryCount', 'model', 'thinkingLevel', 'settingsRevision']) {
+        const value = fields?.[key];
+        if (typeof value === 'string') safe[key] = value.slice(0, 160);
+        else if (typeof value === 'number' || typeof value === 'boolean') safe[key] = value;
+      }
+      console.log('[MiniOrchestrator] action=' + String(action).slice(0, 160) + ' ' + JSON.stringify(safe));
+    },
+  });
+  miniOrchestratorHookRelease = getAgentResponseObservationReader().onAgentResponseCompletion(event => {
+    if (!miniOrchestratorRuntime?.isEnabled(event.tabId) || event.subject?.toolType !== 'claude') return;
+    const owner = readMiniOrchestratorOwner(event.tabId)?.owner;
+    if (!owner || owner.sessionId !== event.subject.sessionId) return;
+    miniOrchestratorRuntime.capture.observeClaudeCompletion({ tabId: event.tabId, owner,
+      turnId: event.subject.targetExecutionContext.turnId,
+      answerId: 'claude-final:' + event.subject.providerPromptId,
+      answer: event.result.assistantText, sourceVerified: event.result.sourceVerified,
+      complete: event.result.complete, truncated: event.result.truncated });
+    // The same admitted Stop stack is still updating public busy metadata.
+    queueMicrotask(() => miniOrchestratorRuntime?.capture.flush(event.tabId));
+  }, { accept: event => miniOrchestratorRuntime?.isEnabled(event.tabId) === true });
+  return miniOrchestratorRuntime;
+}
+function miniOrchestratorSendFailure(tabId, options = {}) {
+  const handoffId = options.handoffId || options.preflightScope?.handoffId;
+  if (!String(handoffId || '').startsWith('mini-orchestrator:')) return null;
+  return miniOrchestratorRuntime?.guard({ tabId, handoffId }) || (!miniOrchestratorRuntime ? {
+    success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+    status: 'not-submitted', code: 'mini_orchestrator_review_stale', error: 'Mini reviewer is not active in this process.',
+  } : null);
+}
+function observeMiniOrchestratorCodex(state, record, suppressed, outcome, audit = null) {
+  if (!miniOrchestratorRuntime?.isEnabled(state.tabId)) return;
+  const event = codexEventType(record);
+  const preferredResponseInput = record.type === 'response_item' && record.payload?.type === 'message'
+    && record.payload.role === 'user' && state.preferredUserAuditOffsets?.has(record.__byteOffset) === true;
+  const input = event === 'user_message' || preferredResponseInput;
+  const final = (record.type === 'response_item' && record.payload?.role === 'assistant'
+    || event === 'agent_message') && record.payload?.phase === 'final_answer';
+  if (!input && !final && !['task_started', 'task_complete', 'turn_aborted'].includes(event)) return;
+  const offset = record.__byteOffset, generation = getTerminalLifecycleGeneration(state.tabId);
+  const verified = codexTurnWatchers.get(state.tabId) === state && !!terminals.get(state.tabId)
+    && state.sourceObservationTerminal === terminals.get(state.tabId)
+    && !!generation && state.processGeneration === generation && !state.sourceObservationLaunchId
+    && state.deferredUntilComposer !== true && Number.isSafeInteger(offset)
+    && Number.isSafeInteger(state.processGenerationBoundaryOffset) && offset >= state.processGenerationBoundaryOffset
+    && (!Number.isSafeInteger(state.capacityRetryLiveAfterOffset) || offset >= state.capacityRetryLiveAfterOffset);
+  // Writer proof has already been established before this exact live byte
+  // range is replayed. The remaining suppression is a publication/scan fence,
+  // not an instruction to discard the current request. Collect read-only now;
+  // ready above still forbids Gemini/send until the existing release commits.
+  const sourceProofReplay = state.releasePublicSuppressionAfterCatchUp === true
+    && state.releasePublicSuppressionKind === 'source-proof-replay'
+    && Number.isSafeInteger(state.releasePublicSuppressionTargetOffset)
+    && state.releasePublicSuppressionTargetOffset >= state.processGenerationBoundaryOffset
+    && !state.manualBindingConflict;
+  if (!verified || suppressed && !sourceProofReplay) {
+    const reason = verified ? 'publication-held'
+      : codexTurnWatchers.get(state.tabId) !== state ? 'watcher-changed'
+        : state.sourceObservationTerminal !== terminals.get(state.tabId) ? 'terminal-changed'
+          : !generation || state.processGeneration !== generation ? 'lifecycle-changed'
+            : state.sourceObservationLaunchId ? 'writer-proof-pending'
+              : state.deferredUntilComposer ? 'composer-deferred'
+                : !Number.isSafeInteger(offset) ? 'record-offset-unknown'
+                  : !Number.isSafeInteger(state.processGenerationBoundaryOffset) ? 'launch-boundary-unknown'
+                    : offset < state.processGenerationBoundaryOffset ? 'before-launch-boundary'
+                      : 'before-live-boundary';
+    const key = event + ':' + offset + ':' + reason;
+    if (state.miniOrchestratorLastCaptureLog !== key) {
+      state.miniOrchestratorLastCaptureLog = key;
+      console.log('[MiniOrchestrator] capture=ignored tab=' + String(state.tabId).slice(-12)
+        + ' event=' + (event || (input ? 'user-carrier' : 'final')) + ' offset=' + offset + ' reason=' + reason);
+    }
+    return;
+  }
+  // The initial audit may have been consumed while this range was held. Reuse
+  // History's exact source→handoff map; never match a replayed prompt by text.
+  const inputOwner = input ? audit?.matched === true ? audit
+    : resolveCodexLivePromptOwner(state, codexLiveSourceIdentity(state, record, 'codex-user')) : null;
+  const inputText = input ? codexUserMessagePresentationText(record) : null;
+  // Same reserved metadata classifiers as primary History. A proved ordinary
+  // Send is still human input even if it intentionally quotes that syntax.
+  if (preferredResponseInput && !inputOwner && (isCodexEnvironmentContextUserText(inputText)
+    || isCodexProjectInstructionsUserText(inputText) || isCodexGoalContinuationUserText(inputText))) return;
+  const turnId = event === 'task_started' ? record.payload?.turn_id || null
+    : input ? state.busy === true ? state.currentTurnId || null : null
+      : record.payload?.turn_id || state.currentTurnId || null;
+  miniOrchestratorRuntime.capture.observeCodex({ tabId: state.tabId,
+    owner: { provider: 'codex', sessionId: state.sessionId, generation },
+    record: preferredResponseInput ? { type: 'event_msg', payload: { type: 'user_message' } } : record,
+    sourceVerified: true, turnId,
+    recordId: codexLiveSourceIdentity(state, record, 'codex-mini-review'),
+    ...(input ? { inputId: record.__auditCanonicalCarrier?.entryUuid || audit?.entryUuid || codexStableLiveUserUuid(state, record),
+      inputAliases: record.__auditEntryUuidAliases || [],
+      inputText,
+      correctionHandoffId: String(inputOwner?.handoffId || '').startsWith('mini-orchestrator:')
+        ? inputOwner.handoffId : undefined } : {}),
+    completionProven: outcome?.reason === 'task_complete' && outcome.hasFinalResult === true,
+  });
+  if (inputOwner?.handoffId) miniOrchestratorRuntime.acknowledgeInput(state.tabId, inputOwner.handoffId);
+  if (['task_started', 'task_complete'].includes(event)) console.log('[MiniOrchestrator] capture=accepted tab='
+    + String(state.tabId).slice(-12) + ' event=' + event + ' turn=' + String(turnId || '-')
+    + ' offset=' + offset + ' mode=' + (sourceProofReplay ? 'source-proof-replay' : 'live'));
+}
+for (const [channel, action] of [['mini-orchestrator:get', 'get'], ['mini-orchestrator:set-enabled', 'setEnabled'], ['mini-orchestrator:clear', 'clear'], ['mini-orchestrator:set-settings', 'setSettings']]) {
+  ipcMain.handle(channel, async (_event, { tabId, enabled, model, thinkingLevel, expectedRevision } = {}) => {
+    try {
+      if (typeof tabId !== 'string' || !projectManager.db.db.prepare('SELECT tab_id FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId))
+        return { success: false, error: 'Вкладка недоступна.' };
+      if (action === 'setEnabled' && typeof enabled !== 'boolean') return { success: false, error: 'enabled must be boolean' };
+      const runtime = getMiniOrchestratorRuntime();
+      if (action === 'setEnabled') runtime.setEnabled(tabId, enabled);
+      if (action === 'setSettings') runtime.setSettings(tabId, { model, thinkingLevel, expectedRevision });
+      if (action === 'clear' && !runtime.clear(tabId)) return { success: false, error: 'Дождитесь текущей проверки.' };
+      return { success: true, snapshot: runtime.get(tabId) };
+    } catch (error) {
+      if (action === 'setSettings') console.log('[MiniOrchestrator] settings-rejected tab=' + String(tabId || '-').slice(-12)
+        + ' reason=' + String(error.code || error.message || 'unknown').slice(0, 160));
+      return { success: false, error: String(error.code || error.message || 'mini_reviewer_unavailable').slice(0, 240),
+      ...(action === 'setSettings' && miniOrchestratorRuntime ? { snapshot: miniOrchestratorRuntime.get(tabId) } : {}) }; }
+  });
+}
 const savedPromptService = createSavedPromptService({
   projectManager,
   onUpdated: (prompt) => {
@@ -1081,6 +1249,7 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require(path.join(srcMainDir, 'codex-runtime-contract'));
+const { normalizeAgentDefaultEffort } = require(path.join(srcMainDir, '..', 'shared', 'agent-default-effort.cjs'));
 const {
   nextCodexFastIntent,
   planCodexFastIntentReconcile,
@@ -2213,20 +2382,72 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
 
 // ========== EXTERNAL FREEZE WATCHDOG ==========
 const perfNativeMonitors = new Map();
-const { createManualCaptureController, installManualCaptureMenu } = require(path.join(srcMainDir, 'perf-manual-capture.js'));
+const perfNativeCaptureHolds = new Set();
+let lastSyncWorkReport = -Infinity;
+function reportMainSyncWork(actionId, endAbs) {
+  if (!perfDiagnosticsEnabled || endAbs - lastSyncWorkReport < 1000) return;
+  lastSyncWorkReport = endAbs;
+  const report = perfCausal.syncSnapshot({ from: endAbs - 3000, to: endAbs, limit: 32 });
+  const rows = report.rows; delete report.rows;
+  for (let offset = 0; offset < rows.length || offset === 0; offset += 8) {
+    console.warn('[Perf:SyncWindow] ' + JSON.stringify({ actionId,
+      relationToAction: 'temporal-only', delivery: 'existing-logger-no-durable-ack',
+      ...report, offset, total: rows.length, rows: rows.slice(offset, offset + 8) }));
+  }
+}
+function suspendNativePerfForCapture(reason, options = { preserve: true }) {
+  // Chromium tracing is application-wide. A profile targeting another window
+  // must first release the primary window's input ring as well as its counters.
+  const hold = { released: false, resumes: new Map(), admit(monitor) {
+    if (!this.released && !this.resumes.has(monitor)) this.resumes.set(monitor, monitor.suspend(reason, options));
+  } };
+  perfNativeCaptureHolds.add(hold);
+  for (const monitor of perfNativeMonitors.values()) hold.admit(monitor);
+  const resume = () => {
+    if (hold.released) return;
+    hold.released = true; perfNativeCaptureHolds.delete(hold);
+    for (const done of hold.resumes.values()) done(); hold.resumes.clear();
+  };
+  resume.ready = Promise.all([...hold.resumes.values()].map(done => done.ready));
+  resume.ready.catch(() => {});
+  return resume;
+}
+const { createManualCaptureController, installManualCaptureMenu, pinManualOwner: pinPerfCaptureOwner } = require(path.join(srcMainDir, 'perf-manual-capture.js'));
 const perfManualCapture = createManualCaptureController({ mainPid: process.pid,
   getWatchdog: () => perfWatchdog, fromId: id => BrowserWindow.fromId(id),
   capture: options => require(path.join(srcMainDir, 'perf-incident-profile.js')).captureIncidentProfile(options),
-  suspend: wc => perfNativeMonitors.get(wc.id)?.suspend('incident-profile'),
+  suspend: () => suspendNativePerfForCapture('incident-profile'),
   directory: path.join(path.dirname(mainLogPath || '.'), 'perf-incidents'),
   log: message => console.warn(message),
+});
+require(path.join(srcMainDir, 'perf-pilot.js')).installPerfPilot({ ipcMain, app,
+  allowed: isolatedPerfDiagnostics, key: process.env.NOTED_E2E_PERF_PILOT,
+  capture: options => require(path.join(srcMainDir, 'perf-incident-profile.js')).captureIncidentProfile(options),
+  pin: wc => pinPerfCaptureOwner(BrowserWindow.fromWebContents(wc), { mainPid: process.pid,
+    fromId: id => BrowserWindow.fromId(id), watchdog: perfWatchdog, currentWatchdog: () => perfWatchdog }),
+  suspend: () => suspendNativePerfForCapture('private-pilot'), causal: perfCausal,
+  directory: path.join(path.dirname(mainLogPath || '.'), 'perf-incidents'), log: message => console.warn(message),
 });
 function ensureNativePerfMonitor(webContents) {
   if (!webContents || webContents.isDestroyed() || process.env.NOTED_PERF_WATCHDOG === '0'
     || !perfCollectionAllowed) return null;
   if (!perfNativeMonitors.has(webContents.id)) {
     const { createNativePerfMonitor } = require(path.join(srcMainDir, 'perf-native-metrics.js'));
-    const monitor = createNativePerfMonitor({ webContents, log: message => console.warn(message) });
+    // Only the primary native window owns the one Chromium tracing ring. Other
+    // windows retain their cheap counters without competing Tracing.start calls.
+    let inputPreroll = null;
+    if (mainWindow?.webContents === webContents) {
+      try {
+        inputPreroll = { publish: require(path.join(srcMainDir, 'perf-input-snapshot-store.js')).createInputSnapshotWriter({
+          directory: path.join(path.dirname(mainLogPath || '.'), 'perf-incidents'),
+          mainPid: process.pid, windowId: webContents.id, log: message => console.warn(message),
+        }).publish };
+      } catch { console.warn('[Perf:InputStatus] state=unavailable reason=snapshot-writer-init-failed'); }
+    }
+    const monitor = createNativePerfMonitor({ webContents, inputPreroll, log: message => console.warn(message) });
+    // A new primary must inherit in-progress global capture holds before its
+    // first scheduled sample/bootstrap can start another tracing session.
+    for (const hold of perfNativeCaptureHolds) hold.admit(monitor);
     perfNativeMonitors.set(webContents.id, monitor);
     webContents.once('destroyed', () => { monitor.dispose(); perfNativeMonitors.delete(webContents.id); });
   }
@@ -2240,12 +2461,24 @@ ipcMain.on('perf:native-bootstrap-available', (event) => {
 ipcMain.on('perf:native-bootstrap-ack', (event, payload) => {
   perfNativeMonitors.get(event.sender.id)?.bootstrapAck(event, payload);
 });
+ipcMain.on('perf:input-clock-ack', (event, payload) => {
+  perfNativeMonitors.get(event.sender.id)?.inputClockAck(event, payload);
+});
 ipcMain.on('perf:ui-summary', (event, payload = {}) => {
   if (!/^ui-[a-z0-9-]{1,80}$/.test(payload.id || '') || !Number.isFinite(payload.startAbs)
     || !Number.isFinite(payload.durationMs) || payload.durationMs < 100) return;
   const action = { id: payload.id, event: String(payload.event || '').replace(/[^a-z-]/g, '').slice(0, 24),
     startAbs: payload.startAbs, durationMs: payload.durationMs };
-  void ensureNativePerfMonitor(event.sender)?.sample('ui-action', action);
+  const monitor = ensureNativePerfMonitor(event.sender);
+  try { reportMainSyncWork(action.id, nodePerformance.timeOrigin + nodePerformance.now()); } catch {}
+  const nativeOriginal = payload.nativeOriginal;
+  monitor?.observeInput?.({ ...action, kind: payload.kind,
+    ...(Number.isFinite(payload.inputDelayMs) ? { inputDelayMs: payload.inputDelayMs } : {}),
+    ...(Number.isFinite(payload.documentTimeOriginMs) ? { documentTimeOriginMs: payload.documentTimeOriginMs } : {}),
+    ...(nativeOriginal && typeof nativeOriginal === 'object' ? { nativeOriginal: {
+      type: nativeOriginal.type, timeStampMs: nativeOriginal.timeStampMs, pointerType: nativeOriginal.pointerType,
+    } } : {}) }, event);
+  void monitor?.sample('ui-action', action);
 });
 
 // Forked plain-node process (src/main/perf-watchdog.js) with its OWN event
@@ -2287,13 +2520,28 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && perfCollectionAllowed) {
       if (request?.t !== 'capture' || !/^incident-\d+-\d+$/.test(request.id || '')) return;
       const all = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed());
       const target = all.find(win => win.webContents.getOSProcessId() === request.pid) ||
-        all.find(win => win.isFocused()) || all.find(win => win === mainWindow);
-      const resumeNative = perfNativeMonitors.get(target?.webContents.id)?.suspend('incident-profile');
-      void captureIncidentProfile({ request, webContents: target?.webContents,
+        (request.pid === process.pid ? all.find(win => win.isFocused()) || all.find(win => win === mainWindow) : null);
+      let captureOwner = null;
+      if (target) {
+        try { captureOwner = pinPerfCaptureOwner(target, { mainPid: process.pid,
+          fromId: id => BrowserWindow.fromId(id), watchdog: captureWatchdog, currentWatchdog: () => perfWatchdog }); }
+        catch { console.warn('[Perf:IncidentProfile] id=' + request.id + ' refused=original-owner-unavailable'); return; }
+      }
+      const resumeNative = suspendNativePerfForCapture('incident-profile', {
+        preserve: true, companionCaptureId: request.id,
+      });
+      void Promise.resolve(resumeNative?.ready).then(() => captureIncidentProfile({ request, webContents: target?.webContents,
+        ownerGuard: captureOwner,
         directory: path.join(path.dirname(mainLogPath), 'perf-incidents'),
         log: message => console.warn(message),
-      }).catch(err => console.warn('[Perf:IncidentProfile] failed ' + String(err.message).slice(0, 160)))
-        .finally(() => resumeNative?.());
+      })).then(result => {
+        // A returned report may still have UNKNOWN native cleanup. The same
+        // lease alone can later release this global hold; never finally-resume.
+        void result.whenRetired?.then(receipt => {
+          if (receipt.confirmed && receipt.leaseId === result.leaseId) resumeNative?.();
+        }).catch(() => console.warn('[Perf:IncidentProfile] retirement=unknown reason=release-handler-failed'));
+      }).catch(err => console.warn('[Perf:IncidentProfile] id=' + request.id + ' failed ' + String(err.message).slice(0, 160)))
+        .finally(() => { captureOwner?.dispose(); });
     });
     let contextDueAt = 0;
     let heartbeatPending = false;
@@ -2570,6 +2818,7 @@ function publishTabBackgroundWork(tabId, reason = 'changed') {
     + ' tasks=' + payload.tasks.length
     + ' revision=' + tabBackgroundWorkRevision
     + ' reason=' + reason);
+  if (typeof miniOrchestratorRuntime !== 'undefined') miniOrchestratorRuntime?.capture.flush(tabId);
   // A child may finish after the parent's last turn, without another busy edge.
   idleSessionStopService?.refresh();
   if (workingDirectoryOperations?.waiting(tabId)) queueMicrotask(() => workingDirectoryOperations?.notify(tabId));
@@ -4078,7 +4327,7 @@ function authorizeCodexProviderMainRequest({ tabId, identity } = {}) {
     // to start a provider turn; tool/retry requests use the exact turn above.
     if (owner && prompt?.submitted === true) owner.claimedPrompt = prompt;
   }
-  return verdict;
+  return { ...verdict, causalTurnReason: verdict.allowed ? causalTurn.reason : null };
 }
 
 function publishCodexProviderTurnActivity({
@@ -4147,6 +4396,15 @@ function armCodexProviderSemanticSource({ tabId, launchId } = {}) {
   const terminalToken = terminals.get(tabId) || null;
   const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const previous = codexProviderSemanticSources.get(tabId);
+  const observed = compactOperations.getActive(tabId, 'codex');
+  if (previous && observed?.source === 'provider-compaction' && observed.providerSourceId === previous.sourceId
+    && observed.generation === previous.lifecycleGeneration) {
+    if (previous.sourceId === sourceId && previous.terminalToken === terminalToken
+      && previous.runSeq === runSeq && previous.lifecycleGeneration === lifecycleGeneration) return sourceId;
+    compactOperations.finish({ tabId, provider: 'codex', operationId: observed.operationId,
+      generation: observed.generation, outcome: 'unknown', reason: 'provider-source-replaced' });
+  }
   codexProviderSemanticSources.set(tabId, {
     sourceId,
     launchId: String(launchId),
@@ -4201,6 +4459,155 @@ function disarmCodexProviderSemanticSource(tabId, reason = 'clear', expectedLaun
   return !!current;
 }
 
+function captureCodexProviderCompactionBoundary(tabId, owner, event) {
+  const watcher = codexTurnWatchers.get(tabId);
+  if (!watcher || !event.sessionId || watcher.sessionId !== event.sessionId
+    || watcher.processGeneration !== owner.lifecycleGeneration
+    || watcher.sourceObservationTerminal !== owner.terminalToken
+    || watcher.sourceObservationRunSeq !== owner.runSeq
+    || watcher.sourceObservationLaunchId && watcher.sourceObservationLaunchId !== owner.launchId
+    || watcher.manualBindingConflict || !watcher.filePath) return null;
+  try {
+    const stat = fs.statSync(watcher.filePath);
+    if (!stat.isFile() || !Number.isSafeInteger(stat.size) || !Number.isSafeInteger(stat.dev)
+      || !Number.isSafeInteger(stat.ino)) return null;
+    return { watcher: new WeakRef(watcher), filePath: watcher.filePath, sessionId: watcher.sessionId,
+      dev: stat.dev, ino: stat.ino, sourceByteOffset: stat.size, stopRevision: getTerminalStopRevision(tabId) };
+  } catch { return null; }
+}
+
+function observeCodexProviderCompactionPhase(tabId, owner, event) {
+  if (aiStoppingTabs.has(tabId)) return null;
+  let active = compactOperations.getActive(tabId, 'codex');
+  const threadId = event.threadId || event.sessionId || null;
+  const admittedNewTurn = event.turnId && event.turnId !== active?.turnId
+    && ['submitted-prompt-in-flight', 'rollout-turn-active'].includes(event.causalTurnReason);
+  if (['turn', 'compaction'].includes(event.requestKind) && active?.observationOnly === true
+    && active.source === 'provider-compaction' && active.providerSourceId === owner.sourceId
+    && active.providerLaunchId === owner.launchId && active.providerRunSeq === owner.runSeq
+    && active.generation === owner.lifecycleGeneration
+    && (admittedNewTurn || event.requestKind === 'turn' && active.turnId === event.turnId
+      && active.providerThreadId === threadId && active.providerObservedSessionId === event.sessionId)
+    && event.requestId && event.requestId !== active.providerRequestId) {
+    // Positive transition to a new model request, NOT a network response end.
+    // The old unbound observation has no canonical success to publish.
+    const ended = compactOperations.finish({ tabId, provider: 'codex', operationId: active.operationId,
+      generation: active.generation, outcome: 'unknown', reason: 'provider-phase-advanced',
+      completionProof: admittedNewTurn ? 'new-main-turn-admission' : 'same-provider-turn-request' });
+    if (ended?.active === false && owner.compactObservation?.operationId === active.operationId) owner.compactObservation = null;
+    if (event.requestKind !== 'compaction' || compactOperations.getActive(tabId, 'codex')) return ended;
+    active = null;
+  }
+  if (event.requestKind !== 'compaction') return null;
+  const writer = getCodexWriterProofSnapshot(tabId);
+  const watcher = codexTurnWatchers.get(tabId);
+  if (writer?.sessionId && event.sessionId !== writer.sessionId) return null;
+  const exactOwner = !!writer?.sessionId && watcher?.sessionId === writer.sessionId
+    && watcher.processGeneration === owner.lifecycleGeneration;
+  const boundary = exactOwner ? captureCodexManualCompactBoundary(tabId, {
+    terminal: owner.terminalToken, sessionId: writer.sessionId,
+    generation: owner.lifecycleGeneration, promptSeq: codexPromptGeneration.get(tabId) || 0,
+  }, { requireFileBoundary: true }) : null;
+  const observedBoundary = !active ? captureCodexProviderCompactionBoundary(tabId, owner, event) : null;
+  const operation = compactOperations.observeProviderCompaction({
+    ...(boundary || {}), tabId, provider: 'codex', requestKind: 'compaction',
+    generation: owner.lifecycleGeneration, observationOnly: !boundary,
+    providerSourceId: owner.sourceId, providerRequestId: event.requestId,
+    providerObservedSessionId: event.sessionId, providerThreadId: threadId,
+    providerLaunchId: owner.launchId, providerRunSeq: owner.runSeq,
+    providerStopRevision: getTerminalStopRevision(tabId), turnId: event.turnId || null,
+    acceptedAt: Number.isFinite(event.observedAt) ? event.observedAt : Date.now(),
+  });
+  if (operation?.observationOnly && owner.compactObservation?.operationId !== operation.operationId) {
+    owner.compactObservation = { operationId: operation.operationId, boundary: observedBoundary };
+  }
+  console.log('[CodexProviderCompact] request tab=' + String(tabId).slice(-12)
+    + ' request=' + String(event.requestId || '-') + ' phase=' + (operation?.phase || 'unproven')
+    + ' reason=' + (operation?.observationOnly ? 'current-provider-observation'
+      : exactOwner ? (boundary ? 'current-provider-request' : 'source-boundary-unavailable') : 'writer-scope-unproven'));
+  return operation;
+}
+
+function readCodexProviderCompactionEvidence(state, record) {
+  const tabId = state.tabId, active = compactOperations.getActive(tabId, 'codex');
+  if (!active?.observationOnly) return null;
+  const rejected = reason => {
+    console.log('[CodexProviderCompact] evidence unavailable tab=' + String(tabId).slice(-12)
+      + ' operation=' + active.operationId + ' reason=' + reason);
+    return null;
+  };
+  const owner = codexProviderSemanticSources.get(tabId), proof = owner?.compactObservation;
+  const boundary = proof?.boundary;
+  if (!owner || proof?.operationId !== active.operationId) return rejected('observation-owner-changed');
+  if (!boundary) return rejected('initial-file-boundary-unavailable');
+  if (!codexProviderPreviewOwnerVerdict(owner, currentCodexProviderSemanticOwnerContext(tabId), active.providerSourceId).allowed
+    || owner.launchId !== active.providerLaunchId || owner.runSeq !== active.providerRunSeq
+    || boundary.watcher.deref() !== state || codexTurnWatchers.get(tabId) !== state
+    || state.sessionId !== boundary.sessionId || state.filePath !== boundary.filePath
+    || state.processGeneration !== active.generation || state.manualBindingConflict) return rejected('current-source-scope-changed');
+  if (!Number.isSafeInteger(record.__byteOffset) || record.__byteOffset < boundary.sourceByteOffset) return rejected('record-before-request-boundary');
+  try {
+    const stat = fs.statSync(boundary.filePath);
+    if (stat.dev !== boundary.dev || stat.ino !== boundary.ino || stat.size < boundary.sourceByteOffset) return rejected('source-file-replaced');
+  } catch { return rejected('source-stat-unavailable'); }
+  return { tabId, active, owner, proof, boundary };
+}
+
+function bindCodexProviderCompactionEvidence(state, record) {
+  const evidence = readCodexProviderCompactionEvidence(state, record);
+  if (!evidence || aiStoppingTabs.has(state.tabId)) return false;
+  const { tabId, active, owner, proof, boundary } = evidence;
+  const writer = getCodexWriterProofSnapshot(tabId);
+  if (owner.threadId !== active.providerThreadId || owner.turnId !== active.turnId
+    || getTerminalStopRevision(tabId) !== boundary.stopRevision || boundary.stopRevision !== active.providerStopRevision
+    || state.currentTurnId !== active.turnId || writer?.sessionId !== boundary.sessionId
+    || writer.filePath !== boundary.filePath
+    || writer.terminalToken !== owner.terminalToken || writer.runSeq !== owner.runSeq
+    || writer.lifecycleGeneration !== owner.lifecycleGeneration || writer.launchId !== owner.launchId) {
+    console.log('[CodexProviderCompact] binding unavailable tab=' + String(tabId).slice(-12)
+      + ' operation=' + active.operationId + ' reason=current-writer-turn-scope-unproven');
+    return false;
+  }
+  const bound = compactOperations.bindProviderCompaction({ ...active, sessionId: boundary.sessionId,
+    sourceByteOffset: boundary.sourceByteOffset });
+  if (bound && owner.compactObservation === proof) owner.compactObservation = null;
+  return !!bound;
+}
+
+function observeCodexProviderCompactionLifecycle(state, record) {
+  const type = record?.type === 'event_msg' ? record.payload?.type : null;
+  const turnId = record?.payload?.turn_id;
+  if (!['task_started', 'task_complete', 'turn_aborted'].includes(type) || typeof turnId !== 'string' || !turnId) return null;
+  const evidence = readCodexProviderCompactionEvidence(state, record);
+  if (!evidence) return null;
+  const { tabId, active, owner } = evidence;
+  if (type === 'task_started' ? turnId === active.turnId : turnId !== active.turnId) return null;
+  // The existing source-audit reader already observes these ordered metadata
+  // boundaries. Retire the read-only phase, never claim compact success or
+  // adopt a writer/Send/turn outcome from this provisional source.
+  const ended = compactOperations.finish({ tabId, provider: 'codex', operationId: active.operationId,
+    generation: active.generation, outcome: 'unknown', reason: 'provider-observation-' + type,
+    completionProof: 'post-request-source-lifecycle-observation' });
+  if (owner.compactObservation?.operationId === active.operationId) owner.compactObservation = null;
+  return ended;
+}
+
+function finishCodexProviderCompactionObservation(tabId, reason) {
+  const active = compactOperations.getActive(tabId, 'codex'), owner = codexProviderSemanticSources.get(tabId);
+  if (!owner || !codexProviderPreviewOwnerVerdict(owner, currentCodexProviderSemanticOwnerContext(tabId), owner.sourceId).allowed) return null;
+  // The source can outlive its process while already-buffered network events
+  // drain. This exact successful exit must fence a new observed phase too.
+  owner.processScopeExited = true;
+  if (active?.source !== 'provider-compaction' || active.providerSourceId !== owner.sourceId
+    || active.generation !== owner.lifecycleGeneration) return null;
+  const ended = compactOperations.finish({ tabId, provider: 'codex', operationId: active.operationId,
+    generation: active.generation,
+    outcome: ['manual-stop', 'terminal-kill', 'pty-exit'].includes(reason) ? 'aborted' : 'unknown', reason,
+    completionProof: 'current-process-scope-exited' });
+  if (owner.compactObservation?.operationId === active.operationId) owner.compactObservation = null;
+  return ended;
+}
+
 function handleCodexProviderSemanticEvent(detail) {
   const tabId = detail?.tabId;
   const sourceId = detail?.sourceId;
@@ -4220,28 +4627,11 @@ function handleCodexProviderSemanticEvent(detail) {
     return false;
   }
   if (event.type === 'turn_started') {
+    if (owner.processScopeExited === true) return false;
     // Transport identity is diagnostic/continuation scope only, never a
     // replacement for the process-owned durable writer session.
+    observeCodexProviderCompactionPhase(tabId, owner, event);
     owner.threadId = event.threadId || null;
-    if (event.requestKind === 'compaction') {
-      const writer = getCodexWriterProofSnapshot(tabId);
-      const watcher = codexTurnWatchers.get(tabId);
-      const exactOwner = !!writer?.sessionId && event.sessionId === writer.sessionId
-        && watcher?.sessionId === writer.sessionId
-        && watcher.processGeneration === owner.lifecycleGeneration;
-      const boundary = exactOwner ? captureCodexManualCompactBoundary(tabId, {
-        terminal: owner.terminalToken, sessionId: writer.sessionId,
-        generation: owner.lifecycleGeneration, promptSeq: codexPromptGeneration.get(tabId) || 0,
-      }, { requireFileBoundary: true }) : null;
-      const operation = boundary && compactOperations.observeProviderCompaction({
-        ...boundary, provider: 'codex', requestKind: event.requestKind,
-        providerSourceId: sourceId, providerRequestId: event.requestId,
-        turnId: event.turnId || null, acceptedAt: Number.isFinite(event.observedAt) ? event.observedAt : Date.now(),
-      });
-      console.log('[CodexProviderCompact] request tab=' + String(tabId).slice(-12)
-        + ' request=' + String(event.requestId || '-') + ' phase=' + (operation?.phase || 'unproven')
-        + ' reason=' + (exactOwner ? (boundary ? 'current-provider-request' : 'source-boundary-unavailable') : 'writer-scope-unproven'));
-    }
     publishCodexProviderTurnActivity({
       tabId,
       sourceId,
@@ -8059,6 +8449,7 @@ function commitHeadlessVisibleBufferSnapshot(tabId, state, flushedSeq) {
     committedFrameGeneration,
   );
   observeCodexQueuedMessageCommittedFrame(tabId, state, committed);
+  observeCodexInputLengthRejectedCommittedFrame(tabId, state, committed);
   try { codexNativeQuestionMirror.observeFrame(tabId, committed); }
   catch (error) { console.error('[CodexQuestionMirror] frame failed tab=' + String(tabId).slice(-12) + ' error=' + error.message); }
   observeCodexInputControlReadinessFrame(tabId, state, committed);
@@ -10625,6 +11016,48 @@ async function readMainPublicRuntimeSnapshot(tabId, { inputOnly = false } = {}) 
 async function readAgentContinuationInputAdmission(tabId, expected = {}) {
   const miss = (reason, extra = {}) => ({ version: 1, kind: 'codex-continuation-input',
     known: false, ready: false, reason, ...extra });
+  if (expected.retainedFenceOnly === true) {
+    // Negative evidence only. This read does not inspect processes or History,
+    // refresh the owner, grant readiness, or create an input reservation.
+    const result = (status, reason) => ({ version: 1, kind: 'codex-continuation-fence-check', status, reason });
+    const old = expected.retainedFence;
+    if (old?.version !== 1 || old.toolType !== 'codex' || !old.terminalInstanceId
+      || !old.lifecycleGeneration || !old.ownerToken || !old.ownerEpoch || !old.physicalScope) return result('pending', 'retained_fence_unproven');
+    const provider = resolveAiToolTypeForTab(tabId);
+    if (provider && provider !== 'codex') return result('hard', 'provider_changed');
+    if (!provider) return result('pending', 'provider_unproven');
+    const terminal = terminals.get(tabId), instance = terminal && terminalLifecycleEpochs.get(terminal);
+    if (!terminal || !instance) return result('pending', 'terminal_unproven');
+    if (instance !== old.terminalInstanceId) return result('hard', 'terminal_changed');
+    const identity = captureAgentInputIdentity(tabId, terminal);
+    if (aiStoppingTabs.has(tabId)) return result('hard', 'stop_changed');
+    for (const [field, previous, present] of [
+      ['lifecycle', old.lifecycleGeneration, identity.terminalLifecycleGeneration],
+      ['run', old.terminalRunSeq, identity.terminalRunSeq],
+      ['input', old.inputRevision, identity.inputRevision],
+      ['stop', old.terminalStopRevision, identity.terminalStopRevision],
+      ['mirror', old.mirrorGeneration, identity.mirrorGeneration],
+    ]) {
+      if (previous == null || present == null) return result('pending', field + '_unproven');
+      if (previous !== present) return result('hard', field + '_changed');
+    }
+    let owner;
+    try {
+      const stored = conversationOwners.stored(tabId);
+      owner = stored && conversationOwners.public(stored);
+    } catch { return result('pending', 'owner_unproven'); }
+    if (!owner?.ownerToken || !owner.ownerOrder?.epoch) return result('pending', 'owner_unproven');
+    if (owner.ownerToken !== old.ownerToken || owner.ownerOrder.epoch !== old.ownerEpoch) return result('hard', 'conversation_owner_changed');
+    if (owner.currentBinding?.state === 'unknown') return result('pending', 'owner_binding_unproven');
+    const physical = captureAiProcessLookupScope(tabId);
+    for (const field of ['commandRunning', 'claudeLaunchId', 'projectId', 'cwd']) {
+      const previous = old.physicalScope[field], present = physical[field] ?? null;
+      if (previous != null && present == null) return result('pending', 'physical_scope_unproven');
+      if (previous != null && present != null && previous !== present) return result('hard', 'physical_scope_changed');
+    }
+    if (physical.codexLaunchId && physical.codexLaunchId !== old.launchId) return result('hard', 'launch_changed');
+    return result('same', null);
+  }
   const provider = resolveAiToolTypeForTab(tabId);
   if (provider !== 'codex') return miss('continuation_input_provider_changed', { ownerChanged: !!provider });
   const terminal = terminals.get(tabId);
@@ -10633,7 +11066,10 @@ async function readAgentContinuationInputAdmission(tabId, expected = {}) {
   const observation = getCurrentCodexProvisionalSourceObservation(tabId);
   const writer = getCodexWriterProofSnapshot(tabId);
   const context = getCodexSubmissionObservationContext(tabId, terminalProjects.get(tabId));
-  const owner = conversationOwners.current(tabId);
+  const observedOwner = conversationOwners.current(tabId);
+  const owner = { ownerToken: observedOwner.ownerToken,
+    ownerOrder: observedOwner.ownerOrder && { ...observedOwner.ownerOrder },
+    currentBinding: observedOwner.currentBinding && { ...observedOwner.currentBinding } };
   const ownerKey = JSON.stringify([owner.ownerToken, owner.ownerOrder, owner.currentBinding]);
   const current = () => !!terminal && validateAgentInputIdentity(tabId, identity)
     && aiProcessLookupScopeCurrent(tabId, physical) && !aiStoppingTabs.has(tabId)
@@ -10679,28 +11115,120 @@ async function readAgentContinuationInputAdmission(tabId, expected = {}) {
     || expected.cwd && path.resolve(expected.cwd) !== path.resolve(terminalProjects.get(tabId) || '')) {
     return miss('continuation_input_destination_changed', { ownerChanged: true });
   }
-  const ready = () => current() && isCodexTuiEffectivelyReady(tabId)
-    && !getCodexLiveInputControl(tabId) && !codexLateMcpProofPending.has(tabId)
-    && !hasCodexPromptOrTurnInFlight(tabId)
-    && getHeadlessCodexDraftState(tabId, 'continuation-input-only').hasDraft === false
-    && (mode === 'writer' ? isCodexWriterUsableForMutation(tabId)
-      && getCodexWriterProofSnapshot(tabId)?.sessionId === target.sessionId
-      : getCurrentCodexProvisionalSourceObservation(tabId) === observation
-        && getCodexSubmissionObservationContext(tabId).launchId === target.launchId
-        && classifyCodexProvisionalActionAuthorization({
-          sourceMode: context.sourceMode, sourceSessionId: context.sourceSessionId, launchId: context.launchId,
-          writerStatus: observation.status, writerSessionId: observation.sessionId,
-          discovery: codexWatchers.get(tabId), sourceTurn: codexTurnWatchers.get(tabId),
-          lease: getCodexResumeSourceLeaseForTab(tabId), tabId, tuiReady: isCodexTuiEffectivelyReady(tabId),
-          processRunning: terminalCommandState.get(tabId)?.isRunning === true, processPids: pids,
-          hasInflight: hasCodexPromptOrTurnInFlight(tabId),
-        }).authorized);
-  if (!ready()) return miss('continuation_input_composer_or_owner_pending');
   const fence = { version: 1, mode, ...target, terminalRunSeq: identity.terminalRunSeq,
     inputRevision: identity.inputRevision, terminalStopRevision: identity.terminalStopRevision,
-    mirrorGeneration: identity.mirrorGeneration, ownerKey };
+    mirrorGeneration: identity.mirrorGeneration, ownerKey,
+    ownerToken: owner.ownerToken, ownerEpoch: owner.ownerOrder?.epoch,
+    ownerRevision: owner.ownerOrder?.revision, ownerBinding: owner.currentBinding,
+    sourceMode: context.sourceMode || null, sourceSessionId: context.sourceSessionId || null,
+    proofPids: [...(mode === 'writer' ? writer.pids : observation.pids)].map(Number).sort((a, b) => a - b),
+    physicalScope: { commandRunning: physical.commandRunning ?? null, codexLaunchId: physical.codexLaunchId ?? null,
+      claudeLaunchId: physical.claudeLaunchId ?? null, projectId: physical.projectId ?? null, cwd: physical.cwd ?? null } };
+  // A late recheck must not turn every loss of readiness into an owner change.
+  // Only this Main closure can issue the result; a saved fence alone is never
+  // input authority. A later admission must prove the whole source again.
+  const recheck = (original = null) => {
+    const hard = reason => ({ status: 'hard', reason });
+    const pending = reason => ({ status: 'pending', reason });
+    if (!terminal || terminals.get(tabId) !== terminal) return hard('terminal_changed');
+    if (getTerminalStopRevision(tabId) !== identity.terminalStopRevision || aiStoppingTabs.has(tabId)) return hard('stop_changed');
+    if (getTerminalInputRevision(tabId) !== identity.inputRevision) return hard('input_changed');
+    if (!validateAgentInputIdentity(tabId, identity)) return hard('input_owner_changed');
+    const currentProvider = resolveAiToolTypeForTab(tabId);
+    if (!currentProvider) return pending('provider_unproven');
+    if (currentProvider !== 'codex') return hard('provider_changed');
+    if (!aiProcessLookupScopeCurrent(tabId, physical)) {
+      const observed = captureAiProcessLookupScope(tabId);
+      const samePhysical = Object.keys(observed).every(key => key === 'codexLaunchId' || observed[key] === physical[key]);
+      const sameLaunchOrRetired = !!context.launchId
+        && [null, context.launchId].includes(physical.codexLaunchId || null)
+        && [null, context.launchId].includes(observed.codexLaunchId || null);
+      // Startup payload retirement may coincide with writer adoption. This
+      // old closure cannot grant input; the next full read must prove the
+      // retained writer/source and the original physical boundary again.
+      if (samePhysical && sameLaunchOrRetired) return pending('launch_observation_refined');
+      return hard('physical_scope_changed');
+    }
+    const nowOwner = conversationOwners.current(tabId);
+    if (!owner.ownerToken || !owner.ownerOrder?.epoch || !Number.isSafeInteger(owner.ownerOrder?.revision)
+      || !nowOwner.ownerToken || !nowOwner.ownerOrder?.epoch) return pending('owner_unproven');
+    if (nowOwner.ownerToken !== owner.ownerToken || nowOwner.ownerOrder.epoch !== owner.ownerOrder.epoch) return hard('conversation_owner_changed');
+    if (JSON.stringify([nowOwner.ownerToken, nowOwner.ownerOrder, nowOwner.currentBinding]) !== ownerKey) {
+      // Includes known/unknown and an exact Resume writer adoption. Neither is
+      // authority to reuse this old proof: re-read after the next real wake.
+      return pending('owner_observation_changed');
+    }
+    if (nowOwner.currentBinding?.state === 'unknown') return pending('owner_binding_unproven');
+    if (original) {
+      if (original.version !== 1 || original.toolType !== 'codex'
+        || !original.ownerToken || !original.ownerEpoch || !Array.isArray(original.proofPids)
+        || !original.proofPids.length || !original.physicalScope) return hard('retained_fence_invalid');
+      for (const field of ['terminalInstanceId', 'launchId', 'lifecycleGeneration', 'terminalRunSeq',
+        'inputRevision', 'terminalStopRevision', 'mirrorGeneration', 'ownerToken', 'ownerEpoch']) {
+        if (original[field] !== fence[field]) return hard('retained_' + field + '_changed');
+      }
+      const sameWriterSource = mode === 'writer' && !!original.sourceSessionId
+        && (target.sessionId === original.sourceSessionId || target.acceptedResumeSourceSessionId === original.sourceSessionId)
+        && (original.mode === 'provisional-resume' || target.sessionId === original.sessionId);
+      if (original.sourceMode !== fence.sourceMode || original.sourceSessionId !== fence.sourceSessionId) {
+        // Missing discovery metadata is allowed only when the exact current
+        // writer independently carries the old Resume source proof; a new
+        // non-null/different source or mode is never a refinement.
+        if (!sameWriterSource || fence.sourceMode != null && fence.sourceMode !== original.sourceMode
+          || fence.sourceSessionId != null && fence.sourceSessionId !== original.sourceSessionId) return hard('retained_source_changed');
+      }
+      const { codexLaunchId: oldLaunch, ...oldPhysical } = original.physicalScope;
+      const { codexLaunchId: newLaunch, ...newPhysical } = fence.physicalScope;
+      if (JSON.stringify(oldPhysical) !== JSON.stringify(newPhysical)) return hard('retained_physical_scope_changed');
+      if (oldLaunch !== newLaunch && (!sameWriterSource
+        || ![null, original.launchId].includes(oldLaunch) || ![null, original.launchId].includes(newLaunch))) {
+        return hard('retained_physical_launch_changed');
+      }
+      if (!original.proofPids.every(pid => fence.proofPids.includes(pid))) return hard('retained_process_changed');
+      if (!Number.isSafeInteger(original.ownerRevision) || fence.ownerRevision < original.ownerRevision) return hard('retained_owner_revision_changed');
+      const bindingSame = JSON.stringify(original.ownerBinding) === JSON.stringify(fence.ownerBinding);
+      const adopted = original.mode === 'provisional-resume' && mode === 'writer'
+        && original.sessionId === target.acceptedResumeSourceSessionId
+        && fence.ownerBinding?.provider === 'codex' && fence.ownerBinding?.sessionId === target.sessionId;
+      if (!bindingSame && fence.ownerBinding?.state === 'unknown') return pending('owner_binding_unproven');
+      if (!bindingSame && !adopted) return hard('retained_owner_binding_changed');
+      if (original.sessionId !== target.sessionId && !adopted) return hard('retained_session_changed');
+      if (original.mode === 'writer' && mode !== 'writer') return pending('writer_observation_pending');
+    }
+    if (!isCodexTuiEffectivelyReady(tabId)) return pending('tui_not_ready');
+    if (getCodexLiveInputControl(tabId)) return pending('input_control_active');
+    if (codexLateMcpProofPending.has(tabId)) return pending('late_mcp_proof_pending');
+    if (hasCodexPromptOrTurnInFlight(tabId)) return pending('input_inflight');
+    const draft = getHeadlessCodexDraftState(tabId, 'continuation-input-only');
+    if (draft.hasDraft !== false) return pending(draft.hasDraft === true ? 'draft_present' : 'draft_unknown');
+    if (mode === 'writer') {
+      if (!isCodexWriterUsableForMutation(tabId) || !getCodexWriterProofSnapshot(tabId)) return pending('writer_unproven');
+      if (getCodexWriterProofSnapshot(tabId)?.sessionId !== target.sessionId) return hard('writer_changed');
+    } else {
+      // The provisional observation may remain in its map briefly after the
+      // writer becomes available. Re-read the writer proof rather than using
+      // the still-identical old observation as first-submit authority.
+      if (isCodexWriterUsableForMutation(tabId) && getCodexWriterProofSnapshot(tabId)) return pending('writer_observation_refined');
+      if (getCurrentCodexProvisionalSourceObservation(tabId) !== observation) return pending('source_observation_refined');
+      const nowContext = getCodexSubmissionObservationContext(tabId);
+      if (nowContext.launchId !== target.launchId || nowContext.sourceSessionId !== context.sourceSessionId
+        || nowContext.sourceMode !== context.sourceMode) return hard('source_scope_changed');
+      const verdict = classifyCodexProvisionalActionAuthorization({
+        sourceMode: context.sourceMode, sourceSessionId: context.sourceSessionId, launchId: context.launchId,
+        writerStatus: observation.status, writerSessionId: observation.sessionId,
+        discovery: codexWatchers.get(tabId), sourceTurn: codexTurnWatchers.get(tabId),
+        lease: getCodexResumeSourceLeaseForTab(tabId), tabId, tuiReady: true,
+        processRunning: terminalCommandState.get(tabId)?.isRunning === true, processPids: pids,
+        hasInflight: false,
+      });
+      if (!verdict.authorized) return pending('source_authorization_unproven');
+    }
+    return { status: 'current', reason: null };
+  };
+  const ready = () => recheck().status === 'current';
+  if (!ready()) return miss('continuation_input_composer_or_owner_pending');
   return { version: 1, kind: 'codex-continuation-input', known: true, ready: true, mode, target, fence,
-    revision: JSON.stringify([fence, pids]), isCurrent: ready };
+    revision: JSON.stringify([fence, pids]), isCurrent: ready, recheck };
 }
 
 // A re-queryable readiness boundary for a FINISHED history reservation.
@@ -10871,7 +11399,7 @@ const mainAgentParamsReader = require(path.join(srcMainDir, 'agent-current-param
       defaultModel: captured.provider === 'codex' ? readDefaultCodexSetting('defaultCodexModel')
         : projectManager.db.getAppState('defaultClaudeModel'),
       defaultEffort: captured.provider === 'codex' ? readDefaultCodexSetting('defaultCodexEffort')
-        : projectManager.db.getAppState('defaultClaudeEffort'),
+        : normalizeAgentDefaultEffort(projectManager.db.getAppState('defaultClaudeEffort'), 'claude'),
       contextPct: projectManager.db.getTabContextPct(tabId),
     };
   },
@@ -17716,10 +18244,7 @@ async function resolveClaudeStartupSettingsInMain({
   let model = String(
     projectManager?.db?.getAppState?.('defaultClaudeModel') || 'none',
   ).trim() || 'none';
-  let effort = String(
-    projectManager?.db?.getAppState?.('defaultClaudeEffort') || 'none',
-  ).trim() || 'none';
-  if (effort === 'auto') effort = 'low';
+  let effort = normalizeAgentDefaultEffort(projectManager?.db?.getAppState?.('defaultClaudeEffort'), 'claude');
 
   let row = null;
   try {
@@ -19781,6 +20306,15 @@ function startClaudeHookServer() {
           admitted: hookAdmission.accepted, matched: !busy && taskTurn?.matched === true,
           backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
         });
+        if (busy && miniOrchestratorRuntime?.isEnabled(tabId) && hookAdmission.accepted
+          && taskTurnId && typeof submitted_prompt === 'string' && typeof msg.prompt_id === 'string') {
+          miniOrchestratorRuntime.capture.observeClaudeInput({ tabId,
+            owner: { provider: 'claude', sessionId: session_id, generation: getTerminalLifecycleGeneration(tabId) },
+            turnId: taskTurnId, inputId: msg.prompt_id, text: submitted_prompt, sourceVerified: true,
+            correctionHandoffId: String(promptSubmitAudit?.handoffId || '').startsWith('mini-orchestrator:')
+              ? promptSubmitAudit.handoffId : undefined });
+          miniOrchestratorRuntime.acknowledgeInput(tabId, promptSubmitAudit?.handoffId);
+        }
         if (busy) {
           const sourceId = getTerminalLifecycleGeneration(tabId) + ':claude-provider:' + taskTurnId;
           terminalHistoryPreviewController.activateSemanticSource({
@@ -20419,6 +20953,7 @@ function isCodexExitObserverCurrent(tabId, expectedGeneration, expectedRunSeq = 
 
 function finalizeCodexCommandFinished(tabId, exitCode = 0, reason = 'command-finished') {
   if (!tabId) return;
+  finishCodexProviderCompactionObservation(tabId, reason);
   clearCodexDescendantExitRecheck(tabId, reason);
   clearCodexFinishDebounce(tabId, reason);
 
@@ -26473,6 +27008,9 @@ app.whenReady().then(async () => {
       readTabInspectionResponse,
       readMessageReturnProof: (source, receipt) => getMessageReturnProofs().read(source, receipt),
       readAgentObservedResponse: request => getAgentResponseObservationReader().readAgentObservedResponse(request),
+      readMiniOrchestratorSendAdmission: request => miniOrchestratorSendFailure(request.tabId, request),
+      onMiniOrchestratorInputAccepted: request => miniOrchestratorRuntime?.onInputAccepted(request),
+      onMiniOrchestratorSendReceipt: record => miniOrchestratorRuntime?.onReceipt(record),
       onAgentResponseCompletion: listener => getAgentResponseObservationReader().onAgentResponseCompletion(listener),
       getAgentExecutionContext: getActiveAgentExecutionContext,
       readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
@@ -28904,6 +29442,10 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     providerQueueOperation: result?.providerQueueOperation || null,
     composerDraftState: result?.composerDraftState || null,
     draftPreserved: result?.draftPreserved === true,
+    ...(result?.providerInputRejection ? { providerInputRejection: result.providerInputRejection,
+      inputLimit: result.inputLimit, authoringPreserved: result.authoringPreserved === true,
+      draftPreserved: result.draftPreserved === true ? true : null,
+      submitted: true, pasteWritten: true, enterWritten: true, lateReconciliationPending: false } : {}),
     late: audit.callerTimedOut === true,
     auditTimestamp: result?.auditTimestamp || null,
     actualHash: result?.actualHash || null,
@@ -29482,6 +30024,49 @@ function observeCodexQueuedMessageCommittedFrame(tabId, mirror, snapshot) {
   return accepted;
 }
 
+function observeCodexInputLengthRejectedCommittedFrame(tabId, mirror, snapshot) {
+  try {
+    const term = terminals.get(tabId), state = terminalCommandState.get(tabId);
+    if (!term || mirror !== getHeadlessTerminalMirror(tabId) || state?.isRunning !== true
+      || resolveAiToolTypeForTab(tabId) !== 'codex') return false;
+    const rejection = require(path.join(srcMainDir, 'codex-input-rejection'));
+    if (!rejection.inputRejectionOccurrences(snapshot).length) return false;
+    const matches = [];
+    for (const audit of getPendingCodexPasteAudits(tabId)) {
+      if (!audit.inputRejectionBaseline?.usable || audit.finished || !audit.submitWritten || audit.providerQueueAcceptedResult) continue;
+      const record = agentSendReceiptStore.get(audit.sendOperationKey);
+      const result = rejection.classifyCodexInputRejectionFrame({ baseline: audit.inputRejectionBaseline, snapshot, audit, record,
+        identity: { tabId, sameTerminal: terminals.get(tabId) === term, mirrorGeneration: mirror.generation,
+          sessionId: codexKnownSessions.get(tabId) || codexTurnWatchers.get(tabId)?.sessionId || null,
+          runSeq: Number(state.runSeq || 0), lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+          inputRevision: getTerminalInputRevision(tabId), turnBusy: codexTurnWatchers.get(tabId)?.busy,
+          writeQueueOwned: !ptyLastQueuedWriteOperation.get(term) || ptyLastQueuedWriteOperation.get(term) === audit.writeOperation } });
+      if (result.rejected) matches.push({ audit, record, proof: result.proof });
+    }
+    if (matches.length !== 1) return false;
+    const { audit, record, proof } = matches[0];
+    const result = { ...require(path.join(srcMainDir, 'agent-provider-input-limit')).codexInputLimitReceipt(proof.actual),
+      tabId, operationKey: record.operationKey, attemptId: record.attemptId, handoffId: record.handoffId,
+      promptHash: record.promptHash, expectedHash: audit.expectedHash, sessionId: record.sessionId,
+      submitted: true, pasteWritten: true, enterWritten: true, status: 'provider-not-accepted',
+      receiptState: 'provider-not-accepted', semanticStatus: 'not-submitted',
+      providerAccepted: false, providerTurnCreated: false, lateReconciliationPending: false,
+      composerDraftState: 'exact-provider-length-rejection', draftPreserved: null,
+      authoringPreserved: typeof record.receipt?.promptText === 'string', providerInputRejection: proof };
+    const settled = agentSendReceiptStore.settleAttempt(record.operationKey, record.attemptId, result);
+    if (!settled.applied || settled.record.state !== 'provider-not-accepted') return false;
+    console.warn('[CodexPasteAudit:INPUT_REJECTED] tab=' + String(tabId).slice(-12)
+      + ' operation=' + record.operationKey + ' attempt=' + record.attemptId
+      + ' actual=' + proof.actual + ' max=' + proof.max + ' frame=' + proof.committedFrameGeneration);
+    finishCodexPasteAudit(tabId, audit, result);
+    return true;
+  } catch (error) {
+    console.error('[CodexPasteAudit:INPUT_REJECTED] persistence/projection failed tab=' + String(tabId).slice(-12)
+      + ' code=' + String(error?.code || 'unknown') + ' error=' + String(error?.message || error).slice(0, 240));
+    return false;
+  }
+}
+
 function finishCodexPasteAudit(tabId, audit, result, e2eBypass = false) {
   if (!audit || audit.finished === true) return;
   if (result?.success === true && audit.sendOperationKey && audit.sendAttemptId
@@ -29614,6 +30199,12 @@ async function retryCodexEnterAfterAuditTimeout({
     console.warn(logPrefix + ' [CodexEnterRetry] skipped reason=' + admission.reason);
     return admission;
   }
+  if (audit.inputRejectionBaseline?.usable) {
+    observeCodexInputLengthRejectedCommittedFrame(tabId, getHeadlessTerminalMirror(tabId),
+      getHeadlessTerminalMirror(tabId)?.lastCommittedVisibleSnapshot);
+    return { retry: false, retried: false, reason: audit.finished
+      ? 'exact-provider-input-rejection' : 'oversized-input-retry-cannot-help' };
+  }
 
   // One timeout gets one exact, non-destructive Ctrl+G copy. The capture is
   // an app-owned input revision and returns the real composer text even when
@@ -29677,6 +30268,31 @@ async function retryCodexEnterAfterAuditTimeout({
 
 // Map of term → tabId for the busy broadcast. Filled lazily from `terminals`
 // Map on first paste-busy emit per term.
+function agentCodexInputLimitFailure(tabId, content, options = {}, finalTransport = false) {
+  // Scalar count cannot exceed UTF-16 length. Keep ordinary short input on
+  // its existing path without new runtime or transcript reads.
+  if (typeof content !== 'string' || content.length <= 1048576 && !options.providerPasteSegments?.length) return null;
+  const provider = resolveAiToolTypeForTab(tabId,
+    options.expectedTarget?.toolType || (String(options.source || '').startsWith('codex-') ? 'codex' : null));
+  const limits = require(path.join(srcMainDir, 'agent-provider-input-limit'));
+  const record = options.sendOperationKey && agentSendReceiptStore.get(options.sendOperationKey);
+  const failure = finalTransport ? limits.providerInputLimitFailure(provider, content, options.providerPasteSegments)
+    : limits.earlyProviderInputLimitFailure(provider, content, { ...options,
+      ownedAttachments: record?.receipt?.ownedAttachments || options.ownedAttachments });
+  if (!failure) return null;
+  if (record?.tabId === tabId && record.handoffId === options.handoffId && record.provider === 'codex'
+    && (record.attemptId !== (options.sendAttemptId || null)
+      || !['reserved', 'preparing', 'in-flight'].includes(record.state)
+      || record.inputLease || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true
+      || record.receipt?.submitted === true || record.receipt?.deliveryUnknown === true)) {
+    return desktopHistorySendReplayResult(record); // Never reclassify a crossed/UNKNOWN operation.
+  }
+  console.warn('[AgentInputLimit] refused provider=codex tab=' + String(tabId || '').slice(-12)
+    + ' actual=' + failure.inputLimit.actual + ' max=' + failure.inputLimit.max
+    + ' unit=' + failure.inputLimit.unit + ' finalTransport=' + finalTransport);
+  return failure;
+}
+
 function findTabIdForTerm(target) {
   for (const [tabId, t] of terminals) {
     if (t === target) return tabId;
@@ -30375,6 +30991,9 @@ async function safePasteAndSubmit(term, content, options = {}) {
         if (!recovered.success) return recovered;
       }
       if (operationTabId) {
+        const reviewFailure = typeof miniOrchestratorSendFailure === 'function'
+          ? miniOrchestratorSendFailure(operationTabId, options) : null;
+        if (reviewFailure) return reviewFailure;
         if (operation.preparation?.scope?.continuationInputFence) {
           const continuationFailure = agentSendContinuationInputFailure(operationTabId, options);
           if (continuationFailure) return continuationFailure;
@@ -30576,6 +31195,9 @@ async function finishCodexPasteAuditAfterWrite(term, {
   // never overwrite it with the older timeout result.
   if (audit.finished === true && audit.result) auditResult = audit.result;
   else if (audit.providerQueueAcceptedResult) auditResult = audit.providerQueueAcceptedResult;
+  if (auditResult?.providerInputRejection?.kind === 'codex-message-length') {
+    return { ...baseResult, ...auditResult, codexAudit: auditResult };
+  }
 
   if (auditResult?.error === 'codex_user_message_audit_timeout') {
     const commandState = terminalCommandState.get(tabId);
@@ -30901,6 +31523,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const writeExecutionIdentity = sendOperationContext?.executionIdentity
     || (broadcastTabId ? captureAgentInputIdentity(broadcastTabId, term) : null);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
+  const earlyInputFailure = submit && typeof content === 'string' && content.length > 1048576
+    ? agentCodexInputLimitFailure(broadcastTabId, content, options) : null;
+  if (earlyInputFailure) return earlyInputFailure;
   const codexStartupFrameWait = isCodexPasteSource && broadcastTabId
     ? (options.codexStartupFrameWait !== undefined ? options.codexStartupFrameWait
       : captureCodexSendStartupFrameWait(broadcastTabId, options.codexStartupFrameWaitId || null)) : null;
@@ -30995,6 +31620,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const preparation = sendOperationContext?.preparation
     || readAgentSendPreparation(agentSendReceiptStore, broadcastTabId, options, codexStartupFrameWait);
   const destinationFailure = () => {
+    if (!pasteWritten) {
+      const reviewFailure = typeof miniOrchestratorSendFailure === 'function'
+        ? miniOrchestratorSendFailure(broadcastTabId, { handoffId,
+          preflightScope: preparation?.scope || options.preflightScope }) : null;
+      if (reviewFailure) return reviewFailure;
+    }
     if (!pasteWritten && preparation?.scope?.continuationInputFence) {
       const continuationFailure = agentSendContinuationInputFailure(broadcastTabId, { sendOperationKey, sendAttemptId }, sendOperationContext);
       if (continuationFailure) return continuationFailure;
@@ -31277,6 +31908,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
   }
+  const finalInputFailure = submit && typeof content === 'string' && (content.length > 1048576 || codexImagePasteSegments?.length)
+    ? agentCodexInputLimitFailure(broadcastTabId, content,
+      { ...options, sendOperationKey, sendAttemptId, providerPasteSegments: codexImagePasteSegments }, true) : null;
+  if (finalInputFailure) return finalInputFailure;
   if (isDesktopHistorySendReceiptEligible({
     submit,
     tabId: broadcastTabId,
@@ -32323,6 +32958,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           broadcastTabId,
           stagedCodexAudit,
         );
+        stagedCodexAudit.inputRejectionBaseline = { usable: false };
+        if (content.length > 1048576 || codexImagePasteSegments?.length) {
+          stagedCodexAudit.inputScalarCount = require(path.join(srcMainDir, 'agent-provider-input-limit'))
+            .codexProviderScalarCount(content, codexImagePasteSegments);
+          stagedCodexAudit.inputRejectionBaseline = require(path.join(srcMainDir, 'codex-input-rejection'))
+            .captureCodexInputRejectionBaseline(getHeadlessTerminalMirror(broadcastTabId)?.lastCommittedVisibleSnapshot, stagedCodexAudit);
+        }
         enqueueCodexPasteAudit(broadcastTabId, stagedCodexAudit);
         const delayedStableSourceSubmit = armPendingCodexNativeRewindStableSourceSubmit(
           broadcastTabId,
@@ -33530,6 +34172,7 @@ async function handleTerminalInput(
   const inputRevisionBeforeCurrentInput = getTerminalInputRevision(tabId);
   if (!isTerminalProtocolResponse && !deferManualInputRevision) {
     conversationOwners.noteInput(tabId);
+    if (typeof miniOrchestratorRuntime !== 'undefined') miniOrchestratorRuntime?.rawInput(tabId);
     bumpTerminalInputRevision(tabId);
     revokeCodexActionAuthoritiesForManualInput(tabId);
     if (!isPureCodexEscapeBurst(data)) codexManualQueueInterrupts.delete(tabId);
@@ -34482,6 +35125,8 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
     imagePresentation: imagePresentationFromReceipt(record),
     transcriptBoundary: record.transcriptBoundary,
     auditIdentity: record.auditIdentity,
+    compactStartIdentity: require(path.join(srcMainDir, '..', 'shared', 'compact-send-delivery.cjs'))
+      .compactSendDeliveryIdentity(record),
     presentation: record.presentation,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
@@ -48537,6 +49182,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
     admitStop();
     if (isCodexRuntime) retireAgentInputCaptureForProcess(tabId, 'codex', 'stop-no-process:' + stopReason);
     if (isCodexRuntime && !preserveCodexLaunchPayload) {
+      finishCodexProviderCompactionObservation(tabId, stopReason);
       invalidateCodexExitObservers(tabId, 'stop-no-process:' + stopReason);
       clearCodexLaunchPayload(tabId, stopReason);
       closeCodexWatcher(tabId, stopReason);
@@ -48701,10 +49347,10 @@ async function stopAiProcessInTab(tabId, options = {}) {
 
   // Hoist stopBusyState (declared further below) up so the Ctrl+C graceful
   // exit path can call it on success without referring to it before init.
-  const stopBusyState = () => {
-    // This callback is reached only after waitForAiStopScopeExit proved that
-    // the complete owned process scope is gone. Invalidate the shared ps cache
-    // before any renderer/API observer can consume the finished event.
+  const stopBusyState = (scopeExited = true) => {
+    // Legacy root cleanup also runs when descendants remain. Only proven
+    // complete scope exit may retire the independent observed compact phase.
+    if (scopeExited && processName === 'codex') finishCodexProviderCompactionObservation(tabId, stopReason);
     retireAgentInputCaptureForProcess(tabId, processName, 'stop-scope-exited:' + stopReason);
     invalidateProcessTreeSnapshot('ai-stop:' + processName + ':' + stopReason);
     if (!preservePublicLifecycle) {
@@ -48723,7 +49369,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
       }
       clearCodexKnownSession(tabId, stopReason);
       clearCodexTuiReady(tabId, stopReason);
-      closeCodexTurnWatcher(tabId, stopReason, { suppressBusyClear: true });
+      closeCodexTurnWatcher(tabId, stopReason, { suppressBusyClear: true, preserveProviderCompaction: !scopeExited });
       emitCodexBusy(tabId, false, stopReason);
       return;
     }
@@ -48939,7 +49585,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
   }
 
   const rootAlive = isAiStopSignalTargetAlive(childPid, false);
-  if (!rootAlive) stopBusyState();
+  if (!rootAlive) stopBusyState(false);
   console.warn('[StopAI] residual process scope after SIGKILL tab=' + String(tabId).slice(-12)
     + ' groups=[' + sigkillExit.residual.aliveGroups.join(',') + ']'
     + ' pids=[' + sigkillExit.residual.alivePids.join(',') + ']'
@@ -53462,6 +54108,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
       goalWork: state?.lastOutcomeGoalWork || null,
     });
+    if (typeof miniOrchestratorRuntime !== 'undefined') miniOrchestratorRuntime?.capture.flush(tabId);
   }
 }
 
@@ -53560,7 +54207,7 @@ function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
   }
   if (reason !== 'replace' || options.suppressBusyClear !== true) {
     const activeCompact = compactOperations.getActive(tabId, 'codex');
-    if (activeCompact) {
+    if (activeCompact && !(options.preserveProviderCompaction === true && activeCompact.source === 'provider-compaction')) {
       compactOperations.finish({
         tabId,
         provider: 'codex',
@@ -55105,6 +55752,8 @@ async function publishCodexSuppressedCatchUpRelease(tabId, state, release, sourc
   }
   if (codexTurnWatchers.get(tabId) !== state || state.closeAfterPendingAuditDrain) return false;
   emitCodexTurnStateResolved(tabId, source);
+  if (typeof miniOrchestratorRuntime !== 'undefined' && miniOrchestratorRuntime?.isEnabled(tabId))
+    miniOrchestratorRuntime.capture.flush(tabId);
   return true;
 }
 
@@ -55351,13 +56000,10 @@ function reconcileExactAgentSendReceipt(request) {
 
 function reconcileDurableCodexPromptAuditsForTab(tabId, reason = 'live-user-carrier') {
   if (!tabId || durableCodexAuditReconcileInflight.has(tabId)) return false;
-  const allRecords = agentSendReceiptStore.listAuditReferences('codex');
-  const unresolved = agentSendReceiptStore.list({ tabId }).filter((record) => (
-    record?.provider === 'codex'
-    && (record.state === AGENT_SEND_DURABLE_STATES.AUDIT_PENDING
-      || record.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN)
-  ));
+  const unresolved = agentSendReceiptStore.listUnresolvedCodexAuditsForTab(tabId);
   if (unresolved.length === 0) return false;
+  // Global boundaries/claims remain essential whenever a proof is needed.
+  const allRecords = agentSendReceiptStore.listAuditReferences('codex');
   const work = reconcileAgentSendStartupRecords(unresolved, { allRecords })
     .then((decisions) => {
       for (const decision of decisions) {
@@ -55553,6 +56199,9 @@ function processCodexSourceAuditOnlyText(state, text, incomingStartOffset, prefe
   for (const candidate of [...consumed.records, ...(consumed.boundaries || [])]
     .sort((left, right) => left.byteOffset - right.byteOffset)) {
     candidate.record.__byteOffset = candidate.byteOffset;
+    if (['task_started', 'task_complete', 'turn_aborted'].includes(candidate.record.payload?.type)) {
+      observeCodexProviderCompactionLifecycle(state, candidate.record);
+    }
     observeCodexPromptAuditCarrier(state, candidate.record);
   }
   if (consumed.records.length > 0) {
@@ -56389,6 +57038,7 @@ function publishCodexGoalTurnCompletion(state, record, outcome, manualQueueConti
     // no finishTurn/activity/readiness/preview/input side effects or done replay.
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('codex:busy-state', metadata);
     _webBroadcast(tabId, { ...metadata, type: 'snapshot', toolType: 'codex', provider: 'codex' });
+    if (typeof miniOrchestratorRuntime !== 'undefined') miniOrchestratorRuntime?.capture.flush(tabId);
   };
   const log = decision => console.log('[CodexGoal:Read] tab=' + String(tabId).slice(-12)
     + ' sid=' + String(sessionId).slice(0, 12) + ' turn=' + String(turnId)
@@ -56620,6 +57270,10 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     },
     }),
   });
+  try {
+    if (event !== 'task_started' && typeof miniOrchestratorRuntime !== 'undefined' && miniOrchestratorRuntime)
+      observeMiniOrchestratorCodex(state, record, suppressPublications, turnOutcome, userMessageAudit);
+  } catch (error) { console.warn('[MiniOrchestrator] live-capture-failed code=' + String(error?.code || 'capture-failed')); }
   try {
     if (require(path.join(srcMainDir, 'web-server')).needsMessageReturnProof?.(state.tabId) === true
       && (record.type === 'event_msg' && ['task_started', 'user_message', 'task_complete', 'turn_aborted', 'thread_rolled_back'].includes(event)
@@ -56888,6 +57542,9 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (compactEvidence.kind === 'terminal') {
     // Non-deferred lifecycle outcomes still use compactOperations.finish;
     // task_complete is routed through the causal catch-up below.
+    if (compactOperations.getActive(state.tabId, 'codex')?.observationOnly === true) {
+      bindCodexProviderCompactionEvidence(state, record);
+    }
     const activeCompact = compactOperations.getActive(state.tabId, 'codex');
     const terminalGeneration = String(state.processGeneration || '');
     const currentTerminalGeneration = String(getTerminalLifecycleGeneration(state.tabId) || '');
@@ -57040,6 +57697,10 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     });
     clearCodexPromptInFlight(state.tabId, 'task_started');
     finishCodexStartupLifecycle(state.tabId, 'task_started');
+    try {
+      if (typeof miniOrchestratorRuntime !== 'undefined' && miniOrchestratorRuntime)
+        observeMiniOrchestratorCodex(state, record, suppressPublications, turnOutcome, userMessageAudit);
+    } catch { console.warn('[MiniOrchestrator] turn-capture-failed'); }
     emitCodexBusy(state.tabId, true, 'task_started', {
       outcome: turnOutcome,
       timestamp: record.timestamp,
@@ -64111,6 +64772,7 @@ function shellQuote(value) {
 function readDefaultCodexSetting(key) {
   try {
     const value = projectManager?.db?.getAppState?.(key);
+    if (key === 'defaultCodexEffort') return normalizeAgentDefaultEffort(value, 'codex');
     if (typeof value !== 'string') return null;
     const trimmed = value.trim();
     if (!trimmed || trimmed === 'none') return null;
@@ -64337,7 +64999,12 @@ function buildCodexCommand({
   providerProxyBaseUrl = null,
   authProfileOverrides = [],
 }) {
-  const parts = ['command', 'codex', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+  // The human-only mini DEV replay must not inherit full-access from the
+  // copied conversation. Production/default launch behavior stays unchanged.
+  const miniReadOnly = process.env.NOTED_E2E_TEST === 'true' && process.env.NOTED_MINI_READ_ONLY_CODEX === '1';
+  const parts = ['command', 'codex', '--no-alt-screen', ...(miniReadOnly
+    ? ['--sandbox', 'read-only', '--ask-for-approval', 'on-request']
+    : ['--dangerously-bypass-approvals-and-sandbox'])];
   // Astra sparkle occupies empty composer cells and confuses draft proof.
   // Disable only that decoration for managed launches, not normal animations
   // or user braille text; do not rewrite the user's global Codex config.
@@ -66626,6 +67293,7 @@ async function submitCodexCompactSlashCommandWithProof({
     return { ...firstEnterRefusal, submitted: false, slashInserted: true };
   }
 
+  let compactInputLease = null;
   const writeOwnedEnter = (ordinal) => {
     const ownership = readCodexCompactSubmitOwnership({
       tabId,
@@ -66640,6 +67308,34 @@ async function submitCodexCompactSlashCommandWithProof({
       const error = new Error(reason);
       error.code = reason;
       throw error;
+    }
+    if (sendTimingIdentity?.sendOperationKey && sendTimingIdentity?.sendAttemptId) {
+      // Like ordinary Send, a local Compact must durably cross the possible-
+      // Enter boundary BEFORE touching the PTY. Timing publication is not this
+      // journal: crash/throw after write must never become "restart before Enter".
+      const { sendOperationKey, sendAttemptId, handoffId } = sendTimingIdentity;
+      compactInputLease ||= { version: 1, tabId, provider: 'codex',
+          lifecycleGeneration: identity.terminalLifecycleGeneration,
+          runSeq: identity.terminalRunSeq, inputRevision: identity.inputRevision,
+          mirrorGeneration: identity.mirrorGeneration, capturedAt: Date.now() };
+      let armed;
+      try {
+        const record = agentSendReceiptStore.get(sendOperationKey);
+        const exact = record?.attemptId === sendAttemptId && record.tabId === tabId
+          && record.handoffId === handoffId && record.provider === 'codex';
+        // The native autocomplete flow can authorize a second Enter on a
+        // NEW owned frame. Reuse this attempt's first frozen lease, while
+        // rechecking current ownership/cancellation for every physical write.
+        armed = exact && agentSendReceiptStore.markAttemptState(sendOperationKey, sendAttemptId,
+          'enter-armed', { inputLease: compactInputLease });
+      } catch (cause) {
+        throw Object.assign(new Error('agent_send_enter_not_durably_armed'), {
+          code: 'agent_send_enter_not_durably_armed', cause,
+        });
+      }
+      if (armed?.ok !== true) throw Object.assign(new Error('agent_send_enter_not_durably_armed'), {
+        code: 'agent_send_enter_not_durably_armed', reason: armed?.reason || 'compact-attempt-identity-changed',
+      });
     }
     if (ordinal === 1) beforeEnter?.();
     recordComposerForensicPtyInput(tabId, '\r', {
@@ -66680,6 +67376,12 @@ async function submitCodexCompactSlashCommandWithProof({
     trigger: () => writeOwnedEnter(1),
   });
   let enterCount = first.enterWritten === true ? 1 : 0;
+  if (!enterCount && first.enterWriteUnknown !== true
+    && first.reason === 'agent_send_enter_not_durably_armed') {
+    return { success: false, submitted: false, enterWritten: false, slashInserted: true,
+      compactStartConfirmed: false, compactEnterCount: 0,
+      error: first.reason, code: first.reason };
+  }
   if (first.kind === 'started') {
     console.log(logPrefix + ' compact start confirmed after first Enter proof=' + first.reason);
     return {
@@ -70215,6 +70917,8 @@ async function readCodexSettingsForSend(tabId, scope) {
 }
 
 const codexSettingsSendRuntime = createCodexSettingsSendRuntime({
+  validateInput: request => agentCodexInputLimitFailure(request.tabId, request.content,
+    { ...request.pasteOptions, source: request.source || request.pasteOptions?.source }),
   readScope: readCodexSettingsSendScope,
   readSettings: readCodexSettingsForSend,
   beginPreparation: request => {
@@ -70272,7 +70976,9 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
   const skipVisibleDraftGuard = !!(options && options.skipVisibleDraftGuard === true);
-  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' queueAction=' + (options?.promptQueueAction || 'automatic-default') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
+  const commandForLog = typeof command === 'string' && command.length > 1048576
+    ? '[large input; UTF-16 units=' + command.length + ']' : command;
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' queueAction=' + (options?.promptQueueAction || 'automatic-default') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + commandForLog + '"');
   const term = terminals.get(tabId);
   if (!term) {
     if (isPromptQueueSend) {
@@ -70290,6 +70996,9 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
         cancelled: true, code: 'agent_send_cancelled', error: 'agent_send_cancelled' } : null);
   const beforeComposerFailure = requestFailure();
   if (beforeComposerFailure) return beforeComposerFailure;
+  const inputLimitFailure = typeof command === 'string' && command.length > 1048576
+    ? agentCodexInputLimitFailure(tabId, command, { ...options, source: codexSource }) : null;
+  if (inputLimitFailure) return inputLimitFailure;
   const composerPrepared = await prepareCodexMainComposerForSend(tabId, options);
   const afterComposerFailure = requestFailure();
   if (afterComposerFailure) return afterComposerFailure;
@@ -71208,6 +71917,7 @@ async function executeCodexLiveSlashCommandRequest({
       let activeWriteOwner = ptyWriteOwner;
       const perform = () => withPtyWriteLock(term, async () => {
         let compactPendingOperation = null;
+        let compactDurableStartRequired = false;
         const expired = preparation?.failure();
         if (expired) return expired;
         if (preparationIntent !== undefined) {
@@ -71399,6 +72109,7 @@ async function executeCodexLiveSlashCommandRequest({
                 error: 'compact_send_receipt_binding_failed', reason: 'compact-operation-owned-by-another-attempt' };
             }
             const bound = agentSendReceiptStore.bindCompactOperation(compactPendingOperation);
+            compactDurableStartRequired = !!bound?.record?.compactOperationBinding;
             if (!bound.ok) {
               cancelCodexManualCompactPending(tabId, 'compact-receipt-binding-failed', compactPendingOperation.operationId);
               return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
@@ -71445,6 +72156,24 @@ async function executeCodexLiveSlashCommandRequest({
           preparation, writeOperation: slashOperation, handoffId, sendAttemptId,
         });
         const finishResult = result => {
+        if (compactDurableStartRequired && result?.compactStartConfirmed === true) {
+          // The original native executor completion is a real persistence wake.
+          // A transient failure in the initial registry publisher must not leave
+          // a generic confirmed receipt with no FIFO proof until compact ends.
+          // This repeats only the SAME observed proof, never paste/Enter.
+          const snapshot = compactOperations.snapshot(tabId, 'codex');
+          const exact = [snapshot.active, ...snapshot.settled].find(value => value
+            && value.operationId === compactPendingOperation?.operationId
+            && value.sendOperationKey === sendOperationKey && value.sendAttemptId === sendAttemptId);
+          const persisted = exact && persistCompactSendReceipt(exact);
+          if (!require(path.join(srcMainDir, '..', 'shared', 'compact-send-delivery.cjs'))
+            .compactSendDeliveryIdentity(persisted?.record)) {
+            result = { ...result, success: false, accepted: true, submitted: true,
+              auditPending: false, deliveryUnknown: true, deliveryUnconfirmed: true, status: 'delivery-unknown',
+              code: 'codex_compact_delivery_persistence_pending',
+              error: 'Compact started; its durable delivery confirmation could not be saved.' };
+          }
+        }
         if (result && typeof result === 'object') {
           result.localSlashCommand = true;
           result.queued = queuedHistoryCommand;

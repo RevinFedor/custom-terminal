@@ -5202,9 +5202,9 @@ function App() {
             if (operation.kind === 'delete') await executeHistoryDeleteIterationScenario(request);
             else await executeHistoryRewriteRewindScenario({
               ...request,
-              // The requesting client owns its composer. Never write a hidden
-              // duplicate to desktop History or paste the removed prompt to CLI.
-              restoreDraft: false,
+              // External clients own their composer. A self Rewind instead
+              // restores our draft only when it has no app-owned new task.
+              restoreDraft: operation.origin?.kind === 'self-rewind' && !operation.request?.selfRewind?.nextPrompt,
             });
             return reply(true, await ipcRenderer.invoke('saved-history:get', { tabId, operationId }));
           } catch (error: any) {

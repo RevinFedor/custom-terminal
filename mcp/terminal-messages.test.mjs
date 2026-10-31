@@ -74,6 +74,58 @@ function assertStructured(result) {
   return result.structuredContent;
 }
 
+test('rewind_self is caller-bound, retains the context cut and delegates its sole followup to the app', async () => {
+  const args = { operationId: 'self-op', expectedSessionId: 'S', targetUuid: 'user-before-deploy',
+    retainedContext: 'Deployment succeeded; files and server changes remain.', expectedContextRevision: 7,
+    coveredContextUpdateIds: ['old-member'], nextPrompt: 'Inspect the result without redeploying.' };
+  const h = harness({ respond: call => ({ status: call.method === 'POST' ? 202 : 200,
+    body: call.endpoint === '/api/me' ? { capabilities: { savedHistory: { version: 1, receipts: true,
+      structuredDraft: true, operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true,
+      selfRewind: { version: 1 } } } } : { ok: true, operation: { operationId: 'self-op', tabId: owner.tabId,
+        expectedSessionId: 'S', targetUuid: args.targetUuid, kind: 'rewind', toolType: 'codex', state: 'running', pending: true } } }) });
+  const schema = (await h.list()).find(tool => tool.name === 'rewind_self').inputSchema;
+  assert.equal(schema.additionalProperties, false); assert.equal(schema.properties.tabId, undefined);
+  const result = assertStructured(await h.call('rewind_self', args));
+  assert.equal(result.operationId, 'self-op'); assert.equal(result.tabId, owner.tabId);
+  assert.match(result.guidance, /Finish this old turn/); assert.match(result.guidance, /Do not send it yourself/);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1].endpoint, '/api/terminal-tabs/' + owner.tabId + '/self-rewind');
+  assert.deepEqual(h.calls[1].body.selfRewind, { retainedContext: args.retainedContext, expectedContextRevision: 7,
+    coveredContextUpdateIds: ['old-member'], nextPrompt: args.nextPrompt });
+  assert.equal(h.calls[1].body.sourceMeta.tabId, owner.tabId);
+  const forged = await h.call('rewind_self', { ...args, tabId: 'another-tab' });
+  assert.equal(forged.isError, true); assert.equal(h.calls.length, 2, 'no mutation to an arbitrary target');
+});
+
+test('rewind_self on an older backend refuses before POST; no use of ordinary Rewind/Send as fallback', async () => {
+  const h = harness({ respond: () => ({ status: 200, body: { capabilities: { savedHistory: {
+    version: 1, receipts: true, structuredDraft: true, operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true,
+  } } } }) });
+  const result = await h.call('rewind_self', { operationId: 'frozen-id', expectedSessionId: 'S', targetUuid: 'u',
+    retainedContext: 'Facts', expectedContextRevision: 0 });
+  assert.equal(result.isError, true); assert.equal(result.structuredContent.code, 'app_update_required');
+  assert.equal(result.structuredContent.mutationAttempted, false); assert.equal(h.calls.length, 1);
+});
+
+test('self Rewind pre-admission rejection and lost ACK remain distinguishable with the original recovery ID', async () => {
+  const args = { operationId: 'fixed-id', expectedSessionId: 'S', targetUuid: 'u', retainedContext: 'Facts', expectedContextRevision: 2 };
+  const capability = { capabilities: { savedHistory: { version: 1, receipts: true, structuredDraft: true,
+    operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true, selfRewind: { version: 1 } } } };
+  for (const lost of [false, true]) {
+    const h = harness({ respond: call => {
+      if (call.endpoint === '/api/me') return { status: 200, body: capability };
+      if (lost) throw Error('controlled transport ACK loss');
+      return { status: 409, body: { ok: false, code: 'self_rewind_context_revision_changed',
+        error: 'self_rewind_context_revision_changed', mutationAttempted: false } };
+    } });
+    const result = await h.call('rewind_self', args);
+    assert.equal(result.isError, true); assert.equal(result.structuredContent.mutationAttempted, lost);
+    assert.equal(result.structuredContent.receiptRead.operationId, 'fixed-id');
+    assert.equal(result.structuredContent.receiptRead.tabId, owner.tabId);
+    assert.equal(h.calls.length, 2, 'no automatic read/retry/followup');
+  }
+});
+
 test('inspect_tabs actual dispatcher is two GETs, strict bounds and update-required without fallback', async () => {
   const h = harness({ respond: call => ({ status: 200, body: call.endpoint === '/api/me'
     ? { capabilities: { tabInspection: { version: 1 } } }

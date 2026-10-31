@@ -765,6 +765,21 @@ Failure-only expiry завершает только доказанно не на
 сохраняет unknown до штатного wake. Прежняя certified automatic no-write A1 —
 другая ветка: разрешённый A2 получает новый HEAD scope, не срок A1; UNKNOWN не кандидат.
 
+Late `continuationInputAdmission` после Web await различает hard и pending:
+временная неготовность/неизвестный кадр возвращает прежний no-attempt HEAD к
+событийному допуску, подтверждённые input/Stop/PTY/owner changes запрещают ввод.
+Нельзя просто заново получить ready и привязать тот же Continue к новому вводу.
+Первый выданный fence переживает SQL_BUSY: до proof-await сохраняется capture
+generation; первый результат удерживается тем же receipt owner до записи.
+Незавершённая capture после restart без сохранённого результата остаётся pending
+в первоначальном сроке, не разрешает повторное связывание. Успешно завершённая
+no-proof подготовка освобождает только собственную generation для обычного retry.
+Отказ цели/отмена и beginAttempt проверяют exact no-attempt/no-write/no-UNKNOWN
+атомарно; поздний mismatch не вправе стирать уже появившийся paste/Enter flag.
+Bounded журнал `AgentSendContinuationInput` сообщает stage/class/reason без текста.
+Исторический false predicate случая367 (23.047s при60s HEAD) не был записан;
+новые fault fixtures доказывают класс ремонта, не задним числом его точную причину.
+
 Pre-beginAttempt проверка адресата не должна смешивать раннюю event projection
 с поздним process proof: нормальная adoption первого cold Send иначе превращала
 следующий item в runtime_snapshot_unstable. Public Codex reader обновляет projection
@@ -879,6 +894,28 @@ Send. Исходный pin сохраняется до прежнего provisio
 Main повторно использует её существующий admission policy и lifecycle wake,
 не превращая делегацию в steering. Raw TUI-ввод не перехватывается/не лимитируется.
 Standalone slash и record-without-reply остаются в своих доказательных flows.
+
+Desktop History Codex `/compact` без аргументов, чипов и вложений с29Oct входит
+в этот же Main FIFO и получает ранний application ACK. Это восстанавливает
+сценарий «Compact запускает остановленный Codex → сразу отправить обычный текст»:
+renderer не держит второй Send до окончания Start/Resume. Одного снятия UI-lock
+недостаточно: иначе follower уже получает HEAD deadline, пока ещё ждёт отдельную
+renderer lane. У очереди теперь один порядок подготовки; native local-command
+executor не заменён. Другие slash-команды, внешний `/send` и record-context не
+получают это исключение только по тексту или сериализованному клиентскому флагу.
+
+Доставка Compact подтверждается отдельным Main-owned causal task-start proof,
+не canonical user_message и не `success` renderer. До первого ввода сохраняется
+точная привязка compact operation к исходным request/H/O/A; native start отдельно
+сохраняется в SQLite. После этого и завершения текущего executor следующий Send
+проходит обычные guards, не ждёт окончания сжатия. Legacy confirmed без этой
+привязки не мигрирует в разрешение FIFO. Enter предварительно armed как у обычного
+Send; штатный второй Enter autocomplete сохраняет первую lease и требует нового
+owned frame. Crash/throw после возможного Enter не становится no-submit.
+Если запись native proof временно отказала, завершение того же executor один раз
+повторяет только сохранение того же registry proof. Повторный отказ оставляет
+UNCONFIRMED/held, не SENT и не replay. Receipt read убирает только свою временную
+compact-карточку; после reload не создаёт вымышленную transcript-строку.
 
 Waiting item можно отменить до начала attempt; race с dispatch не объявляется
 доказательством отсутствия прошлой отправки. Desktop History ↩ имеет более точную
@@ -1004,6 +1041,13 @@ startup и live, а не только этот POST. Claim содержит UUID
 парных response/event carriers; metadata сохраняется и после receipt-prune.
 Ранний адрес может уточниться до canonical, но поздний дубликат не понижает его.
 Исторические competing owners не назначаются произвольно одному отправителю.
+
+SOURCE30Oct: live Codex auditor сначала выбирает в SQLite только
+`audit-pending`/`delivery-unknown` данной вкладки. Если выборка пуста, общее
+чтение audit references не запускается. При наличии хотя бы одной записи
+по-прежнему читаются глобальные boundaries и claims, включая другие вкладки;
+ошибка выборки остаётся ошибкой, а не пустым результатом или разрешением Send.
+Это сокращение работы в source, не доказательство причины каждого старого лага.
 
 Live audit переносит всю canonical identity event carrier, включая его физический
 offset/timestamp, даже при event→response порядке. Causal admission сравнивает
@@ -1436,8 +1480,9 @@ context update и plain text не взаимозаменяемы; metadata-only 
 fact-session-history.md::Фильтрованные пользовательские сообщения.
 Явный saved-history Rewind/Delete — другой контракт: Stop → copy-on-write →
 adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. Terminal MCP
-предоставляет только saved-history `rewind_history`, не native Esc/menu и не
-AI-summary Rewind. Пользовательский native UI и прежний `/rewind` HTTP-вход
+предоставляет saved-history `rewind_history` и SOURCE30Oct собственный
+`rewind_self` с сохранением выводов; не native Esc/menu и не AI-summary Rewind.
+Пользовательский native UI и прежний `/rewind` HTTP-вход
 сохраняются отдельно. MCP не становится универсальным редактором provider-файлов.
 
 #### Saved-history Rewind через MCP
@@ -1450,6 +1495,42 @@ AI-summary Rewind. Пользовательский native UI и прежний 
 стирать единственный ключ восстановления. ID допускает1..160символов
 `[A-Za-z0-9_.:-]`. Same ID+same request идемпотентны на existing app receipt;
 изменённый запрос с этим ID отвергается. Неизвестный исход читается, не replay.
+
+SOURCE30Oct `rewind_self` — отдельный own-tab ingress в тот же executor, не второй
+Stop/rewrite/Resume. Требует explicit user instruction и loaded
+`savedHistory.selfRewind.version:1`; старый main отвергается до POST, обычный
+Rewind/Send не используется как fallback. Calling tab берётся из MCP identity,
+`tabId`/другой получатель не принимаются. Human «четыре итерации» модель сначала
+разрешает в exact public user UUID; wire не угадывает по тексту/индексу.
+
+Вызывающая модель передаёт factual `retainedContext` (до100000символов, как
+обычный context update), expectedContextRevision прочитанного workingContext и
+необязательный `nextPrompt`. Изменения файлов/деплой/внешние UNKNOWN не отменяются.
+Summary и snapshot обновлений durable ДО Stop; по умолчанию покрываются все
+обновления наблюдавшейся revision, optional coveredContextUpdateIds сужает набор.
+После binding commit новая Rewind-context row активируется в той же SQLite
+транзакции с receipt; старые unchanged версии получают rewind-superseded, не
+delivered/deleted. Поздние IDs/изменившиеся версии сохраняются, старые frozen
+handoff/receipts не переписываются.
+
+Без nextPrompt возвращается прежний structured draft, но без старых leading
+context chips. Покрытые точные версии в current input также снимаются без
+пересериализации других bytes/prompts/images. В обоих местах новый context chip
+малиновый с History icon; новая задача остаётся фиолетовым user block с
+малиновой шапкой «После отката», не ссылкой на ту же вкладку как отправителя.
+Новая задача считается итерацией, не automatic service/control-only turn.
+
+С nextPrompt Main резервирует ONE deterministic H/O в прежнем FIFO до снятия
+history-input hold. Native dispatch ждёт completed исходного history receipt,
+input-ready/owner/Stop/draft/Goal/UNKNOWN guards прежние. Это model task, не
+standalone local slash command. App сама продолжает после Stop calling session;
+вызывающая модель заканчивает старый ход сразу после acceptance и не досылает
+nextPrompt руками. Lost ACK/restart не запускают новую мутацию/отправку.
+`get_history_operation` читает SAME operationId; historyMutated/binding/Resume
+и followup receipt — отдельные факты. Completed Rewind не равен inputReady или
+готовому ответу на новую задачу. Request dock хранит active/uncertain операции
+даже за пределами recent History; его чтение metadata-only, не History scan.
+SOURCE/private qualification и remaining loaded acceptance — в рабочем RESULT.
 
 Передавать `targetSourceIdentity`, когда она есть. Composite требует exact
 `targetEntryRef`/`expectedContentRevision` из публичной Timeline, не сырые offsets
@@ -1659,6 +1740,15 @@ History восстанавливает file-chip прямо из `<context_file>
 orchestration identity хранит только path/role/label/hash/bytes, а exact delivery
 proof считается по реально отправленному expanded prompt. Контекст source-agent
 не расходуется, но target-agent закономерно платит токенами за полный файл.
+
+SOURCE30Oct отдельно проверяет Codex submit:1 048 576 Unicode scalar values
+для ВСЕГО expanded input с wrappers/контекстом/файлами, не для каждого файла.
+Разбивка файла на несколько допустимых byte snapshots не обходит этот предел.
+Отказ `codex_message_too_large` сохраняет authoring, даёт actual/max/unit и не
+пишет payload/Enter. Можно уменьшить текст либо явно поручить чтение по путям;
+нельзя молча выбрасывать files, автоматически дробить Sends или повторять UNKNOWN.
+После уже случившегося точного TUI отказа физический submitted=true сохраняется
+в `provider-not-accepted`; это не pre-write отказ. Claude и draft-paste не меняются.
 
 Это не `link_file`: тот создаёт визуальную дочернюю file-вкладку и не передаёт
 содержимое модели. Это также не iOS `attachments`, которые являются upload в

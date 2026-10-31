@@ -650,7 +650,12 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
       ...(kind === 'visible-commit' ? { commitPhase: short(own(extra, 'commitPhase'), 140),
         ...(own(extra,'historyWitness') ? { historyWitness: historyWitnessSnapshot(own(extra,'historyWitness')) } : {}) } : {}) };
     emit('[Perf:UIAction] ' + JSON.stringify(data));
-    if (notifyEligible && durationMs >= 100) notify({ id: action.id, event: action.event, startAbs: action.startAbs, durationMs });
+    if (notifyEligible && durationMs >= 100) notify({ id: action.id, event: action.event,
+      startAbs: action.startAbs, durationMs, kind, inputDelayMs: data.inputDelayMs,
+      ...(action.nativeOriginal ? { documentTimeOriginMs: action.documentTimeOriginMs,
+        nativeOriginal: { type: action.nativeOriginal.type, timeStampMs: action.nativeOriginal.timeStampMs,
+          ...(['mouse','touch','pen'].includes(action.nativeOriginal.pointerType)
+            ? { pointerType: action.nativeOriginal.pointerType } : {}) } } : {}) });
   };
   const drag=createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendPhase});
   return {
@@ -799,6 +804,14 @@ export function captureUIAction(event) {
   const clipboardState=describeDiagnosticClipboard(event);
   const action=diagnostics.capture(event.type, performance.timeOrigin + event.timeStamp,
     describeDiagnosticTarget(event.target), discrete || navigation || wheel || !!clipboardState, keys);
+  // Only scalar original-input identity, never key/code/text or coordinates.
+  // EventTiming-only fallback records cannot acquire a fabricated pointer type.
+  if (event.isTrusted === true && ['click','pointerdown','pointerup','mousedown','mouseup','keydown','keyup','wheel'].includes(event.type)
+    && Number.isFinite(event.timeStamp) && event.timeStamp >= 0 && Number.isFinite(performance.timeOrigin)) {
+    action.documentTimeOriginMs = performance.timeOrigin;
+    action.nativeOriginal = { type: event.type, timeStampMs: event.timeStamp };
+    if (['mouse','touch','pen'].includes(event.pointerType)) action.nativeOriginal.pointerType = event.pointerType;
+  }
   if(clipboardState)action.clipboardState=clipboardState;
   return action;
 }

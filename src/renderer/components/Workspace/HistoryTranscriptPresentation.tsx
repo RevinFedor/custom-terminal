@@ -631,6 +631,10 @@ export interface HistoryTranscriptStep {
   turnId?: string;
   instructionFileName?: string;
   instructionScope?: string;
+  /** Presentation-only provenance of an application-provided review object. */
+  contextLabel?: string;
+  footerText?: string;
+  footerTitle?: string;
   tool?: string;
   args?: Record<string, any>;
   argsRef?: { payloadId: string; totalChars: number };
@@ -771,7 +775,7 @@ const transcriptStepsToEntries = (steps: HistoryTranscriptStep[]) => steps.map((
   };
 });
 
-const renderTranscriptStepEntry = (
+const renderTranscriptStepBody = (
   entry: any,
   onCopy?: (text: string) => void,
   loadPayload?: (ref: { payloadId: string; totalChars: number }) => Promise<string | null>,
@@ -798,7 +802,7 @@ const renderTranscriptStepEntry = (
           id: entry.uuid,
           entryUuid: entry.uuid,
           text: entry.content,
-        }} />
+        }} ctx={onCopy && entry.transcriptStep?.contextLabel ? { actions: { onCopy: (item) => onCopy('text' in item ? item.text || '' : '') } } : undefined} />
       </div>
     );
   }
@@ -830,6 +834,23 @@ const renderTranscriptStepEntry = (
   const raw = entry.actions?.[0]?.rawTool;
   if (!raw) return null;
   return <HistoryTranscriptToolCall raw={raw} onCopy={onCopy} loadPayload={loadPayload} />;
+};
+
+const renderTranscriptStepEntry = (
+  entry: any,
+  onCopy?: (text: string) => void,
+  loadPayload?: (ref: { payloadId: string; totalChars: number }) => Promise<string | null>,
+  onMessageContextMenu?: (event: React.MouseEvent<HTMLDivElement>, step: HistoryTranscriptStep) => void,
+) => {
+  const body = renderTranscriptStepBody(entry, onCopy, loadPayload, onMessageContextMenu);
+  const step = entry.transcriptStep as HistoryTranscriptStep | undefined;
+  if (!step?.contextLabel && !step?.footerText) return body;
+  return <div data-history-transcript-context={step.contextLabel || undefined}>
+    {step.contextLabel && <div style={{ fontSize: '0.78em', color: '#777', padding: '4px 4px 0' }}>{step.contextLabel}</div>}
+    {body}
+    {step.footerText && <div data-history-transcript-footer title={step.footerTitle}
+      style={{ fontSize: '0.82em', color: '#888', padding: '2px 4px 6px', overflowWrap: 'anywhere' }}>{step.footerText}</div>}
+  </div>;
 };
 
 const HistoryTranscriptInstructionChip = memo(({

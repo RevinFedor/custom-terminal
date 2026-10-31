@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
-import { ArrowDownLeft, ArrowUpRight, CircleAlert, Globe, SquareTerminal } from 'lucide-react';
+import { ArrowDownLeft, ArrowUpRight, CircleAlert, Globe, History, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
 import { resolveTabCardBackground } from '../../utils/tabCardVisual.mjs';
@@ -70,12 +70,12 @@ export function ResearchSourceAction({ runId, label, iconOnly = false, researchI
 }
 
 export function HistoryPromptSource({ source, phase, onNavigate, researchIcon = false }: {
-  source: Partial<Source> & { label?: string; description?: string; researchRunId?: string }; phase?: string; onNavigate?: () => void;
+  source: Partial<Source> & { label?: string; description?: string; researchRunId?: string; rewind?: boolean }; phase?: string; onNavigate?: () => void;
   researchIcon?: boolean;
 }) {
   const incoming = phase === 'question' || phase === 'request' || phase === 'prompt';
   const response = phase === 'reply' || phase === 'completion' || phase === 'failure';
-  const Icon = incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
+  const Icon = source.rewind ? null : incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
   const [jumping, setJumping] = useState(false);
   const jump = async () => {
     setJumping(true);
@@ -104,7 +104,12 @@ export function HistoryPromptSource({ source, phase, onNavigate, researchIcon = 
     {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />
       : source.researchRunId ? <ResearchSourceAction runId={source.researchRunId} label={source.label}
         researchIcon={researchIcon} onNavigate={onNavigate} />
-      : <span title={source.description} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
+      : <span title={source.description} data-history-self-rewind={source.rewind || undefined}
+        style={{ minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 5, overflow: 'hidden',
+          textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11,
+          color: source.rewind ? '#e87994' : '#c4b5fd',
+          ...(source.rewind ? { border: '1px solid #9b4764', borderRadius: 4, background: '#482534', padding: '2px 6px' } : {}) }}>
+        {source.rewind && <History size={13} style={{ flexShrink: 0 }} aria-hidden="true" />}{source.label}</span>}
   </div>;
 }
 

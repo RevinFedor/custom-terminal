@@ -115,6 +115,7 @@ async function fixture(t, options = {}) {
     enrichCodexAuditAddress: () => {},
     routeAgentPromptAuditDetail: detail => { publications.push(detail); },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, webSource);
   vm.runInContext('let exactAgentSendReceiptReconciler = null;\n' + mainFunctions + '\n' + webFunctions, context);
   context.reconcileAgentSendReceipt = context.reconcileExactAgentSendReceipt;
   context.readBody = async req => { let body = ''; for await (const chunk of req) body += chunk;
@@ -155,6 +156,59 @@ async function fixture(t, options = {}) {
     },
   };
 }
+
+test('actual live auditor skips global references only when the target has no unresolved Codex audit', async t => {
+  const h = await fixture(t);
+  const actual = h.store.listAuditReferences.bind(h.store);
+  let globalReads = 0;
+  h.store.listAuditReferences = provider => { globalReads++; return actual(provider); };
+  assert.equal(h.context.reconcileDurableCodexPromptAuditsForTab('empty-tab'), false);
+  assert.equal(globalReads, 0);
+  assert.equal(h.context.reconcileDurableCodexPromptAuditsForTab('T'), true);
+  await h.tabFlights.get('T');
+  assert.equal(globalReads, 1, 'a positive target still reads global competing claims');
+});
+
+test('an unreadable target selector is an error, not an empty audit or a queue release', async t => {
+  const h = await fixture(t);
+  const before = h.store.get(h.head.sendOperationKey);
+  h.store.statements.unresolvedCodexAuditsForTab = { all() { throw new Error('fixture_sqlite_unreadable'); } };
+  assert.throws(() => h.context.reconcileDurableCodexPromptAuditsForTab('T'), /fixture_sqlite_unreadable/);
+  assert.equal(h.store.get(h.head.sendOperationKey).state, before.state);
+  assert.equal(h.queue.item(h.follower.sendOperationKey).state, 'waiting');
+  assert.equal(h.publications.length, 0);
+});
+
+test('a global reference read failure after a positive target does not publish or release', async t => {
+  const h = await fixture(t); h.append();
+  const before = h.store.get(h.head.sendOperationKey);
+  h.store.listAuditReferences = () => { throw new Error('fixture_global_reference_unreadable'); };
+  assert.throws(() => h.context.reconcileDurableCodexPromptAuditsForTab('T'), /fixture_global_reference_unreadable/);
+  assert.equal(h.store.get(h.head.sendOperationKey).state, before.state);
+  assert.equal(h.queue.item(h.follower.sendOperationKey).state, 'waiting');
+  assert.equal(h.publications.length, 0);
+  assert.deepEqual(h.sent, ['head-429']);
+});
+
+test('a later boundary from another tab still limits the actual live auditor', async t => {
+  const h = await fixture(t);
+  fs.appendFileSync(h.file, JSON.stringify({ type: 'event_msg', payload: { type: 'turn_aborted' } }) + '\n');
+  const other = { operationKey: 'history:foreign:later', tabId: 'foreign', handoffId: 'later',
+    surface: 'desktop-history', provider: 'codex', sessionId, requestFingerprint: 'foreign-later',
+    promptHash: promptAuditFingerprint(prompt), promptLength: prompt.length };
+  const begun = h.store.beginAttempt(other);
+  h.store.stageAttemptContext(other.operationKey, begun.attemptId, { sessionId,
+    transcriptBoundary: { sessionId, filePath: h.file, fileSize: fs.statSync(h.file).size, capturedAt: Date.now() } });
+  h.store.markAttemptState(other.operationKey, begun.attemptId, 'enter-armed');
+  h.append();
+  assert.equal(h.context.reconcileDurableCodexPromptAuditsForTab('T'), true);
+  await h.tabFlights.get('T');
+  assert.equal(h.store.get(h.head.sendOperationKey).state, 'delivery-unknown');
+  assert.equal(h.store.get(other.operationKey).state, 'enter-armed');
+  assert.equal(h.queue.item(h.follower.sendOperationKey).state, 'waiting');
+  assert.equal(h.publications.length, 0);
+  assert.deepEqual(h.sent, ['head-429']);
+});
 
 test('actual HTTP -> Main publisher -> existing scanner -> SQLite frees ONLY the original follower after late exact proof', async t => {
   const h = await fixture(t);

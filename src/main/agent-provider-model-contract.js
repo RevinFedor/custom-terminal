@@ -1,6 +1,7 @@
 'use strict';
 
 const { mergeCodexModelOptions, projectCodexModelOptions } = require('../shared/codex-model-catalog.cjs');
+const { normalizeAgentDefaultEffort } = require('../shared/agent-default-effort.cjs');
 
 const AGENT_PROVIDERS = new Set(['claude', 'codex']);
 const CLAUDE_MODEL_ALIASES = new Set([
@@ -230,7 +231,7 @@ function resolveConfiguredAgentDefaultPair(defaultModel, defaultEffort, projecte
   const row = (Array.isArray(projectedModels) ? projectedModels : []).find((candidate) => candidate?.id === model);
   if (!row) return null;
   const efforts = uniqueCleanStrings(row.efforts).filter((effort) => effort !== 'ultra');
-  const requestedEffort = clean(defaultEffort);
+  const requestedEffort = normalizeAgentDefaultEffort(defaultEffort, 'codex');
   const effort = requestedEffort !== 'none' && efforts.includes(requestedEffort)
     ? requestedEffort
     : (efforts.includes(clean(row.defaultEffort)) ? clean(row.defaultEffort) : (efforts[0] || ''));

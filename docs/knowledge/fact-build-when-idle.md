@@ -222,6 +222,17 @@ continuation с захваченной задачей; lost ACK/UNKNOWN/restart 
 своего ответа. Ready-return last-await перед синхронным enqueue сохраняет FIFO
 порядок callbacks. Source/private fixtures не являются installed/native приёмкой.
 
+Сохраняющий late-guard repair29Oct не превращает любое `isCurrent=false` в
+failed Continue: временная потеря готовности/reader refinement заново проходит
+весь прежний допуск на том же frozen H/O и исходном HEAD deadline. Настоящая
+смена input/Stop/PTY/owner остаётся отказом; переход source→writer допустим
+только с прежним exact Resume proof. Первый fence сохраняется до следующих
+await и не переопределяется после ошибки SQLite. Потерянная capture после
+restart — pending без нового ввода, не повод перепривязаться или продлить срок.
+Поздний target refusal не стирает UNKNOWN; no-write settlement и начало attempt
+имеют отдельный exact CAS. Старый failed Continue367 не повторяется и не меняется;
+его журнал не позволял доказать конкретный false predicate.
+
 CLI отдельно показывает installed и restoration counts: confirmed native input,
 already-working/result-ready, pending и refused. Registered restore не означает
 «все продолжились»; видимый отказ даёт общий ok=false/exit1 при уже установленной
@@ -599,10 +610,19 @@ revision, mode, phase/stage, callback/error/report. После restart снач�
 честный stale cache, затем состояние живого владельца. Cancel адресует точные
 requestId/jobId/source своему installer API; orchestration detach не вызывается.
 
-Галочка подтверждает установку, а жёлтый цвет оставшегося ожидания относится к
-ответу агента на доставленный callback. Завершение install и доставка уведомления
-ещё не являются естественным концом этого ответа; ручного подтверждения здесь
-нет. Плашка автоматически уходит после exact natural-result proof.
+До подтверждения доставки callback, в том числе после restart, левый status-slot
+показывает синий вращающийся индикатор. Успешная установка с доставленным callback
+зелёная; ожидание natural final не превращает успех в жёлтое предупреждение.
+Подтверждённый отказ установки/доставки красный, stale/неизвестность — отдельный
+жёлтый статус. Завершение install и доставка уведомления ещё не являются концом
+ответа: плашка автоматически уходит после exact natural-result proof.
+
+Клик открывает только выбранный job/request в общей боковой панели Send/Reply /
+Build Continue; hover не раскрывает детали. Старое inline-раскрытие вниз меняло
+высоту dock и вызывало скачок ширины при появлении scrollbar. Теперь строка остаётся
+однострочной, панели и списку зарезервировано место под scrollbar. X панели закрывает
+просмотр; X карточки по-прежнему адресно отменяет запрос. UI не меняет receipt,
+callback/natural-final guards и не выполняет повторную отправку.
 
 Confirmed audit той же доставки может позже получить canonical UUID или alias.
 Build Install сохраняет исходный callback binding, но принимает это обогащение,

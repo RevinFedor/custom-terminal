@@ -1,4 +1,5 @@
 import { uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
+import { runRendererSyncWork } from './perfSyncWork.mjs';
 
 const PANE_BOUNDARY_SELECTOR = [
   '[data-terminal-pane-wrapper][data-pane-focus-isolated]',
@@ -134,7 +135,9 @@ export function createPaneFocusIsolationManager(
     state.isolated = false;
   };
 
-  const observerFor = (boundary: HTMLElement, state: BoundaryState) => new MutationObserver((records) => {
+  const observerFor = (boundary: HTMLElement, state: BoundaryState) => new MutationObserver((records) =>
+    runRendererSyncWork('pane.focusMutationObserver', { owner: tabIdOfBoundary(boundary),
+      presented: !state.isolated }, () => {
     if (disposed || !state.isolated || !boundary.isConnected) return;
     for (const record of records) {
       if (record.type === 'childList') {
@@ -150,7 +153,7 @@ export function createPaneFocusIsolationManager(
         quarantineElement(boundary, state, record.target);
       }
     }
-  });
+  }));
 
   const isolateBoundary = (boundary: HTMLElement, state: BoundaryState) => {
     if (state.isolated) return;
@@ -215,7 +218,7 @@ export function createPaneFocusIsolationManager(
       if (moved) orderDirty = true;
     } else if (inventory.delete(boundary)) orderDirty = true;
   };
-  const updateInventory = (records: MutationRecord[]) => {
+  const updateInventory = (records: MutationRecord[]) => runRendererSyncWork('pane.focusInventory', {}, () => {
     inventoryRecords += records.length;
     const added = new Set<Element>();
     let structureChanged = false;
@@ -237,7 +240,7 @@ export function createPaneFocusIsolationManager(
     if (structureChanged) for (const boundary of inventory) {
       if (boundary !== root && !root.contains(boundary)) { inventory.delete(boundary); orderDirty = true; }
     }
-  };
+  });
   const inventoryObserver = inventoryAttributes ? new MutationObserver(updateInventory) : null;
   if (inventoryObserver) {
     inventoryObserver.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: inventoryAttributes! });
@@ -312,6 +315,7 @@ export function createPaneFocusIsolationManager(
   }
 
   function flushOneBoundary(version: number) {
+    return runRendererSyncWork('pane.focusDeferred', { generation: version }, () => {
     if (disposed || version !== presentationVersion) return;
     const callbackStartedAt = performance.now();
     const liveList = liveBoundaries();
@@ -353,6 +357,7 @@ export function createPaneFocusIsolationManager(
       + ' totalMs=' + (performance.now() - callbackStartedAt).toFixed(1));
 
     scheduleDeferredBoundary(version);
+    });
   }
 
   const sync = () => {

@@ -153,3 +153,15 @@ test('late cancellation readback cannot regress a newer epoch or an unmounted vi
   const late = h.h.cancel(target), before = h.state(); h.cleanup(); release({ ok: true, snapshot: snap(200, { state: 'confirmed' }) }); await late;
   assert.equal(h.state(), before);
 });
+
+test('continuation indicators distinguish pending delivery, proven failure, unknown and confirmed', async () => {
+  const { BuildContinueTracker } = await trackerModule();
+  const render = patch => renderToStaticMarkup(React.createElement(BuildContinueTracker, { target: { ...target, ...patch }, onOpen() {}, onCancel() {} }));
+  const waiting = render({ state: 'pending', active: true });
+  assert.match(waiting, /color:#60a5fa/); assert.match(waiting, /animate-spin/);
+  const failed = render({ state: 'unresolved', active: false, reason: 'continue-not-delivered' });
+  assert.match(failed, /color:#f87171/); assert.doesNotMatch(failed, /animate-spin/);
+  assert.match(render({ state: 'unknown', active: true }), /color:#fbbf24/);
+  assert.match(render({ state: 'confirmed', active: false }), /color:#4ade80/);
+  assert.doesNotMatch(render({ state: 'confirmed', active: false }), /animate-spin/);
+});

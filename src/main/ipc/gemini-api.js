@@ -18,12 +18,10 @@ const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models
  * @param {string} model    Идентификатор модели Gemini.
  * @param {string} thinking Уровень размышления: NONE | LOW | MEDIUM | HIGH.
  */
-async function callGeminiApi(system, prompt, model = 'gemini-3.8-flash', thinking = 'HIGH') {
+async function callGeminiApi(system, prompt, model = 'gemini-3.8-flash', thinking = 'HIGH', options = {}) {
   try {
-    console.log('[gemini-api] Sending ' + Math.round(prompt.length / 1024) + 'KB, model=' + model + ' thinking=' + thinking);
-
     const requestBody = {
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      contents: options.contents || [{ role: 'user', parts: [{ text: prompt }] }],
       systemInstruction: { parts: [{ text: system }] },
     };
 
@@ -32,14 +30,23 @@ async function callGeminiApi(system, prompt, model = 'gemini-3.8-flash', thinkin
         thinkingConfig: { thinkingLevel: thinking }
       };
     }
+    if (options.tools) requestBody.tools = options.tools;
+    if (options.toolConfig) requestBody.toolConfig = options.toolConfig;
+    if (options.maxOutputTokens) requestBody.generationConfig = {
+      ...requestBody.generationConfig, maxOutputTokens: options.maxOutputTokens,
+    };
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) return { success: false, error: 'GEMINI_API_KEY is not configured' };
+    const encoded = JSON.stringify(requestBody);
+    console.log('[gemini-api] Sending ' + Math.round(Buffer.byteLength(encoded) / 1024) + 'KB, model=' + model + ' thinking=' + thinking);
     const response = await fetch(
-      GEMINI_ENDPOINT + model + ':generateContent?key=' + apiKey,
+      GEMINI_ENDPOINT + model + ':generateContent',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: encoded,
+        ...(options.signal ? { signal: options.signal } : {}),
       }
     );
 
@@ -61,6 +68,8 @@ async function callGeminiApi(system, prompt, model = 'gemini-3.8-flash', thinkin
     return {
       success: true,
       text: responseText,
+      ...(options.tools ? { parts: textParts, content: data.candidates[0].content,
+        ...(typeof data.modelVersion === 'string' ? { modelVersion: data.modelVersion.slice(0, 160) } : {}) } : {}),
       usage: { input_tokens: usage.promptTokenCount, output_tokens: usage.candidatesTokenCount }
     };
   } catch (error) {

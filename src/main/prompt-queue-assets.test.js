@@ -137,6 +137,33 @@ test('garbage collection keeps referenced assets and removes only old unreferenc
   assert.equal(fs.existsSync(removed.path), false);
 });
 
+test('GC preserves an old asset when its sole reference uses uppercase or a legacy path', async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const store = new PromptQueueAssetStore({ rootDir: f.rootDir, now: () => 1_900_000_000_000 });
+  const kept = await store.materializeRef({ path: f.sourcePath, mediaType: 'image/png' });
+  const old = new Date(1_900_000_000_000 - 40 * 24 * 60 * 60 * 1000);
+  await fs.promises.utimes(kept.path, old, old);
+  const result = await store.garbageCollect(new Set(['/legacy/' + kept.assetId.toUpperCase()]));
+  assert.deepEqual(result.removed, []);
+  assert.equal(fs.existsSync(kept.path), true);
+});
+
+test('an unrecognizable inventory entry cannot authorize deletion of old bytes', async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const store = new PromptQueueAssetStore({ rootDir: f.rootDir, now: () => 1_900_000_000_000 });
+  const kept = await store.materializeRef({ path: f.sourcePath, mediaType: 'image/png' });
+  const old = new Date(1_900_000_000_000 - 40 * 24 * 60 * 60 * 1000);
+  await fs.promises.utimes(kept.path, old, old);
+  await assert.rejects(store.garbageCollect(new Set(['corrupt-owner-reference'])), /asset_inventory_unreadable/);
+  await assert.rejects(store.garbageCollect(undefined), /asset_inventory_unreadable/);
+  assert.equal(fs.existsSync(kept.path), true);
+});
+
+test('unreadable queue and draft snapshots are unknown, not empty inventories', () => {
+  assert.throws(() => collectReferencedAssetIds('{invalid'), /asset_inventory_unreadable/);
+  assert.throws(() => collectComposerDraftAssetIds('{invalid'), /asset_inventory_unreadable/);
+});
+
 test('queue snapshot reference collector reads nested item assets', () => {
   const ids = collectReferencedAssetIds({
     tab: {

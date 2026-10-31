@@ -162,11 +162,15 @@ test('actual restored FIFO admission parks transient continuation owner unknown,
   await h.service.continueRequest('R'); const intent = (await h.store.getInternal('R')).continuationIntent;
   const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
   const tree = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
-  const declaration = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'admitQueuedAgentSend');
-  assert.ok(declaration);
+  const declarations = ['readQueuedContinuationHardFence', 'admitQueuedAgentSend'].map(name => {
+    const declaration = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    assert.ok(declaration, name);
+    return declaration.getText(tree);
+  });
   const env = vm.createContext({ require, getBuildContinueOperations: () => ({ capturing: () => false }),
+    agentSendReceiptStore: h.receipts,
     getOrchestrationRunStore: () => h.store, getOrchestrationContinuationService: () => h.service });
-  vm.runInContext(declaration.getText(tree) + '\nglobalThis.admit = admitQueuedAgentSend;', env);
+  vm.runInContext(declarations.join('\n') + '\nglobalThis.admit = admitQueuedAgentSend;', env);
   const request = { tabId: 'B', source: 'orchestration-continue:R', sendOperationKey: intent.operationKey, handoffId: intent.handoffId };
   const ready = { ...h.states.get('B') }; h.states.set('B', { ...ready, known: false, sessionId: null });
   assert.equal(await env.admit(request), false); assert.equal(h.receipts.list().length, 0);
@@ -548,6 +552,7 @@ test('actual action -> common FIFO -> actual Main canonical publisher -> exact c
   vm.runInContext(web.statements.filter(node => ts.isVariableStatement(node)
     && node.declarationList.declarations.some(d => ['COMPLETION_ADMISSION', 'OPERATIONAL_ADMISSION'].includes(d.name.getText(web))))
     .map(node => node.getText(web)).join('\n'), env);
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(env, web);
   vm.runInContext(['durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay', 'publicAgentSendReceipt',
     'durableAgentSendFailure', 'runPreparedAgentSendScenario', 'runAgentSendScenario', 'readScenarioDestination',
     'notifyAgentPromptAuditResult', 'performOrchestrationAction'].map(name => extract(web, name)).join('\n'), env);

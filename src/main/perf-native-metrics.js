@@ -1,8 +1,9 @@
 'use strict';
 
 // Cheap Chromium counters bridge the gap left by JS LongTask attribution.
-// No DOM traversal, geometry reads, Runtime.evaluate, profiler or trace here.
-// Samples describe an interval containing an action, never exclusive CPU cost.
+// No DOM traversal, geometry reads or Runtime.evaluate. Optional input-only
+// pre-roll shares the owned attachment; it never starts a CPU profiler.
+// Counter samples contain an action, never exclusive CPU cost.
 const { performance } = require('node:perf_hooks');
 const { randomBytes } = require('node:crypto');
 const COUNTERS = ['ThreadTime', 'TaskDuration', 'ScriptDuration', 'RecalcStyleDuration', 'LayoutDuration',
@@ -29,7 +30,8 @@ function metricsDelta(before, after) {
 }
 
 function createNativePerfMonitor({ webContents, log = console.warn, now = absoluteNow, intervalMs = 1000,
-  timeoutMs = 1500, schedule = setTimeout, cancel = clearTimeout, autoStart = true }) {
+  timeoutMs = 1500, schedule = setTimeout, cancel = clearTimeout, autoStart = true,
+  inputPreroll = null }) {
   const dbg = webContents.debugger;
   let disposed = false, owned = false, enabled = false, suspended = 0, generation = 0, rendererGone = false;
   let deferredOwnDetach = false;
@@ -40,6 +42,10 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
   let health = '', samples = 0, coalesced = 0;
   const recent = [], reportedActions = new Set(), methods = [];
   let methodSequence = 0, generationMethods = 0;
+  let attachmentId = null, inputRecorder = null, inputExclusive = 0, inputRetirement = null;
+  let inputTail = Promise.resolve();
+  const inputListeners = new Set(), inputRaw = new Set();
+  const inputClockReads = new Map();
   const identity = () => {
     let rendererPid = null;
     try { if (!webContents.isDestroyed()) rendererPid = webContents.getOSProcessId(); } catch {}
@@ -65,6 +71,103 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     && currentDocument() && document.bootNonce !== null && document.rendererPid === pid;
   const currentOwner = (version, pid) => owned && currentRenderer(version, pid)
     && dbg.isAttached() && !webContents.isDevToolsOpened();
+  const inputScope = () => document && attachmentId ? {
+    mainPid: process.pid, rendererPid: document.rendererPid, window: webContents.id,
+    documentGeneration: document.documentGeneration, frameProcessId: document.frameProcessId,
+    frameRoutingId: document.frameRoutingId, attachmentId,
+  } : null;
+  const inputAuthority = scope => !!scope && scope.attachmentId === attachmentId
+    && scope.mainPid === process.pid && scope.window === webContents.id
+    && owned && !webContents.isDestroyed() && dbg.isAttached();
+  const inputCurrent = scope => inputAuthority(scope) && currentDocument()
+    && document.bootNonce !== null && document.rendererPid === scope.rendererPid
+    && document.documentGeneration === scope.documentGeneration
+    && document.frameProcessId === scope.frameProcessId && document.frameRoutingId === scope.frameRoutingId
+    && !webContents.isDevToolsOpened();
+  const rejectInputClocks = reason => {
+    for (const item of inputClockReads.values()) { cancel(item.timer); item.reject(new Error(reason)); }
+    inputClockReads.clear();
+  };
+  const readInputClock = scope => {
+    if (!inputCurrent(scope) || inputClockReads.size >= 2) return Promise.reject(new Error('input-clock-unavailable'));
+    const clockId = randomBytes(16).toString('hex');
+    return new Promise((resolve, reject) => {
+      const item = { scope, resolve, reject, parentBeforeAbs: now(), timer: null };
+      inputClockReads.set(clockId, item);
+      item.timer = schedule(() => {
+        if (inputClockReads.get(clockId) !== item) return;
+        inputClockReads.delete(clockId); reject(new Error('input-clock-deadline'));
+      }, timeoutMs);
+      item.timer?.unref?.();
+      try {
+        webContents.mainFrame.send('perf:input-clock-challenge', { wcId: scope.window,
+          rendererPid: scope.rendererPid, frameProcessId: scope.frameProcessId,
+          frameRoutingId: scope.frameRoutingId, documentGeneration: scope.documentGeneration,
+          bootNonce: document.bootNonce, clockId });
+      } catch {
+        cancel(item.timer); inputClockReads.delete(clockId); reject(new Error('input-clock-send-failed'));
+      }
+    });
+  };
+  const inputTransport = {
+    scope: () => !disposed && !suspended && !inputRetirement && enabled && inputCurrent(inputScope()) ? inputScope() : null,
+    isCurrent: inputCurrent,
+    canCleanup: inputAuthority,
+    sendRaw(method, params, scope, { cleanup = false } = {}) {
+      const allowed = cleanup ? ['Tracing.end', 'IO.close', 'IO.read'].includes(method) && inputAuthority(scope)
+        : ['Tracing.start', 'Tracing.recordClockSyncMarker', 'IO.read'].includes(method) && inputCurrent(scope);
+      if (!allowed) return Promise.reject(Object.assign(new Error('input-native-command-not-admitted'), { notSent: true }));
+      const operation = { method, attachmentId: scope.attachmentId, issuedAtAbs: now() };
+      inputRaw.add(operation);
+      let native;
+      try { native = dbg.sendCommand(method, params); }
+      catch (error) { inputRaw.delete(operation); return Promise.reject(error); }
+      return Promise.resolve(native).finally(() => { inputRaw.delete(operation); });
+    },
+    subscribe(listener) {
+      const scope = inputScope();
+      const callback = (_event, method, params, sessionId) => {
+        if (sessionId || !inputAuthority(scope)) return;
+        listener(method, params, scope);
+      };
+      inputListeners.add(callback); dbg.on('message', callback);
+      return () => { inputListeners.delete(callback); dbg.removeListener('message', callback); };
+    },
+    runExclusive(fn) {
+      const run = inputTail.catch(() => {}).then(async () => {
+        inputExclusive++;
+        try {
+          if (pending) await pending;
+          if (rawOperation) throw Object.assign(new Error('counter-native-command-unsettled'), { notSent: true });
+          return await fn();
+        } finally { inputExclusive--; }
+      });
+      inputTail = run.then(() => undefined, () => undefined);
+      return run;
+    },
+    readRendererClock: readInputClock,
+  };
+  const ensureInput = () => {
+    if (!inputPreroll || disposed || suspended || inputRetirement || rawOperation || pending || inputRaw.size) return;
+    if (!inputTransport.scope()) return;
+    try {
+      if (!inputRecorder) {
+        const factory = inputPreroll.factory || require('./perf-input-preroll').createInputPreroll;
+        let recorder;
+        recorder = factory({ transport: inputTransport,
+          createCollector: inputPreroll.createCollector || require('./perf-input-latency').createInputLatencyCollector,
+          publish: inputPreroll.publish, log, now, schedule, cancel,
+          onRetired: scope => {
+            const retirement = inputRetirement;
+            if (retirement?.recorder === recorder && scope?.attachmentId === retirement.attachmentId) {
+              finishInputRetirement(retirement);
+            }
+          } });
+        inputRecorder = recorder;
+      }
+      void Promise.resolve(inputRecorder.start()).catch(() => reportHealth('unavailable', 'input-recorder-start-failed'));
+    } catch { reportHealth('unavailable', 'input-recorder-init-failed'); }
+  };
   const methodEvent = (context, phase, extra = {}) => {
     const record = { ...context, phase, atAbs: round(now()), ...extra };
     methods.push(record); if (methods.length > 48) methods.shift();
@@ -94,18 +197,55 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     reportHealth('paused', 'external-debugger');
     return true;
   };
-  const detachOwn = () => {
+  const detachOwnNow = () => {
     enabled = false;
     if (owned && !webContents.isDestroyed() && dbg.isAttached() && webContents.isDevToolsOpened()) {
       deferredOwnDetach = true;
       return;
     }
-    const detach = owned; owned = false; deferredOwnDetach = false;
+    const detach = owned; owned = false; attachmentId = null; deferredOwnDetach = false;
     if (detach && !webContents.isDestroyed() && dbg.isAttached()) { try { dbg.detach(); } catch {} }
     finishDisposedAttachment();
   };
+  const detachOwn = (reason = 'native-monitor-retire', options = {}) => {
+    enabled = false;
+    if (inputRetirement) return inputRetirement.flight;
+    if (!inputRecorder) { detachOwnNow(); return Promise.resolve(!owned); }
+    const recorder = inputRecorder;
+    const retirement = { recorder, attachmentId, done: false, detached: false, flight: null };
+    inputRetirement = retirement;
+    retirement.flight = Promise.resolve().then(() => recorder.pause(reason, options))
+      .catch(() => false).then(clean => {
+        if (clean === true) finishInputRetirement(retirement);
+        // UNKNOWN retains its exact cleanup channel. A later core retirement
+        // event may release it; it does not retry the failed capture request.
+        if (!clean) reportHealth('unavailable', 'input-recorder-retirement-unconfirmed');
+        return clean === true && retirement.detached;
+      });
+    return retirement.flight;
+  };
+  function finishInputRetirement(retirement) {
+    if (retirement.done) return;
+    retirement.done = true;
+    if (inputRecorder === retirement.recorder) inputRecorder = null;
+    if (inputRetirement === retirement) inputRetirement = null;
+    void Promise.resolve(retirement.recorder.dispose()).catch(() => {});
+    // A late A result never detaches whatever B/DevTools may own now.
+    if (attachmentId === retirement.attachmentId) {
+      detachOwnNow(); retirement.detached = !owned;
+    } else retirement.detached = false;
+    finishDisposedAttachment();
+  }
   const onDetach = (_event, reason) => {
-    owned = false; enabled = false; deferredOwnDetach = false; generation++; baseline = null; baselineAt = null;
+    const lostAttachmentId = attachmentId;
+    owned = false; attachmentId = null; enabled = false; deferredOwnDetach = false; generation++; baseline = null; baselineAt = null;
+    if (inputRetirement?.attachmentId === lostAttachmentId) {
+      inputRetirement.done = true; inputRetirement.detached = false; inputRetirement = null;
+    }
+    rejectInputClocks('input-clock-attachment-lost');
+    for (const listener of inputListeners) dbg.removeListener('message', listener);
+    inputListeners.clear();
+    if (inputRecorder) { const recorder = inputRecorder; inputRecorder = null; void Promise.resolve(recorder.dispose()).catch(() => {}); }
     recent.length = 0;
     if (!disposed && !suspended && !rendererGone) reportHealth('paused', String(reason || 'debugger-detached').slice(0, 80));
     finishDisposedAttachment();
@@ -114,18 +254,24 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     // Also revoke an in-flight successful result if DevTools opens and closes
     // before that result settles. Visibility sampling alone can miss it.
     generation++; enabled = false; baseline = null; baselineAt = null; recent.length = 0;
+    rejectInputClocks('input-clock-external-debugger');
+    if (inputRecorder) void Promise.resolve(inputRecorder.pause('external-debugger')).catch(() => {});
     if (!disposed) reportHealth('paused', 'external-debugger');
   };
   const onDevToolsClosed = () => {
     if (deferredOwnDetach) detachOwn();
+    else if (inputRecorder) void Promise.resolve(inputRecorder.resume()).catch(() => {});
     finishDisposedAttachment();
   };
   const onDestroyed = () => {
-    owned = false; deferredOwnDetach = false;
+    owned = false; attachmentId = null; deferredOwnDetach = false;
+    rejectInputClocks('input-clock-window-destroyed');
+    for (const listener of inputListeners) dbg.removeListener('message', listener);
+    inputListeners.clear();
     dispose(); finishDisposedAttachment();
   };
   function finishDisposedAttachment() {
-    if (!disposed || deferredOwnDetach) return;
+    if (!disposed || deferredOwnDetach || inputRetirement) return;
     dbg.removeListener('detach', onDetach);
     webContents.removeListener('devtools-closed', onDevToolsClosed);
     webContents.removeListener('destroyed', onDestroyed);
@@ -144,6 +290,7 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
       state, reason, atAbs: round(now()) }));
   };
   const revokeDocument = reason => {
+    rejectInputClocks('input-clock-document-revoked');
     document = null; documentGeneration++;
     // Detach only our attachment. Neither detachment nor navigation cancels an
     // outstanding sendCommand; rawOperation is deliberately left intact.
@@ -216,6 +363,27 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     document.bootNonce = payload.bootNonce;
     bootstrapEvent('accepted', 'process-loaded');
     if (autoStart) void sample('bootstrap-loaded');
+    return true;
+  };
+  const inputClockAck = (event, payload) => {
+    const item = payload && inputClockReads.get(payload.clockId);
+    if (!item || !senderIsMain(event) || !inputCurrent(item.scope)
+      || payload.wcId !== webContents.id || payload.rendererPid !== document.rendererPid
+      || payload.frameProcessId !== document.frameProcessId || payload.frameRoutingId !== document.frameRoutingId
+      || payload.documentGeneration !== document.documentGeneration
+      || payload.challenge !== document.challenge || payload.bootNonce !== document.bootNonce) return false;
+    const parentAfterAbs = now();
+    cancel(item.timer); inputClockReads.delete(payload.clockId);
+    if (![payload.rendererEpochMs, payload.rendererTimeOriginMs, payload.rendererNowMs]
+      .every(value => Number.isFinite(value) && value >= 0)
+      || Math.abs(payload.rendererEpochMs - payload.rendererTimeOriginMs - payload.rendererNowMs) > 0.001
+      || (document.documentTimeOriginMs !== undefined && document.documentTimeOriginMs !== payload.rendererTimeOriginMs)) {
+      item.reject(new Error('input-clock-renderer-unavailable'));
+    } else {
+      document.documentTimeOriginMs = payload.rendererTimeOriginMs;
+      item.resolve({ rendererEpochMs: payload.rendererEpochMs, rendererTimeOriginMs: payload.rendererTimeOriginMs,
+        rendererNowMs: payload.rendererNowMs, parentBeforeAbs: item.parentBeforeAbs, parentAfterAbs });
+    }
     return true;
   };
   const onRendererGone = () => {
@@ -294,6 +462,10 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     const correlateCurrentAction = () => {
       if (action && currentDocument(actionDocument)) correlate(action);
     };
+    if (inputExclusive || inputRetirement || inputRaw.size) {
+      coalesced++; reportHealth('unavailable', 'input-recorder-native-lane');
+      correlateCurrentAction(); return Promise.resolve(null);
+    }
     if (rawOperation) {
       coalesced++; reportHealth('unavailable', rawOperation.expired ? 'native-command-unsettled-after-deadline' : 'native-command-unsettled');
       if (action && pending && !rawOperation.expired) return pending.then(record => { correlateCurrentAction(); return record; });
@@ -319,7 +491,7 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
           if (dbg.isAttached() || webContents.isDevToolsOpened()) { reportHealth('paused', 'external-debugger'); return null; }
           if (rawOperation || !currentRenderer(version, pid)) return null;
           const attach = methodContext('Debugger.attach', version, pid); methodEvent(attach, 'issue');
-          try { dbg.attach('1.3'); owned = true; enabled = false; methodEvent(attach, 'settled', { durationMs: round(now() - attach.issuedAtAbs), ownerCurrent: currentRenderer(version, pid) }); }
+          try { dbg.attach('1.3'); owned = true; attachmentId = randomBytes(12).toString('hex'); enabled = false; methodEvent(attach, 'settled', { durationMs: round(now() - attach.issuedAtAbs), ownerCurrent: currentRenderer(version, pid) }); }
           catch (error) { methodEvent(attach, 'rejected', { reason: 'native-attach-rejected' }); throw error; }
           lastRendererPid = pid;
         }
@@ -359,7 +531,7 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
         }
         return null;
       }
-    })().finally(() => { pending = null; });
+    })().finally(() => { pending = null; ensureInput(); });
     return pending;
   };
   const tick = async () => {
@@ -367,17 +539,23 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
     await sample();
     if (!disposed && !rendererGone && !timer) { timer = schedule(tick, intervalMs); timer?.unref?.(); }
   };
-  const suspend = (reason = 'incident-profile') => {
+  const suspend = (reason = 'incident-profile', options = { preserve: true }) => {
     suspended++; generation++; baseline = null; baselineAt = null; recent.length = 0;
-    detachOwn(); reportHealth('suspended', reason);
+    const retired = detachOwn(reason, options); reportHealth('suspended', reason);
     let released = false;
-    return () => {
+    const resume = () => {
       if (released) return; released = true; suspended = Math.max(0, suspended - 1);
       if (!disposed && !suspended) void sample('resume');
     };
+    resume.ready = retired.then(clean => { if (!clean) throw new Error('native-observer-retirement-unconfirmed'); });
+    // Legacy callers may ignore the readiness extension; do not create an
+    // unhandled rejection. Callers starting a profiler must await this promise.
+    resume.ready.catch(() => {});
+    return resume;
   };
   const dispose = () => {
     if (disposed) return; disposed = true; generation++; document = null; documentGeneration++;
+    rejectInputClocks('input-clock-disposed');
     if (timer) cancel(timer);
     detachOwn(); finishDisposedAttachment();
     webContents.removeListener('did-start-navigation', onNavigation);
@@ -391,7 +569,13 @@ function createNativePerfMonitor({ webContents, log = console.warn, now = absolu
   webContents.on('devtools-closed', onDevToolsClosed);
   webContents.once('destroyed', onDestroyed);
   if (autoStart) { timer = schedule(tick, 0); timer?.unref?.(); }
-  return { sample, suspend, dispose, bootstrapAvailable, bootstrapAck };
+  return { sample, suspend, dispose, bootstrapAvailable, bootstrapAck, inputClockAck,
+    observeInput: (action, event) => {
+      if (!senderIsMain(event) || !currentDocument()) return false;
+      if (Number.isFinite(document.documentTimeOriginMs) && action?.documentTimeOriginMs !== document.documentTimeOriginMs) return false;
+      try { return inputRecorder?.observe({ ...action, rendererPid: document.rendererPid }) || false; } catch { return false; }
+    },
+    inputState: () => inputRecorder?.state() || { phase: 'unavailable' } };
 }
 
 module.exports = { createNativePerfMonitor, metricsDelta };

@@ -23,6 +23,9 @@ const historySource = fs.readFileSync(path.join(
   'Workspace',
   'HistoryPanel.tsx',
 ), 'utf8');
+const historyRootSurfaceSource = fs.readFileSync(path.join(
+  __dirname, '..', 'renderer', 'components', 'Workspace', 'HistoryPrimaryRootSurface.tsx',
+), 'utf8');
 const composerSource = fs.readFileSync(path.join(
   __dirname,
   '..',
@@ -98,7 +101,8 @@ test('History renders terminal preview as an O(1) footer, outside durable rows',
   assert.match(historySource, /context=\{historyVirtuosoContext\}/);
   // The list renders display UNITS (series collapsing) built from
   // transcriptEntries — the projection stays presentation-only.
-  assert.match(historySource, /data=\{displayUnits\}/);
+  assert.match(historySource, /legacyData=\{displayUnits\}/);
+  assert.match(historyRootSurfaceSource, /<Virtuoso[^>]*data=\{legacyData\}/);
   assert.doesNotMatch(
     historySource,
     /buildHistoryLivePresentation\([^)]*terminalPreview/,

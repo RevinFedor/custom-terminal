@@ -751,6 +751,7 @@ function createProviderSemanticShadow({
           : identity.turnId
             ? 'exact-turn-id'
             : 'turn-identity-missing';
+      let causalTurnReason = null;
       if (classification === 'main' && typeof authorizeCodexMainRequest === 'function') {
         let admission = null;
         try {
@@ -773,6 +774,7 @@ function createProviderSemanticShadow({
         } else if (admission.reason) {
           classificationReason = String(admission.reason);
         }
+        if (admission?.allowed === true) causalTurnReason = admission.causalTurnReason || null;
       }
       classifyCount(providerState, classification);
       if (current && !current.finished) {
@@ -824,6 +826,7 @@ function createProviderSemanticShadow({
             type: 'turn_started',
             requestId,
             requestKind: current.requestKind,
+            causalTurnReason,
             sessionId: current.sessionId,
             observedAt: now(),
             threadId: current.threadId,

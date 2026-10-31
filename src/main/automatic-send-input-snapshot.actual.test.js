@@ -54,7 +54,8 @@ function actualSendHandler(t,{stop=false}={}) {
   bridgeRequest:async()=>({ready:true}),
   readAgentInputRuntimeSnapshot:()=>h.input(),coherentPublicRuntimeSnapshot:()=>c.getCodexRuntimeSessionSnapshot('T'),
   readAutomaticSendFrame:()=>({ready:true})});
- vm.runInContext(webAst.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text==='admitQueuedAgentSend').getText(webAst),web);
+ vm.runInContext(['readQueuedContinuationHardFence','admitQueuedAgentSend']
+  .map(name=>webAst.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text===name).getText(webAst)).join('\n'),web);
  const api={buildInstallAutomationBlocked:()=>false,readAutomaticSendAdmission:()=>web.admitQueuedAgentSend(request),
   certifyAutomaticReadinessWait:(_id,value)=>value};
  const mirror={generation:'mirror-G'};

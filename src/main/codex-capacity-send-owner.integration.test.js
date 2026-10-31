@@ -131,6 +131,7 @@ function sendFixture(t, options = {}) {
       return { success: null, accepted: true, submitted: true, auditPending: true, status: 'audit-pending' };
     },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, webAst);
   vm.runInContext(['readScenarioDestination', 'durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay',
     'durableAgentSendFailure', 'runPreparedAgentSendScenario', 'runAgentSendScenario', 'sendCodexCapacityContinuation']
     .map(name => declaration(webAst, name)).join('\n'), context);

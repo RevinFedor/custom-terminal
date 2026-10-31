@@ -241,6 +241,7 @@ test('SOURCE Main listener and SOURCE watchdog message handler route manual once
   child.send = (message, cb) => { watchdogProcess.emit('message', message); cb?.(null); };
   watchdogProcess.send = message => child.emit('message', message);
   const scope = vm.createContext({ process, path, srcMainDir: __dirname, mainLogPath: path.join(path.dirname(f.dir), 'production.log'),
+    ipcMain: {}, app: {}, isolatedPerfDiagnostics: false, perfCausal: {},
     perfWatchdog: child, BrowserWindow: { fromId: id => id === 7 ? win : undefined,
       getAllWindows: () => { throw Error('manual must not use fallback window inventory'); } },
     Menu, require: file => file === 'electron' ? { MenuItem } : file.endsWith('perf-incident-profile.js') ? { captureIncidentProfile: args => {
@@ -262,6 +263,8 @@ test('SOURCE Main listener and SOURCE watchdog message handler route manual once
   assert.equal(menu.items.length, 1); assert.equal(menu.items[0].submenu.items.length, 1);
   const click = menu.items[0].submenu.items[0].click;
   assert.equal(click(null, win), true);
+  await flush(); // The global native-observer retirement is now awaited before capture.
+  assert.ok(completion, 'capture starts after all native observers release their owned channels');
   assert.equal((await completion).outcome, 'completed');
   await flush();
   assert.equal(f.requests.length, 1); assert.equal(captures.length, 1);

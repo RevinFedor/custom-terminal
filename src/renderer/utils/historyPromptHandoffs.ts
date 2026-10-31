@@ -9,6 +9,7 @@ import {
 import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
 import { readHistorySendRecovery, removeHistorySendRecovery, hideHistorySendRecoveryPresentation } from './historySendRecovery.mjs';
 import { normalizeHistorySendInputTiming } from './historySendTiming.mjs';
+import { compactSendDeliveryIdentity } from '../../shared/compact-send-delivery.cjs';
 import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent, isTabMessageNoInputReceipt } from '../../shared/agent-send-receipt-control.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
@@ -252,6 +253,8 @@ export interface DurableHistorySendReceiptRecord {
     waitingBeforeInput?: boolean; lastNoWriteAttemptId?: string; mergePrevious?: QueuedMessageMergeGuard | null;
     position?: number; merge?: { version: number; sourceOperationKeys: string[]; presentationHandoffId?: string } | null } | null;
   promptHash?: string | null;
+  promptLength?: number | null;
+  compactStartIdentity?: Record<string, unknown> | null;
   imagePresentation?: { version: number; operationKey: string; attemptId: string; requestHash: string;
     imagePaths: HistoryPromptHandoffImageRef[] } | null;
   operationKey?: string | null;
@@ -2486,6 +2489,7 @@ export const recordHistorySendPresentationDismissal = (record: DurableHistorySen
   historyPromptHandoffStore.recordPresentationDismissal(record);
 
 export function historyReceiptNeedsCanonicalProjection(record: DurableHistorySendReceiptRecord) {
+  if (compactSendDeliveryIdentity(record)) return false;
   return (record.state === 'confirmed' || record.state === 'not-submitted'
     && !(record.surface === 'desktop-history' && record.applicationQueue?.version === 1
       && Number(record.applicationQueue.id) > 0)) && !record.presentation;
@@ -2788,6 +2792,14 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   }) || existing.toolType !== toolType
     || (existing.sessionIdHint && record.sessionId && existing.sessionIdHint !== record.sessionId))) {
     return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
+  }
+
+  if (compactSendDeliveryIdentity(record)) {
+    // A local command has its own Main operational phase, not a user_message.
+    // Remove only this exact optimistic owner; reload must not fabricate a
+    // canonical/SENT bubble or wait for unrelated History/compact completion.
+    if (existing) consumeHistoryPromptHandoffIfCurrent(tabId, handoffId, existing);
+    return { hydrated: false, reason: 'durable-history-local-command-confirmed' };
   }
 
   const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'

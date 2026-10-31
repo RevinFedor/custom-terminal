@@ -19,7 +19,7 @@ test('observed terminal-installer case remains visible with an honest static pro
   assert.equal(activity.pending(result.continuations[0]), true);
   const ui = await import('../renderer/utils/buildInstallPresentation.mjs');
   assert.equal(ui.buildInstallVisibleInDock(result.jobs[0]), true);
-  assert.equal(ui.buildInstallPresentation(result.jobs[0]).label, 'Ждём завершения ответа на уведомление');
+  assert.equal(ui.buildInstallPresentation(result.jobs[0]).label, 'Уведомление доставлено');
   assert.equal(ui.buildInstallPresentation(result.jobs[0]).spinning, false);
 });
 test('real running installer stays inherited; stale, foreign and absent owners are not fabricated activity', () => {

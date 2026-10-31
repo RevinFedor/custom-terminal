@@ -5,9 +5,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
-const { captureIncidentProfile, deadline } = require('./perf-incident-profile');
+const { deadline } = require('./perf-incident-profile');
+const captureIncidentProfile = f => f.capture(f);
 
 function fixture(t, options = {}) {
+  // A quarantined UNKNOWN is intentionally process-lifetime. Each fake process
+  // gets an independent module; tests must not "reset" a real held lane.
+  delete require.cache[require.resolve('./perf-incident-profile')];
+  const { captureIncidentProfile: capture } = require('./perf-incident-profile');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-profile-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const calls = [], commands = [], dbg = new EventEmitter();
@@ -53,7 +58,7 @@ function fixture(t, options = {}) {
     } } };
     return {};
   };
-  return { directory, calls, commands, webContents: { debugger: dbg, isDestroyed: () => false,
+  return { capture, resolveCpuStart: () => resolveCpuStart?.(), directory, calls, commands, webContents: { debugger: dbg, isDestroyed: () => false,
     isDevToolsOpened: () => false, getOSProcessId: () => 12, getZoomFactor: () => 2 },
     request: { id: 'incident-123-1', pid: 12, requestedWallMs: Date.now() },
     durationMs: 0, log() {}, inspector: { url: () => 'external-inspector' } };
@@ -121,7 +126,7 @@ test('unconfirmed CPU stop records an explicit UI skip', async t => {
   await captureIncidentProfile(f);
   const ui = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.ui.json')));
   assert.equal(ui.status, 'skipped'); assert.equal(ui.reason, 'capture-stop-unconfirmed');
-  assert.ok(!f.calls.includes('Runtime.evaluate')); assert.equal(f.calls.filter(x => x === 'detach').length, 1);
+  assert.ok(!f.calls.includes('Runtime.evaluate')); assert.equal(f.calls.filter(x => x === 'detach').length, 0);
 });
 
 test('failed CPU start is stopped once before independent native trace collection', async t => {
@@ -157,7 +162,7 @@ test('failed cleanup after a CPU start error forbids trace and UI metadata witho
   assert.equal(status.traceSkipped, 'renderer-cpu-stop-unconfirmed');
 });
 
-test('late original CPU start settles through one stop before native trace; no start replay or deadline renewal', async t => {
+test('pending CPU start holds lane until late START then one STOP; no independent trace or deadline renewal', async t => {
   const f = fixture(t, { cpuStartPending: true });
   let startSettled = false, timedOut = 0;
   f.commandDeadline = (promise, label, ms) => {
@@ -168,14 +173,19 @@ test('late original CPU start settles through one stop before native trace; no s
     }
     return deadline(promise, label, ms);
   };
-  await captureIncidentProfile(f);
-  assert.equal(timedOut, 1); assert.equal(startSettled, true);
+  const result = await captureIncidentProfile(f);
+  assert.equal(timedOut, 1); assert.equal(startSettled, false);
   assert.equal(f.calls.filter(x => x === 'Profiler.start').length, 1);
+  assert.equal(f.calls.filter(x => x === 'Profiler.stop').length, 0);
+  assert.equal((await result.retirement).state, 'unknown');
+  assert.ok(!f.calls.includes('Tracing.start')); assert.ok(!f.calls.includes('detach'));
+  f.resolveCpuStart();
+  assert.equal((await result.whenRetired).confirmed, true);
   assert.equal(f.calls.filter(x => x === 'Profiler.stop').length, 1);
-  assert.ok(f.calls.indexOf('Profiler.stop') < f.calls.indexOf('Tracing.start'));
+  assert.equal(f.calls.filter(x => x === 'detach').length, 1);
   const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
-  assert.equal(status.traceComplete, true); assert.equal(status.intendedDurationMs, 0);
-  assert.ok(status.rendererStoppedWallMs <= status.traceStartedWallMs);
+  assert.equal(status.traceComplete, undefined); assert.equal(status.intendedDurationMs, 0);
+  assert.equal(status.retirementState.state, 'unknown', 'late cleanup does not rewrite the report');
   assert.equal(status.rendererStartedWallMs, undefined);
 });
 test('DevTools replacement during metadata forbids group release and detach through the new owner', async t => {

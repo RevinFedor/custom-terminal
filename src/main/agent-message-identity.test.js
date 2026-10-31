@@ -35,6 +35,7 @@ const live = (overrides = {}) => ({ coherent: true, status: 'busy', toolType: 'c
 function wrapperContext(overrides = {}) {
   const context = vm.createContext({ messageRuntimeIdentity, scenarioDestination, identityUnavailable,
     require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     findOrchestrationTabDescriptor: () => descriptor,
     readAgentRuntimeSnapshot: async () => live(), tabMessageSdkSessions: new Map(), ...overrides });
   vm.runInContext(['resolveTabMessageIdentity', 'readScenarioDestination', 'captureOrchestrationSourceTarget']
@@ -176,6 +177,7 @@ for (const toolType of ['codex', 'claude']) {
       },
       console: { log() {}, warn() {} },
     });
+    require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, ast);
     vm.runInContext(declaration('runAgentSendScenario') + '\n' + declaration('runPreparedAgentSendScenario'), context);
     const result = await context.runAgentSendScenario({
       tabId: 'source', prompt: 'Synthetic completion', workContextPrepared: true,

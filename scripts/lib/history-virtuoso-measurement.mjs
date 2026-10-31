@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { mappedReplacements } from './perf-build-provenance.mjs';
 
 export const HISTORY_VIRTUOSO_VERSION = '4.18.7';
 export const HISTORY_VIRTUOSO_UPSTREAM_SHA256 = '6c6d738438d62d4346df8b0c301f6447abbc2cae507e6d40524837e44577393a';
@@ -144,7 +145,10 @@ export function historyVirtuosoMeasurementVitePlugin() {
     },
     transform(source, id) {
       if (id.startsWith('\0') || !modulePath.test(id.split('?', 1)[0])) return null;
-      return { code: patchHistoryVirtuoso(source), map: null };
+      const code = patchHistoryVirtuoso(source); // retains all existing guards
+      const mapped = mappedReplacements(source, replacements.map(([, before, after]) => [before, after]), id.split('?', 1)[0]);
+      if (mapped.code !== code) throw patchError('mapped patch differs from guarded patch');
+      return mapped;
     },
   };
 }

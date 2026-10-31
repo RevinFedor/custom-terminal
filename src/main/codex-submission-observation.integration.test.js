@@ -288,6 +288,7 @@ function projectLocalHarness(t, { beforeBridge, currentTarget } = {}) {
   let bridgeCalls = 0;
   const webContext = vm.createContext({
     require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
@@ -314,6 +315,7 @@ function projectLocalHarness(t, { beforeBridge, currentTarget } = {}) {
   });
   const web = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
   const tree = ts.createSourceFile('web-server.js', web, ts.ScriptTarget.Latest, true);
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(webContext, tree);
   for (const name of ['readScenarioDestination', 'durableRecordHasProviderQueueAcceptance',
     'durableAgentSendReplay', 'durableAgentSendFailure', 'runPreparedAgentSendScenario']) {
     const node = tree.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);

@@ -1,8 +1,9 @@
 'use strict';
 const { sanitizeSqlEnvelope } = require('../shared/perf-causal-schema.cjs');
 
-// Existing child-process channel, bounded in one place. Node send(false) has
-// enqueued the packet; only the callback is completion of that channel write.
+// Existing child-process channel, bounded in one place. Node send(false) may
+// mean backpressure or a closed channel; the callback reports the write outcome.
+// Neither the boolean nor that callback is a journal-persistence receipt.
 function createCausalTransport({target, onFailure=()=>{}}) {
   let pending=0,ordinary=0;
   const counts={accepted:0,rejected:0,backpressure:0,callbackErrors:0,throws:0,targetErrors:0,disconnected:0,pendingLimit:0,ordinaryLimitDrops:0,malformedWitness:0};

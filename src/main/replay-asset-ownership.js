@@ -5,7 +5,16 @@ const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry')
 const { normalizeStoredAssetId } = require('./prompt-queue-assets');
 const { validOperationId, runAfterError: error } = require('../shared/run-after-api.cjs');
 const { isAutomaticPromptQueueRequest } = require('../shared/prompt-queue-send-intent.cjs');
+const { causal } = require('./perf-causal-context');
+const { prepareQueueInventory, readQueueInventoryPinned, inventoryDiagnostic } = require('./gc-asset-inventory-cache');
 const json = (value, fallback = null) => { try { return JSON.parse(value); } catch { return fallback; } };
+function ownedIds(value) {
+  const ids = json(value);
+  if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())) {
+    throw error('run_after_asset_inventory_unreadable', 503);
+  }
+  return ids;
+}
 const text = value => typeof value === 'string' && value.length > 0 && value.length <= 8192;
 const keys = (value, allowed) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).every(key => allowed.includes(key));
@@ -52,9 +61,10 @@ function validateAssetDisposition(sourceOperationId, input) {
 function assetLease(row, saved = json(row.request_json, {})) {
   const owned = json(row.asset_owner_json);
   if (saved.request?.op !== 'replay' && !owned) return null;
+  const assetIds = ownedIds(row.assets_json);
   return { version: 1, sourceOperationId: row.operation_id, tabId: row.target,
     mainEpoch: row.main_epoch, mainScopeKey: saved.scope?.scopeKey || null,
-    assetIds: json(row.assets_json, []), released: row.released_at != null,
+    assetIds, released: row.released_at != null,
     ...(owned ? { owner: owned } : {}) };
 }
 
@@ -110,7 +120,7 @@ function historyAssetOwner(db, record) {
 function protectQueueAssets(db, operationKey, assetIds) {
   if (!assetIds.length) return;
   const item = db.prepare('SELECT * FROM agent_send_queue WHERE operation_key=?').get(operationKey);
-  const held = [...new Set([...json(item.asset_transfer_ids_json, []), ...assetIds])];
+  const held = [...new Set([...ownedIds(item.asset_transfer_ids_json), ...assetIds])];
   db.prepare('UPDATE agent_send_queue SET asset_transfer_ids_json=? WHERE operation_key=?').run(JSON.stringify(held), operationKey);
   db.prepare('INSERT OR IGNORE INTO agent_send_receipt_pins(operation_key,owner) VALUES(?,?)')
     .run(operationKey, 'replay-asset-transfer');
@@ -128,18 +138,34 @@ function releaseQueueTransferPin(db, operationKey) {
 function adoptCompletedQueueTransfers(db, operationKey = null) {
   if (!table(db, 'agent_send_queue') || !db.prepare('PRAGMA table_info(agent_send_queue)').all()
     .some(column => column.name === 'asset_transfer_ids_json')) return;
-  db.transaction(() => {
-    const rows = db.prepare("SELECT operation_key,asset_transfer_ids_json FROM agent_send_queue WHERE state='completed'"
-      + " AND asset_transfer_ids_json!='[]'" + (operationKey ? ' AND operation_key=?' : '')).all(...(operationKey ? [operationKey] : []));
+  const tracker = operationKey ? null : prepareQueueInventory(db);
+  return inventoryDiagnostic('completed-transfers', metadata => causal.syncWork('gc.queue-transfer', {}, () => db.transaction(() => {
+    const scan = () => causal.sql('gc.queue-transfer', 'all', () => db.prepare(
+      "SELECT operation_key,asset_transfer_ids_json FROM agent_send_queue WHERE state='completed'"
+      + " AND asset_transfer_ids_json!='[]'" + (operationKey ? ' AND operation_key=?' : ''))
+      .all(...(operationKey ? [operationKey] : [])));
+    const result = tracker ? readQueueInventoryPinned(db, tracker, scan)
+      : { value: scan(), reason: operationKey ? 'single' : 'transaction' };
+    causal.count(result.reason === 'hit' ? 'queueCacheHit' : 'queueCacheMiss');
+    const rows = result.value;
+    metadata.rows = result.reason === 'hit' ? 0 : rows.length;
+    metadata.candidates = rows.length;
+    metadata.reason = result.reason;
     for (const row of rows) {
       const owner = historyAssetOwner(db, queueRecord(db, row.operation_key));
       if (!owner) continue;
-      const remaining = json(row.asset_transfer_ids_json, []).filter(id => !owner.assetIds.includes(id));
+      // Corrupt or non-array transfer metadata is unknown, not an empty pin.
+      // Leave it untouched; the GC inventory reader will reject an unreadable
+      // inventory rather than deciding which files can be removed.
+      let transferred;
+      try { transferred = ownedIds(row.asset_transfer_ids_json); }
+      catch { continue; }
+      const remaining = transferred.filter(id => !owner.assetIds.includes(id));
       if (!remaining.length) releaseQueueTransferPin(db, row.operation_key);
       else db.prepare('UPDATE agent_send_queue SET asset_transfer_ids_json=? WHERE operation_key=?')
         .run(JSON.stringify(remaining), row.operation_key);
     }
-  })();
+  })()));
 }
 
 function replacementOwner(journal, manager, input) {
@@ -152,9 +178,10 @@ function replacementOwner(journal, manager, input) {
       || row.handoff_id !== replacement.handoffId || row.provider !== replacement.provider
       || (row.attempt_id || null) !== replacement.attemptId) throw error('run_after_asset_replacement_identity_changed');
     if (!wanted.every(id => inventoryIds(record.request).includes(id))) throw error('run_after_asset_replacement_coverage');
-    const held = new Set([...json(item.asset_ids_json, []), ...json(item.asset_transfer_ids_json, [])]);
+    const transferred = ownedIds(item.asset_transfer_ids_json);
+    const held = new Set([...ownedIds(item.asset_ids_json), ...transferred]);
     const current = !['completed', 'merged'].includes(item.state) && wanted.every(id => held.has(id))
-      || wanted.every(id => json(item.asset_transfer_ids_json, []).includes(id));
+      || wanted.every(id => transferred.includes(id));
     if (current) {
       protectQueueAssets(db, replacement.operationKey, wanted);
       return { ...replacement, owner: 'application-send-queue', state: item.state, assetIds: wanted };
@@ -173,7 +200,13 @@ function replacementOwner(journal, manager, input) {
   const queues = typeof savedQueues === 'string' ? json(savedQueues, {}) : savedQueues || {};
   const item = queues[replacement.tabId]?.items?.find(item => item.id === replacement.itemId);
   if (!item || item.metaAction || !wanted.every(id => explicitIds(item.imagePaths).includes(id))) throw error('run_after_asset_replacement_coverage');
-  const held = [...new Set([...json(row.assets_json, []), ...wanted])];
+  if (row.asset_owner_json != null) {
+    const previousOwner = json(row.asset_owner_json);
+    if (previousOwner?.kind !== 'run-after-item' || previousOwner.itemId !== item.id) {
+      throw error('run_after_asset_owner_unreadable', 503);
+    }
+  }
+  const held = [...new Set([...ownedIds(row.assets_json), ...wanted])];
   db.prepare('UPDATE run_after_operations SET assets_json=?,asset_owner_json=?,updated_at=? WHERE operation_id=?')
     .run(JSON.stringify(held), JSON.stringify({ kind: 'run-after-item', itemId: item.id }), journal.now(), row.operation_id);
   return { ...replacement, owner: 'run-after-item-journal', assetIds: wanted };
@@ -191,7 +224,7 @@ function adoptRunAfterItemAssets(db, identity, request) {
     + " AND asset_owner_json IS NOT NULL AND assets_json!='[]'").all(identity.tabId)) {
     const owner = json(row.asset_owner_json);
     if (owner?.kind !== 'run-after-item' || owner.itemId !== itemId) continue;
-    const held = json(row.assets_json, []), moved = held.filter(id => covered.includes(id));
+    const held = ownedIds(row.assets_json), moved = held.filter(id => covered.includes(id));
     if (!moved.length) continue;
     protectQueueAssets(db, identity.operationKey, moved);
     const remaining = held.filter(id => !moved.includes(id));
@@ -214,8 +247,9 @@ function settleRunAfterItemAssetMutation(db, row, writes, now) {
     + " AND released_at IS NULL AND asset_owner_json IS NOT NULL AND assets_json!='[]'").all(row.target, row.operation_id)) {
     const owner = json(lease.asset_owner_json);
     if (owner?.kind !== 'run-after-item' || op !== 'clear' && owner.itemId !== selected) continue;
-    const held = json(lease.assets_json, []), current = queues[row.target]?.items?.find(item => item.id === owner.itemId);
-    const keep = op === 'replay' ? held.filter(id => !json(row.assets_json, []).includes(id))
+    const held = ownedIds(lease.assets_json), current = queues[row.target]?.items?.find(item => item.id === owner.itemId);
+    const replayIds = op === 'replay' ? ownedIds(row.assets_json) : null;
+    const keep = op === 'replay' ? held.filter(id => !replayIds.includes(id))
       : current ? held.filter(id => explicitIds(current.imagePaths).includes(id)) : [];
     db.prepare('UPDATE run_after_operations SET assets_json=?,released_at=?,updated_at=? WHERE operation_id=?')
       .run(JSON.stringify(keep), keep.length ? null : now, now, lease.operation_id);
@@ -266,7 +300,10 @@ async function disposeReplayAssets(journal, manager, assetStore, sourceOperation
       // Validate every member before touching any replacement inventory. A
       // refusal is itself an immutable journal receipt, not a retry directive.
       if (!refusal && input.transferAssetIds.length) {
-        try { owner = replacementOwner(journal, manager, input); }
+        // A rejected replacement must not commit an earlier partial owner
+        // write. The nested transaction is a savepoint inside this same
+        // immediate transaction; rejection is recorded only after rollback.
+        try { owner = journal.db.transaction(() => replacementOwner(journal, manager, input))(); }
         catch (failure) { refusal = failure.code || 'run_after_asset_proof_unavailable'; }
       }
       const at = journal.now(), remaining = refusal ? lease?.assetIds || []

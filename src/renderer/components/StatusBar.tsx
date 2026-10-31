@@ -599,9 +599,11 @@ function withNoneOption<T extends { id: string; label?: string }>(
   return result;
 }
 
-function withNoneLevel(value: string, options: string[]): string[] {
-  const levels = ['none', ...options.filter(Boolean)];
-  return levels.includes(value) ? levels : [...levels, value];
+function defaultEffortLevels(value: string, options: string[]): string[] {
+  const valid = (level: string) => Boolean(level) && !/^(?:none|default|auto)$/i.test(level);
+  const levels = [...new Set(options.filter(valid))];
+  if (valid(value) && !levels.includes(value)) levels.push(value);
+  return levels.length ? levels : ['low'];
 }
 
 function EngineDefaultsSelector({
@@ -772,7 +774,7 @@ function EngineDefaultsPopup({
   onPopupLeave?: () => void;
 }) {
   const models = useMemo(() => withNoneOption(modelValue, modelOptions), [modelValue, modelOptions]);
-  const levels = useMemo(() => withNoneLevel(effortValue, effortOptions), [effortValue, effortOptions]);
+  const levels = useMemo(() => defaultEffortLevels(effortValue, effortOptions), [effortValue, effortOptions]);
   const maxWidth = Math.max(300, Math.min(560, window.innerWidth - 16));
 
   return (
@@ -821,7 +823,7 @@ function EngineDefaultsPopup({
           options={levels}
           getLabel={effortLabel}
           getKey={(level) => level}
-          onSelect={(level) => onEffortSelect(level === effortValue ? 'none' : level)}
+          onSelect={(level) => onEffortSelect(level)}
         />
       </div>
     </CenteredUpwardPopover>

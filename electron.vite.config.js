@@ -9,10 +9,13 @@ import { buildWorkflowNativeDrag } from './scripts/build-workflow-native-drag.mj
 import { historyVirtuosoMeasurementVitePlugin } from './scripts/lib/history-virtuoso-measurement.mjs';
 import { styleModSameRulesVitePlugin } from './scripts/lib/style-mod-same-rules.mjs';
 import { rendererSharedCjsDevPlugin, rendererSharedCjsIds } from './scripts/lib/renderer-shared-cjs.mjs';
+import { perfBuildProvenancePlugin } from './scripts/lib/perf-build-provenance.mjs';
 
 // Load .env so renderer can access env vars at build time
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
 const SHARED_ROOT = resolve(__dirname, 'vendor/noted-shared');
+// Explicit opt-in for an isolated private diagnostic build only.
+const privateMaps = process.env.NOTED_PRIVATE_SOURCEMAPS === '1';
 // Browser-reachable shared contracts may use CJS for the main process too.
 // Renderer bundles these files; packaged main loads them through its existing
 // `srcSharedDir` runtime path because static local require paths are preserved
@@ -33,11 +36,13 @@ export default defineConfig({
   main: {
     build: {
       outDir: 'dist/main',
+      ...(privateMaps ? { sourcemap: 'hidden' } : {}),
       lib: {
         entry: resolve(__dirname, 'src/main/main.js'),
         formats: ['cjs']
       },
       rollupOptions: {
+        ...(privateMaps ? { output: { sourcemapExcludeSources: true } } : {}),
         external: [
           'electron',
           'node-pty',
@@ -45,6 +50,7 @@ export default defineConfig({
         ]
       }
     },
+    plugins: privateMaps ? [perfBuildProvenancePlugin('main')] : [],
     resolve: {
       alias: {
         './project-manager': resolve(__dirname, 'src/main/project-manager.js'),
@@ -68,7 +74,9 @@ renderer: {
     },
     build: {
       outDir: 'dist/renderer',
+      ...(privateMaps ? { sourcemap: 'hidden' } : {}),
       rollupOptions: {
+        ...(privateMaps ? { output: { sourcemapExcludeSources: true } } : {}),
         input: {
           // Main app — keep `main` key so output stays `index.html`.
           main: resolve(__dirname, 'index.html'),
@@ -81,6 +89,7 @@ renderer: {
       }
     },
     plugins: [
+      ...(privateMaps ? [perfBuildProvenancePlugin('renderer')] : []),
       rendererSharedCjsDevPlugin(__dirname),
       historyVirtuosoMeasurementVitePlugin(),
       styleModSameRulesVitePlugin(),

@@ -16,3 +16,12 @@ test('packaged main resolves working-directory through the packed srcSharedDir',
   assert.ok(packageJson.build.files.includes('src/shared/**/*'));
   assert.equal(fs.existsSync(path.join(root, 'src/shared/working-directory.cjs')), true);
 });
+
+test('Codex input-limit and exact rejection helpers are packed beside their Main owners', () => {
+  assert.ok(packageJson.build.files.includes('src/main/**/*'));
+  for (const name of ['agent-provider-input-limit', 'codex-input-rejection']) {
+    assert.ok(fs.existsSync(path.join(root, 'src/main', name + '.js')));
+    assert.ok(main.includes("require(path.join(srcMainDir, '" + name + "'))"));
+    assert.doesNotMatch(main, new RegExp("require\\(['\"]\\./" + name + "['\"]\\)"));
+  }
+});

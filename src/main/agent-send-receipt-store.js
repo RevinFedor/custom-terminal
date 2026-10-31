@@ -4,11 +4,14 @@ const { readOwnedAttachmentProjection } = require('./owned-mobile-attachments');
 const crypto = require('node:crypto');
 const { compactSendOwner, compactSendOwnerMatches, compactSendStartProven,
   compactSendTerminalSettlement } = require('./compact-send-settlement');
+const { normalizeAgentLocalCommand } = require('../shared/agent-local-command.cjs');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 const {
   RECEIPT_STATES,
   classifyAgentSendRegistryReceipt,
   isExactProviderNotAcceptedReceipt,
+  fingerprintAgentSendRequest,
 } = require('./agent-send-receipt-registry');
 const {
   classifyAgentPromptAuditIdentity,
@@ -104,6 +107,20 @@ function requiredString(value, label) {
 function optionalString(value) {
   const normalized = typeof value === 'string' ? value.trim() : '';
   return normalized || null;
+}
+
+function exactCompactOriginalPrompt(record) {
+  const prompt = record?.receipt?.promptText;
+  return typeof prompt === 'string' && normalizeAgentLocalCommand(prompt) === '/compact'
+    && record.promptLength === prompt.length && record.promptHash === promptAuditFingerprint(prompt);
+}
+
+function exactPrivateCompactBinding(record, operation) {
+  const binding = record?.compactOperationBinding;
+  return binding?.version === 1 && binding.kind === 'compact-send-binding'
+    && binding.requestFingerprint === record.requestFingerprint
+    && binding.promptHash === record.promptHash && binding.promptLength === record.promptLength
+    && compactSendOwnerMatches(binding.owner, operation);
 }
 
 function optionalAuditTimestamp(value) {
@@ -238,6 +255,12 @@ function rowToRecord(row) {
     receipt,
     inboxSetup: decodeJson(row.inbox_setup_json),
     transcriptBoundary: decodeJson(row.transcript_boundary_json),
+    // Never read this authority from receipt_json: generic transport/context
+    // fields are allowed to describe delivery, not confirm native acceptance.
+    compactStartIdentity: decodeJson(row.compact_start_identity_json),
+    // Pre-write binding is NOT native acceptance. It lets the same observer
+    // recover a failed proof publication without upgrading legacy display rows.
+    compactOperationBinding: decodeJson(row.compact_operation_binding_json),
     auditIdentity: row.audit_attempt_id ? {
       attemptId: row.audit_attempt_id,
       provider: row.audit_provider,
@@ -325,6 +348,10 @@ class AgentSendReceiptStore {
     this.db = db;
     this.onChanged = typeof options.onChanged === 'function' ? options.onChanged : null;
     this.listeners = new Set();
+    // The first returned continuation fence is only a constraint on this
+    // existing operation, never input authority. Its durable capture marker
+    // precedes the await; this owner retains a result only until SQLite holds it.
+    this.continuationCaptures = new Map();
     this.onDeliveryUnknown = typeof options.onDeliveryUnknown === 'function' ? options.onDeliveryUnknown : null;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.randomUUID = typeof options.randomUUID === 'function'
@@ -412,6 +439,8 @@ class AgentSendReceiptStore {
     const additiveColumns = [
       ['delivery_control_json', 'TEXT'],
       ['input_lease_json', 'TEXT'],
+      ['compact_start_identity_json', 'TEXT'],
+      ['compact_operation_binding_json', 'TEXT'],
       ['inbox_setup_json', 'TEXT'],
       ['audit_source_identity', 'TEXT'],
       ['audit_timestamp', 'TEXT'],
@@ -432,6 +461,12 @@ class AgentSendReceiptStore {
   _prepareStatements() {
     this.statements = {
       get: this.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE operation_key = ?`),
+      unresolvedCodexAuditsForTab: this.db.prepare(`
+        SELECT * FROM ${TABLE_NAME}
+        WHERE tab_id = ? AND provider = 'codex'
+          AND state IN ('audit-pending', 'delivery-unknown')
+        ORDER BY created_at ASC, operation_key ASC
+      `),
       getSurfaceRun: this.db.prepare(`
         SELECT * FROM ${TABLE_NAME}
         WHERE surface = ? AND run_id = ?
@@ -464,6 +499,8 @@ class AgentSendReceiptStore {
             attempt_id = @attemptId,
             receipt_json = NULL,
             input_lease_json = NULL,
+            compact_start_identity_json = NULL,
+            compact_operation_binding_json = NULL,
             transcript_boundary_json = NULL,
             audit_attempt_id = NULL,
             audit_provider = NULL,
@@ -549,6 +586,19 @@ class AgentSendReceiptStore {
             updated_at = @updatedAt, settled_at = @settledAt
         WHERE operation_key = @operationKey AND attempt_id = @attemptId
           AND state IN ('in-flight', 'enter-armed', 'audit-pending', 'delivery-unknown', 'confirmed')
+      `),
+      observeCompactReceipt: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET receipt_json = @receiptJson, state = @state,
+            compact_start_identity_json = COALESCE(compact_start_identity_json, @compactStartIdentityJson),
+            updated_at = @updatedAt, settled_at = @settledAt
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId
+          AND state IN ('in-flight', 'enter-armed', 'audit-pending', 'delivery-unknown', 'confirmed')
+      `),
+      bindCompactReceipt: this.db.prepare(`
+        UPDATE ${TABLE_NAME} SET compact_operation_binding_json = @bindingJson
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId
+          AND state = 'in-flight' AND compact_operation_binding_json IS NULL
       `),
       settleAuditPendingFinal: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -703,6 +753,9 @@ class AgentSendReceiptStore {
   _pruneAt(timestamp) {
     const cutoff = timestamp - this.settledRetentionMs;
     const info = this.statements.pruneSettled.run(cutoff);
+    if (info.changes) for (const key of this.continuationCaptures.keys()) {
+      if (!this._record(key)) this.continuationCaptures.delete(key);
+    }
     return Number(info.changes || 0);
   }
 
@@ -792,11 +845,16 @@ class AgentSendReceiptStore {
 
   // Admission is durable before a physical attempt exists. This is the same
   // receipt, not an invented provider ACK; beginAttempt still owns its UUID.
-  stageQueuedRequest(operationKey, context) {
+  stageQueuedRequest(operationKey, context, continuationGuard = null) {
     return this._observeChange(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(record.state)) {
         return { ok: false, reason: 'not-waiting', record };
+      }
+      if (continuationGuard && (!this._continuationDispatchMatches(record, continuationGuard.scope)
+        || JSON.stringify(record.receipt?.continuationInputCapture || null) !== JSON.stringify(continuationGuard.capture || null)
+        || JSON.stringify(record.receipt?.continuationInputHold || null) !== JSON.stringify(continuationGuard.hold || null))) {
+        return { ok: false, reason: 'continuation-owner-changed', record };
       }
       this.db.prepare(`UPDATE ${TABLE_NAME} SET receipt_json = ?, updated_at = ?
         WHERE operation_key = ? AND attempt_id IS NULL`).run(
@@ -805,11 +863,181 @@ class AgentSendReceiptStore {
     })());
   }
 
+  _continuationDispatchMatches(record, scope) {
+    if (!record || !scope || record.operationKey !== scope.operationKey || record.tabId !== scope.tabId
+      || record.handoffId !== scope.handoffId || record.requestFingerprint !== scope.requestFingerprint
+      || record.attemptId || Number(record.attempt || 0) !== 0
+      || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(record.state)
+      || (scope.allowCancelled === true ? !record.deliveryControl?.cancelledAt : !!record.deliveryControl?.cancelledAt)
+      || record.receipt?.submitted === true
+      || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true
+      || record.receipt?.deliveryUnknown === true) return false;
+    const head = require('./agent-send-preparation').activeHeadPreparation(record);
+    if (!head || head.startedAt !== scope.startedAt || head.deadlineAt !== scope.deadlineAt) return false;
+    const item = this.db.prepare('SELECT * FROM agent_send_queue WHERE operation_key = ?').get(scope.operationKey);
+    if (!item || item.state !== (scope.queueState || 'dispatching') || item.id !== scope.queueId || item.tab_id !== scope.tabId
+      || item.request_hash !== scope.requestHash || item.request_json !== scope.requestJson) return false;
+    try { return item.request_hash === fingerprintAgentSendRequest(JSON.parse(item.request_json)); }
+    catch { return false; }
+  }
+
+  _continuationConstraintsMatch(record, scope, hold, marker) {
+    if (JSON.stringify(record?.receipt?.continuationInputHold || null) !== JSON.stringify(hold || null)
+      || JSON.stringify(record?.receipt?.continuationInputCapture || null) !== JSON.stringify(marker || null)) return false;
+    if (hold && (hold.version !== 1 || hold.operationKey !== scope.operationKey || hold.tabId !== scope.tabId
+      || hold.handoffId !== scope.handoffId || hold.requestFingerprint !== scope.requestFingerprint
+      || hold.startedAt !== scope.startedAt || hold.deadlineAt !== scope.deadlineAt || !hold.fence)) return false;
+    if (marker && (marker.version !== 1 || !marker.generation || marker.operationKey !== scope.operationKey
+      || marker.tabId !== scope.tabId || marker.handoffId !== scope.handoffId
+      || marker.requestFingerprint !== scope.requestFingerprint || marker.queueId !== scope.queueId
+      || marker.requestHash !== scope.requestHash || marker.startedAt !== scope.startedAt
+      || marker.deadlineAt !== scope.deadlineAt)) return false;
+    return true;
+  }
+
+  // Before a proof-producing await, persist a unique generation on the exact
+  // existing HEAD. A marker without this process's completed result cannot be
+  // used to capture a newer fence after reopen or a lost callback.
+  beginContinuationInputCapture(scope) {
+    const record = this._record(scope.operationKey);
+    if (!this._continuationDispatchMatches(record, scope)) return { ok: false, reason: 'owner-unproven', record };
+    const hold = record.receipt?.continuationInputHold || null;
+    const marker = record.receipt?.continuationInputCapture || null;
+    let memory = this.continuationCaptures.get(scope.operationKey);
+    if (hold) {
+      if (!this._continuationConstraintsMatch(record, scope, hold, marker)) {
+        return { ok: false, reason: 'stored-hold-invalid', record };
+      }
+      if (memory?.phase === 'captured' && JSON.stringify(memory.hold) !== JSON.stringify(hold)) {
+        return { ok: false, reason: 'stored-hold-changed', record };
+      }
+      this.continuationCaptures.delete(scope.operationKey);
+      return { ok: true, state: 'held', hold, marker, record };
+    }
+    if (marker) {
+      if (marker.version !== 1 || !marker.generation || marker.operationKey !== scope.operationKey
+        || marker.tabId !== scope.tabId || marker.handoffId !== scope.handoffId
+        || marker.requestFingerprint !== scope.requestFingerprint || marker.queueId !== scope.queueId
+        || marker.requestHash !== scope.requestHash || marker.startedAt !== scope.startedAt
+        || marker.deadlineAt !== scope.deadlineAt || !memory
+        || JSON.stringify(memory.marker) !== JSON.stringify(marker)) {
+        return { ok: false, reason: 'capture-result-unknown', record };
+      }
+      if (memory.phase === 'captured') return { ok: true, state: 'captured', hold: memory.hold, marker, record };
+      if (memory.phase === 'reading') return { ok: false, reason: 'capture-still-running', record };
+      if (memory.phase === 'empty') {
+        const cleared = this.clearContinuationInputCapture(scope, marker);
+        if (!cleared.ok) return cleared;
+        return this.beginContinuationInputCapture(scope);
+      }
+      return { ok: true, state: 'ready', marker, record };
+    }
+    // A pre-write failure or a completed empty capture can leave only local
+    // bookkeeping. Neither is a proof that a callback returned a fence.
+    if (memory?.phase === 'captured' || memory?.phase === 'reading') {
+      return { ok: false, reason: 'capture-marker-missing', record };
+    }
+    if (!memory || memory.phase === 'empty') {
+      memory = { phase: 'ready', marker: { version: 1, generation: this.randomUUID(),
+        operationKey: scope.operationKey, tabId: scope.tabId, handoffId: scope.handoffId,
+        requestFingerprint: scope.requestFingerprint, queueId: scope.queueId, requestHash: scope.requestHash,
+        startedAt: scope.startedAt, deadlineAt: scope.deadlineAt } };
+      this.continuationCaptures.set(scope.operationKey, memory);
+    }
+    const staged = this.stageQueuedRequest(scope.operationKey, { continuationInputCapture: memory.marker },
+      { scope, capture: null, hold: null });
+    if (!staged.ok || JSON.stringify(staged.record?.receipt?.continuationInputCapture) !== JSON.stringify(memory.marker)) {
+      return { ok: false, reason: 'capture-storage-unproven', record: staged.record };
+    }
+    return { ok: true, state: 'ready', marker: memory.marker, record: staged.record };
+  }
+
+  startContinuationInputCapture(scope, marker) {
+    const memory = this.continuationCaptures.get(scope.operationKey);
+    if (!memory || memory.phase !== 'ready' || JSON.stringify(memory.marker) !== JSON.stringify(marker)) return false;
+    memory.phase = 'reading';
+    return true;
+  }
+
+  clearContinuationInputCapture(scope, marker) {
+    const memory = this.continuationCaptures.get(scope.operationKey);
+    if (!memory || memory.phase !== 'empty' || JSON.stringify(memory.marker) !== JSON.stringify(marker)) {
+      return { ok: false, reason: 'capture-result-unknown', record: this._record(scope.operationKey) };
+    }
+    const result = this.db.transaction(() => {
+      const record = this._record(scope.operationKey);
+      if (!this._continuationDispatchMatches(record, scope)
+        || JSON.stringify(record.receipt?.continuationInputCapture || null) !== JSON.stringify(marker)
+        || record.receipt?.continuationInputHold) return { ok: false, reason: 'owner-unproven', record };
+      const receipt = { ...record.receipt };
+      delete receipt.continuationInputCapture;
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET receipt_json = ?, updated_at = ? WHERE operation_key = ? AND attempt_id IS NULL`)
+        .run(encodeJson(receipt), this.now(), scope.operationKey);
+      return { ok: true, record: this._record(scope.operationKey) };
+    })();
+    if (result.ok) this.continuationCaptures.delete(scope.operationKey);
+    return this._observeChange(result);
+  }
+
+  finishContinuationInputCaptureWithoutHold(scope, marker) {
+    const memory = this.continuationCaptures.get(scope.operationKey);
+    if (!memory || memory.phase !== 'reading' || JSON.stringify(memory.marker) !== JSON.stringify(marker)) {
+      return { ok: false, reason: 'capture-result-unknown', record: this._record(scope.operationKey) };
+    }
+    memory.phase = 'empty';
+    return this.clearContinuationInputCapture(scope, marker);
+  }
+
+  retainContinuationInputHold(scope, marker, hold) {
+    const memory = this.continuationCaptures.get(scope.operationKey);
+    // Main's live proof can contain nested owner objects. Retain a detached
+    // data snapshot so later owner mutations cannot rewrite the first fence.
+    const snapshot = JSON.parse(JSON.stringify(hold));
+    if (!memory || !['reading', 'captured'].includes(memory.phase)
+      || JSON.stringify(memory.marker) !== JSON.stringify(marker)
+      || memory.phase === 'captured' && JSON.stringify(memory.hold) !== JSON.stringify(snapshot)) {
+      return { ok: false, reason: 'capture-result-unknown', record: this._record(scope.operationKey) };
+    }
+    // Set BEFORE the write: even a BUSY or lost ACK cannot replace the first
+    // returned fence with a later input revision in this same Main process.
+    memory.phase = 'captured'; memory.hold = snapshot;
+    const staged = this.stageQueuedRequest(scope.operationKey, { continuationInputHold: snapshot },
+      { scope, capture: marker, hold: null });
+    if (!staged.ok || JSON.stringify(staged.record?.receipt?.continuationInputHold) !== JSON.stringify(snapshot)) {
+      return { ok: false, reason: 'hold-storage-unproven', record: staged.record };
+    }
+    this.continuationCaptures.delete(scope.operationKey);
+    return { ok: true, record: staged.record };
+  }
+
+  settleContinuationNoWrite(scope, expectedHold, expectedCapture, result) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(scope.operationKey);
+      if (!this._continuationDispatchMatches(record, scope)
+        || !this._continuationConstraintsMatch(record, scope, expectedHold, expectedCapture)) {
+        return { ok: false, reason: 'continuation-owner-changed', record };
+      }
+      const now = this.now();
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET state = ?, receipt_json = ?, updated_at = ?, settled_at = ?
+        WHERE operation_key = ? AND attempt_id IS NULL`).run(STORE_STATES.NOT_SUBMITTED,
+        encodeJson({ ...(record.receipt || {}), ...result, success: false, accepted: false,
+          submitted: false, pasteWritten: false, enterWritten: false, status: 'not-submitted' }),
+        now, now, scope.operationKey);
+      return { ok: true, record: this._record(scope.operationKey) };
+    })());
+  }
+
   settleQueuedNoWrite(operationKey, result) {
     return this._observeChange(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record || record.attemptId || !RESUMABLE_STATES.has(record.state)) {
         return { ok: false, reason: 'attempt-already-started', record };
+      }
+      if ((record.receipt?.continuationInputHold || record.receipt?.continuationInputCapture)
+        && (Number(record.attempt || 0) !== 0 || record.receipt?.submitted === true
+          || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true
+          || record.receipt?.deliveryUnknown === true)) {
+        return { ok: false, reason: 'continuation-delivery-unproven', record };
       }
       const now = this.now();
       this.db.prepare(`UPDATE ${TABLE_NAME} SET state = ?, receipt_json = ?, updated_at = ?, settled_at = ?
@@ -915,6 +1143,8 @@ class AgentSendReceiptStore {
         .run(encodeJson(control), operationKey, record.attemptId);
       return { ok: true, applied: true, record: this._record(operationKey) };
     })();
+    // Suppressing publication does not extend a cancelled capture's lifetime.
+    if (result.ok && result.record?.deliveryControl?.cancelledAt) this.continuationCaptures.delete(operationKey);
     return input.notify === false ? result : this._observeChange(result);
   }
 
@@ -931,12 +1161,17 @@ class AgentSendReceiptStore {
     return !!control?.cancelledAt && (attemptId === null || control.attemptId === null || control.attemptId === attemptId);
   }
 
-  beginAttempt(identityInput) {
+  beginAttempt(identityInput, continuationGuard = null) {
     const identity = normalizeIdentity(identityInput);
     return this._observeChange(this.db.transaction(() => {
       const reservation = this._reserveOrGet(identity);
       if (!reservation.ok) return reservation;
       const record = reservation.record;
+      if (continuationGuard && (!this._continuationDispatchMatches(record, continuationGuard.scope)
+        || !this._continuationConstraintsMatch(record, continuationGuard.scope,
+          continuationGuard.hold, continuationGuard.capture))) {
+        return { ok: false, reason: 'continuation-owner-changed', record };
+      }
       if (record.deliveryControl?.cancelledAt || !RESUMABLE_STATES.has(record.state)
         || record.inboxSetup && record.inboxSetup.creationState !== 'created') {
         return {
@@ -1405,11 +1640,25 @@ class AgentSendReceiptStore {
         return { ok: false, reason: 'compact-attempt-mismatch', record };
       }
       const prior = record.receipt?.compactOperationOwner;
-      if (prior) return { ok: compactSendOwnerMatches(prior, operation), applied: false,
+      if (prior && !compactSendOwnerMatches(prior, operation)) return { ok: false, applied: false,
         reason: 'compact-owner-already-bound', record };
-      return this.stageAttemptContext(owner.sendOperationKey, owner.sendAttemptId, {
+      if (record.compactOperationBinding && !exactPrivateCompactBinding(record, operation)) {
+        return { ok: false, applied: false, reason: 'compact-private-binding-mismatch', record };
+      }
+      const staged = prior ? { ok: true, applied: false, reason: 'compact-owner-already-bound', record }
+        : this.stageAttemptContext(owner.sendOperationKey, owner.sendAttemptId, {
         compactOperationId: owner.operationId, compactOperationOwner: owner,
       });
+      if (!staged.ok || record.compactOperationBinding || !exactCompactOriginalPrompt(record)) return staged;
+      // Only this Main pre-write boundary owns the binding. Generic receipt
+      // fields cannot mark a historical confirmation as a new bound operation.
+      const binding = { version: 1, kind: 'compact-send-binding', owner,
+        requestFingerprint: record.requestFingerprint, promptHash: record.promptHash, promptLength: record.promptLength };
+      const info = this.statements.bindCompactReceipt.run({ operationKey: owner.sendOperationKey,
+        attemptId: owner.sendAttemptId, bindingJson: encodeJson(binding) });
+      return { ok: info.changes === 1, applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'compact-private-binding-state-changed',
+        record: this._record(owner.sendOperationKey) };
     })();
   }
 
@@ -1430,12 +1679,30 @@ class AgentSendReceiptStore {
         return { ok: false, applied: false, reason: 'compact-attempt-mismatch', record };
       }
       const previous = record.receipt || {};
+      const mintStartIdentity = !record.compactStartIdentity && exactCompactOriginalPrompt(record)
+        && exactPrivateCompactBinding(record, operation);
       const settled = previous.coordinatedSettlement?.compact;
-      if (settled) return { ok: !terminal || JSON.stringify(settled) === JSON.stringify(terminal),
+      if (settled && !mintStartIdentity) return { ok: !terminal || JSON.stringify(settled) === JSON.stringify(terminal),
         applied: false, idempotent: true, reason: 'compact-already-settled', record };
-      if (!terminal && record.state === STORE_STATES.CONFIRMED && previous.compactStartConfirmed === true) {
+      if (!terminal && record.state === STORE_STATES.CONFIRMED && previous.compactStartConfirmed === true && !mintStartIdentity) {
         return { ok: true, applied: false, idempotent: true, record };
       }
+      // Bind native acceptance to the immutable original request, not a local
+      // command used while preparing some other Send. Preserve whitespace in
+      // that identity even though the command grammar normalizes it. A new
+      // private pre-write binding can recover a failed native publication;
+      // historical display receipts without that binding never gain authority.
+      const compactStartIdentity = mintStartIdentity ? {
+        version: 1, kind: 'compact-start', proof: 'codex-compact-causal-task-started',
+        operationKey: owner.sendOperationKey, attemptId: owner.sendAttemptId,
+        operationId: owner.operationId, tabId: owner.tabId, handoffId: owner.handoffId,
+        provider: owner.provider, sessionId: owner.sessionId, generation: owner.generation,
+        promptGeneration: owner.promptGeneration, sourceByteOffset: owner.sourceByteOffset,
+        causalBoundaryEventSequence: owner.causalBoundaryEventSequence,
+        taskStartedByteOffset: operation.causalStartByteOffset,
+        taskStartedEventSequence: operation.causalStartEventSequence,
+        promptHash: record.promptHash, promptLength: record.promptLength,
+      } : null;
       const receipt = { ...previous, success: true, accepted: true, submitted: true,
         status: 'sent', receiptState: STORE_STATES.CONFIRMED,
         localSlashCommand: true, compactStartConfirmed: true,
@@ -1445,8 +1712,9 @@ class AgentSendReceiptStore {
         ...(terminal ? { coordinatedSettlement: { ...(previous.coordinatedSettlement || {}), compact: terminal } } : {}),
       };
       const updatedAt = this.now();
-      const info = this.statements.compactReceipt.run({ operationKey: owner.sendOperationKey,
+      const info = this.statements.observeCompactReceipt.run({ operationKey: owner.sendOperationKey,
         attemptId: owner.sendAttemptId, receiptJson: encodeJson(receipt),
+        compactStartIdentityJson: encodeJson(compactStartIdentity),
         state: STORE_STATES.CONFIRMED, updatedAt, settledAt: record.settledAt || updatedAt });
       return { ok: info.changes === 1, applied: info.changes === 1,
         reason: info.changes === 1 ? null : 'compact-attempt-state-changed',
@@ -1548,6 +1816,10 @@ class AgentSendReceiptStore {
           deliveryUnknown: false, auditPending: false, preflightScope: record.receipt.preflightScope,
           preflightRefusal: { ...nextReceipt.preflightRefusal, verified: true } });
       }
+      if (mergedReceipt.composerDraftState === 'exact-provider-length-rejection'
+        && !require('./codex-input-rejection').codexInputRejectionMatchesRecord(record, mergedReceipt)) {
+        return { ok: false, applied: false, reason: 'codex-input-rejection-proof-mismatch', record };
+      }
       const nextState = classifyAgentSendRegistryReceipt(mergedReceipt);
       if (record.state === STORE_STATES.ENTER_ARMED && nextState === STORE_STATES.NOT_SUBMITTED) {
         // Durable arm precedes the physical write. A late readiness/cancellation
@@ -1640,6 +1912,10 @@ class AgentSendReceiptStore {
 
   _observeChange(result) {
     if (result?.ok && result.record) {
+      if (result.record.attemptId || result.record.deliveryControl?.cancelledAt
+        || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(result.record.state)) {
+        this.continuationCaptures.delete(result.record.operationKey);
+      }
       try { this.onChanged?.(result.record); }
       catch (error) { console.warn('[AgentSendReceipt] activity observer failed', error?.message); }
       for (const listener of this.listeners) {
@@ -2213,6 +2489,14 @@ class AgentSendReceiptStore {
       + ' ORDER BY created_at ASC, operation_key ASC'
       + (limit ? ` LIMIT ${limit}` : '');
     return this.db.prepare(sql).all(...params).map(rowToRecord);
+  }
+
+  listUnresolvedCodexAuditsForTab(tabId) {
+    // Select before decoding rows so an empty tab neither materializes its
+    // settled payloads nor triggers a global audit-reference scan. Positive
+    // results retain the exact ordering and full records of list({ tabId }).
+    return this.statements.unresolvedCodexAuditsForTab
+      .all(requiredString(tabId, 'tabId')).map(rowToRecord);
   }
 
   listAuditReferences(provider) {

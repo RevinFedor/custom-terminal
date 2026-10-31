@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -467,7 +467,9 @@ test('Vite runs pre, merges prebundle exclusion, and transforms only the ESM dis
     '/root/node_modules/.pnpm/react-virtuoso@4.18.7/node_modules/react-virtuoso/dist/index.mjs?v=abc',
     'C:\\frozen\\react-virtuoso\\dist\\index.mjs',
   ]) {
-    assert.deepEqual(plugin.transform(upstream, id), { code: patched, map: null });
+    const transformed = plugin.transform(upstream, id);
+    assert.equal(transformed.code, patched);
+    assert.equal(transformed.map.version, 3);
   }
   for (const id of [
     '/src/index.mjs', '/react-virtuoso/dist/index.cjs', '/react-virtuoso/dist/index.mjs.map',
@@ -510,6 +512,8 @@ test('frozen standalone adapter imports and esbuild bundles the real patch witho
   const moduleFile = join(moduleDir, 'index.mjs');
   await mkdir(moduleDir, { recursive: true });
   await copyFile(new URL('./history-virtuoso-measurement.mjs', import.meta.url), adapterPath);
+  await copyFile(new URL('./perf-build-provenance.mjs', import.meta.url), join(dir, 'perf-build-provenance.mjs'));
+  await symlink(realpathSync(new URL('../../node_modules', import.meta.url)), join(dir, 'node_modules'), 'dir');
   await writeFile(moduleFile, upstream);
   await chmod(adapterPath, 0o444);
   await chmod(moduleFile, 0o444);

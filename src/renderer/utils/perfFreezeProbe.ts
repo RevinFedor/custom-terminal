@@ -2,6 +2,7 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
 import { reportPerfIncident, setPerfIncidentWriter, sendPerfHeartbeat, createPerfSocketWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
+import { rendererSyncWork, reportRendererSyncWork } from './perfSyncWork.mjs';
 import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming, uiDragInput,
   summarizeUIAction, formatDiagnosticKey, createUIClipboardOutcomeQueue, createUIFrameScheduler } from './uiPerformanceDiagnostics.mjs';
 
@@ -201,6 +202,16 @@ export function installPerfFreezeProbe() {
 
   if (typeof window === 'undefined') return;
 
+  rendererSyncWork.configure({ enabled: true });
+  onFinalPageHide(() => rendererSyncWork.configure({ enabled: false }));
+  try {
+    const p = (window as any).require?.('node:process');
+    if (p?.env.NOTED_E2E_TEST === 'true' && p.env.NOTED_E2E_PERF_PILOT) {
+      Object.defineProperty(window, '__notedSyncWorkPilot', { configurable: true, value: rendererSyncWork });
+      onFinalPageHide(() => { delete (window as any).__notedSyncWorkPilot; });
+    }
+  } catch { /* no private test surface in a browser or ordinary production */ }
+
   const supported = PerformanceObserver.supportedEntryTypes || [];
   log(
     '[Perf:Probe] installed longtask=' + (supported.includes('longtask') ? '1' : '0') +
@@ -214,6 +225,7 @@ export function installPerfFreezeProbe() {
   let frameScheduler: ReturnType<typeof createUIFrameScheduler> | null = null;
   const uiActions = installUIActionDiagnostics({ emit: log, onPendingFrame: () => frameScheduler?.wake(), notify: (action: any) => {
     try { diagnosticIpc?.send('perf:ui-summary', action); } catch {}
+    try { reportRendererSyncWork(action, log); } catch {}
   } });
   log('[Perf:Probe] actionSchema=2 targetSnapshot=1 safeKeyClass=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
 

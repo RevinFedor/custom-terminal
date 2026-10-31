@@ -332,10 +332,11 @@ pane; это UI-проверка, не доказательство MCP message 
 дочерний ряд; основной header не становится выше native-run.
 Это два индикатора, не две команды с одинаковым действием.
 Каркас открытого Send/Reply preview вынесен в `RequestDetailsPopover`: тот же
-компонент используется для одного выбранного Build Continue event. Он сохраняет
+компонент используется для одного выбранного Build Continue event или Build Install
+job/request. Он сохраняет
 боковое позиционирование/viewport clamp, ограничение высоты, click-outside и
 capture-phase Escape. Selection остаётся у dock owner: одновременно открыт
-один message или continuation preview; выбор другого события закрывает прежнее.
+один message, continuation или install preview; выбор другого события закрывает прежнее.
 Данные сообщений, чтение их полного текста и delivery/cancel остаются у прежних
 owners. Hover не создаёт preview и не выполняет чтение другого события.
 По умолчанию внутри сообщения общий source-header вместо слов «Вопрос/Ответ» показывает

@@ -113,6 +113,7 @@ function createAgentResponseObservationReader({
   const revisions = new Map();
   const hookResults = new Map();
   const listeners = new Set();
+  const completionAcceptors = new WeakMap();
   let serial = 0, retainedChars = 0;
 
   function revision(tabId, advance = false) {
@@ -217,7 +218,11 @@ function createAgentResponseObservationReader({
     const reportFailure = () => console.warn('[AgentResponseObservation] completion listener failed'
       + ' tab=' + String(tabId).slice(-12) + ' generation=' + subject.targetExecutionContext.generation);
     for (const listener of listeners) {
-      try { Promise.resolve(listener(clone(evidence))).catch(reportFailure); } catch { reportFailure(); }
+      try {
+        const accept = completionAcceptors.get(listener);
+        if (accept && accept(evidence) !== true) continue;
+        Promise.resolve(listener(clone(evidence))).catch(reportFailure);
+      } catch { reportFailure(); }
     }
     return true;
   }
@@ -434,10 +439,11 @@ function createAgentResponseObservationReader({
         assistantChars: saved.result.assistantChars,
         truncated: saved.result.truncated === true || saved.result.assistantText.length > 2000 };
     },
-    onAgentResponseCompletion(listener) {
+    onAgentResponseCompletion(listener, { accept } = {}) {
       if (typeof listener !== 'function') throw new TypeError('completion listener required');
       listeners.add(listener);
-      return () => listeners.delete(listener);
+      if (typeof accept === 'function') completionAcceptors.set(listener, accept);
+      return () => { completionAcceptors.delete(listener); listeners.delete(listener); };
     },
     stats: () => ({ hookEntries: hookResults.size, retainedChars, stateEntries: revisions.size }),
   };

@@ -4,6 +4,7 @@
   --work-context-border: #62517f;
   --work-context-background: #242426;
   --work-context-text: #dedee3;
+  --rewind-context-accent: #e87994;
 }
 
 /* The neutral body distinguishes updates from fully tinted saved prompts.
@@ -29,4 +30,9 @@
 .hp-context-update-chip .cb-composer-chip-leading {
   position: relative;
   color: var(--work-context-accent);
+}
+.hp-context-update-chip--rewind {
+  --work-context-accent: var(--rewind-context-accent);
+  --work-context-segment: #482534;
+  --work-context-border: #9b4764;
 }

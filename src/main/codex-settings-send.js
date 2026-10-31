@@ -3,6 +3,7 @@
 const { classifyCodexSettingsWriterTransition } = require('./codex-settings-writer-transition');
 const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
 const { mapPreparedInput } = require('./agent-send-preparation');
+const { earlyProviderInputLimitFailure } = require('./agent-provider-input-limit');
 const clean = value => typeof value === 'string' && value.trim() !== 'none' ? value.trim() : '';
 
 function codexSettingsSendNotSubmitted(result = {}) {
@@ -80,6 +81,7 @@ function createCodexSettingsSendRuntime({
   readScope, readSettings, withSettingsQueue, withWriteLock,
   selectSettings, paste, sendLocalCommand, publishSettings = () => {},
   resolveModelIdentity = null, beginPreparation = null,
+  validateInput = request => earlyProviderInputLimitFailure('codex', request.content, request.pasteOptions || {}),
 }) {
   const appliedByTerminal = new WeakMap();
   function publishApplied(tabId, result) {
@@ -120,6 +122,8 @@ function createCodexSettingsSendRuntime({
     if (!initialScope?.terminal || initialScope.live !== true) {
       return codexSettingsSendNotSubmitted({ error: 'codex_send_runtime_unavailable' });
     }
+    const inputFailure = validateInput(request);
+    if (inputFailure) return inputFailure;
     let preparation = request.preparation || null;
     let promptPasteInvoked = false;
     let settingsResult = null;

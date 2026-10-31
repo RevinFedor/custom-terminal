@@ -30,7 +30,8 @@ export interface TabContextUpdate {
   memberIds?: string[];
   title: string;
   text: string;
-  kind: 'message' | 'file' | 'file-batch' | 'file-error';
+  kind: 'message' | 'file' | 'file-batch' | 'file-error' | 'rewind';
+  rewind?: { operationId: string; sourceSessionId: string; targetUuid: string };
   path?: string;
   sourceTabId?: string | null;
   sourceTabs?: TabContextUpdateSource[];

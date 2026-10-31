@@ -295,6 +295,7 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
       id: String(chip.id || `durable-prompt-chip-${index}`),
       kind: 'prompt',
       ...(typeof chip.contextUpdateId === 'string' ? { contextUpdateId: chip.contextUpdateId } : {}),
+      ...(chip.contextUpdateId && chip.contextUpdateKind === 'rewind' ? { contextUpdateKind: 'rewind' } : {}),
       label,
       text,
       ...(typeof chip.sourceKey === 'string' && chip.sourceKey.trim()
@@ -382,6 +383,8 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
           ...(senderText('sourceProjectId') ? { sourceProjectId: senderText('sourceProjectId') } : {}),
         } : {}),
         ...(systemSource ? { systemSource } : {}),
+        ...(source === 'terminal-mcp' && typeof tag.selfRewindOperationId === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(tag.selfRewindOperationId)
+          ? { selfRewindOperationId: tag.selfRewindOperationId } : {}),
         ...((systemSource || source === 'terminal-mcp') && typeof tag.auditSourceIdentity === 'string' && tag.auditSourceIdentity.trim()
           ? { auditSourceIdentity: tag.auditSourceIdentity.trim() }
           : {}),
@@ -824,7 +827,8 @@ function backfillConfirmedSystemPromptPresentations(db, records) {
     if (row?.entryUuid && row.entryUuid !== audit.entryUuid) continue;
     const snapshot = splitPromptPresentationRow(row);
     if (snapshot.semanticTags.some(item => item.kind === tag.kind
-      && item.source === tag.source && item.systemSource === tag.systemSource)) continue;
+      && item.source === tag.source && item.systemSource === tag.systemSource
+      && item.selfRewindOperationId === tag.selfRewindOperationId)) continue;
     const semanticTag = {
       ...tag,
       ...(audit.sourceIdentity ? { auditSourceIdentity: audit.sourceIdentity } : {}),

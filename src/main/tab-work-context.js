@@ -50,7 +50,7 @@ const fail = (message, statusCode = 400) => Object.assign(new Error(message), { 
 
 function updateWrapper(update) {
   return '<saved_prompt name="' + escape(update.title) + '" context-update-id="'
-    + escape(update.id) + '">\n'
+    + escape(update.id) + '"' + (update.kind === 'rewind' ? ' context-update-kind="rewind"' : '') + '>\n'
     + update.text.split('</saved_prompt>').join('<\\/saved_prompt>') + '\n</saved_prompt>';
 }
 
@@ -1019,6 +1019,7 @@ class TabWorkContext {
     if (!updateColumns.has('file_changes_json')) {
       this.db.exec('ALTER TABLE tab_context_updates ADD COLUMN file_changes_json TEXT');
     }
+    if (!updateColumns.has('origin_json')) this.db.exec('ALTER TABLE tab_context_updates ADD COLUMN origin_json TEXT');
     const handoffColumns = new Set(
       sqlStatement('tabContext.init.tab_context_handoffs', 'all', () => this.db.prepare('PRAGMA table_info(tab_context_handoffs)'), statement => statement.all()).map((column) => column.name),
     );
@@ -1079,12 +1080,12 @@ class TabWorkContext {
     if (!clean(tabId) || !this.tab(tabId)) throw fail('tab not found', 404);
   }
 
-  touch(tabId) {
+  touch(tabId, { notify = true } = {}) {
     const work = () => {
       sqlStatement('tabContext.touch.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, revision) VALUES (?, 1)
         ON CONFLICT(tab_id) DO UPDATE SET revision=revision+1`), statement => statement.run(tabId));
-      if (this.onChanged) causal.count('notifications');
-      this.onChanged?.(this.get(tabId));
+      if (notify && this.onChanged) causal.count('notifications');
+      if (notify) this.onChanged?.(this.get(tabId));
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.touch', { tabId }, work);
   }
@@ -1147,6 +1148,7 @@ class TabWorkContext {
       endLine: endLine ?? null,
       status: row.status,
       createdAt: row.created_at,
+      ...(row.kind === 'rewind' && row.origin_json ? { rewind: JSON.parse(row.origin_json) } : {}),
     };
   }
 
@@ -1316,6 +1318,71 @@ class TabWorkContext {
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.publish', {}, work);
   }
+
+  stageRewindContext(record) {
+    const { tabId, operationId } = record, spec = record.request?.selfRewind;
+    this.requireTab(tabId);
+    if (!spec || !clean(spec.retainedContext) || spec.retainedContext.length > 100000) throw fail('self_rewind_context_required');
+    const retainedText = 'Rewind changes conversation history only; files, deployed services, and external operations are not rolled back. '
+      + 'The following are retained notes, not a new task or permission to repeat completed or UNKNOWN actions.\n\n' + spec.retainedContext;
+    const requestKey = 'self-rewind:' + operationId;
+    const existing = sqlStatement('tabContext.stageRewind.existing', 'get', () => this.db.prepare(
+      'SELECT * FROM tab_context_updates WHERE tab_id=? AND request_key=?'), statement => statement.get(tabId, requestKey));
+    if (existing) {
+      const origin = JSON.parse(existing.origin_json || 'null');
+      if (existing.kind !== 'rewind' || existing.text !== retainedText
+        || origin?.operationId !== operationId || origin.sourceSessionId !== record.expectedSessionId) throw fail('self_rewind_context_conflict', 409);
+      return { updateId: existing.id, ...origin };
+    }
+    const revision = sqlStatement('tabContext.stageRewind.revision', 'get', () => this.db.prepare(
+      'SELECT revision FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId))?.revision || 0;
+    if (revision !== spec.expectedContextRevision) throw fail('self_rewind_context_revision_changed', 409);
+    const ids = spec.coveredContextUpdateIds == null ? sqlStatement('tabContext.stageRewind.snapshot', 'all', () => this.db.prepare(
+      "SELECT id FROM tab_context_updates WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at,rowid"), statement => statement.all(tabId)).map(row => row.id)
+      : spec.coveredContextUpdateIds;
+    const covered = [...new Set(ids)].map(id => {
+      const row = sqlStatement('tabContext.stageRewind.member', 'get', () => this.db.prepare(
+        "SELECT * FROM tab_context_updates WHERE tab_id=? AND id=? AND status IN ('pending','sending')"), statement => statement.get(tabId, id));
+      if (!row) throw fail('self_rewind_context_member_changed', 409);
+      const { status: _status, ...version } = row;
+      return { id, hash: hash(JSON.stringify(version)), textHash: hash(this.presentUpdate(row).text) };
+    });
+    const id = crypto.randomUUID(), origin = { operationId, sourceSessionId: record.expectedSessionId,
+      targetUuid: record.targetUuid, covered };
+    sqlStatement('tabContext.stageRewind.insert', 'run', () => this.db.prepare(`INSERT INTO tab_context_updates
+      (id,tab_id,source_tab_id,request_key,title,text,kind,status,origin_json,created_at)
+      VALUES (?,?,NULL,?,'Контекст после отката',?,'rewind','rewind-held',?,?)`), statement =>
+      statement.run(id, tabId, requestKey, retainedText, JSON.stringify(origin), Date.now()));
+    return { updateId: id, ...origin };
+  }
+
+  commitRewindContext(record) {
+    if (record.bindingCommitted !== true || !record.rewindContext) throw fail('self_rewind_binding_unproven', 409);
+    const { tabId, rewindContext: ref } = record;
+    const row = sqlStatement('tabContext.commitRewind.read', 'get', () => this.db.prepare(
+      'SELECT * FROM tab_context_updates WHERE id=? AND tab_id=?'), statement => statement.get(ref.updateId, tabId));
+    if (!row || row.kind !== 'rewind' || JSON.parse(row.origin_json || 'null')?.operationId !== record.operationId) throw fail('self_rewind_context_conflict', 409);
+    if (row.status !== 'rewind-held') return ref;
+    const superseded = [], changed = [];
+    this.db.transaction(() => {
+      for (const member of ref.covered) {
+        const current = sqlStatement('tabContext.commitRewind.member', 'get', () => this.db.prepare(
+          "SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status IN ('pending','sending')"), statement => statement.get(member.id, tabId));
+        if (!current) continue;
+        const { status: _status, ...version } = current;
+        if (hash(JSON.stringify(version)) !== member.hash) { changed.push(member.id); continue; }
+        sqlStatement('tabContext.commitRewind.supersede', 'run', () => this.db.prepare(
+          "UPDATE tab_context_updates SET status='rewind-superseded' WHERE id=? AND tab_id=? AND status IN ('pending','sending')"), statement => statement.run(member.id, tabId));
+        superseded.push(member.id);
+      }
+      sqlStatement('tabContext.commitRewind.activate', 'run', () => this.db.prepare(
+        "UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='rewind-held'"), statement => statement.run(ref.updateId, tabId));
+      this.touch(tabId, { notify: false });
+    })();
+    return { ...ref, activatedAt: Date.now(), superseded, changed };
+  }
+
+  announceRewindContext(tabId) { if (this.onChanged) causal.count('notifications'); this.onChanged?.(this.get(tabId)); }
 
   attributionBinding(tab, forceOwner = false) {
     const resolved = this.resolveAttributionSource?.(tab);

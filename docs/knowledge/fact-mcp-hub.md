@@ -189,10 +189,28 @@ Actual private Luna roundtrip выполнен через общий hub, без
   `codex exec` в `routeViaCodex`/`runCodexIndexFile` получил `-c 'mcp_servers={}'`
   — роутер-промпт запрещает tools, а без этого флага вложенный codex поднимал
   весь MCP-флот (~380 МБ и секунды старта) ради текстового JSON-ответа.
+  С30Oct default — `gpt-6-luna`/low; старый environment-default `gpt-5.6-luna`
+  нормализуется в helper, explicit per-call модель и остальные ENV-модели сохранены.
+  SOURCE hub config не добавляет второй fallback. Live helper обновляется отдельным
+  idle restart knowledge, без App build/глобального hub restart/перезапуска AI.
 - **electron-mcp** (connection.mjs): синглтон state → `Map clientId → {state,
   lastConnect}` за Proxy; каждый клиент держит СВОЁ CDP-подключение (два клиента
   одновременно на 9236 и 9237 проверены). Колбэки (`disconnected`, `close`,
   `window`, `page`) биндятся к контексту момента подписки, не к Proxy.
+  Native OS input при этом имеет отдельного общего process-level owner в
+  `tools.mjs`; потерянная квитанция может удерживать там UNKNOWN. Swift lease
+  не заменяет это состояние: helper может очистить lease до потери своей
+  квитанции, а её путь зависит от temporary directory. Отдельный process с
+  импортом тех же functions создаёт другого JS owner и не доказывает состояние
+  hub. До31Oct `electron_native_input_status` при отказе source helper скрывал
+  даже JS owner. Исправленный error receipt сохраняет исходный отказ и добавляет
+  свежий `nativeOwner` после await; `nativeAdmission.available` остаётся false,
+  а непрочитанная lease — unknown. Idle JS owner не означает свободную OS lease
+  и не разрешает restart. Проверки охватывают idle/running/UNKNOWN и сохранение
+  исходного blocker через MCP serialization; helper readiness не сбрасывает owner.
+  Успешный preflight после отдельного restart child не доказывает причину прежнего
+  перемежающегося EPERM. Не подменять owner пустой local lease,
+  нулём общих pending RPC или неподдержанным zero-delta вызовом как reservation.
 - **ios-mcp** (tools.mjs): 7 модульных `let` → `S()` поверх AsyncLocalStorage
   (свой симулятор/appium/WDA у каждого клиента).
 - **browser** и **sc-desktop** — без изменений (SDK-серверы, `_meta` проходит
@@ -202,6 +220,32 @@ Actual private Luna roundtrip выполнен через общий hub, без
   контекста (закрыть CDP, убить WDA-сессию). Плюс TTL-свип 6ч в хабе.
 
 ## UI
+
+### Docs Search: индекс выбирает директория вкладки
+
+Workflow организует вкладки, но не имеет отдельного MCP-процесса или модели.
+Общий knowledge использует `projectPath`, затем caller cwd; одна вкладка main
+может искать в custom-terminal, соседняя — в sc-desktop. В home `/Users/fedor`,
+`/` и пустом workflow отсутствие проектной `docs/`/индекса не означает падение
+MCP: передать точный `projectPath` с нужной базой. Общие `docs-global/` patterns
+добавляются к проектному индексу, а не заменяют отсутствующий проектный индекс.
+
+Успех initialize проверяет транспорт, а не Codex-доступ или актуальность индекса.
+Freshness проверяется hashes индексируемых Markdown, не возрастом `.json`.
+Полностью cached reindex не вызывает модель. Проверка реального поиска требует
+model result и выбранных существующих sections; `found:0/raw:[]` — отсутствие
+совпадений данного запроса, не transport failure. No-index/read/JSON ошибки helper
+различает как `index_missing/index_unreadable/index_invalid`; не объяснять все
+три отсутствующим файлом.
+
+429 при reindex — сохранённый отказ provider; из одной строки нельзя установить,
+какой лимит/аккаунтная квота/нагрузка его вызвали, или считать модель недоступной.
+Неудачный файл сохраняет предыдущий полный индекс. Повтор через MCP с
+`parallel:1` и целевой Luna6 обрабатывает только changed/missing entries; это
+снижение конкуренции, не обход лимита.30Oct main188/188, FlowTab61/61 иportfolio11/11
+реально обновлены без ошибок после исходного429; проверен живой default Luna6.
+
+### Панель хаба и нативный каталог Codex
 
 `McpHubButton.tsx` в шапке рядом с ResourceUsageButton: точка-статус
 (зелёная 6/6 / янтарная часть или неизвестный статус / красная 0 готовых в прочитанном списке), панель со списком серверов

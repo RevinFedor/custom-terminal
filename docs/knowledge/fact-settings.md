@@ -70,6 +70,32 @@ Fresh default — `gemini-3.5-flash-lite`/NONE; ранее сохранённа�
 custom; сама feature/фиксированная role появятся после обычного обновления пары
 Main+renderer. Контракт и приёмка — `fact-tab-task-plan.md`.
 
+## Мини-оркестратор — отдельная configured Gemini роль
+
+Отдельная Source-роль `mini-orchestrator-review` использует уже созданную custom
+запись и её configured Gemini model/thinking/live filePaths. Runtime обращается
+по ID; usage показывает mini-orchestrator-review без превращения записи в built-in
+или создания дубликата. Это не Run After Loop/Opt+V и не модель основного Codex.
+Чип фиксирует версию реально разрешённой инструкции. Само наличие записи в старом
+Main ещё не включает функцию; см. `fact-мини-оркестратор.md`.
+
+В popup Mini с30Oct добавлен per-tab model/thinking override. SystemPrompt —
+общий default и инструкция, не меняется от выбора одной вкладки. Пара закреплена
+на запрос; Main блокирует смену при reviewing/sending и проверяет revision.
+Worked footer хранит использованную пару, а не новый выбор picker. Это не
+Model/Effort основного CLI.
+
+## Effort defaults: незаданный уровень — low
+
+30Oct пользователь отменил `none` именно для глобального Effort Claude/Codex:
+в StatusBar defaults и Codex Settings больше нет «не задан», повторный клик
+не сбрасывает выбранный уровень. Старые null/empty/none/default/auto получают
+low при загрузке и в Main launch defaults; явные high/max/custom сохраняются.
+Для Codex conversation-only ultra не сохраняется как global default. Выбор
+модели none остаётся отдельной возможностью без CLI model override.
+Поздний SQLite hydrate не затирает новый выбор. Это политика будущих запусков,
+не proof текущего effort и не отмена session-scoped Resume/Fork restoration.
+
 ## Run After Loop — системный текст, но не отдельная AI-модель
 
 `Run After Loop` находится в AI → Системные промпты и редактирует тот же общий текст, что карандашик Loop. Раньше этот текст был отдельным app-state и потому отсутствовал в каталоге; миграция сохраняет custom body, а после неё запись системного промпта является единственным источником. В карточке стоит «АГЕНТ ВКЛАДКИ», не Flash/Pro: выполнение идёт у owner-агента с его моделью/effort. Поэтому отдельные Model/Thinking, file attachments, context-menu toggle и выбор этой записи как Rewind-промпта недоступны — они обещали бы другой способ исполнения. Built-in не удаляется; поведение остановки и границы миграции — `fact-prompt-queue.md::Loop`.

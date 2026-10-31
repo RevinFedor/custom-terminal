@@ -10,14 +10,18 @@ function actual(name,optional=false){const n=ast.statements.find(n=>ts.isFunctio
  if(!n&&!optional)throw Error('missing actual '+name);return n?.getText(ast)||'';}
 function fixture(t,options={}){
  const h=writeFixture(t,{open:false,...options}),c=h.ctx,term=h.term;
- const control={busy:false,ready:true,provider:'codex',process:'found',processRead:null,writer:null,lease:true,cwd:'/fixture',frame:true};
+ const control={busy:false,ready:true,provider:'codex',process:'found',processRead:null,writer:null,lease:true,cwd:'/fixture',frame:true,
+  inputControl:null};
  const owner={ownerToken:'owner-T',ownerOrder:{epoch:'epoch',revision:1},currentBinding:{provider:'codex',sessionId:'source'}};
  const intent={sourceMode:'resume',sourceSessionId:'source',launchId:'launch-T',startedAt:h.clock.now()};
  const discovery={...intent,provisionalSubmitReservation:null};
  const observation=Object.freeze({status:'provisional-source',sessionId:'source',sourceSessionId:'source',launchId:'launch-T',
   terminalToken:term,runSeq:1,lifecycleGeneration:'L1',pids:[7]});
  const scope=()=>({terminal:c.terminals.get('T'),generation:c.getTerminalLifecycleGeneration('T'),
-  runSeq:c.terminalCommandState.get('T').runSeq,provider:control.provider});
+  runSeq:c.terminalCommandState.get('T').runSeq,provider:control.provider,
+  commandRunning:c.terminalCommandState.get('T').isRunning===true,
+  codexLaunchId:c.codexLastRunCommandPayload.get('T')?.launchId||null,claudeLaunchId:null,
+  projectId:'project-T',cwd:c.terminalProjects.get('T')||null});
  Object.assign(c,{path,...require('../codex-writer-ownership'),...require('../codex-action-authority'),
   terminalLifecycleEpochs:new WeakMap([[term,'physical-T']]),
   codexProvisionalSourceObservations:new Map([['T',observation]]),codexSessionDiscoveryIntents:new Map([['T',intent]]),
@@ -25,16 +29,16 @@ function fixture(t,options={}){
   codexLastRunCommandPayload:new Map([['T',{command:'codex-c',sessionId:'source',launchId:'launch-T',terminalToken:term,
    runSeq:1,lifecycleGeneration:'L1',startedAt:h.clock.now()}]]),
   codexLateMcpProofPending:new Map(),terminalProjects:new Map([['T','/fixture']]),
-  conversationOwners:{current:()=>owner,noteInput(){}},getCodexWriterProofSnapshot:()=>control.writer,
+  conversationOwners:{current:()=>owner,stored:()=>owner,public:value=>value,noteInput(){}},getCodexWriterProofSnapshot:()=>control.writer,
   isCodexWriterUsableForMutation:()=>!!control.writer,resolveAiToolTypeForTab:()=>control.provider,
   getTerminalLifecycleGeneration:()=>c.terminals.get('T')===term?'L1':'L2',
   codexSessionIdFromDb:()=> 'source',getCodexResumeSourceLeaseForTab:()=>control.lease?{tabId:'T',sourceSessionId:'source',launchId:'launch-T'}:null,
-  isCodexTuiEffectivelyReady:()=>control.ready,getCodexLiveInputControl:()=>null,
+  isCodexTuiEffectivelyReady:()=>control.ready,getCodexLiveInputControl:()=>control.inputControl,
   hasCodexPromptOrTurnInFlight:()=>control.busy,
   captureAiProcessLookupScope:scope,aiProcessLookupScopeCurrent:(_tab,s)=>Object.keys(scope()).every(k=>scope()[k]===s[k]),
   AI_PROCESS_LOOKUP_STATUS:{FOUND:'found',ABSENT:'absent',UNKNOWN:'unknown'},
   inspectAiDescendantProcessesByTab:async()=>{await control.processRead?.();return {status:control.process,matches:control.process==='found'?[{pid:7}]:[]};},
-  getCodexResumeReadIdentityLeaseForTab:()=>null,currentCodexAcceptedResumeSourceProof:()=>null,
+  getCodexResumeReadIdentityLeaseForTab:()=>null,
   resolveAuthoritativeTabProjectId:()=> 'project-T',codexActionAuthorities:new Map(),codexActionAuthoritySeq:0,
   codexActionAuthorityTestWaiters:new Map(),codexActionAuthorityTestHoldEnabled:()=>false,
   CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT:'resumed-active-submit',
@@ -50,7 +54,7 @@ function fixture(t,options={}){
   reconcileCodexWriterFromProcess:async()=>({status:'provisional-source',sessionId:'source',pids:[7]}),
  });
  const names=['captureAgentInputIdentity','validateAgentInputIdentity','validatePromptQueueImageMarkers','getCurrentCodexProvisionalSourceObservation',
-  'getCodexSubmissionObservationContext','readAgentSendDestinationAtWriteBoundary','armCodexSubmissionObservationWithoutProof',
+  'getCodexSubmissionObservationContext','currentCodexAcceptedResumeSourceProof','readAgentSendDestinationAtWriteBoundary','armCodexSubmissionObservationWithoutProof',
   'ensureCodexSubmissionWatcher','codexActionAuthorityKey','currentCodexActionAuthorityIdentity','publishCodexActionAuthorityState',
   'createMainCodexActionAuthority','transitionMainCodexActionAuthority','validateMainCodexActionAuthority',
   'readAgentContinuationInputAdmission','agentSendContinuationInputFailure'];

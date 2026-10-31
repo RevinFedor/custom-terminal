@@ -143,7 +143,10 @@ function markdownUrlTransform(url: string): string {
   return /^file:/i.test(url) ? url : defaultUrlTransform(url);
 }
 
-export const Markdown = React.memo(function Markdown({ text, preview = false }: { text: string; preview?: boolean }) {
+export const Markdown = React.memo(function Markdown({ text, preview = false, renderLink }: {
+  text: string; preview?: boolean;
+  renderLink?: (link: { href?: string; children: React.ReactNode }) => React.ReactNode;
+}) {
   if (!text.trim()) return null;
   return (
     <div className={preview ? 'cb-prose cb-prose-preview' : 'cb-prose'} onCopy={handleProseCopy}>
@@ -170,6 +173,8 @@ export const Markdown = React.memo(function Markdown({ text, preview = false }: 
             // The host owns a collapsed preview's whole-row navigation. A
             // nested link must not also open another target from that click.
             if (preview) return <span>{children}</span>;
+            const customLink = renderLink?.({ href, children });
+            if (customLink !== undefined) return customLink;
             return (
               <a
                 {...props}

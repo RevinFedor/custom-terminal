@@ -8,6 +8,7 @@ import * as icons from 'lucide-react';
 import { transformSync } from 'esbuild';
 import * as details from '../../utils/orchestrationDetails.mjs';
 import * as projection from '../../utils/orchestrationRunProjection.mjs';
+import { isRequestSuccessPresentation } from '../../utils/requestTrackerVisibility.mjs';
 
 const source = fs.readFileSync(new URL('./OrchestrationStatusChip.tsx', import.meta.url), 'utf8');
 const rowSource = fs.readFileSync(new URL('./RequestTrackerRow.tsx', import.meta.url), 'utf8');
@@ -37,10 +38,19 @@ const continuationRows = evaluate(fs.readFileSync(new URL('./BuildContinueTracke
   if (name === 'react') return React;
   if (name === 'lucide-react') return icons;
   if (name === './RequestTrackerRow') return rows;
+  if (name === './RequestDetailsPopover') return { RequestDetailsPopover: ({ children }) => React.createElement('aside', null, children) };
   if (name === './TabMessageSourceChip') return navigation;
   if (name.endsWith('/useWorkspaceStore')) return { useWorkspaceStore: { getState: () => ({ openTabById: () => { throw Error('Display must not navigate'); } }) } };
   if (name.endsWith('/Tooltip')) return { __esModule: true, default: ({ children, content, actionBar, side, align }) => React.createElement('section',
     { 'data-tooltip-side': side, 'data-tooltip-align': align }, children, React.createElement('aside', null, content), actionBar) };
+  throw Error(name);
+});
+const selfRewindRows = evaluate(fs.readFileSync(new URL('./SelfRewindTracker.tsx', import.meta.url), 'utf8'), name => {
+  if (name === 'react') return React;
+  if (name === 'lucide-react') return icons;
+  if (name === './RequestTrackerRow') return rows;
+  if (name === './RequestDetailsPopover') return { RequestDetailsPopover: ({ children }) => React.createElement('aside', null, children) };
+  if (name === './TabContextUpdates') return {};
   throw Error(name);
 });
 const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', sourceTabId: 'source',
@@ -51,7 +61,7 @@ const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', s
 
 // Execute the whole component and real row/icon markup. Only retained hook state,
 // dock placement, message transport and Tooltip's overlay host are controlled.
-function render(run, { history = false, tabId = 'source', recoveryTargets = [] } = {}) {
+function render(run, { history = false, tabId = 'source', recoveryTargets = [], selfRewinds = [] } = {}) {
   let state = 0;
   const hooks = { ...React,
     useState: initial => {
@@ -74,12 +84,15 @@ function render(run, { history = false, tabId = 'source', recoveryTargets = [] }
     if (name.endsWith('/useBuildInstallStatus')) return { useBuildInstallStatus: () => ({ jobs: [] }) };
     if (name.endsWith('/useBuildContinueStatus')) return { useBuildContinueStatus: () => ({ targets: recoveryTargets, error: null,
       cancel: () => { throw Error('Display must not cancel recovery'); } }) };
+    if (name.endsWith('/useSelfRewinds')) return { useSelfRewinds: () => ({ rows: selfRewinds, error: null,
+      dismiss: () => { throw Error('SSR must not dismiss an operation'); } }) };
+    if (name === './SelfRewindTracker') return selfRewindRows;
     if (name.endsWith('/buildInstallPresentation.mjs')) return { buildInstallVisibleInDock: () => false };
     if (name === './BuildInstallTracker') return { BuildInstallTracker: () => null };
     if (name === './BuildContinueTracker') return continuationRows;
     if (name.endsWith('/useRequestDockLayout')) return { useRequestDockLayout: () => ({ visible: true }) };
     if (name.endsWith('/tabMessageProjection')) return { tabMessageVisibleInTracker: () => false };
-    if (name.endsWith('/requestTrackerVisibility.mjs')) return { isRequestSuccessPresentation: () => false };
+    if (name.endsWith('/requestTrackerVisibility.mjs')) return { isRequestSuccessPresentation };
     if (name.endsWith('/useWorkspaceStore')) return {};
     if (name.endsWith('/orchestrationRunProjection.mjs')) return projection;
     if (name.endsWith('/orchestrationDetails.mjs')) return details;
@@ -105,24 +118,50 @@ test('outgoing Research details expose exact-run SC and browser buttons in fixed
   }
 });
 
+test('self Rewind uses the actual request dock while running and remains only in History after success', () => {
+  const ordinary = { ...base, status: 'completed', resultComplete: true, notificationSuppressed: true };
+  const rewind = { tabId: 'source', operationId: 'self-rewind-own', state: 'running', phase: 'rewriting',
+    revision: 2, createdAt: 2, hasNextPrompt: false };
+  const running = render(ordinary, { selfRewinds: [rewind] });
+  assert.match(running, /data-request-kind="self-rewind"/);
+  assert.match(running, /data-self-rewind-open="self-rewind-own"/);
+  const finished = { ...rewind, state: 'completed', phase: 'completed' };
+  assert.doesNotMatch(render(ordinary, { selfRewinds: [finished] }), /data-self-rewind-row=/);
+  assert.match(render(ordinary, { selfRewinds: [finished], history: true }), /data-self-rewind-row="self-rewind-own"/);
+});
+
+test('Codex oversized-input failure is an error card with the actual/max counts, not a delivery-check loader', () => {
+  const run = { ...base, runKind: 'delegation', targetTabId: 'codex-target', targetTabName: 'Codex target',
+    targetProjectName: 'Private fixture', externalResearchProvider: null, externalResearchJobId: null,
+    status: 'failed', attentionRequiredAt: 1792310000002, targetPromptProofAt: null,
+    requiresTargetPromptProof: true, deliveryAuditPendingAt: 1792310000001,
+    errorCode: 'codex_message_too_large',
+    error: 'Codex message is too large: 1226681 Unicode characters; maximum 1048576. Reduce the transmitted text or provide file paths for the agent to read separately.' };
+  const before = JSON.stringify(run);
+  for (const history of [false, true]) {
+    const html = render(run, { history });
+    assert.match(html, /Ошибка/); assert.match(html, /1226681/); assert.match(html, /1048576/);
+    assert.match(html, /file paths/); assert.doesNotMatch(html, /Проверка доставки/);
+  }
+  assert.equal(JSON.stringify(run), before);
+});
+
 test('the real request dock renders saved recovery before History content or a confirmed native turn exists', () => {
   const recovery = { operationId: 'capture-one', capturedAt: 1, tabId: 'source', phase: 'restoring', state: 'pending',
     active: true, reason: 'runtime-input-pending', handoffId: 'same-H', operationKey: 'same-O', route: { kind: 'local' } };
   const before = JSON.stringify(recovery), html = render({ ...base, status: 'completed', resultComplete: true }, { recoveryTargets: [recovery] });
-  assert.match(html, /data-request-kind="continuation"/); assert.match(html, /Продолжение задачи после обновления/);
+  assert.match(html, /data-request-kind="continuation"/); assert.match(html, /data-build-continue-open="same-O"/);
   assert.match(html, /Автопродолжение ждёт проверки сессии/); assert.match(html, /Отменить автопродолжение/);
   assert.doesNotMatch(html, /Продолжение доставлено/); assert.equal(JSON.stringify(recovery), before);
 });
 
-test('the real recovery dock retains a completed Research identity and its existing SC/browser actions', () => {
+test('the real recovery dock does not borrow completed Research details or navigation', () => {
   const recovery = { operationId: 'capture-one', capturedAt: 1, tabId: 'source', phase: 'restoring', state: 'pending',
     active: true, reason: 'runtime-input-pending', handoffId: 'same-H', operationKey: 'same-O', route: { kind: 'local' },
     source: { tabId: 'source', name: 'чаты с hh' }, taskId: 'original-task' };
   const html = render({ ...base, status: 'completed', resultComplete: true, notificationStatus: 'sent' }, { recoveryTargets: [recovery] });
-  assert.match(html, /чаты с hh/); assert.match(html, /original-task/); assert.match(html, /noted_saved-run/);
-  assert.match(html, /Research завершён · результат сохранён/); assert.match(html, /Ответ отправлен во вкладку/);
-  assert.match(html, /data-external-research-source="saved-run"/); assert.match(html, /data-external-research-destination="browser"/);
-  assert.match(html, /alt="SC Desktop"/); assert.match(html, /data-tooltip-side="left"/);
+  assert.match(html, /чаты с hh/);
+  assert.doesNotMatch(html, /original-task|noted_saved-run|Research завершён|data-external-research-source|data-tooltip-side/);
 });
 
 test('native/observed and incoming requests do not acquire Research browser actions', () => {

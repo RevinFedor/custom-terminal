@@ -214,6 +214,7 @@ test('actual HTTP Send + registry carries done fact once; GET status stays done 
     isScResearchTerminalStatus: status => ['done', 'error'].includes(status),
     externalResearchAnswerText: snapshot => snapshot?.result?.text || '',
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(env, ast);
   vm.runInContext(['appendAttachmentsToPrompt', 'runAgentSendScenario', 'runPreparedAgentSendScenario',
     'boundedExternalResearchResult', 'readExternalResearchResult'].map(actual).join('\n'), env);
   const sendRoute = web.slice(web.indexOf('  // Send prompt to a project terminal tab.'),

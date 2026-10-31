@@ -1151,6 +1151,26 @@ sidecar с exact operation/attempt/source binding. Waiting/unknown/failed/cancel
 actual sidecar adoption; explicit failed/cancelled dismissal сохраняет своё право
 удаления. Sidecar остаётся обычным History owner, включая последующее удаление.
 
+SOURCE31Oct: повреждённый список или нестроковый элемент FIFO/Replay assets не
+является пустым списком. Adoption сохраняет такой pin; сборка GC inventory
+отказывает, вместо того чтобы удалять файлы при неизвестных ссылках. Неразборчивый
+History sidecar или снимок очереди/черновика также не разрешает удаление.
+Неизвестный список получателя нельзя перезаписать новой передачей. Ошибка внутри записи
+replacement откатывает её savepoint до сохранения отказа и исходного lease. Повторный
+GC сравнивает защищённые имена в нормализованном виде: legacy path и иной регистр
+не освобождают тот же файл. Нераспознаваемый элемент не разрешает удаление.
+Повторный сбор History IDs и кандидатов завершённой очереди можно переиспользовать только
+для того же SQLite-соединения и подтверждённого снимка: локальные изменения,
+commit другого соединения или изменение схемы отзывают witness. Если tracker
+недоступен, выполняется прежнее чтение; ошибка либо отсутствующая SQLite-версия
+не разрешает GC. Cache не заменяет повторную проверку receipt
+и фактического sidecar owner. Лимит cache означает fallback, не усечение ссылок.
+TEMP schema cookie сам по себе не доказывает связь триггеров с текущей таблицей:
+rename переносит их на старое имя, а `temp_store` может повторить значение
+cookie. Перед reuse сверяются определения и таблица каждого триггера. Одноимённая
+TEMP-таблица или view выключает reuse: исходный unqualified запрос продолжает
+читать TEMP-объект, а не перенаправляется на main.
+
 Replacement `run-after-item` связывает applied add/update operationId/mainEpoch/
 mainScopeKey/itemId/target с текущим persisted item и всеми передаваемыми IDs.
 Точный historical epoch/scope add/update возвращается в receipt.assetOperationScope;

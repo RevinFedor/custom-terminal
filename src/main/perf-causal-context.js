@@ -4,6 +4,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createHash } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { CAUSAL_SCHEMA_VERSION, sanitizeWorkSummary, compactWorkSummary, sanitizeSqlWitness } = require('../shared/perf-causal-schema.cjs');
+const { createSyncWorkRing } = require('../shared/perf-sync-work.cjs');
 
 const ID_FIELDS = new Set(['tabId', 'sessionId', 'actionId', 'readId', 'requestId', 'initAttemptId', 'cwdHash', 'fileIdentity']);
 const TEXT_FIELDS = new Set(['caller', 'mode', 'reason', 'threadCpuSource', 'threadCpuUnavailableReason', 'gcCoverage']);
@@ -34,6 +35,9 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
   boot = 'main-' + pid + '-' + Math.floor(now()).toString(36), maxActive = 256, maxRecent = 96 } = {}) {
   const storage = new AsyncLocalStorage(), active = new Map(), recent = [];
   let enabled = false, sink = () => false, metrics = null, seq = 0, spanSeq = 0;
+  // Existing syncWork already measures thread CPU once per work summary.
+  // Do not add extra thread FFI/process-counter calls for this lightweight ring.
+  const syncRing = createSyncWorkRing({ now, timeOrigin: 0, sourceBoot: boot, role: 'main' });
   const losses = { transport: 0, active: 0, recent: 0, unavailable: 0 };
   const retainedWork = new Map();
   const workHealth = { completed:0, retainedEvictions:0, unacknowledgedEvictions:0,
@@ -117,6 +121,7 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
   const api = {
     configure(options = {}) {
       if ('enabled' in options) enabled = options.enabled === true;
+      syncRing.configure({ enabled });
       if (typeof options.sink === 'function') sink = options.sink;
       if (options.metrics) metrics = options.metrics;
     },
@@ -179,7 +184,8 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
       } catch { losses.unavailable++; }
       const previous=executingWork;executingWork=work;
       let outcome='success';
-      try { return storage.run(op,callback); }
+      try { return syncRing.run(siteId, { owner: fields.tabId, readId: fields.readId,
+        actionId: fields.actionId, relation: fields.actionId ? 'inherited' : 'none' }, () => storage.run(op,callback)); }
       catch(error){outcome='error';throw error;}
       finally {
         executingWork=previous;active.delete(id);
@@ -318,6 +324,8 @@ function createCausalContext({ now = () => performance.timeOrigin + performance.
       }
       send({kind,...fields});
     },
+    syncSnapshot(options) { return syncRing.snapshot(options); },
+    setSyncRingEnabled(value) { syncRing.configure({ enabled: enabled && value === true }); },
     snapshot({delivery=false}={}) {
       const at=now();pruneWork(at);
       const completedWork=[];

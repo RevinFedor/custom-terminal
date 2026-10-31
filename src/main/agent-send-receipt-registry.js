@@ -96,6 +96,9 @@ function immutableCopy(value) {
 }
 
 function isExactProviderNotAcceptedReceipt(receipt = {}) {
+  if (receipt?.composerDraftState === 'exact-provider-length-rejection') {
+    return require('./codex-input-rejection').isExactCodexInputRejectionReceipt(receipt);
+  }
   const exactProviderImageTransform = receipt?.composerDraftState === 'exact-provider-image-transform'
     && receipt?.providerImageTransform === true
     && Number(receipt?.expectedImagePathCount) > 0

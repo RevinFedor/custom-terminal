@@ -82,6 +82,7 @@ import {
   historyDisplayPath,
 } from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { runRendererSyncWork } from '../../utils/perfSyncWork.mjs';
 import {
   deleteTabContextUpdate,
   dismissTabContextUpdate,
@@ -92,7 +93,8 @@ import {
   type TabContextUpdate,
   useTabWorkContext,
 } from '../../utils/tabWorkContext';
-import { ContextUpdatePreviewBody, TabContextUpdateChip, contextUpdateChipProps } from './TabContextUpdates';
+import { ContextUpdatePreviewBody, TabContextUpdateChip, contextUpdateChipProps, rewindContextChipProps } from './TabContextUpdates';
+import { renderHistoryIterationLink } from './HistoryIterationLink';
 import {
   useSessionAvailability,
   type AgentSessionAvailability,
@@ -325,7 +327,6 @@ import {
   HISTORY_TAIL_MUTATION_MIN_SETTLE_FRAMES,
   HISTORY_TAIL_MUTATION_REQUIRED_STABLE_FRAMES,
   HISTORY_TAIL_PIN_THRESHOLD_PX,
-  isHistoryTailPinned,
   reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
 } from '../../utils/historyBottomScroll.mjs';
@@ -1463,7 +1464,7 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
           }}
         >
           <div style={{ fontSize: '1em' }}>
-            <CBMarkdown text={segment.text} />
+            <CBMarkdown text={segment.text} renderLink={renderHistoryIterationLink} />
           </div>
         </ConversationMessage>
           ))}
@@ -4809,7 +4810,9 @@ type HistoryPromptPresentationPart = {
 };
 
 const historyContextFileChipProps = (chip: HistoryPromptDraftChip) => (
-  chip.contextUpdateId
+  chip.contextUpdateId && chip.contextUpdateKind === 'rewind'
+    ? rewindContextChipProps
+    : chip.contextUpdateId
     ? contextUpdateChipProps
     : chip.attachmentKind === 'file'
     ? {
@@ -5397,6 +5400,7 @@ const HistoryUserEntry = memo(({
     [entry],
   );
   const mcpAsUser = useUIStore(state => !!orchestrationPrompt
+    && orchestrationPrompt.kind !== 'self-rewind'
     && orchestrationPrompt.runKind !== 'external-research'
     && !researchReply
     && !serviceBody.questionReply
@@ -5921,7 +5925,7 @@ const HistoryAssistantEntry = memo(({
 
       {entry.content && (
         <div {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':text', 'text')} style={{ fontSize: '1em' }}>
-          <CBMarkdown text={entry.content} />
+          <CBMarkdown text={entry.content} renderLink={renderHistoryIterationLink} />
         </div>
       )}
 
@@ -14284,7 +14288,8 @@ function HistoryPanel({
   // Every actual local/status/removal/adoption writer synchronously mirrors
   // only its CURRENT native locals into this independently owned subject.
   const publishHistoryRows = useCallback((next: FullHistoryEntry[], owns = () => true,
-    sourceHint: ReturnType<typeof primaryAgentSourceOwner.capture> = null) => {
+    sourceHint: ReturnType<typeof primaryAgentSourceOwner.capture> = null) => runRendererSyncWork('history.publishRows',
+    { owner: tabId, generation: historyOwnerGenerationRef.current, presented: historyPresentationProofRef.current.presented }, () => {
     const original = presentationEntriesRef.current;
     const scope = { ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current };
     try {
@@ -14301,7 +14306,7 @@ function HistoryPanel({
     }
     presentationEntriesRef.current = next;
     return true;
-  }, [primarySparsePublicationOwner]);
+  }), [primarySparsePublicationOwner, tabId]);
   const primaryLocalPublicationAtRender = primarySparsePublicationOwner.publishCompatibility(entries, {
     ownerKey: historyOwnerKeyRef.current, generation: historyOwnerGenerationRef.current,
   });
@@ -15347,7 +15352,8 @@ function HistoryPanel({
     ) || null;
   }
   const displayUnits = useMemo(
-    () => {
+    () => runRendererSyncWork('history.displayUnits', { owner: tabId,
+      generation: historyOwnerGenerationRef.current, presented: historyPresentationProofRef.current.presented }, () => {
       const unitOptions = {
         enabled: historyGroupActionsEnabled,
         responseWork: false,
@@ -15410,7 +15416,7 @@ function HistoryPanel({
             + ' ms=' + elapsedMs.toFixed(1));
         }
       }
-    },
+    }),
     [displayEntries, expandedGroupKeys, historyGroupActionsEnabled, historyOwnerKey, tabId],
   );
   displayUnitsPrevRef.current = {
@@ -19001,8 +19007,16 @@ function HistoryPanel({
           // exact canonical transcript row can retire a local card that was
           // already projected while the renderer was alive.
           if (record?.surface !== 'desktop-history') continue;
+          // Capture BEFORE hydration can notify a reentrant replacement with
+          // the same H. The exact Main proof is validated by the hydrator;
+          // this witness owns only removal of the already-present UI row.
+          const compactRemoval = record.compactStartIdentity ? captureLocalPromptRemoval(record.handoffId,
+            undefined, { operationKey: record.operationKey, attemptId: record.attemptId }) : null;
           const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
           if (outcome.hydrated) hydrated += 1;
+          if (outcome.reason === 'durable-history-local-command-confirmed' && compactRemoval) {
+            removeLocalPromptEntry(record.handoffId, outcome.reason, compactRemoval);
+          }
           if (!outcome.hydrated && (
             outcome.reason === 'durable-history-presentation-already-materialized'
             || outcome.reason === 'durable-history-presentation-dismissed'
@@ -19064,6 +19078,7 @@ function HistoryPanel({
     presentedOwnerKey,
     receiptPresentationRevision,
     fileRewriteEpoch,
+    captureLocalPromptRemoval,
     removeLocalPromptEntry,
     consumeLocalPromptEntry,
     setHistoryPromptDraft,
@@ -22795,11 +22810,10 @@ function HistoryPanel({
         + ' chars=' + String(incoming.text?.length || 0)
         + ' hash=' + String(incoming.textHash || '-')
         + ' followBottom=' + (isAtBottomRef.current ? '1' : '0')
-        + ' physicalPinned=' + (virtuosoScrollerRef.current
-            ? (isHistoryTailPinned(virtuosoScrollerRef.current) ? '1' : '0')
-            : 'na')
-        + ' scrollTop=' + Math.round(virtuosoScrollerRef.current?.scrollTop || 0)
-        + ' scrollHeight=' + Math.round(virtuosoScrollerRef.current?.scrollHeight || 0)
+        // This preview notification does not own a fresh physical scroll
+        // measurement. Reading layout only to log it can force synchronous
+        // geometry work; follow intent is not proof of the physical bottom.
+        + ' physicalPinned=unknown scrollTop=unknown scrollHeight=unknown'
         + (priorityOutcome
           ? ' priority=' + priorityOutcome.reason + ':' + Math.round(priorityOutcome.waitedMs)
           : '')
@@ -24157,8 +24171,19 @@ function HistoryPanel({
     const scroller = virtuosoScrollerRef.current;
     if (!scroller?.isConnected) return;
     const now = performance.now();
-    const snapshot = captureHistoryScrollTraceDomSnapshot(scroller);
-    historyRevealGeometryRef.current = { scroller, ownerToken: historyScrollerOwnerToken(),
+    const cached = historyRevealGeometryRef.current;
+    const cachedAge = cached ? performance.timeOrigin + now - cached.atAbs : Infinity;
+    const snapshot = phase === 'before'
+      ? cached && cached.scroller === scroller && cached.ownerToken === historyScrollerOwnerToken()
+        && cachedAge >= 0 && cachedAge <= 1000 ? cached.snapshot : null
+      : runRendererSyncWork('observer.historyGeometry', { owner: tabId, origin: 'observer',
+        presented: historyPresentationProofRef.current.presented }, () => captureHistoryScrollTraceDomSnapshot(scroller));
+    if (!snapshot) {
+      historyDiag('SCROLL_GESTURE_FRAME tab=' + tabId.slice(-12) + ' gid=' + trace.id
+        + ' phase=' + phase + ' snapshot=unavailable reason=no-current-cached-geometry');
+      return;
+    }
+    if (phase !== 'before') historyRevealGeometryRef.current = { scroller, ownerToken: historyScrollerOwnerToken(),
       atAbs: performance.timeOrigin + performance.now(), snapshot };
     const proof = historyPresentationProofRef.current;
     const roundTenth = (value: number | null) => value === null
@@ -24167,6 +24192,8 @@ function HistoryPanel({
     historyDiag('SCROLL_GESTURE_FRAME tab=' + tabId.slice(-12)
       + ' gid=' + trace.id
       + ' phase=' + phase
+      + ' snapshotSource=' + (phase === 'before' ? 'cached' : 'observed')
+      + ' snapshotAgeMs=' + (phase === 'before' ? Math.round(cachedAge) : 0)
       + ' ageMs=' + Math.round(now - trace.startedAt)
       + ' sinceInputMs=' + Math.round(now - trace.lastInputAt)
       + ' wheels=' + trace.wheelEvents

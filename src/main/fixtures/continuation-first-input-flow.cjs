@@ -38,7 +38,8 @@ async function fixture(t,{agent=false}={}){
  const next={...old,turnId:'continued-task',generation:2,processId:'7',startedAt:Date.now()+10000};
  const controls={queueReady:true,revision:'restored',parentRevision:'parent',parentSession:'parent-source',responseBusy:null,transitioning:true,background:0,goal:null,
   originalComplete:false,originalUnknown:false,latest:old,intervalUnknown:false,audit:true,loseAck:false,
-  beforeOriginal:null,beforeLatest:null,beforeAdmit:null,beforePrepare:null,beforeBridge:null,returns:null};
+  beforeOriginal:null,beforeLatest:null,beforeAdmit:null,afterAdmit:null,beforePrepare:null,beforeDestination:null,destinationResult:null,beforeBridge:null,returns:null,
+  lateReply:null,lateResult:null};
  const calls={bridge:0,preparation:0,original:0,latest:0,requests:[],releases:0};
  const response=()=>({known:true,exists:true,toolType:h.control.provider,sessionId:'source',cwd:'/fixture',
   revision:JSON.stringify([controls.revision,controls.responseBusy,controls.transitioning,controls.background,controls.goal]),
@@ -83,21 +84,23 @@ async function fixture(t,{agent=false}={}){
   bindStructuredAuthoringPresentation:require('../structured-authoring').bindStructuredAuthoringPresentation,
   withPromptOriginPresentation:value=>value,tabWorkContext:null,
   findOrchestrationTabDescriptor:()=>({tabType:'terminal',projectId:'project-T',toolType:'codex',sessionId:'source',cwd:'/fixture'}),
-  readAgentRuntimeSnapshot:async()=>({coherent:true,toolType:'codex',processStatus:'found',status:'active',liveLifecycle:true,
-   inputReady:true,writerConfirmed:false,sendTarget:{toolType:'codex',sessionId:null,terminalInstanceId:'physical-T',launchId:'launch-T',lifecycleGeneration:'L1'}}),
+  readAgentRuntimeSnapshot:async()=>{await controls.beforeDestination?.();return controls.destinationResult || {coherent:true,toolType:'codex',processStatus:'found',status:'active',liveLifecycle:true,
+   inputReady:true,writerConfirmed:false,sendTarget:{toolType:'codex',sessionId:null,terminalInstanceId:'physical-T',launchId:'launch-T',lifecycleGeneration:'L1'}};},
   scenarioDestination:require('../agent-message-identity').scenarioDestination,
   isLocalSlashCommandPrompt:require('../agent-history-send-receipt').isLocalSlashCommandPrompt,
+  isDesktopCodexCompactQueueRequest:require('../../shared/agent-local-command.cjs').isDesktopCodexCompactQueueRequest,
   agentSendTargetPreconditionFailure:require('../../shared/agent-send-target-precondition.cjs').agentSendTargetPreconditionFailure,
-  bridgeRequest:async(action,request)=>{assert.equal(action,'sendAgentPromptScenario');calls.bridge++;calls.requests.push(request);
+  bridgeRequest:async(action,request,_timeout,callbacks)=>{assert.equal(action,'sendAgentPromptScenario');calls.bridge++;calls.requests.push(request);
    await controls.beforeBridge?.(request);let result;try{result=await h.write(request);}catch(error){h.logs.push(error.stack||error.message);throw error;}
    if(result.submitted===true&&controls.audit){assert.equal(audit(store.get(request.sendOperationKey)).promoted,true);
     controls.responseBusy=true;controls.transitioning=false;controls.revision='continued';}
-   if(controls.loseAck&&result.submitted===true)throw Object.assign(Error('controlled lost bridge ACK'),{dispatched:true});
+   if(controls.loseAck&&result.submitted===true){controls.lateReply=callbacks?.onLateReply;controls.lateResult=result;
+    throw Object.assign(Error('controlled lost bridge ACK'),{dispatched:true,code:'bridge_timeout'});}
    return result;},
  });
  vm.runInContext(webDeclarations(['COMPLETION_ADMISSION','BUILD_CONTINUE_ADMISSION','readScenarioDestination','durableRecordHasProviderQueueAcceptance',
   'durableAgentSendReplay','durableAgentSendFailure','runAgentSendScenario','runPreparedAgentSendScenario','wakeLoopDependencies',
-  'prepareQueuedBuildContinueInput']),c);
+  'prepareQueuedBuildContinueInput','readQueuedContinuationHardFence','admitQueuedAgentSend']),c);
  const make=pid=>productModule('build-continue-operation').createBuildContinueOperations({pid,instanceId:'instance-'+pid,now:h.clock.now,
   read:()=>fs.existsSync(path.join(root,'build.json'))?JSON.parse(fs.readFileSync(path.join(root,'build.json'),'utf8')):null,
   write:value=>{saved=JSON.parse(JSON.stringify(value));fs.writeFileSync(path.join(root,'build.json'),JSON.stringify(saved));},
@@ -115,7 +118,9 @@ async function fixture(t,{agent=false}={}){
  });
  // The production private symbol is lexical; expose the normal internal
  // Build entry, not a forged caller boolean. No public endpoint is called.
- vm.runInContext('globalThis.sendBuild = request => runAgentSendScenario({...request,[BUILD_CONTINUE_ADMISSION]:true});',c);
+ vm.runInContext(`globalThis.sendBuild = request => runAgentSendScenario({...request,[BUILD_CONTINUE_ADMISSION]:true});
+  globalThis.sendQueuedContinuation = request => runPreparedAgentSendScenario({...request,
+   ...(String(request.source || '').startsWith('build-install-continue:') ? {[BUILD_CONTINUE_ADMISSION]:true} : {})});`,c);
  operation=make(11);await operation.capture('first-continue-operation',11);
  if(agent)await runs.beginRecovery('R','interrupted','turn_aborted');
  operation.dispose();operation=make(22);c.buildContinueOperations=operation;c.getBuildContinueOperations=()=>operation;
@@ -127,10 +132,12 @@ async function fixture(t,{agent=false}={}){
  const openQueue=()=>new AgentSendQueue({store,ready:()=>controls.queueReady,now:h.clock.now,
   setTimer:h.clock.setTimer,clearTimer:h.clock.clearTimer,
   admit:async request=>{await controls.beforeAdmit?.();
-   if(String(request.source||'').startsWith('build-install-continue:'))return operation.admit(request);
+   if(String(request.source||'').startsWith('build-install-continue:')){const decision=await c.admitQueuedAgentSend(request);
+    await controls.afterAdmit?.(decision,request);return decision;}
+   let fence=c.readQueuedContinuationHardFence(request);if(typeof fence?.then==='function')fence=await fence;if(fence!==true)return fence;
    try{await continuation.prepareRequest('R',(await runs.getInternal('R')).continuationIntent.operationId);return true;}
    catch(error){if(/runtime_unknown|target_not_idle|state_changed/.test(error.message))return false;throw error;}},
-  execute:async(request,scope)=>c.runPreparedAgentSendScenario({...request,applicationQueueExecution:true,sendRequestFingerprint:scope.requestFingerprint,
+  execute:async(request,scope)=>c.sendQueuedContinuation({...request,applicationQueueExecution:true,sendRequestFingerprint:scope.requestFingerprint,
    prepareSend:async()=>{calls.preparation++;await controls.beforePrepare?.();
     return String(request.source||'').startsWith('build-install-continue:')?c.prepareQueuedBuildContinueInput(request,'first-continue-operation')
      :continuation.prepareRequest('R',(await runs.getInternal('R')).continuationIntent.operationId);}})});

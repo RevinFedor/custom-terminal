@@ -4,6 +4,25 @@ import { createUIActionDiagnostics, createStylesheetDiagnostics, describeDiagnos
   describeDiagnosticTarget, describeDiagnosticClipboard, recordUIClipboardOutcome, createUIClipboardOutcomeQueue,
   summarizeUIAction, formatDiagnosticKey, UI_ACTION_COVERAGE } from './uiPerformanceDiagnostics.mjs';
 
+test('native input identity is captured from trusted scalar event fields, not synthetic events or private payload', async () => {
+  const module = await import('./uiPerformanceDiagnostics.mjs?native-original-control');
+  const old = globalThis.document; globalThis.document = { styleSheets: [] };
+  try {
+    const d = module.installUIActionDiagnostics({ emit() {} });
+    const base = { type: 'click', timeStamp: 10, pointerType: 'mouse', target: null,
+      get text() { throw Error('no private text'); }, get key() { throw Error('not a key event'); },
+      get clientX() { throw Error('no coordinate reading for native identity'); } };
+    const fake = Object.create(base); fake.timeStamp = 9; fake.isTrusted = false;
+    const synthetic = module.captureUIAction(fake);
+    assert.equal(synthetic.nativeOriginal, undefined);
+    const event = Object.create(base); event.isTrusted = true;
+    const actual = module.captureUIAction(event);
+    assert.deepEqual(actual.nativeOriginal, { type: 'click', timeStampMs: 10, pointerType: 'mouse' });
+    assert.equal(actual.startAbs, actual.documentTimeOriginMs + actual.nativeOriginal.timeStampMs);
+    assert.equal(d.matching('click', actual.startAbs), actual);
+  } finally { globalThis.document = old; }
+});
+
 test('admitted hover reuses the physical Meta action and bounds pointer work without reading message text/layout', async () => {
   const module = await import('./uiPerformanceDiagnostics.mjs?hover-owner-control-v1');
   const previousDocument = globalThis.document; globalThis.document = { styleSheets: [] };
@@ -40,7 +59,7 @@ test('a removed click target keeps captured source and correlated frame/native o
   d.eventTiming('click', 92, 230, { handlerMs: 7 });
   assert.equal(logs[1].id, a.id); assert.equal(logs[1].target.source, 'HistorySearchBar.tsx:33');
   assert.equal(native[0].id, a.id); assert.equal(logs[0].frame2Abs, 320);
-  assert.deepEqual(Object.keys(native[0]).sort(), ['durationMs', 'event', 'id', 'startAbs'], 'native counters channel stays intact');
+  assert.deepEqual(Object.keys(native[0]).sort(), ['durationMs', 'event', 'id', 'inputDelayMs', 'kind', 'startAbs'], 'native counters retain boundaries and unmeasured original remains absent');
   assert.equal(logs[0].coverage, UI_ACTION_COVERAGE);
   assert.ok(!JSON.stringify(logs).includes('SECRET'));
 });

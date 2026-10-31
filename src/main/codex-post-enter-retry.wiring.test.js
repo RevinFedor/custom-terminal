@@ -62,8 +62,7 @@ test('a later manual user carrier replays durable unresolved receipts after memo
   const reconcileEnd = mainSource.indexOf('\nfunction processCodexUserMessagePasteAudit', reconcileStart);
   assert.ok(reconcileStart >= 0 && reconcileEnd > reconcileStart);
   const reconcile = mainSource.slice(reconcileStart, reconcileEnd);
-  assert.match(reconcile, /AGENT_SEND_DURABLE_STATES\.AUDIT_PENDING/);
-  assert.match(reconcile, /AGENT_SEND_DURABLE_STATES\.DELIVERY_UNKNOWN/);
+  assert.match(reconcile, /listUnresolvedCodexAuditsForTab\(tabId\)/);
   assert.match(reconcile, /reconcileAgentSendStartupRecords\(unresolved, \{ allRecords \}\)/);
   assert.match(reconcile, /publishDurableAgentSendReceiptAudit\(record, decision\.audit, 'durable-late-reconcile'\)/);
   const publisherStart = mainSource.indexOf('function publishDurableAgentSendReceiptAudit');

@@ -1,6 +1,7 @@
 export declare const TERMINAL_MESSAGE_MIME: 'application/x-noted-terminal-message-reference';
 export declare const TERMINAL_MESSAGE_HTML_PREFIX: '<!--noted-terminal-message-reference:';
 export declare const TERMINAL_MESSAGE_HTML_ATTRIBUTE: 'data-noted-terminal-message-reference';
+export declare const TERMINAL_MESSAGE_LINK_PREFIX: '#noted-message?';
 
 export interface TerminalMessageTarget {
   tabId: string;
@@ -30,6 +31,8 @@ export interface TerminalMessageSnapshot {
 }
 
 export declare function normalizeTerminalMessageTarget(value: unknown): TerminalMessageTarget | null;
+export declare function terminalMessageLink(value: unknown): string | null;
+export declare function readTerminalMessageLink(href: unknown): TerminalMessageTarget | null;
 export declare function makeTerminalMessageSnapshot(detailsText: string, source: unknown, referenceId: string): TerminalMessageSnapshot | null;
 export declare function normalizeTerminalMessageSnapshot(value: unknown, expectedText?: string): TerminalMessageSnapshot | null;
 export declare function terminalMessageLabel(value: Partial<TerminalMessageTarget> | { source: Partial<TerminalMessageTarget> }): string;

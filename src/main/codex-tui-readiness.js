@@ -33,7 +33,7 @@ const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain t
 // Goal achieved, or a future replacement) and must not gate readiness. Codex
 // also right-aligns its warning counter without a dot after model/effort.
 // Accept that complete native suffix, not arbitrary prose after an effort.
-const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([^\r\n]{1,128}?)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|\s+⚠\uFE0F?\s+[1-9]\d*\s+warnings?\s*·\s*f2\s+to\s+view|)$/i;
+const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([^\r\n]{1,128}?)\s+(default|none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|\s+⚠\uFE0F?\s+[1-9]\d*\s+warnings?\s*·\s*f2\s+to\s+view|)$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 const CODEX_BOOTSTRAP_STATUS_RE = /^\s*(?:Resuming|Forking)\s+session(?:…|\.{3})\s*$/i;
@@ -97,7 +97,7 @@ function parseCodexComposerStatusFooter(frameText, modelCatalog = []) {
   const label = String(match[1] || '').trim().replace(/[\t ]+/g, ' ');
   const model = resolveCodexDisplayModelIdentity(label, modelCatalog);
   const effort = String(match[2] || '').trim().toLowerCase();
-  if (!label || label.toLowerCase() === 'default' || !effort || effort === 'default') return null;
+  if (!label || label.toLowerCase() === 'default' || !effort) return null;
   // An exact current GPT display-label footer can prove the composer even
   // when its ID is absent/ambiguous in the catalog. This structural proof is
   // not model identity and must never be persisted as a guessed slug.
@@ -105,6 +105,12 @@ function parseCodexComposerStatusFooter(frameText, modelCatalog = []) {
   const recognizableSlug = /^[a-z0-9][a-z0-9_.-]*$/i.test(label);
   const knownReserveLabel = /^luna[\t ]+reserve$/i.test(label);
   if (!model && !recognizableDisplay && !recognizableSlug && !knownReserveLabel) return null;
+  // v0.166 can paint an initialized composer with an unresolved `default`
+  // effort. It proves input chrome, not an actual effort choice. Require a
+  // resolved model or native GPT display shape for this otherwise weak word.
+  const exactCatalogModel = model && Array.isArray(modelCatalog) && modelCatalog.some((row) => row?.id === model
+    && [row.id, row.label].some((value) => typeof value === 'string' && value.trim().toLowerCase() === label.toLowerCase()));
+  if (effort === 'default' && !recognizableDisplay && !/^gpt-\d/i.test(label) && !knownReserveLabel && !exactCatalogModel) return null;
   return { label, model, effort, fast: !!match[3] };
 }
 
@@ -114,7 +120,7 @@ function hasCodexComposerStatusFooter(frameText, modelCatalog = []) {
 
 function parseCodexVerifiedComposerFooter(frameText, modelCatalog = []) {
   const status = parseCodexComposerStatusFooter(frameText, modelCatalog);
-  if (!status?.model || status.model === 'default') return null;
+  if (!status?.model || status.model === 'default' || status.effort === 'default') return null;
   return {
     model: status.model,
     effort: status.effort,

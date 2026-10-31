@@ -93,6 +93,7 @@ async function harness({ loseReply = false } = {}) {
     sendDeliveryUnknown: (res, data) => sendJson(res, 202, data),
     sendAuditPending: (res, data) => sendJson(res, 202, data),
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, tree);
   vm.runInContext([fn('appendAttachmentsToPrompt'), fn('runAgentSendScenario'), fn('runPreparedAgentSendScenario')].join('\n'), context);
   const run = vm.runInContext('(async (req,res,parsed)=>{ let m; ' + routeSource + '})', context);
   const server = http.createServer((req, res) => run(req, res, { pathname: req.url }).catch(e => sendJson(res, 500, { error: e.message })));

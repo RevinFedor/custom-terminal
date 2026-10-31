@@ -8,8 +8,11 @@ const ts = require('typescript');
 const { isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey } = require('../shared/prompt-queue-send-intent.cjs');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const ast = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
-const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'admitQueuedAgentSend');
-assert.ok(node);
+const admissionSource = ['readQueuedContinuationHardFence', 'admitQueuedAgentSend'].map(name => {
+  const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
+  assert.ok(node, name);
+  return node.getText(ast);
+}).join('\n');
 function fixture() {
   let root = { ready: true }, status = { status: 'active', inputReady: true, busy: false,
     writerConfirmed: false, writerStatus: 'provisional-source', sessionId: null }, frame = { ready: true };
@@ -24,7 +27,7 @@ function fixture() {
     resolveAgentSessionInfo: async () => { throw Error('legacy reader must not gate automatic Sends'); },
     readAutomaticSendFrame: (_tab, wake) => { calls.push('frame'); frame.wake = wake; return frame; },
     agentSendQueue: { notifyRuntime: id => queue.push(id) } };
-  const admit = vm.runInNewContext(node.getText(ast) + ';admitQueuedAgentSend;', ctx);
+  const admit = vm.runInNewContext(admissionSource + ';admitQueuedAgentSend;', ctx);
   const request = { tabId: 'T', provider: 'codex', source: 'prompt-queue', handoffId: 'H',
     promptQueueIntent: { version: 1, kind: 'queue', itemId: 'I', armedAt: 1, triggerTabId: 'T', conditionKey: '', triggerKey: 'null' } };
   return { ctx, request, logs, calls, queue, admit: () => admit(request),

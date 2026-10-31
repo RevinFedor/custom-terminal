@@ -12,6 +12,8 @@ export function systemPromptSource(value) {
 export function promptOriginTagForSource(source) {
   if (source === 'prompt-loop') return { kind: 'prompt-origin', source: 'loop' };
   const ownedSource = String(source || '').replace(/^(?:claude|codex)-/, '');
+  if (/^self-rewind:[A-Za-z0-9_.:-]{1,160}$/.test(ownedSource)) return {
+    kind: 'prompt-origin', source: 'terminal-mcp', selfRewindOperationId: ownedSource.slice('self-rewind:'.length) };
   if (ownedSource === 'terminal-mcp' || /^tab-message:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(ownedSource)) {
     return { kind: 'prompt-origin', source: 'terminal-mcp' };
   }
@@ -27,6 +29,7 @@ export function isSystemPromptEntry(entry) {
 }
 
 export function isServicePromptEntry(entry) {
+  if (isSelfRewindOriginTag(getTerminalMcpTag(entry))) return false;
   return isSystemPromptEntry(entry) || !!getTerminalMcpTag(entry);
 }
 
@@ -49,7 +52,13 @@ export function getAutomaticContinuationKind(entry) {
 export function getTerminalMcpTag(entry) {
   const tags = Array.isArray(entry?.semanticTags) ? entry.semanticTags : [];
   return getTabMessageTag(entry) || tags.find(tag => tag?.kind === 'orchestration')
+    || tags.find(isSelfRewindOriginTag)
     || tags.find(tag => tag?.kind === 'prompt-origin' && tag.source === 'terminal-mcp') || null;
+}
+
+export function isSelfRewindOriginTag(tag) {
+  return tag?.kind === 'prompt-origin' && tag.source === 'terminal-mcp'
+    && typeof tag.selfRewindOperationId === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(tag.selfRewindOperationId);
 }
 
 export function getTabMessageTag(entry) {
@@ -67,6 +76,6 @@ export function withPromptOriginPresentation(snapshot, source) {
   if (!tag) return snapshot || null;
   const semanticTags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
   if (semanticTags.some(item => item?.kind === tag.kind && item.source === tag.source
-    && item.systemSource === tag.systemSource)) return snapshot;
+    && item.systemSource === tag.systemSource && item.selfRewindOperationId === tag.selfRewindOperationId)) return snapshot;
   return { ...(snapshot || {}), semanticTags: [...semanticTags, tag] };
 }

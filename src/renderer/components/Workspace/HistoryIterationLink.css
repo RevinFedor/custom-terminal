@@ -1,0 +1,9 @@
+.cb-prose a.history-iteration-link {
+  color: #78b7ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cb-prose a.history-iteration-link:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: 2px;
+}

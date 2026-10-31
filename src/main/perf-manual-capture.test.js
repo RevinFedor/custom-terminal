@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { createManualCaptureController, handleManualWatchdogRequest, installManualCaptureMenu,
   validManualRequest } = require('./perf-manual-capture');
+const retired = result => ({ ...result, leaseId: 'lease-1', retirementState: { confirmed: true },
+  whenRetired: Promise.resolve({ confirmed: true, leaseId: 'lease-1' }) });
 
 function fixture(t, options = {}) {
   const wc = new EventEmitter(), window = new EventEmitter(), child = new EventEmitter();
@@ -61,7 +63,7 @@ test('typed request is fixed10s, exact owner; duplicate request/reply never star
   assert.ok(!f.logs.some(x => x.state === 'ready'), 'delivery is not ready');
   f.captures[0].onReady({ rendererCpu: true });
   assert.equal(f.logs.filter(x => x.state === 'ready').length, 1);
-  f.resolve({ outcome: 'completed', artifacts: { trace: { bytes: 77 } } }); await f.flush();
+  f.resolve(retired({ outcome: 'completed', artifacts: { trace: { bytes: 77 } } })); await f.flush();
   assert.deepEqual(f.counts(), { suspends: 1, resumes: 1 });
   assert.equal(f.logs.at(-1).outcome, 'completed');
   f.controller.handle(f.reply(), f.child); assert.equal(f.captures.length, 1);
@@ -101,17 +103,43 @@ test('wrong request ID/old watchdog cannot consume a pending request; deadline l
   assert.ok(f.logs.some(x => x.state === 'unknown'));
 });
 
-test('capture failure releases the original monitor and owner listeners once', async t => {
+test('capture failure retains the monitor hold and refuses a new request', async t => {
   const f = fixture(t, { captureFails: true }); f.request(); f.controller.handle(f.reply(), f.child);
-  await f.flush(); assert.deepEqual(f.counts(), { suspends: 1, resumes: 1 });
+  await f.flush(); assert.deepEqual(f.counts(), { suspends: 1, resumes: 0 }); assert.equal(f.request(), false);
   assert.ok(f.logs.some(x => x.state === 'failed' && x.reason === 'capture-failed'));
 });
 
-test('monitor cleanup failure is logged and cannot leak the flight latch or reject an unobserved Promise', async t => {
+test('monitor cleanup failure is observed and retains the flight latch', async t => {
   const f = fixture(t, { resumeFails: true }); f.request(); f.controller.handle(f.reply(), f.child);
-  f.resolve({ outcome: 'incomplete' }); await f.flush();
+  f.resolve(retired({ outcome: 'incomplete' })); await f.flush();
   assert.deepEqual(f.counts(), { suspends: 1, resumes: 1 });
   assert.ok(f.logs.some(x => x.state === 'cleanup-failed' && x.reason === 'resume-failed'));
+  assert.equal(f.request(), false);
+});
+
+test('unknown cleanup holds admission until late retirement of the same lease', async t => {
+  const f = fixture(t); f.request(); f.controller.handle(f.reply(), f.child);
+  let confirm;
+  const whenRetired = new Promise(resolve => { confirm = resolve; });
+  f.resolve({ outcome: 'incomplete', leaseId: 'lease-1', retirementState: { confirmed: false }, whenRetired });
+  await f.flush(); assert.equal(f.request(), false); assert.equal(f.counts().resumes, 0);
+  // Collection is over, but the profiler's independent cleanup is pending.
+  assert.equal(f.wc.listenerCount('did-start-navigation'), 0);
+  confirm({ confirmed: true, leaseId: 'lease-1' }); await f.flush();
+  assert.equal(f.counts().resumes, 1); assert.equal(f.request(), true);
+  f.controller.handle({ t: 'perf-manual-decision', requestId: f.requests[1].requestId, allowed: false }, f.child);
+});
+
+test('wrong lease, missing proof and rejected retirement keep hold and admission closed', async t => {
+  for (const mode of ['wrong-lease', 'missing', 'rejected']) await t.test(mode, async t => {
+    const f = fixture(t); f.request(); f.controller.handle(f.reply(), f.child);
+    const result = { outcome: 'incomplete', leaseId: 'lease-1', retirementState: { confirmed: true } };
+    if (mode === 'wrong-lease') result.whenRetired = Promise.resolve({ confirmed: true, leaseId: 'other' });
+    if (mode === 'rejected') result.whenRetired = Promise.reject(Error('retirement-failed'));
+    f.resolve(result); await f.flush();
+    assert.equal(f.counts().resumes, 0); assert.equal(f.request(), false);
+    if (mode === 'rejected') assert.ok(f.logs.some(x => x.state === 'cleanup-unknown' && x.reason === 'retirement-failed'));
+  });
 });
 
 test('unknown/lost send or admission ACK latches one request without automatic or new click retry', async t => {
@@ -138,7 +166,7 @@ test('accepted admission alone is not ready; later channel/owner loss cancels th
   f.wc.emit('render-process-gone');
   assert.equal(await guard.invalidated, 'renderer-gone'); assert.equal(guard.isCurrent(), false);
   f.captures[0].onReady({}); assert.ok(!f.logs.some(x => x.state === 'ready'));
-  f.resolve({ outcome: 'incomplete', errors: ['original-owner-lost'] }); await f.flush();
+  f.resolve(retired({ outcome: 'incomplete', errors: ['original-owner-lost'] })); await f.flush();
   assert.deepEqual(f.counts(), { suspends: 1, resumes: 1 });
 });
 

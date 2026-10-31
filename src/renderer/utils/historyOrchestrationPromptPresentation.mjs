@@ -1,4 +1,4 @@
-import { getTabMessageTag, getTerminalMcpTag, promptOriginTagForSource, systemPromptSource } from '../../shared/prompt-origin.mjs';
+import { getTabMessageTag, getTerminalMcpTag, isSelfRewindOriginTag, promptOriginTagForSource, systemPromptSource } from '../../shared/prompt-origin.mjs';
 import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
 const ORCHESTRATION_PHASES = new Set(['request', 'completion', 'failure']);
@@ -32,6 +32,7 @@ export function resolveHistoryOrchestrationPromptPresentation(entry) {
     return { kind: 'tab-message-outcome', phase: 'prompt' };
   }
   const origin = getTerminalMcpTag(entry);
+  if (isSelfRewindOriginTag(origin)) return { kind: 'self-rewind', phase: 'prompt', operationId: origin.selfRewindOperationId };
   if (origin?.source === 'terminal-mcp') {
     return { kind: 'terminal-mcp', phase: 'prompt',
       ...(typeof origin.sourceTabId === 'string' && origin.sourceTabId.trim() ? {
@@ -97,6 +98,8 @@ export function projectHistoryServicePromptBody(entry, fingerprint) {
 
 export function resolveHistoryPromptSender(presentation) {
   if (!presentation) return null;
+  if (presentation.kind === 'self-rewind') return { label: 'После отката', rewind: true,
+    description: 'Новая задача этой же сессии после сохранённого Rewind' };
   if (presentation.kind === 'tab-message-outcome') return { label: 'Noted · статус вопроса',
     description: 'Служебное уведомление приложения о вашем исходящем вопросе, не сообщение другой вкладки' };
   const completion = presentation.kind !== 'tab-message'
@@ -125,6 +128,7 @@ export function resolveHistoryPromptHandoffSemanticTags(handoff) {
   }
   const presentation = resolveHistoryOrchestrationHandoffPresentation(handoff);
   if (presentation?.kind === 'tab-message-outcome') return [promptOriginTagForSource(handoff.source)];
+  if (presentation?.kind === 'self-rewind') return [promptOriginTagForSource(handoff.source)];
   if (presentation?.kind === 'terminal-mcp') return [{ kind: 'prompt-origin', source: 'terminal-mcp' }];
   return presentation ? [{ kind: 'orchestration', runId: presentation.runId,
     phase: presentation.phase }] : undefined;
@@ -135,6 +139,9 @@ export function resolveHistoryPromptHandoffSemanticTags(handoff) {
 export function resolveHistoryOrchestrationHandoffPresentation(handoff) {
   const handoffId = String(handoff?.handoffId || '');
   const source = normalizeOwnedHandoffSource(handoff?.source);
+  if (source.startsWith('self-rewind:') && handoffId === source && promptOriginTagForSource(source)?.selfRewindOperationId) {
+    return { kind: 'self-rewind', phase: 'prompt', operationId: source.slice('self-rewind:'.length) };
+  }
   if (source.startsWith('tab-message-outcome:') && handoffId === source
     && promptOriginTagForSource(source)?.systemSource === 'tab-message-outcome') {
     return { kind: 'tab-message-outcome', phase: 'prompt' };

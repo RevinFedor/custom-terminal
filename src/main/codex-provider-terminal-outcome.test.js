@@ -10,6 +10,7 @@ const { projectCodexPublicRuntimeProjection } = require('./codex-runtime-contrac
 const { shouldCreateHistoryResponseTiming } = require('./history-response-timings');
 const { createProviderSemanticShadow } = require('./provider-semantic-shadow');
 const { TaskCompletionIntentRegistry, taskCompletionOutcomeMeta } = require('./task-completion-intent');
+const { createCompactOperationRegistry } = require('./compact-operation-state');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const part = name => {
@@ -45,7 +46,10 @@ function harness({ suppressed = false } = {}) {
     codexPromptInFlight: prompts,
     CODEX_PROMPT_IN_FLIGHT_TTL_MS: 60000,
     clearCodexPromptInFlight: tab => prompts.delete(tab),
-    compactOperations: { getPending: () => null },
+    compactOperations: createCompactOperationRegistry(), aiStoppingTabs: new Map(),
+    // This fixture has no organization/Loop owner; use the actual boundary
+    // helper's unknown-owner result without manufacturing a Loop receipt.
+    captureConversationOwner: () => null,
     isCodexStartupLifecycleFresh: () => false,
     getCodexWriterProofSnapshot: () => null,
     terminalHistoryPreviewController: { observeSemanticEvent: detail => previews.push(detail), finish() {} },
@@ -68,7 +72,7 @@ function harness({ suppressed = false } = {}) {
     getCodexPublicWriterFields: () => ({}), _webBroadcast() {},
     console: { log() {}, warn() {} },
   };
-  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'emitCodexBusy', 'observeCodexProviderPreviewRawRecord', 'codexProviderRequestCausalTurnSnapshot', 'authorizeCodexProviderMainRequest', 'handleCodexProviderSemanticEvent'];
+  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'emitCodexBusy', 'observeCodexProviderPreviewRawRecord', 'codexProviderRequestCausalTurnSnapshot', 'authorizeCodexProviderMainRequest', 'observeCodexProviderCompactionPhase', 'handleCodexProviderSemanticEvent', 'captureLoopInputBoundary'];
   const functions = vm.runInNewContext(names.map(part).join('\n') + '\n({' + names.join(',') + '})', context);
   return { ...functions, owner, watcher, current, projections, events, timings, previews, prompts };
 }

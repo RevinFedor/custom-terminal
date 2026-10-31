@@ -10,6 +10,7 @@ const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).
 const fail = code => { throw Object.assign(new Error(code), { code, statusCode: 409 }); };
 const text = value => typeof value === 'string' ? value : '';
 const terminal = record => ['completed', 'failed'].includes(record?.state);
+const FINISH_SELF = Symbol('finish-self-rewind');
 
 function normalizeSavedHistoryRequest(tabId, body = {}) {
   if (!text(tabId) || !/^[A-Za-z0-9_.:-]{1,160}$/.test(text(body.operationId))) fail('history_operation_identity_required');
@@ -32,6 +33,12 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
     || body.repairOfOperationId === body.operationId || body.kind !== 'rewind' || toolType !== 'codex')) {
     fail('history_repair_selector_invalid');
   }
+  const self = body.selfRewind;
+  if (self && (body.kind !== 'rewind' || body.repairOfOperationId
+    || !text(self.retainedContext).trim() || self.retainedContext.length > 100000
+    || !Number.isSafeInteger(self.expectedContextRevision) || self.expectedContextRevision < 0
+    || self.coveredContextUpdateIds != null && (!Array.isArray(self.coveredContextUpdateIds) || self.coveredContextUpdateIds.some(id => !text(id)))
+    || self.nextPrompt != null && !text(self.nextPrompt).trim())) fail('self_rewind_request_invalid');
   return { tabId, operationId: body.operationId, kind: body.kind, toolType,
     expectedSessionId: body.expectedSessionId, targetUuid: body.targetUuid,
     targetSourceIdentity: text(body.targetSourceIdentity) || null,
@@ -42,7 +49,11 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
       segmentId: text(body.targetEntryRef.segmentId) || null,
     } : null,
     expectedContentRevision: text(body.expectedContentRevision) || null,
-    ...(body.repairOfOperationId !== undefined ? { repairOfOperationId: body.repairOfOperationId } : {}) };
+    ...(body.repairOfOperationId !== undefined ? { repairOfOperationId: body.repairOfOperationId } : {}),
+    ...(self ? { selfRewind: { retainedContext: self.retainedContext,
+      expectedContextRevision: self.expectedContextRevision,
+      coveredContextUpdateIds: self.coveredContextUpdateIds == null ? null : [...new Set(self.coveredContextUpdateIds)],
+      nextPrompt: self.nextPrompt ?? null } } : {}) };
 }
 
 function selectSavedHistoryTarget(timeline, request, checkRevision = true) {
@@ -71,16 +82,22 @@ function targetSnapshot(entry) {
 }
 
 class SavedHistoryOperations {
-  constructor({ db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair = null, hashRecords = null, claude = null, broadcast = () => {} }) {
-    Object.assign(this, { db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair, hashRecords, claude, broadcast });
+  constructor({ db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair = null, hashRecords = null, claude = null, selfRewind = null, broadcast = () => {} }) {
+    Object.assign(this, { db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair, hashRecords, claude, selfRewind, broadcast });
     this.leases = new Map();
   }
 
   key(tabId, operationId) { return PREFIX + hash([tabId, operationId]); }
   lockKey(tabId) { return PREFIX + 'tab:' + tabId; }
+  selfIndexKey(tabId) { return PREFIX + 'self-index:' + tabId; }
+  selfSummaryKey(tabId, operationId) { return PREFIX + 'self-summary:' + hash([tabId, operationId]); }
   read(tabId, operationId) {
-    const record = this.db.getAppState(this.key(tabId, operationId));
+    let record = this.db.getAppState(this.key(tabId, operationId));
     if (!record) return null;
+    if (record.request?.selfRewind) {
+      const summary = this.db.getAppState(this.selfSummaryKey(tabId, operationId));
+      if (summary?.followup) record = { ...record, followup: summary.followup };
+    }
     return !terminal(record) && !this.leases.has(this.key(tabId, operationId))
       ? { ...record, state: 'outcome-unknown', pending: true, error: record.error || 'history_operation_interrupted' }
       : record;
@@ -88,19 +105,28 @@ class SavedHistoryOperations {
 
   save(lease, patch, commitBinding = null) {
     const previousCheckpoint = lease.record.ownerCheckpoint;
+    const contextWasActive = !!lease.record.rewindContext?.activatedAt;
     const next = { ...lease.record, ...patch, revision: lease.record.revision + 1, updatedAt: Date.now() };
     const commit = () => {
       commitBinding?.();
       if (patch.bindingCommitted === true && !lease.record.ownerCheckpoint && this.runtime?.owner) {
         next.ownerCheckpoint = this.runtime.owner.checkpoint(next.tabId, next, this.runtime.owner.observation(next.tabId));
       }
+      if (next.request.selfRewind && next.bindingCommitted && !next.rewindContext?.activatedAt) {
+        next.rewindContext = this.selfRewind.context.commitRewindContext(next);
+      }
       this.db.setAppState(lease.key, next);
+      if (next.request.selfRewind) this.db.setAppState(this.selfSummaryKey(next.tabId, next.operationId), this.selfSummary(next));
     };
-    if (commitBinding) {
+    if (commitBinding || next.request.selfRewind) {
       if (!this.db.db?.transaction) fail('history_binding_transaction_unavailable');
       this.db.db.transaction(commit)();
     } else commit(); // Persist BEFORE publishing or the next side effect.
     lease.record = next;
+    if (next.rewindContext?.activatedAt && !contextWasActive) {
+      try { this.selfRewind?.context.announceRewindContext(next.tabId); }
+      catch (error) { console.warn('[SelfRewind] context publication failed: ' + error.message); }
+    }
     if (next.ownerCheckpoint && next.ownerCheckpoint !== previousCheckpoint) this.runtime?.owner?.announce(next.tabId);
     if (terminal(next)) {
       this.runtime?.owner?.finishOperation(next.tabId, next.operationId);
@@ -114,7 +140,8 @@ class SavedHistoryOperations {
     }
     const { tabId, operationId, state, phase, pending, success, historyMutated,
       bindingCommitted, newSessionId, revision, error, resume, toolType, binding, fileDeleted, mutationSessionId, origin } = next;
-    this.broadcast(next.tabId, { type: 'saved-history-operation', operation: {
+    if (next.request.selfRewind) this.emitSelf(next);
+    else this.broadcast(next.tabId, { type: 'saved-history-operation', operation: {
       tabId, operationId, state, phase, pending, success, historyMutated,
       bindingCommitted, newSessionId, revision, error, resume, toolType, binding, fileDeleted, mutationSessionId, origin,
     } });
@@ -126,6 +153,7 @@ class SavedHistoryOperations {
 
   accept(tabId, body, { origin = null, validateOwner = null, onReserve = null, onSettled = null } = {}) {
     const request = normalizeSavedHistoryRequest(tabId, body);
+    if (request.selfRewind && (origin?.kind !== 'self-rewind' || !this.selfRewind?.context)) fail('self_rewind_admission_required');
     if (request.toolType === 'claude' && !this.claude?.loadOperationSource) fail('history_operation_provider_unavailable');
     const key = this.key(tabId, request.operationId);
     const existing = this.read(tabId, request.operationId);
@@ -149,12 +177,19 @@ class SavedHistoryOperations {
       validateOwner?.();
       this.db.setAppState(key, record);
       this.db.setAppState(this.lockKey(tabId), request.operationId);
+      if (request.selfRewind) {
+        record.rewindContext = this.selfRewind.context.stageRewindContext(record);
+        this.db.setAppState(key, record);
+        const ids = this.db.getAppState(this.selfIndexKey(tabId)) || [];
+        this.db.setAppState(this.selfIndexKey(tabId), [...ids, request.operationId]);
+        this.db.setAppState(this.selfSummaryKey(tabId, request.operationId), this.selfSummary(record));
+      }
       onReserve?.(record);
     };
     const historyInput = this.runtime?.reserveInput?.({ tabId, operationId: request.operationId,
       sessionId: request.expectedSessionId, toolType: request.toolType }) || null;
     try {
-      if (onReserve) {
+      if (onReserve || request.selfRewind) {
         if (!this.db.db?.transaction) fail('history_binding_transaction_unavailable');
         this.db.db.transaction(reserve)();
       } else reserve();
@@ -168,6 +203,7 @@ class SavedHistoryOperations {
     this.runtime?.owner?.noteInput(tabId);
     const lease = { key, record, executing: false, scope: null, mutation: null, validateOwner, onSettled, historyInput };
     this.leases.set(key, lease);
+    if (request.selfRewind) this.emitSelf(record);
     // Request acceptance never awaits a UI component or a long-lived HTTP POST.
     Promise.resolve().then(() => this.dispatch('savedHistoryOperationScenario', { tabId, operationId: request.operationId }))
       .catch(error => {
@@ -176,6 +212,111 @@ class SavedHistoryOperations {
           pending: error.dispatched !== false, error: error.code || error.message });
       });
     return record;
+  }
+
+  acceptSelf(tabId, body) {
+    if (!this.selfRewind?.context || !this.selfRewind?.send) fail('self_rewind_unavailable');
+    if (!body.selfRewind) fail('self_rewind_request_invalid');
+    if (body.sourceMeta?.server !== 'terminal' || body.sourceMeta?.mode !== 'internal'
+      || body.sourceMeta?.tabId !== tabId) fail('self_rewind_caller_mismatch');
+    if (body.selfRewind?.nextPrompt && require('./agent-history-send-receipt').isLocalSlashCommandPrompt(body.selfRewind.nextPrompt)) {
+      fail('self_rewind_followup_requires_model_task');
+    }
+    return this.accept(tabId, { ...body, kind: 'rewind' }, { origin: { kind: 'self-rewind', sourceTabId: tabId } });
+  }
+
+  selfSummary(record) {
+    const fields = ['tabId', 'operationId', 'kind', 'toolType', 'expectedSessionId', 'targetUuid', 'newSessionId',
+      'activeSessionId', 'state', 'phase', 'pending', 'success', 'historyMutated', 'bindingCommitted', 'revision',
+      'createdAt', 'updatedAt', 'error', 'resume', 'followup', 'origin', 'presentationHiddenAt'];
+    const previous = this.db.getAppState(this.selfSummaryKey(record.tabId, record.operationId));
+    const followup = record.followup && previous?.followup?.operationKey === record.followup.operationKey
+      && previous.followup.updatedAt ? { ...record.followup, ...previous.followup } : record.followup;
+    return { ...Object.fromEntries(fields.filter(key => record[key] !== undefined).map(key => [key, record[key]])),
+      ...(followup ? { followup } : {}),
+      contextUpdateId: record.rewindContext?.updateId || null, hasNextPrompt: !!record.request.selfRewind.nextPrompt };
+  }
+
+  publicSelf(record) {
+    const value = record.request ? this.selfSummary(record) : { ...record };
+    if (!terminal(value) && !this.leases.has(this.key(value.tabId, value.operationId))) {
+      Object.assign(value, { state: 'outcome-unknown', pending: true, error: value.error || 'history_operation_interrupted' });
+    }
+    return value;
+  }
+
+  emitSelf(record) {
+    try { this.broadcast(record.tabId, { type: 'saved-history-operation', operation: this.publicSelf(record) }); }
+    catch (error) { console.warn('[SelfRewind] receipt publication failed: ' + error.message); }
+  }
+
+  observeSelfFollowup(record) {
+    if (record.surface !== 'self-rewind' || !String(record.handoffId || '').startsWith('self-rewind:')) return false;
+    const operationId = record.handoffId.slice('self-rewind:'.length), key = this.selfSummaryKey(record.tabId, operationId);
+    const previous = this.db.getAppState(key);
+    if (!previous?.followup || previous.followup.operationKey !== record.operationKey
+      || previous.followup.handoffId !== record.handoffId || previous.toolType !== record.provider) return false;
+    if ((previous.followup.updatedAt || 0) > record.updatedAt
+      || previous.followup.receiptState === 'confirmed' && record.state !== 'confirmed') return false;
+    const next = { ...previous, followup: { ...previous.followup, receiptState: record.state,
+      attemptId: record.attemptId, updatedAt: record.updatedAt, error: record.receipt?.error || null,
+      cancelledAt: record.deliveryControl?.cancelledAt || null } };
+    this.db.setAppState(key, next);
+    this.emitSelf(next);
+    return true;
+  }
+
+  listSelf(tabId) {
+    const ids = this.db.getAppState(this.selfIndexKey(tabId)) || [];
+    const recent = ids.slice(-100).reverse().map(id => this.db.getAppState(this.selfSummaryKey(tabId, id))).filter(Boolean);
+    // Restrict the indexed key range to compact projections. Active/uncertain
+    // operations cannot be evicted by a long tail of successful History rows.
+    const active = this.db.db.prepare(`SELECT value FROM app_state WHERE key>=? AND key<?
+      AND json_extract(value,'$.tabId')=? AND json_extract(value,'$.presentationHiddenAt') IS NULL
+      AND (json_extract(value,'$.state')!='completed' OR (json_extract(value,'$.hasNextPrompt')=1
+        AND COALESCE(json_extract(value,'$.followup.receiptState'),'')!='confirmed'))`)
+      .all(PREFIX + 'self-summary:', PREFIX + 'self-summary;', tabId).map(row => JSON.parse(row.value));
+    return [...new Map([...recent, ...active].map(row => [row.operationId, row])).values()]
+      .sort((a, b) => b.createdAt - a.createdAt).map(row => this.publicSelf(row));
+  }
+
+  dismissSelf(tabId, operationId) {
+    const view = this.read(tabId, operationId);
+    if (!view?.request.selfRewind || view.state === 'running') fail('self_rewind_presentation_active');
+    const record = this.db.getAppState(this.key(tabId, operationId));
+    record.presentationHiddenAt ||= Date.now();
+    this.db.db.transaction(() => {
+      this.db.setAppState(this.key(tabId, operationId), record);
+      this.db.setAppState(this.selfSummaryKey(tabId, operationId), this.selfSummary(record));
+    })();
+    const result = this.publicSelf(record);
+    this.emitSelf(record);
+    return result;
+  }
+
+  validateSelfReservation(request) {
+    const ref = request.selfRewindRef, lease = ref && this.lease(ref), record = lease?.record;
+    if (!record?.request.selfRewind || record.tabId !== request.tabId || record.phase !== 'resuming' && !record.fileDeleted
+      || record.followup?.operationKey !== request.sendOperationKey || record.followup?.handoffId !== request.handoffId
+      || hash(request.expectedTarget) !== hash(record.followup?.expectedTarget)) fail('self_rewind_followup_unowned');
+    if (lease.historyInput) this.runtime.assertInput?.(lease.historyInput);
+    const now = this.runtime.capture(record.tabId), old = lease.scope;
+    if (now.terminalToken !== old.terminalToken || now.projectId !== old.projectId || now.cwd !== old.cwd
+      || now.runSeq !== old.runSeq || now.lifecycleGeneration !== old.lifecycleGeneration || now.stopping) fail('self_rewind_owner_changed');
+    const payloadHash = hash(request.prompt);
+    if (record.followup.payloadHash && record.followup.payloadHash !== payloadHash) fail('self_rewind_followup_changed');
+    this.save(lease, { followup: { ...record.followup, payloadHash } });
+    return true;
+  }
+
+  admitSelfFollowup(request) {
+    const ref = request.selfRewindRef;
+    const record = ref && this.read(ref.tabId, ref.operationId);
+    if (!record?.request.selfRewind || record.tabId !== request.tabId
+      || record.followup?.operationKey !== request.sendOperationKey || record.followup.handoffId !== request.handoffId
+      || record.followup.payloadHash !== hash(request.prompt)) return { cancel: true, reason: 'self_rewind_followup_unowned' };
+    if (record.state === 'failed') return { cancel: true, reason: 'self_rewind_failed' };
+    return record.state === 'completed';
   }
 
   lease(request) {
@@ -300,6 +441,10 @@ class SavedHistoryOperations {
     const lease = this.lease(request);
     const { phase, data = {} } = request;
     const spec = lease.record.request;
+    if (phase === 'completed' && spec.selfRewind && request[FINISH_SELF] !== true) {
+      lease.finishing ||= Promise.resolve().then(() => this.step({ ...request, [FINISH_SELF]: true }));
+      return lease.finishing;
+    }
     if (phase === 'prepare') {
       if (lease.executing) fail('history_operation_already_executing');
       lease.executing = true;
@@ -366,6 +511,7 @@ class SavedHistoryOperations {
       this.save(lease, { phase: 'preparing', target: draftTarget, contentRevision: timeline.contentRevision || null });
       return { sessionId: spec.expectedSessionId, mutationSessionId: lease.mutationSessionId || spec.expectedSessionId,
         toolType: spec.toolType, cwd: info.cwd, target: draftTarget,
+        ...(spec.selfRewind ? { selfRewind: true, coveredDraftContexts: lease.record.rewindContext.covered } : {}),
         ...(lease.historyInput ? { historyInput: lease.historyInput } : {}),
         ...(lease.repair ? { incumbentCodexSettingsProof: lease.repair.childSettingsProof } : {}) };
     }
@@ -504,6 +650,28 @@ class SavedHistoryOperations {
         if (data.resume?.launchWritten || data.resume?.skipped !== true) fail('history_operation_result_unproven');
       } else if (phase === 'completed' && (!lease.record.bindingCommitted || !data.resume?.launchWritten
         || lease.record.resume?.status !== 'write-pending' || data.resume.launchId !== lease.launchId)) fail('history_operation_result_unproven');
+      if (phase === 'completed' && spec.selfRewind?.nextPrompt && !lease.record.followup) {
+        const sessionId = this.boundSessionId(lease);
+        let expectedTarget = { toolType: spec.toolType, sessionId };
+        if (!sessionId) {
+          const current = this.runtime.owner?.current(spec.tabId);
+          if (current?.currentBinding.state !== 'none') fail('self_rewind_empty_binding_unproven');
+          expectedTarget = { toolType: spec.toolType, expectedBinding: 'none',
+            ownerToken: current.ownerToken, ownerOrder: current.ownerOrder };
+        }
+        this.save(lease, { followup: { operationKey: 'self-rewind:' + spec.tabId + ':' + spec.operationId,
+          handoffId: 'self-rewind:' + spec.operationId, expectedTarget, receiptState: 'preparing' } });
+        try {
+          const result = await this.selfRewind.send(lease.record);
+          if (terminal(lease.record)) return lease.record;
+          this.save(lease, { followup: { ...lease.record.followup, receiptState: result.receiptState || result.status,
+            applicationQueued: result.applicationQueued === true, error: result.error || null } });
+        } catch (error) {
+          if (terminal(lease.record)) return lease.record;
+          this.save(lease, { followup: { ...lease.record.followup,
+            receiptState: error.submitted === false ? 'not-submitted' : 'outcome-unknown', error: error.code || error.message } });
+        }
+      }
       const currentBinding = lease.mutation?.newSessionId && this.runtime.capture(spec.tabId).sessionId === lease.mutation.newSessionId;
       return this.save(lease, { phase, state: phase, pending: false, success: phase === 'completed',
         ...(lease.mutation ? { historyMutated: true, ...(spec.toolType === 'codex' ? { newSessionId: lease.mutation.newSessionId } : {}) } : {}),

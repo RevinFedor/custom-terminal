@@ -9,6 +9,7 @@ const ts = require('typescript');
 const { createProviderSemanticShadow } = require('./provider-semantic-shadow');
 const { createTerminalHistoryPreviewController } = require('./terminal-history-preview-controller');
 const { codexProviderPreviewOwnerVerdict } = require('./codex-provider-preview');
+const { createCompactOperationRegistry } = require('./compact-operation-state');
 
 const mainFile = path.join(__dirname, 'main.js');
 const tree = ts.createSourceFile(mainFile, fs.readFileSync(mainFile, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -39,6 +40,7 @@ function harness() {
   // No PTY, send, launch, Stop, or readiness API is available in this VM.
   const context = vm.createContext({
     codexCanonicalPresentation: null,
+    compactOperations: createCompactOperationRegistry(), aiStoppingTabs: new Map(),
     console: log, codexProviderSemanticSources: new Map([[tabId, owner]]),
     codexProviderPreviewOwnerVerdict,
     currentCodexProviderSemanticOwnerContext: () => current,
@@ -51,7 +53,9 @@ function harness() {
       observeSemanticEvent: detail => { forwarded.push(detail); return controller.observeSemanticEvent(detail); },
     },
   });
-  vm.runInContext(handlerNode.getText(tree), context);
+  const compactObserver = tree.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === 'observeCodexProviderCompactionPhase');
+  vm.runInContext([compactObserver?.getText(tree), handlerNode.getText(tree)].filter(Boolean).join('\n'), context);
   const shadow = createProviderSemanticShadow({ log,
     onCodexSemanticEvent: detail => {
       events.push(detail.event);

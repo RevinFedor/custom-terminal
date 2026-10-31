@@ -40,6 +40,19 @@ function fixture(t) {
 }
 const resolve = f => sourceRequire('./mcp-hub-config').resolveHubConfiguration(f.env);
 const entry = (config, name) => config.status.entries.find(row => row.name === name);
+
+test('profile: knowledge owns its current default model without an independent hub fallback', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.home, '.claude/mcp'), { recursive: true });
+  fs.copyFileSync(f.script, path.join(f.home, '.claude/mcp/knowledge-server.mjs'));
+  const normal = resolve(f).serverDefs.knowledge;
+  assert.equal(normal.env.KNOWLEDGE_CODEX_MODEL, undefined);
+  assert.equal(normal.env.KNOWLEDGE_ROUTER_PROVIDER, 'codex');
+  assert.equal(normal.env.KNOWLEDGE_CODEX_EFFORT, 'low');
+  const explicit = sourceRequire('./mcp-hub-config').resolveHubConfiguration({ ...f.env,
+    KNOWLEDGE_CODEX_MODEL: 'custom-explicit-model' }).serverDefs.knowledge;
+  assert.equal(explicit.env.KNOWLEDGE_CODEX_MODEL, 'custom-explicit-model');
+});
 const request = async (hub, name, method) => (await fetch(`http://127.0.0.1:${hub.actualPort}/mcp/${name}?tab=caller`, {
   method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: {} }),
 })).json();

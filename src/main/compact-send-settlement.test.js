@@ -85,6 +85,7 @@ async function httpReceipt(store) {
     parsed: { pathname: '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/send-receipts', query: { handoffId } },
     sendJson: (_res, status, body) => ({ status, body }),
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, web.ast);
   vm.runInContext(['durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay', 'publicAgentSendReceipt']
     .map(web.fn).join('\n'), context);
   const begin = web.source.indexOf('  m = parsed.pathname.match(/^\\/api\\/terminal-tabs\\/([^/]+)\\/send-receipts$/);');

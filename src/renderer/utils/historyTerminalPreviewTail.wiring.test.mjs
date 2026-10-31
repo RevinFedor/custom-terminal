@@ -192,9 +192,11 @@ test('a newly presented persistent pane wakes a hidden canonical handoff', () =>
     '// Terminal bytes can appear before Claude\/Codex',
   );
   assert.match(scheduler, /terminalPreviewPresentationWakeRef\.current = scheduleTerminalPreviewHandoffWake/);
+  const membership = sliceFrom('const canonicalInPresentation =', 'const rebase = historyTerminalPreviewHandoffRebaseVerdict');
+  assert.match(membership, /primaryPhysicalCandidate[\s\S]*membership\?\.preparedPresent === true\s*:\s*!!canonicalEntry/);
   const layout = sliceFrom('const rebase = historyTerminalPreviewHandoffRebaseVerdict', 'const ownsWrite =');
   assert.match(layout, /presentationVisit: presentation\.visit/);
-  assert.match(layout, /canonicalInPresentation: !!canonicalEntry/);
+  assert.match(layout, /canonicalInPresentation, canonicalTextHash: canonicalHash/);
   assert.match(layout, /canonicalTextHash: canonicalHash/);
   assert.match(layout, /ownerGeneration: historyOwnerGenerationRef\.current/);
   assert.match(layout, /TERMINAL_PREVIEW_HANDOFF_REBASE/);

@@ -96,6 +96,7 @@ import {
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { pendingPromptTabIds } from '../../utils/promptQueueDependencies.mjs';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
+import { MiniOrchestratorControl, MiniOrchestratorToggle, useMiniOrchestrator } from './MiniOrchestratorControl';
 import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
@@ -603,6 +604,7 @@ export function PromptQueueOverlay({
   onRewindTargetModeChange,
   onHoverGestureChange,
 }: Props) {
+  const miniOrchestrator = useMiniOrchestrator(tabId, !embedded);
   const FLOATING_OVERLAY_Z_INDEX = embedded ? 15100 : 130;
   const [localPreviewId, setLocalPreviewId] = useState<string | null>(null);
   const agentLabel = AGENT_LABEL[sessionType];
@@ -4198,6 +4200,9 @@ export function PromptQueueOverlay({
         {!embedded && <div
           ref={railRef}
           className="pq-collapsed-rail"
+          style={{ order: -1, position: 'relative', zIndex: 2, display: 'flex', flexDirection: 'column', gap: 2 }}
+        >
+        <div
           style={{
             // Horizontal row of always-available controls ABOVE the panel.
             // The measured gap below is occupied by border-mounted Post/Loop
@@ -4227,8 +4232,10 @@ export function PromptQueueOverlay({
             panelOpen={panelOpen}
             effectiveWidth={effectiveWidth}
             queueVisible={panelOpen || queueHoverPreviewVisible}
+            miniOrchestrator={miniOrchestrator}
           />
           <AutoCompactControl tabId={tabId} />
+          <MiniOrchestratorToggle controller={miniOrchestrator} />
           <ControlHint
             label={collapsed ? 'Закрепить очередь Run after' : 'Закрыть очередь Run after'}
             shortcut={`${activeItemCount} активных шагов`}
@@ -4343,6 +4350,8 @@ export function PromptQueueOverlay({
               )}
             </button>
           </ControlHint>
+        </div>
+        <div style={{ alignSelf: 'flex-end' }}><MiniOrchestratorControl controller={miniOrchestrator} /></div>
         </div>}
       </div>
 

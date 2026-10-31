@@ -196,6 +196,7 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
       return queuedReceipt();
     },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, webAst);
   vm.runInContext([
     'durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay',
     'publicAgentSendReceipt', 'durableAgentSendFailure',

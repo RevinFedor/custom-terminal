@@ -108,6 +108,31 @@ function openMemoryHarness(t, options = {}) {
   return { db, store, getUuidCount: () => uuid };
 }
 
+test('targeted Codex audit selection keeps pending and unknown in original order without other rows', (t) => {
+  let now = 10;
+  const h = openMemoryHarness(t, { now: () => now++ });
+  if (!h) return;
+  const make = (key, tabId, provider, status) => {
+    const request = identity({ operationKey: key, handoffId: key, requestFingerprint: key, tabId, provider });
+    const attempt = h.store.beginAttempt(request);
+    if (status !== 'in-flight') {
+      h.store.settleAttempt(key, attempt.attemptId, { submitted: true, auditPending: true });
+      if (status === 'unknown') h.store.markDeliveryUnknown(key, attempt.attemptId, { reason: 'fixture' });
+    }
+  };
+  make('own-unknown', 'tab-a', 'codex', 'unknown');
+  make('foreign-pending', 'tab-b', 'codex', 'pending');
+  make('own-other-provider', 'tab-a', 'claude', 'pending');
+  make('own-in-flight', 'tab-a', 'codex', 'in-flight');
+  make('own-pending', 'tab-a', 'codex', 'pending');
+  const previous = h.store.list({ tabId: 'tab-a' }).filter(record => record.provider === 'codex'
+    && (record.state === STORE_STATES.AUDIT_PENDING || record.state === STORE_STATES.DELIVERY_UNKNOWN));
+  assert.deepEqual(h.store.listUnresolvedCodexAuditsForTab('tab-a'), previous);
+  assert.deepEqual(previous.map(record => record.operationKey), ['own-unknown', 'own-pending']);
+  assert.deepEqual(h.store.listUnresolvedCodexAuditsForTab('absent'), []);
+  assert.throws(() => h.store.listUnresolvedCodexAuditsForTab(''), /tabId/);
+});
+
 test('global Codex audit ownership rejects another tab on every store promotion path and after reopen', (t) => {
   const h = openMemoryHarness(t);
   if (!h) return;

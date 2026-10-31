@@ -84,6 +84,7 @@ export type AIModel = GeminiModelId;
 // of call sites. The list itself lives in constants/claudeLevels.ts.
 export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
+import { normalizeAgentDefaultEffort } from '../../shared/agent-default-effort.cjs';
 import {
   DEFAULT_CLAUDE_CODE_SETTINGS,
   normalizeClaudeCodeSettings,
@@ -134,6 +135,7 @@ export type HistoryPromptDraftChipKind = 'prompt' | 'paste';
 export interface HistoryPromptDraftChip {
   messageReference?: unknown;
   contextUpdateId?: string;
+  contextUpdateKind?: 'rewind';
   id: string;
   kind: HistoryPromptDraftChipKind;
   text: string;
@@ -2032,6 +2034,7 @@ const initialMirrorEnabled = loadMirrorEnabled();
 // empty localStorage — user sees "max disappeared". Move persistence to SQLite via
 // app:setState so it survives across origins and restarts unconditionally.
 const APP_STATE_KEY_EFFORT = 'defaultClaudeEffort';
+let defaultClaudeEffortRevision = 0;
 const loadDefaultClaudeEffort = (): DefaultClaudeEffort => {
   // Fallback to localStorage so existing users don't lose their setting on first load;
   // we'll migrate it into SQLite on the first set. Async load below overrides this.
@@ -2040,11 +2043,12 @@ const loadDefaultClaudeEffort = (): DefaultClaudeEffort => {
     // Legacy migration: Claude removed 'auto' in May 2026 and added 'xhigh'.
     // Old persisted values: map 'auto' → 'low' (the new toggle-off-equivalent).
     if (saved === 'auto') saved = 'low';
-    if (saved && saved.trim()) return saved.trim();
+    if (saved && saved.trim()) return normalizeAgentDefaultEffort(saved, 'claude');
   } catch {}
-  return 'none';
+  return 'low';
 };
 const saveDefaultClaudeEffort = (v: DefaultClaudeEffort) => {
+  defaultClaudeEffortRevision += 1;
   try { localStorage.setItem('noted-terminal-default-claude-effort', v); } catch {}
   // Authoritative: SQLite (origin-independent, survives any vite port reshuffle).
   try {
@@ -2056,10 +2060,12 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
 // Async upgrade: pull authoritative value from SQLite on startup and overwrite the
 // localStorage-derived initial value if they differ.
 (async () => {
+  const revision = defaultClaudeEffortRevision;
   try {
     const { ipcRenderer } = window.require('electron');
     let v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_EFFORT);
-    if (v === 'auto') v = 'low'; // legacy migration — Claude dropped 'auto' May 2026
+    if (revision !== defaultClaudeEffortRevision) return;
+    v = normalizeAgentDefaultEffort(v, 'claude');
     if (typeof v === 'string' && v.trim()) {
       // Use the store's setter so the change propagates to all subscribers.
       // Importing here would be circular; reach into the store after it's defined below
@@ -2137,6 +2143,7 @@ const initialDefaultCodexModel = loadDefaultCodexModel();
 })();
 
 const APP_STATE_KEY_CODEX_EFFORT = 'defaultCodexEffort';
+let defaultCodexEffortRevision = 0;
 const APP_STATE_KEY_CODEX_RESUME_GOAL = 'codexResumePausedGoal';
 const APP_STATE_KEY_CODEX_USAGE_POLICY = 'codexUsageExhaustionPolicy';
 const LS_KEY_CODEX_USAGE_POLICY = 'noted-terminal-codex-usage-exhaustion-policy';
@@ -2189,17 +2196,17 @@ const saveCodexResumePausedGoal = (value: boolean | null) => {
   } catch {}
 })();
 const normalizePersistentCodexEffort = (value: unknown): DefaultCodexEffort => {
-  const effort = typeof value === 'string' ? value.trim() : '';
-  return effort && effort !== 'ultra' ? effort : 'none';
+  return normalizeAgentDefaultEffort(value, 'codex');
 };
 const loadDefaultCodexEffort = (): DefaultCodexEffort => {
   try {
     const saved = localStorage.getItem('noted-terminal-default-codex-effort');
     if (saved && saved.trim()) return normalizePersistentCodexEffort(saved);
   } catch {}
-  return 'none';
+  return 'low';
 };
 const saveDefaultCodexEffort = (v: DefaultCodexEffort) => {
+  defaultCodexEffortRevision += 1;
   const persistentEffort = normalizePersistentCodexEffort(v);
   try { localStorage.setItem('noted-terminal-default-codex-effort', persistentEffort); } catch {}
   try {
@@ -2209,9 +2216,11 @@ const saveDefaultCodexEffort = (v: DefaultCodexEffort) => {
 };
 const initialDefaultCodexEffort = loadDefaultCodexEffort();
 (async () => {
+  const revision = defaultCodexEffortRevision;
   try {
     const { ipcRenderer } = window.require('electron');
-    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_EFFORT);
+    const v = normalizePersistentCodexEffort(await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_EFFORT));
+    if (revision !== defaultCodexEffortRevision) return;
     if (typeof v === 'string' && v.trim()) {
       const persistentEffort = normalizePersistentCodexEffort(v);
       const s = useUIStore.getState();
@@ -3678,7 +3687,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Default Claude effort (status-bar selector)
   defaultClaudeEffort: initialDefaultClaudeEffort,
-  setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
+  setDefaultClaudeEffort: (v) => {
+    const effort = normalizeAgentDefaultEffort(v, 'claude');
+    set({ defaultClaudeEffort: effort }); saveDefaultClaudeEffort(effort);
+  },
   defaultClaudeModel: initialDefaultClaudeModel,
   setDefaultClaudeModel: (v) => { set({ defaultClaudeModel: v }); saveDefaultClaudeModel(v); },
   defaultCodexModel: initialDefaultCodexModel,
@@ -3710,7 +3722,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
       const nextModel = normalized.models.find((model) => model.id === defaultModel);
       defaultModel = nextModel?.id || 'none';
       if (defaultModel !== 'none' && defaultEffort !== 'none') {
-        defaultEffort = resolveCodexPersistentEffortForModel(nextModel, defaultEffort) || 'none';
+        defaultEffort = resolveCodexPersistentEffortForModel(nextModel, defaultEffort) || 'low';
       }
     }
     set({ codexSettings: normalized, defaultCodexModel: defaultModel, defaultCodexEffort: defaultEffort });
@@ -3734,7 +3746,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
         || normalized.models.find((model) => model.label.toLowerCase() === defaultModel.toLowerCase());
       defaultModel = nextModel?.id || 'none';
       if (defaultModel !== 'none' && defaultEffort !== 'none') {
-        defaultEffort = resolveClaudeEffortForModel(nextModel, defaultEffort) || 'none';
+        defaultEffort = resolveClaudeEffortForModel(nextModel, defaultEffort) || 'low';
       }
     }
 

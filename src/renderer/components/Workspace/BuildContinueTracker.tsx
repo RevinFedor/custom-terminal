@@ -1,5 +1,5 @@
 import type { RefObject } from 'react';
-import { Clock3, CircleAlert, CircleCheck, X } from 'lucide-react';
+import { Clock3, LoaderCircle, CircleAlert, CircleCheck, X } from 'lucide-react';
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, requestRowLinkStyle } from './RequestTrackerRow';
 import type { BuildContinueTarget } from '../../hooks/useBuildContinueStatus';
 import { RequestDetailsPopover } from './RequestDetailsPopover';
@@ -30,6 +30,14 @@ export const buildContinueVisible = (target: BuildContinueTarget) => target.rout
   && (target.active || target.cancellation && !target.cancellation.acknowledgedAt
     || ['unknown', 'unresolved', 'paused'].includes(target.state) && !target.cancellation);
 
+export function buildContinuePresentation(target: BuildContinueTarget) {
+  if (target.cancellation) return { color: '#a1a1aa', spinning: !target.cancellation.acknowledgedAt, attention: false };
+  if (target.state === 'unresolved') return { color: '#f87171', spinning: false, attention: true };
+  if (['unknown', 'paused'].includes(target.state)) return { color: '#fbbf24', spinning: false, attention: true };
+  if (target.state === 'confirmed') return { color: '#4ade80', spinning: false, attention: false };
+  return { color: target.active ? '#60a5fa' : '#a1a1aa', spinning: target.active, attention: false };
+}
+
 function targetName(target: BuildContinueTarget) {
   const tab = [...(useWorkspaceStore.getState().openProjects?.values() || [])]
     .map(project => project.tabs.get(target.tabId)).find(Boolean);
@@ -41,14 +49,11 @@ export function BuildContinueTracker({ target, history = false, error, onCancel,
   onOpen: (selection: BuildContinueSelection) => void; selected?: boolean; disabled?: boolean;
 }) {
   const label = buildContinueLabel(target), name = targetName(target);
-  const warning = ['unknown', 'unresolved', 'paused'].includes(target.state);
-  const pending = target.active || target.cancellation && !target.cancellation.acknowledgedAt;
-  const Icon = warning ? CircleAlert : pending ? Clock3 : CircleCheck;
-  const color = warning ? '#fbbf24' : target.state === 'confirmed' ? '#4ade80'
-    : target.state === 'sending' ? '#60a5fa' : '#a1a1aa';
+  const { color, spinning, attention } = buildContinuePresentation(target);
+  const Icon = attention ? CircleAlert : spinning ? LoaderCircle : CircleCheck;
   return <div data-request-kind="continuation" data-build-continue-operation={target.operationId}
     data-build-continue-row={target.operationKey} data-build-continue-history={history || undefined}
-    style={{ minWidth: 0, borderBottom: '1px solid #303030' }}>
+    style={{ minWidth: 0, flexShrink: 0, borderBottom: '1px solid #303030' }}>
     <RequestTrackerRow actions={buildContinueVisible(target) && <button type="button" data-build-continue-cancel={target.operationKey}
       title={error || (target.active ? 'Отменить это автопродолжение. Уже отправленное сообщение останется в истории.'
         : 'Убрать это автопродолжение из активных. История и квитанции сохранятся; новый ввод не отправляется.')}
@@ -62,7 +67,8 @@ export function BuildContinueTracker({ target, history = false, error, onCancel,
           onOpen({ operationKey: target.operationKey, anchor, rect: anchor.getBoundingClientRect(), history });
         }}
         style={{ ...requestRowLinkStyle, color, overflow: 'hidden', whiteSpace: 'nowrap', background: selected ? '#303030' : 'transparent' }}>
-        <RequestTrackerStatus title={label}><Icon size={12} /></RequestTrackerStatus>
+        <RequestTrackerStatus title={label}><span className={spinning ? 'noted-infinite-animation animate-spin' : undefined}
+          style={{ display: 'inline-flex' }}><Icon size={12} /></span></RequestTrackerStatus>
         <span data-build-continue-label style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
       </button>
     </RequestTrackerRow>
@@ -74,11 +80,10 @@ export function BuildContinuePreview({ selection, target, error, onClose, previe
   previewRef: RefObject<HTMLElement | null>;
 }) {
   const name = targetName(target), label = buildContinueLabel(target);
-  const warning = ['unknown', 'unresolved', 'paused'].includes(target.state);
-  const color = warning ? '#fbbf24' : target.state === 'confirmed' ? '#4ade80' : '#d4d4d4';
+  const { color, attention } = buildContinuePresentation(target);
   return <RequestDetailsPopover {...selection} previewRef={previewRef} onClose={onClose}
     id={'build-continue-preview-' + target.operationKey} attributes={{ 'data-build-continue-details': target.operationKey }}
-    title="Продолжение после обновления" icon={<Clock3 size={13} color="#93c5fd" />} closeLabel="Закрыть сведения о продолжении">
+    title="Продолжение после обновления" icon={attention ? <CircleAlert size={13} color={color} /> : <Clock3 size={13} color={color} />} closeLabel="Закрыть сведения о продолжении">
     <div style={{ padding: '5px 10px 10px', display: 'grid', gap: 7, fontSize: 11, lineHeight: 1.35, overflowWrap: 'anywhere' }}>
       <div style={{ color }}>{label}</div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ color: '#999' }}>Вкладка:</span>

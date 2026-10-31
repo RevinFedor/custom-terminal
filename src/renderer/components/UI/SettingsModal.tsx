@@ -1748,7 +1748,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const quickCodexModel = codexModelsForSettings.find((model) => model.id === codexSettings.quickModel);
   const quickCodexEfforts = (quickCodexModel?.efforts || []).filter((effort) => effort !== 'ultra');
   const selectedDefaultCodexModel = codexModelsForSettings.find((model) => model.id === defaultCodexModel);
-  const defaultCodexEfforts = (selectedDefaultCodexModel?.efforts || []).filter((effort) => effort !== 'ultra');
+  const defaultCodexEfforts = (selectedDefaultCodexModel?.efforts || []).filter((effort) => !['ultra', 'none', 'default', 'auto'].includes(effort));
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
@@ -4513,13 +4513,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     </select>
                     <select
                       data-testid="codex-default-effort"
-                      value={defaultCodexEfforts.includes(defaultCodexEffort) ? defaultCodexEffort : ''}
+                      value={defaultCodexEfforts.includes(defaultCodexEffort) ? defaultCodexEffort : (resolveCodexPersistentEffortForModel(selectedDefaultCodexModel, 'low') || 'low')}
                       disabled={!selectedDefaultCodexModel}
-                      onChange={(e) => setDefaultCodexEffort(e.currentTarget.value || 'none')}
+                      onChange={(e) => setDefaultCodexEffort(e.currentTarget.value || 'low')}
                       style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: selectedDefaultCodexModel ? 'pointer' : 'not-allowed', opacity: selectedDefaultCodexModel ? 1 : 0.45 }}
                       title="Уровень усилий для новых запусков Codex"
                     >
-                      <option value="">не задан</option>
                       {defaultCodexEfforts.map((effort) => (
                         <option key={effort} value={effort}>{compactEffortLabel(effortLabel(codexEffortOptions, effort))}</option>
                       ))}

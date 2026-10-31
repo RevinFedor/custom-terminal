@@ -129,19 +129,35 @@ function createManualCaptureController({ mainPid, getWatchdog, fromId, capture, 
       let resume;
       try {
         resume = suspend(item.pin.webContents);
+        if (resume?.ready) await resume.ready;
         if (!item.pin.isCurrent()) throw new Error('stale-original-owner');
         const result = await capture({ request: message, webContents: item.pin.webContents, directory, log,
           durationMs: MANUAL_DURATION_MS, ownerGuard: item.pin,
           onReady: ready => { if (item.pin.isCurrent()) report('ready', { id: message.id, ...ready }, item); } });
+        if (result?.whenRetired) {
+          const release = resume; resume = null;
+          item.state = 'cleanup-unknown';
+          void Promise.resolve(result.whenRetired).then(async receipt => {
+            if (receipt?.confirmed !== true || receipt.leaseId !== result.leaseId) {
+              report('cleanup-unknown', { id: message.id, reason: 'retirement-not-confirmed-for-lease' }, item);
+              return;
+            }
+            try { await release?.(); }
+            catch (error) { report('cleanup-failed', { id: message.id, reason: String(error.message || error).slice(0, 180) }, item); return; }
+            if (active === item) { item.state = 'finished'; active = null; }
+          }).catch(error => report('cleanup-unknown', { id: message.id, reason: String(error?.message || error).slice(0, 180) }, item));
+        } else {
+          // A snapshot alone cannot prove that this hold may be released.
+          resume = null; item.state = 'cleanup-unknown';
+        }
         report('finished', { id: message.id, outcome: result?.outcome || 'unknown',
           profileFile: result?.profileFile || null, artifacts: result?.artifacts || {}, errors: result?.errors || [],
           skipped: { main: result?.mainSkipped, renderer: result?.rendererSkipped, trace: result?.traceSkipped },
           traceComplete: result?.traceComplete ?? null, dataLoss: result?.traceDataLoss ?? null }, item);
-      } catch (error) { report('failed', { reason: String(error.message || error).slice(0, 180) }, item); }
+      } catch (error) { item.state = 'cleanup-unknown'; report('failed', { reason: String(error.message || error).slice(0, 180) }, item); }
       finally {
-        try { resume?.(); }
-        catch (error) { report('cleanup-failed', { reason: String(error.message || error).slice(0, 180) }, item); }
-        finally { item.pin.dispose(); item.state = 'finished'; if (active === item) active = null; }
+        item.pin.dispose();
+        if (item.state !== 'cleanup-unknown') { item.state = 'finished'; if (active === item) active = null; }
       }
     })();
     return true;

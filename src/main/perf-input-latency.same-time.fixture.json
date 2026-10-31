@@ -1,0 +1,518 @@
+{
+  "qualification": "Selected safe native records only, not a full capture replay. Original report and trigger remain UNKNOWN; other flows/orphans/output omissions are not reconstructed.",
+  "originalCapture": {
+    "path": "evidence/real2125/captures/incident-1793283969546-16174.input.json",
+    "sha256": "41577b8c4d829b3194447be49c637dc0356c540fa3968cb334610a92b7c6bc37",
+    "trigger": {
+      "status": "unknown",
+      "reason": "incomplete-evidence",
+      "candidates": [
+        "10403"
+      ],
+      "candidateCount": 1,
+      "omittedCandidates": 0
+    },
+    "flowStatus": "partial",
+    "flowIssues": [
+      "missing-core-stage"
+    ],
+    "omitted": {
+      "records": 0,
+      "flowRecords": 0,
+      "components": 0,
+      "threadRecords": 0,
+      "outputFlows": 39,
+      "outputNativeIntervals": 22,
+      "outputClockMarkers": 0,
+      "outputThreadRecords": 0,
+      "outputOrphanEvidence": 1,
+      "retainedByteRecords": 0,
+      "retainedBytes": 0
+    }
+  },
+  "options": {
+    "mainPid": 16174,
+    "rendererPid": 16336,
+    "documentTimeOriginMs": 1793283127609.7
+  },
+  "events": [
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 0,
+      "args": {
+        "name": "Compositor"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 16336,
+      "tid": 259,
+      "ts": 0,
+      "args": {
+        "name": "CrRendererMain"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 16174,
+      "tid": 259,
+      "ts": 0,
+      "args": {
+        "name": "CrBrowserMain"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 16174,
+      "tid": 40963,
+      "ts": 0,
+      "args": {
+        "name": null
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 16336,
+      "tid": 13059,
+      "ts": 0,
+      "args": {
+        "name": null
+      }
+    },
+    {
+      "name": "LatencyInfo.Flow",
+      "ph": "X",
+      "pid": 16174,
+      "tid": 259,
+      "ts": 2816088335542,
+      "dur": 42,
+      "tdur": 42,
+      "args": {
+        "chrome_latency_info": {
+          "trace_id": "10403",
+          "step": "STEP_SEND_INPUT_EVENT_UI"
+        }
+      }
+    },
+    {
+      "name": "LatencyInfo.Flow",
+      "ph": "X",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335684,
+      "dur": 71,
+      "tdur": 71,
+      "args": {
+        "chrome_latency_info": {
+          "trace_id": "10403",
+          "step": "STEP_HANDLE_INPUT_EVENT_IMPL"
+        }
+      }
+    },
+    {
+      "name": "LatencyInfo.Flow",
+      "ph": "X",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335749,
+      "dur": 1,
+      "tdur": 0,
+      "args": {
+        "chrome_latency_info": {
+          "trace_id": "10403",
+          "step": "STEP_DID_HANDLE_INPUT_AND_OVERSCROLL"
+        }
+      }
+    },
+    {
+      "name": "LatencyInfo.Flow",
+      "ph": "X",
+      "pid": 16336,
+      "tid": 259,
+      "ts": 2816088346771,
+      "dur": 277,
+      "tdur": 278,
+      "args": {
+        "chrome_latency_info": {
+          "trace_id": "10403",
+          "step": "STEP_HANDLE_INPUT_EVENT_MAIN"
+        }
+      }
+    },
+    {
+      "name": "InputLatency::MouseWheel",
+      "ph": "b",
+      "pid": 16174,
+      "tid": 259,
+      "ts": 2816087802883,
+      "id": "120",
+      "args": {
+        "chrome_latency_info": {
+          "trace_id": "10403",
+          "is_coalesced": false,
+          "component_info": [
+            {
+              "component_type": "COMPONENT_INPUT_EVENT_LATENCY_BEGIN_RWH",
+              "time_us": 2816088335528
+            },
+            {
+              "component_type": "COMPONENT_INPUT_EVENT_LATENCY_ORIGINAL",
+              "time_us": 2816087802883
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InputLatency::MouseWheel",
+      "ph": "e",
+      "pid": 16174,
+      "tid": 259,
+      "ts": 2816088335556,
+      "id": "120"
+    },
+    {
+      "name": "EventLatency",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816087802883,
+      "id2": {
+        "local": "123"
+      },
+      "args": {
+        "event_latency": {
+          "event_latency_id": "10403",
+          "event_type": "MOUSE_WHEEL"
+        }
+      }
+    },
+    {
+      "name": "GenerationToBrowserMain",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816087802883,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "GenerationToBrowserMain",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335528,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "BrowserMainToRendererCompositor",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335528,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "BrowserMainToRendererCompositor",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335683,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererCompositorQueueingDelay",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335683,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererCompositorProcessing",
+      "ph": "n",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335748,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererCompositorQueueingDelay",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335748,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererCompositorToMain",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088335748,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererCompositorToMain",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088346773,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererMainProcessing",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088346773,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererMainProcessing",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088347046,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererMainFinishedToCommit",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088347046,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "RendererMainFinishedToCommit",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088440604,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Commit",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088440604,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Commit",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088440797,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "EndCommitToActivation",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088440797,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "EndCommitToActivation",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088442072,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Activation",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088442072,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Activation",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088442509,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "EndActivateToSubmitCompositorFrame",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088442509,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "EndActivateToSubmitCompositorFrame",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088443002,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "SubmitCompositorFrameToPresentationCompositorFrame",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088443002,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "SubmitToReceiveCompositorFrame",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088443002,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "SubmitToReceiveCompositorFrame",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088443420,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "ReceiveCompositorFrameToStartDraw",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088443420,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "ReceiveCompositorFrameToStartDraw",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088448535,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "StartDrawToSwapStart",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088448535,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "StartDrawToSwapStart",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088454922,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Swap",
+      "ph": "b",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088454922,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "Swap",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088455507,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "SubmitCompositorFrameToPresentationCompositorFrame",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088455507,
+      "id2": {
+        "local": "123"
+      }
+    },
+    {
+      "name": "EventLatency",
+      "ph": "e",
+      "pid": 16336,
+      "tid": 19459,
+      "ts": 2816088455656,
+      "id2": {
+        "local": "123"
+      }
+    }
+  ]
+}

@@ -112,7 +112,11 @@ function readRunAfterAssetIds(db) {
   const ids = new Set();
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_after_operations'").get()) return ids;
   for (const row of db.prepare("SELECT assets_json FROM run_after_operations WHERE released_at IS NULL AND assets_json!='[]'").iterate()) {
-    for (const id of JSON.parse(row.assets_json)) ids.add(id);
+    const saved = JSON.parse(row.assets_json);
+    if (!Array.isArray(saved) || saved.some(id => typeof id !== 'string' || !id.trim())) {
+      throw runAfterError('run_after_asset_inventory_unreadable', 503);
+    }
+    for (const id of saved) ids.add(id);
   }
   return ids;
 }

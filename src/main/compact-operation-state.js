@@ -224,18 +224,48 @@ class CompactOperationRegistry {
 
   observeProviderCompaction(input = {}) {
     if (input.provider !== 'codex' || input.requestKind !== 'compaction'
-      || !optionalText(input.sessionId) || !optionalText(input.generation)
-      || !optionalText(input.providerSourceId) || !optionalText(input.providerRequestId)
-      || !Number.isSafeInteger(input.sourceByteOffset) || input.sourceByteOffset < 0) return null;
+      || !optionalText(input.generation) || !optionalText(input.providerSourceId)
+      || !optionalText(input.providerRequestId)) return null;
+    const observationOnly = input.observationOnly === true;
+    if (observationOnly ? !optionalText(input.turnId) || !optionalText(input.providerThreadId)
+      || !optionalText(input.providerObservedSessionId) || !optionalText(input.providerLaunchId)
+      || !Number.isSafeInteger(input.providerRunSeq) || input.providerRunSeq <= 0
+      || !Number.isSafeInteger(input.providerStopRevision) || input.providerStopRevision < 0
+      : !optionalText(input.sessionId) || !Number.isSafeInteger(input.sourceByteOffset) || input.sourceByteOffset < 0) return null;
     // A request inside an explicitly tracked /compact is not a second
     // command, Send receipt or timer. Pending intent still needs its original
     // causal task_started. Retries within one observed phase keep its start.
     const existing = this.getActive(input.tabId, 'codex') || this.getPending(input.tabId, 'codex');
-    if (existing) return ownerMatches(existing, input) ? existing : null;
+    if (existing) {
+      if (existing.source !== 'provider-compaction') return ownerMatches(existing, input) ? existing : null;
+      const sameProvider = existing.providerSourceId === input.providerSourceId
+        && ['providerLaunchId', 'providerRunSeq', 'providerThreadId', 'providerObservedSessionId', 'turnId']
+          .every(key => existing[key] == null || existing[key] === input[key]);
+      return sameProvider && ownerMatches(existing, { ...input,
+        ...(existing.observationOnly ? { sessionId: null } : {}) }) ? existing : null;
+    }
     return this._begin({ ...input, command: null, handoffId: null,
       sendOperationKey: null, sendAttemptId: null, source: 'provider-compaction',
+      ...(observationOnly ? { sessionId: null, sourceByteOffset: null } : {}),
       operationId: 'codex:provider-compaction:' + input.providerSourceId + ':' + input.providerRequestId,
     }, true);
+  }
+
+  // Called only after Main proves the original pre-request physical file and
+  // current writer. This does not rebase EOF, restart the phase or authorize input.
+  bindProviderCompaction(input = {}) {
+    const active = this.activeByTab.get(input.tabId);
+    if (!active?.observationOnly || active.source !== 'provider-compaction'
+      || active.operationId !== input.operationId || active.generation !== input.generation
+      || ['providerSourceId', 'providerLaunchId', 'providerRunSeq', 'providerStopRevision', 'providerThreadId', 'turnId']
+        .some(key => active[key] !== input[key])
+      || !optionalText(input.sessionId) || input.sessionId !== active.providerObservedSessionId
+      || !Number.isSafeInteger(input.sourceByteOffset) || input.sourceByteOffset < 0) return null;
+    const bound = cloneOperation({ ...active, observationOnly: false,
+      sessionId: input.sessionId, sourceByteOffset: input.sourceByteOffset });
+    this.activeByTab.set(input.tabId, bound);
+    this.publish(bound);
+    return this.activeByTab.get(input.tabId) === bound ? bound : null;
   }
 
   _begin(input, providerObserved) {
@@ -257,7 +287,13 @@ class CompactOperationRegistry {
       provider,
       command: providerObserved ? null : '/compact',
       ...(providerObserved ? { providerSourceId: input.providerSourceId,
-        providerRequestId: input.providerRequestId } : {}),
+        providerRequestId: input.providerRequestId,
+        observationOnly: input.observationOnly === true,
+        providerObservedSessionId: optionalText(input.providerObservedSessionId),
+        providerThreadId: optionalText(input.providerThreadId),
+        providerLaunchId: optionalText(input.providerLaunchId),
+        providerRunSeq: input.providerRunSeq ?? null,
+        providerStopRevision: input.providerStopRevision ?? null } : {}),
       operationId,
       sessionId,
       generation,
@@ -460,6 +496,7 @@ class CompactOperationRegistry {
     const tabId = requireText(input.tabId, 'tabId');
     const active = this.activeByTab.get(tabId) || null;
     if (!ownerMatches(active, input)) return null;
+    if (input.outcome === 'completed' && active.observationOnly === true) return null;
     // A copied marker from the historical rollout prefix cannot settle a new
     // operation merely because tab/session/generation still match.
     if (Number.isFinite(input.completionByteOffset)
@@ -536,6 +573,7 @@ class CompactOperationRegistry {
     const tabId = requireText(input.tabId, 'tabId');
     const active = this.activeByTab.get(tabId) || null;
     if (!ownerMatches(active, { ...input, provider: 'codex' })) return null;
+    if (active.observationOnly === true) return null;
     const offset = finiteOffset(input.rolloutOffset ?? input.completionByteOffset);
     const eventSequence = finiteOffset(input.eventSequence);
     if (active.provider !== 'codex' || !Number.isFinite(offset)) return null;

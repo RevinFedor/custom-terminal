@@ -120,6 +120,7 @@ test('real Project send rejects a destination that changes while preparation is 
     agentSendTargetPreconditionFailure: check,
     bridgeRequest: async () => { calls.push('bridge'); return { success: true, submitted: true }; },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, web);
   vm.runInContext(declaration(web, 'runPreparedAgentSendScenario'), context);
   const result = await context.runPreparedAgentSendScenario({
     tabId: 'tab', prompt: 'callback', expectedTarget: { toolType: 'codex', sessionId: 'A' },

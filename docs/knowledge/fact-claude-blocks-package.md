@@ -84,6 +84,13 @@ collapse и `<pasted_content>`-чипы принадлежат presentation-сл
 Inspector над composer: Task-строка в основной Virtuoso-ленте
 лишь выбирает агента и не владеет вложенным scroll-container.
 
+Optional contextLabel/footerText/footerTitle у вложенного transcript — только
+presentation Mini reviewer. Общие user card/Markdown/Copy/collapse остаются теми
+же; без Edit/Repeat/Rewind callbacks canonical write authority не появляется.
+У обычных subagent steps эти поля отсутствуют, старый DOM профиль сохраняется.
+Inline User Copy для annotated Mini object передаётся в общий ChatMessage ctx;
+у обычных subagent steps прежний context-menu/DOM не расширяется этим change.
+
 Codex History использует тот же `ToolCallPart`, поэтому верхнеуровневый `exec` нельзя
 «чинить визуально» внутри пакета: это transport-envelope нового rollout, а не новый
 вид пользовательского действия. Codex adapter обязан до пакета развернуть вложенные

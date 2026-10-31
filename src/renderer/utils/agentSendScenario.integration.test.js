@@ -101,12 +101,12 @@ async function buildBundle() {
         toolType,
         runtime,
         sessionId: options.sessionId || null,
-        prompt: 'integration prompt',
+        prompt: options.prompt === undefined ? 'integration prompt' : options.prompt,
         handoffId: options.handoffId || 'integration-handoff',
         // This suite exercises the executing side of the shared scenario;
         // application admission is tested with actual Main/SQLite separately.
-        sendOperationKey: 'history:scenario-integration-tab:integration-handoff',
-        sendAttemptId: 'integration-attempt',
+        sendOperationKey: options.applicationAdmission ? undefined : 'history:scenario-integration-tab:integration-handoff',
+        sendAttemptId: options.applicationAdmission ? undefined : 'integration-attempt',
         source: options.source || 'prompt-queue',
         statusAtSend: options.statusAtSend || options.status || 'active',
         ...(options.omitSettingsIntent ? {} : {
@@ -114,6 +114,8 @@ async function buildBundle() {
         }),
         historyRestartSettings: options.historyRestartSettings,
         recordWithoutReply: options.recordWithoutReply === true,
+        presentationSnapshot: options.presentationSnapshot,
+        authoringSnapshot: options.authoringSnapshot,
       }); } finally { unsubscribe(); }
       return { result, events: state.events, sendOptions: state.lastSendOptions, sendActivity };
     }
@@ -153,6 +155,12 @@ async function buildBundle() {
   global.window = { require: () => ({ ipcRenderer: {
     on() {}, removeListener() {},
     async invoke(channel, request) {
+      if (channel === 'agent:enqueue-prompt') {
+        globalThis.__sendScenarioState.events.push(['enqueue', request]);
+        return { success: true, accepted: true, submitted: false, applicationQueued: true,
+          status: 'application-queued', handoffId: request.handoffId,
+          operationKey: 'history:' + request.tabId + ':' + request.handoffId };
+      }
       // This fixture has no attached/deferred working context; execute the
       // real renderer context wrapper against its explicit neutral API reply.
       if (channel === 'tab-work-context:prepare') return { success: true, prompt: request.prompt, prefix: '' };
@@ -176,6 +184,52 @@ async function buildBundle() {
 
 let bundle;
 test.before(async () => { bundle = await buildBundle(); });
+
+test('desktop Codex Compact uses the same Main enqueue IPC without a renderer launch or provider send', async () => {
+  const { result, events, sendActivity } = await bundle.run({ applicationAdmission: true,
+    toolType: 'codex', source: 'history-panel', prompt: '/compact', status: 'inactive',
+    authoringSnapshot: { editorText: '/compact', chips: [], imagePaths: [] },
+    presentationSnapshot: { promptChips: [], imagePaths: [] } });
+  assert.equal(result.applicationQueued, true);
+  assert.deepEqual(events.map(event => event[0]), ['enqueue']);
+  const admitted = events[0][1];
+  assert.equal(admitted.prompt, '/compact');
+  assert.equal(admitted.toolType, 'codex');
+  assert.equal(admitted.source, 'history-panel');
+  assert.equal(admitted.sendOperationKey, undefined);
+  assert.deepEqual(admitted.authoringSnapshot, { editorText: '/compact', chips: [], imagePaths: [] });
+  assert.deepEqual(sendActivity, []);
+});
+
+for (const [label, options] of [
+  ['Claude Compact', { toolType: 'claude', prompt: '/compact' }],
+  ['Project API Compact', { source: 'project-api', prompt: '/compact' }],
+  ['native Compact', { source: 'mobile-native', prompt: '/compact' }],
+  ['another local command', { prompt: '/fast' }],
+  ['image-bearing Compact', { prompt: '/compact', presentationSnapshot: { imagePaths: [{ id: 1, path: '/fixture/image.png' }] } }],
+  ['chip-bearing Compact', { prompt: '/compact', presentationSnapshot: { promptChips: [{ kind: 'prompt', text: 'keep me' }] } }],
+]) test('actual renderer caller retains the prior non-FIFO route for ' + label, async () => {
+  const { events } = await bundle.run({ applicationAdmission: true, toolType: 'codex', source: 'history-panel', ...options });
+  assert.equal(events.some(event => event[0] === 'enqueue'), false);
+  assert.equal(events.filter(event => event[0] === 'send').length, 1, 'the pre-existing provider operation still runs exactly once');
+});
+
+test('an already admitted Compact executes once without recursively enqueuing its Main operation', async () => {
+  const { events, sendOptions } = await bundle.run({ toolType: 'codex', source: 'history-panel', prompt: '/compact' });
+  assert.equal(events.some(event => event[0] === 'enqueue'), false);
+  assert.equal(events.filter(event => event[0] === 'send').length, 1);
+  assert.equal(sendOptions.sendOperationKey, 'history:scenario-integration-tab:integration-handoff');
+  assert.equal(sendOptions.sendAttemptId, 'integration-attempt');
+});
+
+for (const [label, prompt] of [['ordinary text', 'integration prompt'], ['multiline slash authoring', '/compact\nkeep this text']]) {
+  test('actual renderer caller preserves ordinary Main FIFO admission for ' + label, async () => {
+    const { result, events } = await bundle.run({ applicationAdmission: true, toolType: 'codex', source: 'history-panel', prompt });
+    assert.equal(result.applicationQueued, true);
+    assert.deepEqual(events.map(event => event[0]), ['enqueue']);
+    assert.equal(events[0][1].prompt, prompt);
+  });
+}
 
 for (const code of ['agent_send_cancelled', 'agent_send_preparation_expired', 'agent_send_preparation_storage_unavailable']) {
   test('actual renderer scenario preserves Main pre-input preparation refusal: ' + code, async () => {

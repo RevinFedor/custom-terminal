@@ -1,6 +1,6 @@
 'use strict';
 
-const { StringDecoder } = require('string_decoder');
+const { createTraceLineReader, parseTraceEventLine } = require('./perf-trace-events');
 const { randomUUID } = require('crypto');
 const { performance } = require('perf_hooks');
 
@@ -15,17 +15,12 @@ const MAX_ANIMATIONS = 256;
 function createLayoutRootCollector({ rendererPid, maxRoots = MAX_ROOTS, maxCarryBytes = 65536 } = {}) {
   const cap = Math.max(1, Math.min(MAX_ROOTS, maxRoots));
   const carryCap = Math.max(64, Math.min(65536, maxCarryBytes));
-  const decoder = new StringDecoder('utf8');
   const roots = new Map();
-  let carry = '', discarding = false, done = false;
-  const stats = { bytes: 0, lines: 0, layoutEvents: 0, malformedLayoutLines: 0,
-    overlongLines: 0, ignoredRootOccurrences: 0, incompleteTailBytes: 0, completeExport: false };
+  const stats = { layoutEvents: 0, malformedLayoutLines: 0, ignoredRootOccurrences: 0 };
   function line(text) {
-    stats.lines++;
     if (!text.includes('"layoutRoots"')) return;
-    text = text.replace(/^\s*\{\s*"traceEvents"\s*:\s*\[/, '').trim().replace(/,$/, '');
     let event;
-    try { event = JSON.parse(text); } catch { stats.malformedLayoutLines++; return; }
+    try { event = parseTraceEventLine(text); } catch { stats.malformedLayoutLines++; return; }
     if (!['Layout', 'LocalFrameView::layout'].includes(event.name)) return;
     if (rendererPid && event.pid !== rendererPid) return;
     const entries = event.args?.endData?.layoutRoots || event.args?.data?.layoutRoots;
@@ -40,36 +35,13 @@ function createLayoutRootCollector({ rendererPid, maxRoots = MAX_ROOTS, maxCarry
       else stats.ignoredRootOccurrences++;
     }
   }
-  function text(value) {
-    let offset = 0;
-    while (offset < value.length) {
-      const newline = value.indexOf('\n', offset);
-      const end = newline < 0 ? value.length : newline;
-      const part = value.slice(offset, end);
-      if (!discarding) {
-        if (Buffer.byteLength(carry) + Buffer.byteLength(part) > carryCap) {
-          carry = ''; discarding = true; stats.overlongLines++;
-        } else carry += part;
-      }
-      if (newline < 0) break;
-      if (!discarding) line(carry);
-      carry = ''; discarding = false; offset = newline + 1;
-    }
-  }
+  const reader = createTraceLineReader({ onLine: line, maxCarryBytes: carryCap, traceEventsOnly: true });
   return {
-    write(data) {
-      if (done) return;
-      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      stats.bytes += buffer.length; text(decoder.write(buffer));
-    },
+    write: reader.write,
     finish(completeExport = false) {
-      if (!done) {
-        text(decoder.end()); stats.completeExport = completeExport === true;
-        if (completeExport && carry && !discarding) line(carry);
-        else stats.incompleteTailBytes = Buffer.byteLength(carry);
-        carry = ''; done = true;
-      }
-      return { ...stats, carryLimitBytes: carryCap, rootLimit: cap,
+      const { bytes, lines, overlongLines, incompleteTailBytes, completeExport: complete } = reader.finish(completeExport);
+      return { bytes, lines, ...stats, overlongLines, incompleteTailBytes, completeExport: complete,
+        carryLimitBytes: carryCap, rootLimit: cap,
         roots: [...roots.values()].sort((a, b) => b.occurrences - a.occurrences || a.backendNodeId - b.backendNodeId) };
     },
   };

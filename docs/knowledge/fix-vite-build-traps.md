@@ -199,3 +199,29 @@ Actual Vite transformRequest regression воспроизвёл raw browser impor
 keywords и CSS property values за кандидаты; их нельзя объявлять пропавшими
 DOM-классами без просмотра caller. Smaller CSS не заменяет реальный замер
 переключения/scroll и проверку доступных UI-поверхностей.
+
+## Часть 9: private source maps и inspector
+
+Hidden maps сами не гарантируют привязку CPU-профиля к исходнику. В diagnostic
+сборке122 исходные позиции History/decode/pane были null: inspector core1.5.1
+менял JSX, возвращая строку без карты. `inspector-private-sourcemap.mjs` устанавливает
+в частном compiler entry Node load hook **до** импорта Vite config, проверяет
+exact SHA зависимости и возвращает map той же MagicString-трансформации.
+Generated code сохраняется; shared node_modules не меняются. Для неизменённого
+текста map:null сохраняет предыдущую карту; injected spans остаются unmapped.
+
+Побуквенная карта вызвала compiler OOM, token-boundary вариант пересёк прежний
+лимит роста RSS. Построчная карта сохранила нужные file/line mappings; точность
+source column не заявляется. Проверка включает actual final assets и четыре
+точки после всех преобразований, hashes code/map/source и runtime samples.
+Тест отдельного helper не заменяет compose maps в готовой сборке. Default build
+остаётся без private maps; opt-in флаг сам не устанавливает inspector load hook.
+
+Raw Main-модуль, загружаемый через `srcMainDir`, может вообще не входить в compiler
+graph. В isolated stream-overlay разрешено переиспользовать проверенные compiled
+assets, если полный source manifest изменился только в явно названных raw modules,
+их нет в прежнем graph, остальные bytes/modes/membership неизменны и совпадают
+hashes старого output и текущего baseline. Все native/unpacked файлы, подпись,
+resource guards и проверка нового ASAR остаются прежними. Receipt явно говорит
+«compiled output reused», не выдумывает новую компиляцию. Любая другая разница
+отказывает в reuse и требует соответствующей сборки; близость имён/дат не proof.

@@ -74,6 +74,7 @@ async function fixture(t, provider = 'codex') {
     sendAuditPending: (res, data) => ctx.sendJson(res, 202, { ok: true, ...data }),
     isAgentSendProviderQueueAccepted: () => false,
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(ctx, tree);
   for (const name of ['mobileAttachmentRoot', 'sanitizeMobileAttachmentName', 'normalizeMobileAttachmentKind',
     'inferMobileAttachmentMimeType', 'safeMobileAttachmentPath', 'removeMobileAttachment', 'storeMobileAttachment',
     'sendAttachmentError', 'findOwnedMobileUpload', 'normalizeSendAttachments', 'appendAttachmentsToPrompt', 'readMobileAttachmentPreview',

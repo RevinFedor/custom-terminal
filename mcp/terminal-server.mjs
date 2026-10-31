@@ -532,7 +532,7 @@ async function httpApiGet(target, endpoint) {
     error.code = json.code;
     error.revision = json.revision;
     if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
-    if (/\/history-operations(?:\/|\?|$)/.test(endpoint)
+    if (/\/history-operations(?:\/|\?|$)/.test(endpoint) || /\/self-rewind$/.test(endpoint)
       || /\/send-receipts\/(?:reconcile|release)$/.test(endpoint)) {
       error.toolDetails = json;
       error.code = json.code || json.error;
@@ -561,8 +561,14 @@ async function httpApiPost(target, endpoint, body, presentationSource = null) {
     error.code = json.code;
     error.messageId = json.messageId;
     error.deliveryState = json.deliveryState;
+    if (json.code === 'codex_message_too_large' && json.inputLimit?.provider === 'codex') {
+      // Return scalar diagnostics, never echo the persisted oversized draft.
+      error.toolDetails = { code: json.code, provider: 'codex', inputLimit: json.inputLimit,
+        recommendation: json.recommendation, submitted: json.submitted === true,
+        runId: json.runId, tabId: json.tabId || json.targetTabId, handoffId: json.handoffId };
+    }
     if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
-    if (/\/history-operations(?:\/|\?|$)/.test(endpoint)
+    if (/\/history-operations(?:\/|\?|$)/.test(endpoint) || /\/self-rewind$/.test(endpoint)
       || /\/send-receipts\/(?:reconcile|release)$/.test(endpoint)) {
       error.toolDetails = json;
       error.code = json.code || json.error;
@@ -1013,6 +1019,7 @@ async function ensureSavedHistorySupport(target, toolType = null, request = null
     || request?.repairOfOperationId && cap.repairOfOperationId !== true) {
     throw Object.assign(new Error('This Noted Terminal app requires an update for saved-history Rewind/receipts. No native, AI-summary or raw-file fallback is allowed.'), { code: 'app_update_required' });
   }
+  return cap;
 }
 
 const HISTORY_OPERATION_GUIDANCE = 'Acceptance/202 and a completed receipt are not inputReady or proof of a clean history prefix. Inspect operation historyMutated, bindingCommitted/binding, newSessionId, draft and resume separately. Read current status and the exact resulting history before an authorized single send_prompt; Rewind never submits the restored prompt. Do not poll or repeat an unknown operation.';
@@ -1032,6 +1039,7 @@ function requireHistoryOperationResponse(result, tabId, operationId, kind = null
 
 function historyOperationError(cause, tabId, operationId, mutationAttempted = false) {
   let details = cause?.toolDetails || {};
+  if (details.mutationAttempted === false) mutationAttempted = false;
   let code = cause?.code || details.code;
   if (details.operation) {
     try { requireHistoryOperationResponse(details, tabId, operationId); }
@@ -1055,6 +1063,7 @@ const SYSTEM_PROMPT_FIELDS = {
 const SYSTEM_PROMPT_SCOPE = { projectId: { type: 'string' }, cwd: { type: 'string' } };
 
 const ORCHESTRATION_COMPLETION_GUIDANCE = ' On apps advertising orchestrationInlineResults:{version:1}, the later completion notification normally carries the full answer. Check the actual notification: use an inline full answer directly; call get_delegation_result only if it says the result is omitted/oversize, does not include the full answer (including older apps), or for explicit recovery. Do not poll or wait inside the initiating turn.';
+const CODEX_INPUT_LIMIT_GUIDANCE = ' Codex submit is limited to 1048576 Unicode scalar values in the final expanded input, including file bodies and wrappers; file byte limits are separate. codex_message_too_large reports actual/max and physical submitted flags; preflight refuses before input. Reduce the text or explicitly provide paths for the target to read; never silently drop files, split sends or replay UNKNOWN.';
 const CODEX_GOAL_GUIDANCE = ' If native Codex reports codex_resume_goal_action_required, read get_codex_goal and use resolve_codex_goal for the authorized choice; do not retry Start/Send or synthesize terminal keys.';
 
 const STRUCTURED_JSON_TOOLS = new Set([
@@ -1080,11 +1089,29 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'notify_user', 'get_user_notification',
   'reconcile_send_receipt', 'release_send_queue_head',
   'get_codex_goal', 'resolve_codex_goal',
-  'rewind_history', 'get_history_operation', 'rewind_ai',
+  'rewind_history', 'rewind_self', 'get_history_operation', 'rewind_ai',
   'change_working_directory', 'get_working_directory_operation',
 ]);
 
 const TOOLS = [
+  {
+    name: 'rewind_self',
+    description: 'Only on the user\'s explicit instruction, rewind THIS full session with the existing saved-history executor. Save a concise factual retainedContext first: code/server changes, deployment outcome, findings, constraints and unresolved effects; Rewind does not undo files or external actions. Resolve the requested iteration to an exact user UUID, never guess by index/text. Read current_context/get_tab_context first; pass its expectedContextRevision and retain all notes from that snapshot. By default all observed updates are covered; explicit coveredContextUpdateIds can narrow the set. Those old chips are superseded only after binding; later changed/new updates remain. With no nextPrompt the removed prompt is restored as a draft beside a Rewind context chip; with nextPrompt the app queues ONE ordinary model task after Rewind through the existing FIFO. No native menu or AI-summary mode. Choose operationId before calling. This is the LAST tool action of the old turn: finish immediately after acceptance; the app owns Stop/rewrite/Resume/followup. Lost ACK/UNKNOWN must be read by the SAME tabId/operationId using get_history_operation, never rerun or send the followup yourself. Requires savedHistory.selfRewind.version:1 in the loaded app.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' },
+      expectedSessionId: { type: 'string', minLength: 1 }, targetUuid: { type: 'string', minLength: 1 },
+      toolType: { type: 'string', enum: ['codex', 'claude'] },
+      targetSourceIdentity: { type: ['string', 'null'] }, expectedContentRevision: { type: ['string', 'null'] },
+      targetEntryRef: { type: ['object', 'null'], properties: { physicalSessionId: { type: 'string' },
+        rawUuid: { type: 'string' }, sourceIdentity: { type: ['string', 'null'] }, segmentId: { type: 'string' },
+        viewOwnerSessionId: { type: 'string' }, contentRevision: { type: 'string' } },
+        required: ['physicalSessionId', 'rawUuid'], additionalProperties: false },
+      retainedContext: { type: 'string', minLength: 1, maxLength: 100000 },
+      expectedContextRevision: { type: 'integer', minimum: 0 },
+      coveredContextUpdateIds: { type: ['array', 'null'], items: { type: 'string', minLength: 1 }, description: 'Normally omit: retain and supersede ALL updates in the observed expectedContextRevision snapshot. Explicit IDs restrict coverage to those incorporated in retainedContext.' },
+      nextPrompt: { type: 'string', minLength: 1, description: 'Optional NEW model task, not a local slash command. Omit for Rewind only; never send it again after acceptance.' },
+    }, required: ['operationId', 'expectedSessionId', 'targetUuid', 'retainedContext', 'expectedContextRevision'] },
+  },
   {
     name: 'inspect_tabs',
     description: 'Passively inspect up to 8 exact tabs: Main event/runtime and turn state, own background work, tracked jobs and pending result delivery separately. Optional bounded last completed response is read only from verified existing caches; cold/stale evidence stays unavailable. Historical text never proves current completion. Does not run ps, scan full histories, send, resume, stop or register an observer. Use wait_for_tab_response for actual waiting, not polling this reader.',
@@ -1425,7 +1452,7 @@ const TOOLS = [
   },
   {
     name: 'delegate_to_session',
-    description: 'Start a persistent cross-tab delegation through the Project API. `files` sends local UTF-8 text as server-resolved context snapshots; pass paths and roles only, never read large bodies into this caller context. This is for a separate visible Claude/Codex session, not for a temporary internal subagent or a short question to a busy owner (use send_message). It returns immediately with a durable runId; only a non-empty runId proves acceptance, not completion. An error, null, or missing runId is not confirmed acceptance. Finish the current turn after acceptance; the source receives one later completion notification. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.' + ORCHESTRATION_COMPLETION_GUIDANCE,
+    description: 'Start a persistent cross-tab delegation through the Project API. `files` sends local UTF-8 text as server-resolved context snapshots; pass paths and roles only, never read large bodies into this caller context. This is for a separate visible Claude/Codex session, not for a temporary internal subagent or a short question to a busy owner (use send_message). It returns immediately with a durable runId; only a non-empty runId proves acceptance, not completion. An error, null, or missing runId is not confirmed acceptance. Finish the current turn after acceptance; the source receives one later completion notification. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.' + CODEX_INPUT_LIMIT_GUIDANCE + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2043,7 +2070,7 @@ const TOOLS = [
   },
   {
     name: 'send_prompt',
-    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns a delivery status, not an answer. For pending/unknown delivery use get_send_receipt({tabId,handoffId}); never retry changed or empty text to check status, and never invent a new operation ID for an unresolved send. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use send_message for short questions with an addressed reply, and run_command for generic shells.',
+    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns a delivery status, not an answer. For pending/unknown delivery use get_send_receipt({tabId,handoffId}); never retry changed or empty text to check status, and never invent a new operation ID for an unresolved send. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use send_message for short questions with an addressed reply, and run_command for generic shells.' + CODEX_INPUT_LIMIT_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -3883,6 +3910,32 @@ async function callTool(name, args) {
       return JSON.stringify(await callWorkingDirectoryOperation(name, args, {
         target, get: httpApiGet, post: httpApiPost,
       }), null, 2);
+    }
+
+    case 'rewind_self': {
+      const tabId = PARENT_TAB_ID();
+      if (EXTERNAL_MODE || !tabId) throw Object.assign(new Error('Self Rewind requires the calling full Noted Terminal session'), { code: 'self_rewind_caller_required' });
+      const { retainedContext, expectedContextRevision, coveredContextUpdateIds = null, nextPrompt, ...targetArgs } = args;
+      if (typeof retainedContext !== 'string' || !retainedContext.trim() || retainedContext.length > 100000
+        || !Number.isSafeInteger(expectedContextRevision) || expectedContextRevision < 0
+        || coveredContextUpdateIds !== null && (!Array.isArray(coveredContextUpdateIds) || coveredContextUpdateIds.some(id => typeof id !== 'string' || !id))
+        || nextPrompt !== undefined && (typeof nextPrompt !== 'string' || !nextPrompt.trim())) throw historyArgumentError('Invalid retained context, revision, covered member IDs or nextPrompt');
+      if (Object.keys(targetArgs).some(key => !['operationId', 'expectedSessionId', 'targetUuid', 'toolType',
+        'targetSourceIdentity', 'targetEntryRef', 'expectedContentRevision'].includes(key))) throw historyArgumentError('Self Rewind cannot address another tab or repair an old operation');
+      const { operationId, request } = historyOperationArgs({ ...targetArgs, tabId });
+      let mutationAttempted = false;
+      try {
+        const target = projectHint({}, tabId);
+        const capability = await ensureSavedHistorySupport(target, request.toolType, request);
+        if (capability.selfRewind?.version !== 1) throw Object.assign(new Error('Update Noted Terminal for retained-context Self Rewind; no fallback was attempted'), { code: 'app_update_required' });
+        mutationAttempted = true;
+        const result = requireHistoryOperationResponse(await httpApiPost(target,
+          '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/self-rewind', { ...request,
+            selfRewind: { retainedContext, expectedContextRevision, coveredContextUpdateIds, nextPrompt: nextPrompt ?? null },
+            sourceMeta: buildSourceMeta() }), tabId, operationId, 'rewind', request);
+        return JSON.stringify({ ...result, tabId, operationId,
+          guidance: 'Finish this old turn now. The app owns Rewind and the optional single followup. Do not send it yourself, poll, or retry unknown. For explicit recovery read get_history_operation with this SAME tabId/operationId.' });
+      } catch (error) { throw historyOperationError(error, tabId, operationId, mutationAttempted); }
     }
 
     case 'rewind_history': {

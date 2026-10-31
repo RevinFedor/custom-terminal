@@ -22,7 +22,7 @@ test('native counter intervals distinguish JS/style/layout and do not fabricate 
 // Run the actual CommonJS producer with only Electron transport/process replaced.
 // No app, inspector, renderer runtime, provider, or timer is started here.
 const preloadSource = fs.readFileSync(path.join(__dirname, 'perf-native-bootstrap-preload.js'), 'utf8');
-function preloadControl(onSend = () => {}, isMainFrame = true) {
+function preloadControl(onSend = () => {}, isMainFrame = true, globals = {}) {
   const ipc = new EventEmitter(), process = new EventEmitter(), sent = [];
   process.isMainFrame = isMainFrame;
   process.once = (name, listener) => {
@@ -32,13 +32,35 @@ function preloadControl(onSend = () => {}, isMainFrame = true) {
   };
   ipc.send = (channel, payload) => { sent.push({ channel, payload }); onSend(channel, payload); };
   const run = new vm.Script('(function(require, process, module, exports) {\n' + preloadSource + '\n})');
-  run.runInNewContext()((name) => {
+  run.runInNewContext(globals)((name) => {
     if (name === 'electron') return { ipcRenderer: ipc };
     assert.equal(name, 'node:crypto'); return require(name);
   }, process, { exports: {} }, {});
   return { ipc, process, sent };
 }
 const drain = () => new Promise(resolve => setImmediate(resolve)); // Promise/event turn, never a readiness sleep.
+
+test('actual preload clock is scalar, exact-bootstrap-bound and duplicate-stable', () => {
+  let time = 12;
+  const f = preloadControl(() => {}, true, { window: { performance: { timeOrigin: 1000, now: () => time } } });
+  const base = { wcId: 1, rendererPid: 2, frameProcessId: 77, frameRoutingId: 3,
+    documentGeneration: 1, challenge: 'a'.repeat(32) };
+  f.ipc.emit('perf:native-bootstrap-challenge', {}, base); f.process.emit('loaded');
+  const boot = f.sent.find(x => x.channel === 'perf:native-bootstrap-ack').payload;
+  const request = { ...base, bootNonce: boot.bootNonce, clockId: 'b'.repeat(32) };
+  f.ipc.emit('perf:input-clock-challenge', {}, { ...request, bootNonce: 'c'.repeat(32) });
+  f.ipc.emit('perf:input-clock-challenge', {}, { ...request, frameRoutingId: 4 });
+  assert.equal(f.sent.filter(x => x.channel === 'perf:input-clock-ack').length, 0);
+  f.ipc.emit('perf:input-clock-challenge', {}, request);
+  const first = f.sent.at(-1).payload;
+  assert.equal(first.rendererEpochMs, 1012); assert.equal(first.clockId, request.clockId);
+  time = 99; f.ipc.emit('perf:input-clock-challenge', {}, request);
+  assert.equal(f.sent.at(-1).payload.rendererEpochMs, 1012);
+  assert.deepEqual([first.rendererTimeOriginMs, first.rendererNowMs], [1000, 12]);
+  assert.deepEqual(Object.keys(first).sort(), [...Object.keys(base), 'bootNonce', 'clockId',
+    'rendererEpochMs', 'rendererTimeOriginMs', 'rendererNowMs'].sort());
+});
+
 function fixture(t, external = false, options = {}) {
   const { proof = true, ...monitorOptions } = options;
   const dbg = new EventEmitter(), wc = new EventEmitter(), calls = [], logs = [], challenges = [];
@@ -78,6 +100,124 @@ function fixture(t, external = false, options = {}) {
   return { dbg, wc, calls, logs, monitor, challenges, newFrame, event, commit, loaded, ack, sendCommand,
     setAttached(value) { attached = value; } };
 }
+
+function inputFixture(t, extra = {}) {
+  let ports;
+  const record = { starts: 0, pauses: [], resumes: 0, disposals: 0 };
+  const recorder = { start() { record.starts++; return Promise.resolve(true); },
+    pause(reason, options) { record.pauses.push({ reason, options }); return Promise.resolve(true); },
+    resume() { record.resumes++; return Promise.resolve(true); },
+    dispose() { record.disposals++; return Promise.resolve(true); }, observe() { return true; },
+    state: () => ({ phase: 'recording' }), ...extra };
+  const f = fixture(t, false, { inputPreroll: { factory(options) { ports = options.transport; return recorder; },
+    createCollector() {}, publish: async () => true } });
+  return { ...f, record, recorder, ports: () => ports };
+}
+
+test('input trace ports require loaded owner and permit only fixed methods on that attachment', async t => {
+  const f = inputFixture(t); assert.equal(f.ports(), undefined);
+  await f.monitor.sample(); const ports = f.ports(), scope = ports.scope();
+  assert.equal(scope.rendererPid, 2); assert.equal(scope.window, 1);
+  await assert.rejects(ports.sendRaw('Runtime.evaluate', { expression: 'not allowed' }, scope), /not-admitted/);
+  await assert.rejects(ports.sendRaw('Tracing.start', {}, { ...scope, attachmentId: 'foreign' }), /not-admitted/);
+  await ports.sendRaw('Tracing.recordClockSyncMarker', { syncId: 'owned-control' }, scope);
+  const original = f.calls.length;
+  f.setAttached(false); f.dbg.emit('detach', {}, 'external-replacement'); f.setAttached(true);
+  assert.equal(ports.canCleanup(scope), false);
+  await assert.rejects(ports.sendRaw('Tracing.end', {}, scope, { cleanup: true }), /not-admitted/);
+  assert.equal(f.calls.length, original);
+});
+
+test('clock reply joins only the exact current frame/nonce and revocation rejects pending reads', async t => {
+  const f = inputFixture(t); await f.monitor.sample();
+  const ports = f.ports(), scope = ports.scope();
+  const clock = ports.readRendererClock(scope);
+  const request = f.challenges.at(-1); assert.equal(request.channel, 'perf:input-clock-challenge');
+  const response = { ...request.payload, challenge: f.ack(f.wc.mainFrame).challenge,
+    rendererEpochMs: 1234, rendererTimeOriginMs: 1000, rendererNowMs: 234 };
+  assert.equal(f.monitor.inputClockAck({ sender: { id: 1 }, senderFrame: f.wc.mainFrame }, response), false);
+  assert.equal(f.monitor.inputClockAck(f.event(), { ...response, bootNonce: 'a'.repeat(32) }), false);
+  assert.equal(f.monitor.inputClockAck(f.event(), response), true);
+  const got = await clock; assert.equal(got.rendererEpochMs, 1234); assert.ok(got.parentAfterAbs >= got.parentBeforeAbs);
+  assert.equal(f.monitor.inputClockAck(f.event(), response), false);
+  const old = ports.readRendererClock(scope); const rejected = assert.rejects(old, /revoked|lost/);
+  f.commit(); await rejected;
+});
+
+test('heavy profiler admission waits for input cleanup and unknown cleanup does not become ready', async t => {
+  let finish;
+  const f = inputFixture(t, { pause: () => new Promise(resolve => { finish = resolve; }) });
+  await f.monitor.sample(); const resume = f.monitor.suspend('incident-profile', { preserve: true });
+  let ready = false; resume.ready.then(() => { ready = true; }, () => {});
+  await drain(); assert.equal(ready, false); assert.equal(f.calls.includes('detach'), false);
+  finish(true); await resume.ready; assert.equal(f.calls.includes('detach'), true); resume();
+  const g = inputFixture(t, { pause: async () => false }); await g.monitor.sample();
+  const failed = g.monitor.suspend(); await assert.rejects(failed.ready, /retirement-unconfirmed/); failed();
+});
+
+test('disposal keeps detach observation until asynchronous input retirement ends', async t => {
+  let finish;
+  const f = inputFixture(t, { pause: () => new Promise(resolve => { finish = resolve; }) });
+  await f.monitor.sample(); f.monitor.dispose(); await drain();
+  assert.ok(f.dbg.listenerCount('detach') > 0);
+  f.setAttached(false); f.dbg.emit('detach', {}, 'external-replaced'); f.setAttached(true);
+  finish(true); await drain(); await drain();
+  assert.equal(f.calls.includes('detach'), false, 'never detach external replacement');
+  assert.equal(f.dbg.listenerCount('detach'), 0);
+});
+
+test('UNKNOWN START retains its exact attachment until late core cleanup, then a new document may attach', async t => {
+  let resolveStart;
+  const deadlines = [], events = [];
+  const f = fixture(t, false, { inputPreroll: { publish: async () => true },
+    schedule(fn, ms) { const item = { fn, ms, cancelled: false }; deadlines.push(item); return item; },
+    cancel(item) { if (item) item.cancelled = true; } });
+  f.dbg.sendCommand = async (method) => {
+    events.push(method);
+    if (method.startsWith('Performance.')) return { metrics: [] };
+    if (method === 'Tracing.start') return new Promise(resolve => { resolveStart = resolve; });
+    if (method === 'Tracing.end') { f.dbg.emit('message', {}, 'Tracing.tracingComplete', { stream: 'old-A', dataLossOccurred: false }); return {}; }
+    if (method === 'IO.close') return {};
+    assert.fail('unexpected ' + method);
+  };
+  await f.monitor.sample(); await drain(); assert.equal(typeof resolveStart, 'function');
+  f.commit(); f.loaded(); await drain();
+  for (const item of deadlines.filter(item => !item.cancelled && item.ms === 3000)) { item.cancelled = true; item.fn(); }
+  await drain(); await drain();
+  assert.equal(f.calls.filter(x => x === 'detach').length, 0, 'deadline is not a tracing cancellation proof');
+  assert.equal(await f.monitor.sample('new-document-before-old-proof'), null);
+  assert.equal(events.filter(x => x === 'Tracing.start').length, 1);
+  resolveStart({}); await drain(); await drain();
+  assert.equal(events.filter(x => x === 'Tracing.end').length, 1);
+  assert.equal(events.filter(x => x === 'IO.close').length, 1);
+  assert.equal(f.calls.filter(x => x === 'detach').length, 1);
+  // Leave the subsequent start as a known refusal; do not create another
+  // unknown diagnostic operation merely for a test cleanup.
+  f.dbg.sendCommand = async method => {
+    events.push(method); if (method === 'Tracing.start') throw Error('Tracing has already been started');
+    return { metrics: [] };
+  };
+  assert.ok(await f.monitor.sample('new-document-after-old-proof')); await drain();
+  assert.equal(f.calls.filter(x => x === 'attach').length, 2);
+  assert.equal(f.calls.filter(x => x === 'detach').length, 1, 'late A cleanup cannot detach B');
+});
+
+test('clock-bound current origin rejects old UI summaries even with reused numeric frame IDs', async t => {
+  let accepted = 0;
+  const f = inputFixture(t, { observe() { accepted++; return true; } }); await f.monitor.sample();
+  const oldFrame = f.wc.mainFrame;
+  f.commit(); f.loaded(); await drain(); await drain(); await f.monitor.sample();
+  const scope = f.ports().scope();
+  const clock = f.ports().readRendererClock(scope), request = f.challenges.at(-1).payload;
+  f.monitor.inputClockAck(f.event(), { ...request, challenge: f.ack(f.wc.mainFrame).challenge,
+    rendererTimeOriginMs: 2000, rendererNowMs: 34, rendererEpochMs: 2034 });
+  await clock;
+  const action = { id: 'ui-b-1', event: 'wheel', startAbs: 2030, durationMs: 200,
+    documentTimeOriginMs: 1000, nativeOriginal: { type: 'wheel', timeStampMs: 1030 } };
+  assert.equal(f.monitor.observeInput(action, f.event(oldFrame)), false); assert.equal(accepted, 0);
+  assert.equal(f.monitor.observeInput({ ...action, documentTimeOriginMs: 2000 }, f.event()), true);
+  assert.equal(accepted, 1);
+});
 test('passive monitor never reads DOM or starts a profiler and yields to an owned incident capture', async t => {
   const f = fixture(t); await f.monitor.sample(); await f.monitor.sample('ui-action', { id: 'a1' });
   assert.ok(f.logs.some(s => s.startsWith('[Perf:NativeWindow]') && s.includes('RecalcStyleDurationMs')));
@@ -545,30 +685,49 @@ test('Main source syntax and focused actual bootstrap handlers/window preference
   assert(start > 0 && end > start);
   const handlersSource = source.slice(start, end);
   const ast = require('acorn').parse(handlersSource, { ecmaVersion: 'latest' });
-  assert.equal(ast.body.filter(node => node.type === 'ExpressionStatement').length, 2);
+  const ipcRegistration = node => node.type === 'ExpressionStatement'
+    && node.expression.type === 'CallExpression' && node.expression.callee.type === 'MemberExpression'
+    && node.expression.callee.object.name === 'ipcMain' && node.expression.callee.property.name === 'on';
+  const channels = ast.body.filter(ipcRegistration)
+    .map(node => node.expression.arguments[0].value).sort();
+  assert.deepEqual(channels, ['perf:native-bootstrap-available', 'perf:native-bootstrap-ack', 'perf:input-clock-ack'].sort());
   // Execute the real counter-owner boundary. The adjacent manual-capture
   // controller has its own actual tests and is not a bootstrap dependency.
-  const focusedSource = ast.body.filter(node => node.type === 'ExpressionStatement'
+  const focusedSource = ast.body.filter(node => ipcRegistration(node)
     || (node.type === 'FunctionDeclaration' && node.id.name === 'ensureNativePerfMonitor')
-    || (node.type === 'VariableDeclaration' && node.declarations.some(d => d.id.name === 'perfNativeMonitors')))
+    || (node.type === 'VariableDeclaration' && node.declarations.some(d => ['perfNativeMonitors','perfNativeCaptureHolds'].includes(d.id.name))))
     .map(node => handlersSource.slice(node.start, node.end)).join('\n');
-  const ipcMain = new EventEmitter(), routed = [], installs = [];
+  const ipcMain = new EventEmitter(), routed = [], installs = [], writers = [];
   const owned = { id: 47, isDestroyed: () => false, once() {} };
   const monitor = { dispose() {}, bootstrapAvailable(event) { routed.push(['available', event]); },
-    bootstrapAck(event, payload) { routed.push(['ack', event, payload]); } };
-  const context = { ipcMain, process: { env: {} }, perfCollectionAllowed: true, path, srcMainDir: __dirname,
-    console, require(name) { assert.equal(name, path.join(__dirname, 'perf-native-metrics.js'));
-      return { createNativePerfMonitor(options) { installs.push(options.webContents); return monitor; } }; } };
+    bootstrapAck(event, payload) { routed.push(['ack', event, payload]); },
+    inputClockAck(event, payload) { routed.push(['clock', event, payload]); } };
+  const publish = () => true;
+  const context = { ipcMain, process: { env: {}, pid: 333 }, mainWindow: { webContents: owned },
+    mainLogPath: '/private/owned-logs/production.log', perfCollectionAllowed: true, path, srcMainDir: __dirname,
+    console, require(name) {
+      if (name === path.join(__dirname, 'perf-input-snapshot-store.js')) return {
+        createInputSnapshotWriter(options) { writers.push(options); return { publish }; } };
+      assert.equal(name, path.join(__dirname, 'perf-native-metrics.js'));
+      return { createNativePerfMonitor(options) { installs.push(options); return monitor; } }; } };
   vm.runInNewContext(focusedSource + '\nthis.ensure = ensureNativePerfMonitor;', context);
   const foreign = { sender: { id: 999 } };
   ipcMain.emit('perf:native-bootstrap-available', foreign); ipcMain.emit('perf:native-bootstrap-ack', foreign, {});
+  ipcMain.emit('perf:input-clock-ack', foreign, {});
   assert.deepEqual(installs, []); assert.deepEqual(routed, []);
   assert.equal(context.ensure(owned), monitor); assert.equal(context.ensure(owned), monitor);
   const event = { sender: owned, senderFrame: { processId: 5, routingId: 6 } }, payload = { exact: true };
   ipcMain.emit('perf:native-bootstrap-available', event); ipcMain.emit('perf:native-bootstrap-ack', event, payload);
+  ipcMain.emit('perf:input-clock-ack', event, payload);
   assert.equal(installs.length, 1); assert.equal(routed[0][1], event); assert.equal(routed[1][1], event);
+  assert.equal(installs[0].inputPreroll.publish, publish); assert.equal(writers.length, 1);
+  assert.equal(writers[0].mainPid, 333); assert.equal(writers[0].windowId, owned.id);
+  context.ensure({ ...owned, id: 48 });
+  assert.equal(installs[1].inputPreroll, null, 'secondary windows never own another global trace');
+  assert.equal(writers.length, 1);
   assert.equal(routed[1][2], payload);
-  for (const channel of ['perf:native-bootstrap-available', 'perf:native-bootstrap-ack']) {
+  assert.deepEqual(routed[2], ['clock', event, payload]);
+  for (const channel of ['perf:native-bootstrap-available', 'perf:native-bootstrap-ack', 'perf:input-clock-ack']) {
     assert.equal(source.split("ipcMain.on('" + channel + "'").length - 1, 1);
     assert.equal(source.split("ipcMain.handle('" + channel + "'").length - 1, 0);
   }

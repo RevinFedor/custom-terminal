@@ -402,13 +402,56 @@ Codex — ровно один раз в main, а materialization status чита
 
 Ручной Enter и автоматическая отправка используют общий локальный порядок PTY-байтов, но не общий status-preflight. Ручной Enter записывается сразу и запускает наблюдение writer после write. Автоматический путь до paste отдельно защищается от чужого draft, затем пишет paste+Enter без промежуточного render-ACK и ждёт rollout `user_message`; это не превращает ручной жест в «одно launch-scoped действие» и не ставит process/session lookup перед клавишей.
 
+Шрам30Oct: два Terminal MCP аудита отправили1 226 681/1 227 075 символов одной
+вставкой. Codex0.165.0 явно показал `Message exceeds the maximum length of
+1048576 characters` до user_message. Разбивка одного файла больше1MiB на3части
+устранила только per-file HTTP413 Noted: все части всё равно склеились в одно
+сообщение. Лимиты файлов в байтах и итогового CLI input в Unicode scalar values
+различны; повтор Enter этот отказ не исправляет. Видимая TUI ошибка не попала
+в orchestration outcome и дала долгую «Проверку доставки». Это диагноз старого
+среза; его два UNKNOWN не переписываются и не replay.
+
+SOURCE30Oct проверяет submit по всему собранному input, а не по сырому prompt:
+первый отказ у Main FIFO сохраняет authoring и `not-submitted` без attempt,
+второй — перед paste после image/upload projection. Лимит1 048 576 считается
+без копии массива символов: surrogate pair — один scalar; Unicode White_Space
+на внешних краях не входит в native composer count, внутренние пробелы и BOM
+сохраняются. Оригинальный текст не меняется. Нативные image labels учитываются
+вместо транспортных путей; возможное сокращение откладывает ранний отказ до
+финальной проекции. Claude и editable draft без submit не получают этот cap.
+Count-only проекция также учитывает native CRLF/CR→LF, удаление CSI/controls,
+пробел после image label и продолжение blockquote в следующей paste-группе;
+не материализует второй полный buffer/string исходного сообщения.
+
+`codex_message_too_large` содержит provider/actual/max/`unicode-scalars` и совет
+уменьшить input либо явно дать пути для чтения. Файлы не отбрасываются, Send не
+делится автоматически. Точный свежий TUI length-refusal после Enter имеет иной
+результат: `provider-not-accepted`, физические paste/Enter=true сохраняются.
+Он требует current mirror/run/lifecycle/input/SID/O/H/A, pre-Enter baseline,
+рост exact warning с совпадающим count и отсутствие positive user/queue proof.
+Старый scrollback, timeout, изменённый owner и durable UNKNOWN этим не закрываются.
+Это Source/private proof, не подтверждение обновлённого установленного App.
+
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и не ждёт обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь. ControlBar Fast больше не является непосредственной slash-кнопкой: он сохраняет желаемый service tier, а main выполняет внутренний `/fast` только после exact readiness/tier proof. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` строже остальных: локальная строка становится `SENT` только после причинного `task_started`; последующее завершение подтверждают terminal compact evidence, а служебный `Conversation compacted` не является user-message carrier.
 
-У такой локальной desktop `SENT`-строки намеренно нет generic user-message receipt: он ждал бы
+У локальной desktop `SENT`-строки намеренно нет generic user-message receipt: он ждал бы
 несуществующий `user_message` audit. Поэтому её крестик потребляет локальный
-handoff и убирает только карточку; он не обращается к durable receipt API.
+handoff и убирает только карточку; у прежнего receiptless пути он не обращается к durable receipt API.
 Обычные prompts и receipt-backed карточки по-прежнему скрываются через main,
 чтобы presentation переживала restart независимо от результата доставки.
+
+Исключение для admission, не для native proof: desktop History standalone
+`/compact` с29Oct сохраняется в Main FIFO до запуска, поэтому следующий обычный
+текст можно принять уже во время Start/Resume. У него отдельная durable local
+receipt, а не user-message audit; exact causal start освобождает очередь без
+ожидания compact final. Private binding до ввода и start proof сохраняются
+раздельно; generic renderer success и legacy `serviceCommand` не заменяют их.
+После confirmed History потребляет прежнюю optimistic строку, не воссоздаёт её
+при reload. Внешние и остальные local-command пути не меняют свой admission.
+Сбой SQLite на start проверяется вместе с завершением native executor, crash
+после Enter и autocomplete: telemetry Enter сама не была durable arm, а новая
+lease на втором Enter ошибочно отзывала штатный submit. Подробнее —
+`fact-terminal-mcp.md::Main FIFO принятых Send`.
 
 У внешнего `/send` (включая native iOS) durable receipt всё же есть: он хранит
 доставку local command, а не фиктивный user UUID. Для `/compact` Main до записи
@@ -553,7 +596,15 @@ Run After законно joins pending Resume, а AutoResume ложно выда
 
 Стартовые параметры модели и effort можно передавать сразу: `--model <id>` и `-c 'model_reasoning_effort="<effort>"'`. Это отличается от Claude: у Codex нет отдельного Think-toggle, а reasoning effort меняется через тот же `/model` flow, что и модель.
 
-Стартовые параметры Codex двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`); `none` означает «не добавлять CLI override, пусть Codex читает `~/.codex/config.toml`». На fresh-tab ControlBar может хранить per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Если итоговые значения не `none`, fresh `codex` получает `--model` и `-c 'model_reasoning_effort="..."'`.
+Стартовые параметры Codex двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`). С30Oct `none` остаётся только выбором модели — «не добавлять model override». У глобального effort нет none/default: незаданный или старый sentinel разрешается в low; явный выбранный уровень сохраняется. На fresh-tab ControlBar может хранить per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Fresh `codex` получает конкретный `-c 'model_reasoning_effort="..."'` и `--model`, если модель задана.
+
+Native Codex0.166 может показать `GPT-6.1-Sol default · cwd`. В incident
+ab3849ff committed собственный composer был виден, но readiness не принимал
+его footer и завершался startup-timeout через60s. Parser теперь отличает
+initialized chrome с default от известной пары настроек: current prompt+такой
+GPT/catalog footer допускает readiness, но parseCodexVerifiedComposerFooter
+возвращает null (не выдумывает low/applied effort). StartupDraft/model:loading,
+чужой frame/owner и прежние auth/trust/Goal guards не обходятся.
 
 Fresh и restore/fork нельзя склеивать. Обычный `codex` действительно потребляет выбранную tab/global пару и только после принятого запуска сохраняет её как fallback вкладки. `codex-c` и `codex-f` обязаны восстановить точную пару из source rollout; renderer launch payload не сохраняется как будто он уже стал состоянием нового writer. Иначе между кликом и writer proof UI показывает чужую пару, а crash в этом окне делает ложь durable. Общий launch helper всё ещё обязателен для всех путей, но main различает fresh defaults и source settings; AutoResume/Resume All/Continue/Fork не повышают локальный UI-кэш до истины.
 
@@ -1804,6 +1855,32 @@ run» описывает чтение актуальных файлов, а не
 его не доказывает. Сохранённый разговор и текущие проектные правила — разные
 источники: продолжение прежнего диалога не требует игнорировать изменения правил.
 
+Exact source0.165.0 уточняет условие: `AgentsMdState.render_diff` не создаёт
+новый fragment при равных directory/text и известном предыдущем snapshot;
+absent/unknown/different требует нового состояния. После Rewind проверяется
+сохранённый model-visible snapshot, не «файл уже когда-то был в этом SID».
+Поэтому удалённая откатом инструкция может потребоваться снова без изменения
+файла. Удалять body и оставлять checkpoint «инструкция известна» нельзя.
+Проверенный30Oct случай HH: retained carrier12:55 и новый19:48 имели разные
+полные тексты; Send содержал только154символа без AGENTS. В private planner
+AGENTS→world_state→user пока оставляет preamble у предыдущего user после suffix
+Rewind, в отличие от обычного preamble без checkpoint. Это диагностированный
+пробел границы, не исправленный runtime; точный raw production interval не читался.
+Контракт/ссылки — [upstream0.165.0](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/core/src/context/world_state/agents_md.rs),
+evidence/остаток — рабочий план AI-состояний.
+
+Уточнение31Oct по exact0.165.0: отсутствие повторного fragment гарантируется
+именно для known equal snapshot в diff-пути. `render_history_diff` считает legacy
+текст без точного snapshot состоянием unknown, а отсутствие reference context
+выбирает full initial context, поэтому одинаковый файл сам по себе не обещает
+отсутствия нового carrier после восстановления. Native `trim_pre_turn_context_updates`
+снимает contextual preamble удаляемого хода без сравнения с сегодняшним файлом,
+но сохраняет общий prefix до первого реального user. Сравнение файлов не должно
+решать ownership удаления. Native replay также восстанавливает world-state только
+из surviving segments; raw JSONL и текущий model window не взаимозаменяемы.
+См. exact [history](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/core/src/context_manager/history.rs),
+[reconstruction](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/core/src/session/rollout_reconstruction.rs).
+
 `event_msg.token_count` питает **три** независимых потребителя, и каждый берёт своё поле — не путать: точки Timeline (выше), usage-чип лимитов (`payload.rate_limits`, см. `## Usage limits`) и живой контекст-метр в ControlBar (`info.last_token_usage.total_tokens / info.model_context_window`, канал `codex:context-update`, см. `fact-claude-control-bar.md::Context % bridge`). **Ловушка, заложенная в `contextPct` внутри самого `codex:get-timeline`:** он делит `total_token_usage.total_tokens` (кумулятив за всю сессию) на окно → на длинной сессии это десятки миллионов / 258k = тысячи процентов, клампится в вечные 100%. Это поле сейчас не рендерится в renderer (Timeline-метр контекста живёт в ControlBar по `last_token_usage`), поэтому баг латентный и не чинён — но при любом будущем выводе контекст-% из Timeline формулу `total_token_usage` копировать нельзя, правильный знаменатель-числитель — `last_token_usage` (последний запрос ≈ занятость окна, т.к. Codex каждый ход пере-отправляет всю историю).
 
 Контекст-метр принадлежит rollout-сессии, а не живому PTY конкретной вкладки. Main держит один лёгкий transcript-observer на UUID и продолжает читать append после Stop: top-level `compacted` немедленно делает любой прежний процент неизвестным, а следующий `token_count` устанавливает новое точное значение. Compact не означает `0%`: между этими двумя записями UI скрывает число. После рестарта observer последовательно восстанавливается для всех открытых вкладок с Codex UUID и читает JSONL назад порциями до ближайшего `token_count` или `compacted`, не загружая большой rollout целиком; запись/очистка SQLite выполняется только при всё ещё точном `tabId + codex_session_id`. Production-шрам `tab-3894`: Noted Terminal остановил PTY в 17:35 МСК, другой процесс дописал compact в тот же UUID в 17:40, History увидела файл, но прежний per-PTY watcher уже отсутствовал; после restart показывались сохранённые `84.69%`, хотя post-compact `token_count` давал `10.157%`. Build Install лишь проявил старый кэш и не был причиной.
@@ -1837,16 +1914,25 @@ provider transcript и уже отправленные context wrappers не п�
 с request/session/turn и causal verdict; это ещё не writer proof. Шрам08–09.10: emit терял requestKind и
 передавал generic `turn_started`, поэтому Main публиковал `provider-response`,
 а History оставался Working до появления позднего compacted. Теперь typed
-requestKind/sessionId сохраняются; при совпадении живого writer, watcher и
-lifecycle Main включает прежний `agent:operational-phase`/compact registry.
+requestKind/sessionId сохраняются. SOURCE29Oct включает прежний
+`agent:operational-phase`/compact registry по exact current physical source,
+launch/run/lifecycle и допущенному Main compaction request, не ожидая первого
+canonical user_message после Resume. До writer proof это `observationOnly`:
+sessionId и sourceByteOffset остаются null, transport session хранится отдельно.
 Observed source `provider-compaction` не притворяется командой: command/handoff/
 sendOperationKey/attempt остаются null. Уже существующий explicit `/compact`
 или pending intent не заменяется этим наблюдением и сохраняет causal start.
 
-Observed phase хранит exclusive rollout EOF перед запросом. Только новый
-compacted того же владельца на/после EOF завершает её; старый prefix и чужая
-generation не подходят. Она заканчивается на compacted, не ждёт конца обычного
-ответа, который может продолжиться. Whole-turn busy/outcome и Loop остаются у
+Для canonical результата сохраняется private pre-request boundary: exact
+watcher/file path/dev/ino/EOF, physical owner и Stop revision. Поздний current
+writer того же файла может связать исходную phase, не меняя её start/id. Только
+новый compacted на/после этого EOF подтверждает успех. Отсутствовавший boundary
+не достраивается поздним stat; source→child не переносит старый EOF. Фаза может
+закончиться без доказанного успеха: следующий точный same-turn `turn` request,
+новый Main-admitted turn, post-boundary lifecycle либо уход owner снимают лишь
+наблюдение с UNKNOWN. Network end/retry/prewarm/recap успеха не дают. Для нового
+turn provenance несёт Main admission callback, не клиентский payload. Обычный
+ответ может продолжиться после compact. Whole-turn busy/outcome и Loop остаются у
 своих прежних владельцев. Request end не даёт success/idle; потеря source даёт
 unknown, app restart не восстанавливает фазу по старой истории. History временно
 показывает `Compacting · mm:ss` от startedAt операции, не переписывая исходный
@@ -1862,6 +1948,14 @@ JSONL до сжатия содержал общий `task_started`, а `compacte
 для действий. Наблюдаемая current physical source/launch/turn/request фаза и
 право приписать canonical результат должны оставаться разными доказательствами;
 network end сам по себе по-прежнему не подтверждает success.
+
+Три WS→HTTP попытки одного exact turn сохраняют одну operation и первый start.
+Успешный Stop/подтверждённый exit закрывают и phase без watcher, и возможность
+позднего source request её воскресить. Неуспешный Stop с оставшимися descendants
+не объявляет provider compact завершённым; explicit `/compact` сохраняет свой
+прежний contract. Уже существующий source-audit-only reader отдаёт ordered
+lifecycle metadata для снятия observation UNKNOWN, без новой подписки, полного
+History read, writer adoption, Send receipt или whole-turn outcome.
 
 Read-only witness754 / SID2e712969, 08.10.2026 UTC: request codex-8369 принят как
 compaction17:16:32.196, на следующей строке ACTIVITY phase=provider-response;

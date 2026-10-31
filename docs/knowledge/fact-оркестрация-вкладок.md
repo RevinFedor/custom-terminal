@@ -729,6 +729,20 @@ rollback/alias, stale commits, close во время чтения и чужой 
 
 ## Ошибка, восстановление и очистка
 
+Подтверждённый30Oct разрыв до provider turn: oversized Codex input был явно
+отвергнут TUI, но sender вернул audit-pending после Enter. `markDelivery` оставил
+run в sent с deliveryAuditPendingAt и без recoveryDeadline; «Проверка доставки»
+не завершалась по failureGraceMs, потому что scheduler применяет его только к
+waiting_recovery. Это не «модель долго думает» и не proof принятия задачи.
+Сама ошибка была видна в терминале, а в карточку не перенеслась. Installed и
+CURRENT на момент диагноза relevant методы совпали; старые `/compact`/Continue
+исправления этот класс не закрывали. SOURCE30Oct добавляет отдельный final-input
+preflight: `codex_message_too_large` до input сразу завершает run как failed,
+сохраняя deliveryFailure provider/actual/max/unit и исходное authoring у receipt.
+MCP получает компактную ошибку вместо большого draft. Повтор того же runId
+возвращает сохранённый отказ, не новый input. Исторические два UNKNOWN не меняются.
+Подробный input-limit шрам и граница Source/installed — `fact-codex.md`.
+
 Точный окончательный отказ Claude — `StopFailure` с main-owned turn context
 либо `isApiErrorMessage=true` в assistant-записи выбранного provider-turn —
 завершает run как failed сразу, с причиной провайдера. Это отдельное исключение
@@ -739,13 +753,20 @@ rollback/alias, stale commits, close во время чтения и чужой 
 
 Остальные ошибки провайдера без окончательного proof, startup failure, выход процесса и закрытие target не должны выглядеть как успешный ответ или вечная очередь. Они нормализуются в отдельный outcome и переводят run в `waiting_recovery` с сохранённым deadline. Исключение — точно доказанный отказ до submit (`submitted=false`): Enter не был принят, поэтому run сразу получает конечную ошибку и уведомляет source без recovery grace. Неизвестная доставка и пропажа процесса такого доказательства не дают и сохраняют обычное окно восстановления. Ручной interrupt/Escape всегда переводит уже начатый вызов в то же видимое ожидание, но настройка управляет только таймером: выключенная реакция оставляет связь без срока, включённая запускает обратный отсчёт до передачи ошибки.
 
-Есть второе точное исключение без recovery grace: после Enter
+Есть второе точное исключение без recovery grace: после Enter у Claude
 `provider-not-accepted` доказывает, что provider-turn не создан,
 исходный draft без изменений остался в composer, а новой
 user-записи нет. Run сразу завершается ошибкой, освобождает
 serialization-lane и уведомляет source. Draft не очищается, а тот
 же handoff не повторяется. Смешанный или изменённый draft такого
 доказательства не даёт и остаётся в неопределённом состоянии.
+
+У Codex отдельный exact length-refusal proof, не выдуманное состояние draft:
+свежий committed TUI frame принадлежит тому же Main pending attempt и точному
+подсчитанному input. Main сначала сохраняет `provider-not-accepted`, затем audit
+callback лишь будит проекцию run; ранний transport ACK не мешает конечному failed.
+Факты прежнего Enter и audit-pending не стираются. Положительный canonical proof,
+отмена и старый UNKNOWN не отзываются отрицательной догадкой по timeout.
 
 После ручного interrupt следующее сообщение в той же target-сессии автоматически продолжает этот вызов, но только по новому точному контексту provider/session/turn и только при одном ожидающем кандидате. Повторный busy старого хода, событие без identity, другая сессия и несколько подходящих recovery-run ничего не привязывают. Закрытие target, смена процесса и реальные ошибки по-прежнему требуют явного Retry: они не являются паузой того же разговора. Retry создаёт новую доказанную причинную границу; поздняя работа после dismiss или истёкшего deadline старый вызов не оживляет.
 

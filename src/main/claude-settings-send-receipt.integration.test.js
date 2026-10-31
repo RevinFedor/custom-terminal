@@ -147,6 +147,8 @@ function harness(t, initialFault) {
   });
   vm.runInContext(compile(declaration(rendererSource, 'sendClaudePtyPrompt')), renderer);
   const projectApi = vm.createContext({
+    require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     console: quiet,
     tabWorkContext: null, // This receipt fixture has no attached context updates.
     crypto: require('node:crypto'),
@@ -171,6 +173,7 @@ function harness(t, initialFault) {
       return receipt;
     },
   });
+  require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(projectApi, ast(webSource));
   vm.runInContext([
     'durableRecordHasProviderQueueAcceptance', 'durableAgentSendReplay',
     'durableAgentSendFailure', 'runPreparedAgentSendScenario', 'runAgentSendScenario',

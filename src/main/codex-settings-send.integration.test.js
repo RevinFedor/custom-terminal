@@ -194,7 +194,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   if (fs.existsSync(helperPath)) Object.assign(context, require(helperPath));
   vm.runInContext(require('./fixtures/codex-draft-request-observation.cjs').startupFrameDeclarations(), context);
   for (const name of ['readCodexSettingsSendScope', 'readCodexSettingsForSend',
-    'captureAgentInputIdentity', 'agentSendExecutionFailure',
+    'captureAgentInputIdentity', 'agentSendExecutionFailure', 'agentCodexInputLimitFailure',
     'codexPolicyFrame',
     'resolveConfiguredCodexSettingsModelIdentity',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',

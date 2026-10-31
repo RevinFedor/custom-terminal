@@ -855,9 +855,9 @@ revision; событие Stop удерживается на всё ожидан�
 
 Лог: `[TrimStartupSlash] session=<sid> trimmed trailing startup slash blocks (N lines, model=X, effort=Y) at offset <byteOffset>`. `_deleteEffortEntries` (старая re-append версия) оставлена мёртвым кодом — НЕ переиспользована, потому что она re-append'ит хвост после удаляемого без relink (создала бы phantom если бы после slash-команды была реальная запись). Новая функция избегает этого через строгий suffix-match.
 
-### EffortInject kill-switch (`effort=none`) + resume-guard
+### Effort defaults и resume-guard (исторический `effort=none`)
 
-В StatusBar `Effort=none` означает «не задавать effort по умолчанию для fresh/неопределённой сессии». Это больше не глобальный запрет восстановить уже подтверждённый session-scoped effort: Resume обязан вернуть effort своей сессии даже если app default сейчас `none`. Если чтение session settings упало, состояние `unknown` также не вызывает paste — приложение не угадывает.
+До30Oct StatusBar `Effort=none` означал «не задавать effort для fresh/неопределённой сессии». Пользователь отменил этот вариант: global default теперь конкретный low при незаданном/legacy none/default; high/max и другие явные уровни сохраняются. Это не глобальный запрет/замена session-scoped effort: Resume по-прежнему восстанавливает подтверждённое значение своей сессии, а ошибка чтения/unknown не разрешает угадывать его или делать paste. Model=none — отдельная настройка, не удалена.
 
 **Resume-guard — только на process-started/Bridge:Fresh пути, НЕ на tui-ready.**
 
@@ -869,7 +869,7 @@ revision; событие Stop удерживается на всё ожидан�
 
 Детекция resume: через renderer-side `getPendingResume(tabId)` из `utils/pendingResume.ts`. `markPendingResume` ставится при `claude --resume <sid>` (в AutoResume и любом другом code path запускающем resume), `clearPendingResume` в `handleSessionDetected` после bridge confirmation.
 
-Полная таблица поведения:
+Таблица прежней границы guard (первая строка историческая; после30Oct global none→low):
 
 | Условие | `/effort` paste | Путь | Лог |
 |---|---|---|---|
@@ -881,9 +881,11 @@ revision; событие Stop удерживается на всё ожидан�
 
 ### Click-toggle-off на effort кнопке
 
-Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/дизайн-принципы.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
-
-Реализация: `const targetLevel = isActive ? (isDeepSeek ? 'off' : 'auto') : level;` — один тернарник в onClick, остальная логика без изменений. Tooltip меняется на `Click again to deselect (→ auto)` когда `isActive`.
+Глобальные StatusBar defaults с30Oct — явный выбор: повторный клик оставляет
+тот же effort, none не создаётся. Это отличается от локального runtime toggle:
+Claude использует low как нейтральный уровень после удаления auto, DeepSeek
+сохраняет собственный off. Старое описание `→ auto` было историческим поведением,
+не разрешением вернуть отсутствующий CLI-параметр или менять session proof.
 
 ## Stop button — SIGTERM по PID, не keystroke в TUI
 

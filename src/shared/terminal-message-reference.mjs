@@ -25,6 +25,30 @@ export function normalizeTerminalMessageTarget(value) {
     timeLabel: text(value.timeLabel, 128) || null,
     role: text(value.role, 64) || null };
 }
+export const TERMINAL_MESSAGE_LINK_PREFIX = '#noted-message?';
+const linkFields = new Set(['tabId', 'messageId', 'sessionId', 'provider', 'terminalInstancePid',
+  'physicalSessionId', 'rawUuid', 'viewOwnerSessionId', 'transcriptSegmentId', 'sourceIdentity', 'handoffId',
+  'tabName', 'iteration', 'messageTimestamp', 'timeLabel', 'role']);
+export function terminalMessageLink(value) {
+  const target = normalizeTerminalMessageTarget(value);
+  if (!target) return null;
+  const query = new URLSearchParams(Object.entries(target).filter(([, value]) => value != null)
+    .map(([key, value]) => [key, String(value)]));
+  const href = TERMINAL_MESSAGE_LINK_PREFIX + query;
+  return href.length <= 16384 ? href : null;
+}
+export function readTerminalMessageLink(href) {
+  if (typeof href !== 'string' || href.length > 16384 || !href.startsWith(TERMINAL_MESSAGE_LINK_PREFIX)) return null;
+  const value = {}, query = new URLSearchParams(href.slice(TERMINAL_MESSAGE_LINK_PREFIX.length));
+  for (const [key, raw] of query) {
+    if (!linkFields.has(key) || Object.hasOwn(value, key)) return null;
+    if (['iteration', 'terminalInstancePid'].includes(key)) {
+      if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) return null;
+      value[key] = Number(raw);
+    } else value[key] = raw;
+  }
+  return normalizeTerminalMessageTarget(value);
+}
 export function makeTerminalMessageSnapshot(detailsText, source, referenceId) {
   const target = normalizeTerminalMessageTarget(source);
   if (!target || typeof detailsText !== 'string' || !detailsText.length

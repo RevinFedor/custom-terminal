@@ -61,7 +61,9 @@ async function harness(t,{durable=false,unknown=false}={}){
   'inboxSetupOutcome','inboxSetupRetryable','assertInboxSetupOwner','settleInboxSetupBeforeSend','readDurableInboxRun'];
  const start=source.indexOf("  if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST')");
  const end=source.indexOf("  if (parsed.pathname === '/api/inbox/sessions/resume'",start);
- vm.createContext(ctx);vm.runInContext(names.map(fn).join('\n'),ctx);
+ vm.createContext(ctx);
+ require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(ctx,tree);
+ vm.runInContext(names.map(fn).join('\n'),ctx);
  const handle=vm.runInContext('(async(req,res,parsed)=>{'+source.slice(start,end)+'})',ctx);
  const server=http.createServer((req,res)=>handle(req,res,{pathname:'/api/inbox/runs'}).catch(e=>sendJson(res,500,{error:e.message})));
  await new Promise(r=>server.listen(0,'127.0.0.1',r));

@@ -101,6 +101,7 @@ async function fixture(t) {
     });
     // Current sender also fences external-completion input. This fixture sends
     // an ordinary continuation and carries that real private symbol declaration.
+    require('./test-helpers/agent-send-web-bindings.cjs').installAgentSendWebBindings(context, web);
     vm.runInContext(completionAdmissionCode + '\n' + sendCode, context);
     queue = new AgentSendQueue({ store: receipts, admit: async request => {
       await controls.beforeDispatch?.(request);

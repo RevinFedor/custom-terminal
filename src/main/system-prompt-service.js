@@ -48,6 +48,9 @@ function createSystemPromptService({ projectManager, onChanged = () => {} }) {
   };
   const publish = prompt => {
     const usage = [...(USES[prompt.id] || [])];
+    // Custom role already created by the user; binding it must not reserve its
+    // id as a new built-in or silently create a duplicate Settings record.
+    if (prompt.id === 'mini-orchestrator-review') usage.push('mini-orchestrator-review');
     if (getSettings().rewindPromptId === prompt.id) usage.push('rewind');
     if (prompt.showInContextMenu) usage.push('context-menu');
     const editableFields = prompt.id === RUN_AFTER_LOOP_PROMPT_ID

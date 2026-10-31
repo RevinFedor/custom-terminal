@@ -183,6 +183,116 @@ test('managed+mobile refs, repeated/reordered occurrences: same IDs atomically l
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM agent_send_queue').get().n, before);
 });
 
+test('malformed transferred inventory cannot release its pin or authorize asset collection', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('malformed-transfer', 'replay', ids);
+  const replacement = f.admit(refs, 'malformed-send');
+  assert.equal((await f.post('malformed-transfer', f.transfer('malformed-transfer', replacement, ids))).status, 200);
+  const confirmed = f.confirm(replacement);
+  f.sidecar(confirmed, refs.slice(0, 1));
+  for (const malformed of ['{invalid', '""', '{}', 'null', '', '[null]', '[0]', '[{}]', '[""]']) {
+    f.db.prepare('UPDATE agent_send_queue SET asset_transfer_ids_json=? WHERE operation_key=?')
+      .run(malformed, replacement.operationKey);
+    adoptCompletedQueueTransfers(f.db);
+    assert.equal(f.queue.item(replacement.operationKey).asset_transfer_ids_json, malformed);
+    assert.ok(f.db.prepare("SELECT 1 FROM agent_send_receipt_pins WHERE operation_key=? AND owner='replay-asset-transfer'")
+      .get(replacement.operationKey));
+    await assert.rejects(f.collect());
+    for (const ref of refs) assert.equal(fs.existsSync(f.assetStore.assetPath(ref.assetId)), true);
+  }
+});
+
+test('unreadable Replay inventory cannot be released as an empty lease', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('unreadable-replay', 'replay', ids);
+  const lease = f.api().receipt('unreadable-replay').assetLease;
+  f.db.prepare('UPDATE run_after_operations SET assets_json=? WHERE operation_id=?')
+    .run('{invalid', 'unreadable-replay');
+  const body = { version: 1, requestId: 'unreadable-disposition', tabId: 'T',
+    source: { mainEpoch: lease.mainEpoch, mainScopeKey: lease.mainScopeKey },
+    expectedAssetIds: [], discardAssetIds: [], transferAssetIds: [] };
+  await f.post('unreadable-replay', body).catch(() => null);
+  const row = f.db.prepare('SELECT assets_json,released_at FROM run_after_operations WHERE operation_id=?').get('unreadable-replay');
+  assert.equal(row.assets_json, '{invalid');
+  assert.equal(row.released_at, null);
+  for (const malformed of ['{invalid', '[null]', '[0]', '[""]', '{}']) {
+    f.db.prepare('UPDATE run_after_operations SET assets_json=? WHERE operation_id=?')
+      .run(malformed, 'unreadable-replay');
+    assert.throws(() => f.api().receipt('unreadable-replay'), /run_after_asset_inventory_unreadable/);
+    await assert.rejects(f.collect());
+  }
+  for (const ref of refs) assert.equal(fs.existsSync(f.assetStore.assetPath(ref.assetId)), true);
+});
+
+test('unreadable History presentation cannot authorize collection of its possibly referenced bytes', async t => {
+  const f = await fixture(t), refs = await f.assets();
+  const broken = '[{"kind":"image-ref","assetId":"' + refs[0].assetId + '"';
+  f.db.prepare(`INSERT INTO history_prompt_presentations
+    (tool_type,session_id,audit_timestamp,transport_hash,schema_version,chips_json)
+    VALUES(?,?,?,?,3,?)`).run('codex', 'private-malformed', 'time', 'hash', broken);
+  await assert.rejects(f.collect(), /history_asset_inventory_unreadable/);
+  for (const ref of refs) assert.equal(fs.existsSync(f.assetStore.assetPath(ref.assetId)), true);
+});
+
+test('a failed replacement pin write cannot leave a partial FIFO transfer', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('pin-failure', 'replay', ids);
+  const replacement = f.admit(refs, 'pin-failure-send');
+  f.db.exec(`CREATE TEMP TRIGGER private_fail_replay_pin BEFORE INSERT ON agent_send_receipt_pins
+    WHEN NEW.owner='replay-asset-transfer' BEGIN SELECT RAISE(ABORT, 'private_pin_write_failed'); END`);
+  const response = await f.post('pin-failure', f.transfer('pin-failure', replacement, ids));
+  assert.equal(response.status, 409);
+  assert.equal(response.body.operation.result.disposition, 'retained');
+  assert.deepEqual(JSON.parse(f.queue.item(replacement.operationKey).asset_transfer_ids_json), []);
+  assert.equal(f.api().receipt('pin-failure').assetLease.released, false);
+  for (const ref of refs) assert.equal(fs.existsSync(f.assetStore.assetPath(ref.assetId)), true);
+});
+
+test('a corrupt FIFO replacement inventory cannot be overwritten by a new transfer', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('source-corrupt-fifo', 'replay', ids);
+  const replacement = f.admit(refs.slice(1), 'corrupt-fifo-send');
+  f.db.prepare('UPDATE agent_send_queue SET asset_transfer_ids_json=? WHERE operation_key=?')
+    .run('{invalid', replacement.operationKey);
+  const response = await f.post('source-corrupt-fifo', f.transfer('source-corrupt-fifo', replacement, [ids[1]]));
+  assert.equal(response.status, 409);
+  assert.equal(response.body.operation.result.disposition, 'retained');
+  assert.equal(f.queue.item(replacement.operationKey).asset_transfer_ids_json, '{invalid');
+  assert.deepEqual(f.api().receipt('source-corrupt-fifo').assetLease.assetIds, ids);
+});
+
+test('a corrupt RunAfter replacement inventory cannot be overwritten by a new transfer', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('source-corrupt-item', 'replay', ids);
+  f.pm.db.setAppState('promptQueueByTab', JSON.stringify({ T: { items: [{ id: 'I', imagePaths: refs.slice(1) }] } }));
+  f.createOperation('corrupt-add', 'add', [], { itemId: 'I' });
+  const row = f.api().journal.record('corrupt-add');
+  const replacement = { kind: 'run-after-item', tabId: 'T', operationId: 'corrupt-add',
+    mainEpoch: row.main_epoch, mainScopeKey: JSON.parse(row.request_json).scope.scopeKey, itemId: 'I' };
+  f.db.prepare('UPDATE run_after_operations SET assets_json=? WHERE operation_id=?').run('{invalid', 'corrupt-add');
+  const response = await f.post('source-corrupt-item', f.transfer('source-corrupt-item', replacement, [ids[1]]));
+  assert.equal(response.status, 409);
+  assert.equal(response.body.operation.result.disposition, 'retained');
+  assert.equal(f.api().journal.record('corrupt-add').assets_json, '{invalid');
+  assert.deepEqual(f.api().receipt('source-corrupt-item').assetLease.assetIds, ids);
+});
+
+test('a corrupt RunAfter replacement owner cannot be overwritten by a new transfer', async t => {
+  const f = await fixture(t), refs = await f.assets(), ids = refs.map(ref => ref.assetId);
+  f.createOperation('source-corrupt-owner', 'replay', ids);
+  f.pm.db.setAppState('promptQueueByTab', JSON.stringify({ T: { items: [{ id: 'I', imagePaths: refs.slice(1) }] } }));
+  f.createOperation('corrupt-owner-add', 'add', [], { itemId: 'I' });
+  const row = f.api().journal.record('corrupt-owner-add');
+  const replacement = { kind: 'run-after-item', tabId: 'T', operationId: 'corrupt-owner-add',
+    mainEpoch: row.main_epoch, mainScopeKey: JSON.parse(row.request_json).scope.scopeKey, itemId: 'I' };
+  f.db.prepare('UPDATE run_after_operations SET asset_owner_json=? WHERE operation_id=?').run('{invalid', 'corrupt-owner-add');
+  const response = await f.post('source-corrupt-owner', f.transfer('source-corrupt-owner', replacement, [ids[1]]));
+  assert.equal(response.status, 409);
+  assert.equal(response.body.operation.result.disposition, 'retained');
+  assert.equal(f.api().journal.record('corrupt-owner-add').asset_owner_json, '{invalid');
+  assert.deepEqual(f.api().receipt('source-corrupt-owner').assetLease.assetIds, ids);
+});
+
 for (const kind of ['waiting', 'awaiting-receipt', 'failed', 'cancelled', 'released-unknown']) {
   test('current FIFO pins survive ' + kind + ', restart and GC without any provider invocation', async t => {
     const f = await fixture(t), refs = await f.assets(), ids = refs.map(r => r.assetId);
@@ -269,10 +379,18 @@ test('queued→completed gap pins bytes; exact canonical sidecar adopts before l
   assert.equal((await f.post('R', f.transfer('R', replacement, ids))).status, 200);
   const confirmed = f.confirm(replacement); assert.equal(f.queue.item(replacement.operationKey).state, 'completed');
   f.queue.releasePresentation(replacement.operationKey); assert.equal((await f.collect()).removed.length, 0);
+  const prepare = f.db.prepare.bind(f.db);
+  let candidateScans = 0;
+  f.db.prepare = sql => {
+    if (sql.startsWith('SELECT operation_key,asset_transfer_ids_json FROM agent_send_queue')) candidateScans++;
+    return prepare(sql);
+  };
   f.sidecar(confirmed, refs, { entryUuid: 'FOREIGN' }); adoptCompletedQueueTransfers(f.db);
   assert.deepEqual(JSON.parse(f.queue.item(replacement.operationKey).asset_transfer_ids_json), ids);
   f.sidecar(confirmed, refs); adoptCompletedQueueTransfers(f.db);
   assert.deepEqual(JSON.parse(f.queue.item(replacement.operationKey).asset_transfer_ids_json), []);
+  assert.equal(candidateScans, 1, 'candidate reuse still rechecks the updated exact owner');
+  f.db.prepare = prepare;
   assert.equal((await f.collect()).removed.length, 0);
   f.db.prepare('DELETE FROM history_prompt_presentations').run();
   assert.deepEqual(new Set((await f.collect()).removed), new Set(ids));

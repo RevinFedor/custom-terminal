@@ -301,3 +301,62 @@ for(const pool of ['causal','native'])test(pool+' 65MiB pool cannot fall to 61Mi
   assert.equal(pool==='native'?result.nativeSampleBytes:result.causalBytes,65*miB);
   assert.ok(result.bytes<=5*1024*miB);
 });
+
+test('input payload shares the same recent causal64MiB protection under a full5GiB metadata budget', async t => {
+  const { store, now, sparse } = artifactFixture(t), miB = 1048576;
+  const { createInputSnapshotWriter } = require('./perf-input-snapshot-store');
+  const { createInputLatencyCollector } = require('./perf-input-latency');
+  const fixture = require('./perf-input-latency.test.cjs');
+  const c = createInputLatencyCollector(fixture.options);
+  c.write('{"traceEvents":[\n' + fixture.events.map(e => JSON.stringify(e)).join(',\n') + '\n]}');
+  const evidence = c.finish({ completeExport: true, dataLoss: false, clockMarkers: fixture.clockMarkers });
+  const r = { version: 1, kind: 'input-native-preroll', cpuProfiler: false,
+    scope: { mainPid: fixture.options.mainPid, rendererPid: fixture.options.rendererPid, window: 1,
+      documentGeneration: 1, frameProcessId: 1, frameRoutingId: 1 },
+    actions: [], errors: [], evidence, recordingStartedAbs: now - 10, captureStartedAbs: now, captureFinishedAbs: now + 1 };
+  assert.equal(await createInputSnapshotWriter({ directory: store.directory, mainPid: fixture.options.mainPid }).publish(r), true);
+  const name = 'incident-' + now + '-' + fixture.options.mainPid + '.input.json';
+  const payload = fs.readFileSync(store.file(name));
+  fs.utimesSync(store.file(name), new Date(now - 6 * 3600000), new Date(now - 6 * 3600000));
+  for (let i = 0; i < 16; i++) sparse('causal-202610' + String(i + 1).padStart(2, '0') + '00.ndjson', 4 * miB, now - 8 * 3600000 - i);
+  for (let i = 0; i < 8; i++) sparse('stall-' + (now - 7 * 3600000 - i) + '-123-' + i + '.sample.txt', 8 * miB, now - 7 * 3600000 - i);
+  // Non-heavy CPU/metadata flood is newer than the captured input. A size-only
+  // floor used to make the tiny input the only evictable causal remainder.
+  for (let i = 0; i < 1280; i++) sparse('incident-' + (now - 4 * 3600000 - i) + '-1.json', 4 * miB, now - 4 * 3600000 - i);
+  const result = store.prune(now);
+  assert.ok(result.bytes <= 5 * 1024 * miB);
+  assert.equal(result.causalBytes, 64 * miB + payload.length);
+  assert.equal(result.nativeSampleBytes, 64 * miB);
+  assert.deepEqual(fs.readFileSync(store.file(name)), payload);
+  assert.deepEqual(JSON.parse(store.read(name, 262144)).evidence, evidence);
+  assert.ok(store.retentionLedger().entries.some(e => e.reason === 'artifact-budget'));
+});
+
+test('input artifacts expire at24h, remain bounded by shared protection, and never become heavy/native quota receipts', t => {
+  const { store, now, sparse } = artifactFixture(t), day = 86400000, miB = 1048576;
+  const expired = 'incident-' + (now - day) + '-9.input.json', recent = 'incident-' + (now - day + 1) + '-9.input.json';
+  sparse(expired, 128, now - day); sparse(recent, 128, now - day + 1);
+  const huge = 'incident-' + (now - 180000) + '-9.input.json'; sparse(huge, 5 * 1024 * miB, now - 180000);
+  assert.throws(() => store.file('../' + recent));
+  assert.throws(() => store.file('incident-x-9.input.json'));
+  assert.throws(() => store.read(huge, 262144));
+  const result = store.prune(now);
+  assert.equal(fs.existsSync(store.file(expired)), false);
+  assert.equal(fs.existsSync(store.file(recent)), true);
+  assert.equal(fs.existsSync(store.file(huge)), false);
+  assert.ok(result.bytes <= 5 * 1024 * miB); assert.equal(result.causalBytes, 128);
+  assert.equal(store.reserveCaptureDetails('incident-' + now + '-10', now, 'ui-click').remaining, 3);
+  assert.equal(store.reserveCaptureDetails('incident-' + now + '-11', now, 'manual').allowed, true);
+  assert.equal(store.reserveCaptureDetails('incident-' + (now + 1) + '-11', now + 1, 'manual').allowed, false);
+});
+
+test('causal share is shared, not a permanent input reservation or a new pool', t => {
+  const { store, now, sparse } = artifactFixture(t), miB = 1048576;
+  const old = 'incident-' + (now - 12 * 3600000) + '-9.input.json'; sparse(old, 262144, now - 12 * 3600000);
+  for (let i = 0; i < 16; i++) sparse('causal-202610' + String(i + 1).padStart(2, '0') + '00.ndjson', 4 * miB, now - 3600000 - i);
+  for (let i = 0; i < 1280; i++) sparse('incident-' + (now - 2 * 3600000 - i) + '-1.json', 4 * miB, now - 2 * 3600000 - i);
+  const result = store.prune(now);
+  assert.equal(fs.existsSync(store.file(old)), false, 'older input outside the newest causal share can be evicted');
+  assert.equal(result.causalBytes, 64 * miB);
+  assert.ok(result.bytes <= 5 * 1024 * miB);
+});

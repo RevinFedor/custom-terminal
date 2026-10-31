@@ -97,11 +97,15 @@ function createCausalJournal({ artifacts, now = Date.now, maxPerMinute = 60, max
   let lastFlushAt = now(), lastFlushLagMs = null, lastErrorAt = -Infinity;
   function lose(category, reason) { losses[category][reason]++; }
   function ack(data) {
+    // Immediate refusal and a later channel-write failure are the same ACK
+    // attempt. Neither failure undoes the already confirmed append.
+    let failed = false;
+    const reportFailure = () => { if (!failed) { failed = true; counts.ackErrors++; } };
     try {
       if (onPersisted({ sourcePid: data.sourcePid, sourceBoot: data.sourceBoot,
-        summaryId: data.summaryId, revision: data.revision }) === false) counts.ackErrors++;
+        summaryId: data.summaryId, revision: data.revision }, reportFailure) === false) reportFailure();
     }
-    catch { counts.ackErrors++; } // A failed transport ACK does not undo the append.
+    catch { reportFailure(); }
   }
   function observeSequence(input, origin) {
     const data = cleanCausalRecord({ ...input, kind: 'sequence' }, origin, now());

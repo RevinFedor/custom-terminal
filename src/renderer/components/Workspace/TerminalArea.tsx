@@ -1,5 +1,6 @@
 import React, { memo, useCallback, useMemo, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
+import { runRendererSyncWork } from '../../utils/perfSyncWork.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -1554,7 +1555,7 @@ function TerminalArea({
     return result;
   }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs, sharedActivity, tabLayerRefFor, paneChromeRefFor]);
 
-  useLayoutEffect(() => {
+  useLayoutEffect(() => runRendererSyncWork('pane.presentationLayout', { owner: projectId }, () => {
     const startedAt = performance.now();
     const next = paneLayerPresentationsRef.current;
     const previous = previousPaneLayerPresentationKeysRef.current;
@@ -1672,7 +1673,7 @@ function TerminalArea({
       + ' historyEvents=' + historyEvents
       + ' ms=' + elapsed.toFixed(1));
     uiPerformancePhase('pane-presentation-complete', { ms: elapsed, changed: changedTabIds.length, historyEvents });
-  }, [activeLayerKey, terminals]);
+  }), [activeLayerKey, terminals]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

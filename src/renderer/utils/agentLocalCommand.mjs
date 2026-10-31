@@ -4,6 +4,10 @@ export function normalizeAgentLocalCommand(rawPrompt) {
   return localCommand.normalizeAgentLocalCommand(rawPrompt);
 }
 
+export function isDesktopCodexCompactQueueRequest(request) {
+  return localCommand.isDesktopCodexCompactQueueRequest(request);
+}
+
 export function isStandaloneAgentLocalCommand({
   prompt,
   imageCount = 0,

@@ -55,6 +55,6 @@ export function RequestDetailsPopover({ anchor, rect, previewRef, onClose, title
       <button type="button" aria-label={closeLabel} title="Закрыть" onClick={onClose}
         style={{ width: 23, height: 23, display: 'grid', placeItems: 'center', flexShrink: 0, padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: '#aaa', cursor: 'pointer' }}><X size={14} /></button>
     </div>
-    <div className="scrollbar-thin" style={{ overflowY: 'auto', minHeight: 0 }}>{children}</div>
+    <div className="scrollbar-thin" style={{ overflowY: 'auto', scrollbarGutter: 'stable', minHeight: 0 }}>{children}</div>
   </aside>, document.body);
 }
