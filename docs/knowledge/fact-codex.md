@@ -1862,10 +1862,16 @@ absent/unknown/different требует нового состояния. Пос�
 Поэтому удалённая откатом инструкция может потребоваться снова без изменения
 файла. Удалять body и оставлять checkpoint «инструкция известна» нельзя.
 Проверенный30Oct случай HH: retained carrier12:55 и новый19:48 имели разные
-полные тексты; Send содержал только154символа без AGENTS. В private planner
-AGENTS→world_state→user пока оставляет preamble у предыдущего user после suffix
-Rewind, в отличие от обычного preamble без checkpoint. Это диагностированный
-пробел границы, не исправленный runtime; точный raw production interval не читался.
+полные тексты; Send содержал только154символа без AGENTS. Диагноз30Oct воспроизвёл
+в private planner orphan в AGENTS→world_state→user: checkpoint сбрасывал pending
+preamble на предыдущий user. SOURCE31Oct сохраняет такой checkpoint в том же
+pending preamble и physical source до canonical input; suffix Rewind удаляет
+инструкции и их full/patch state вместе. Обычный checkpoint после реального
+input/его late companion остаётся у прежнего хода. Та же правка есть в configured
+reader; сравнения с сегодняшним файлом и удаления всех AGENTS нет. Предыдущие
+правила/compact baseline сохраняются, а точный raw production interval старого
+HH-инцидента по-прежнему не читался. Source/private проверки не заменяют installed
+приёмку и не переписывают уже выполненные исторические откаты.
 Контракт/ссылки — [upstream0.165.0](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/core/src/context/world_state/agents_md.rs),
 evidence/остаток — рабочий план AI-состояний.
 

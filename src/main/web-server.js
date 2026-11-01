@@ -568,15 +568,20 @@ function getBuildContinueOperations() {
     read: () => manager.db.getAppState('buildContinueOperations.v1'),
     write: value => manager.db.setAppState('buildContinueOperations.v1', value),
     instanceId: webServerInstanceId,
+    hasTaskCaptureShutdownOwner: () => typeof releaseBuildContinueShutdownBindings === 'function',
     readRuns: () => getOrchestrationRunStore().installSnapshot(),
     readMessages: () => getTabMessageService().restartReferences(),
     captureOne: tabId => captureTabInspection?.(tabId),
+    captureCutOne: tabId => typeof captureBuildContinueTabInspection === 'function'
+      ? captureBuildContinueTabInspection(tabId) : captureTabInspection?.(tabId),
     captureTabs: () => listExecutionNamespaces(manager).flatMap(project => (project.tabs || []).map(tab => {
-      const view = captureTabInspection?.(tab.tabId);
+      const view = typeof captureBuildContinueTabInspection === 'function'
+        ? captureBuildContinueTabInspection(tab.tabId) : captureTabInspection?.(tab.tabId);
       if (!view) throw Error('build_continue_runtime_reader_unavailable');
       return { ...view, tabId: tab.tabId, projectId: project.id, name: tab.name, subject: capturedCodexSubject(view) };
     })),
     readCaptureSubject: async view => {
+      if (view.captureTaskProof?.known === false) return null;
       if (view.subject) return view.subject;
       const state = await getAgentResponseState(view.tabId), expected = view.executionContext, actual = state.executionContext;
       return state.known === true && state.busy === true && state.sessionId === view.sessionId
@@ -668,7 +673,15 @@ function getBuildContinueOperations() {
     readPrepared: (tabId, handoffId) => tabWorkContext?.readPreparedHandoff(tabId, handoffId),
     changed: operation => {
       buildContinuePublication++;
-      for (const target of operation.targets) publishBuildInstallEvent('build-continue:status', readBuildContinueStatus(target.source.tabId));
+      if (operation.phase === 'captured') for (const item of operation.unresolved || []) if (item.stage === 'capture') {
+        console.warn('[BuildContinue:Capture] ' + JSON.stringify({ operationId: operation.id,
+          tabId: item.tabId, sourceMainPid: operation.sourceMainPid, stage: 'capture', reason: item.reason,
+          taskGeneration: item.detail?.taskGeneration ?? null, taskTurnId: item.detail?.taskTurnId ?? null,
+          watcherTurnId: item.detail?.watcherTurnId ?? null, lifecycleGeneration: item.detail?.lifecycleGeneration ?? null }));
+      }
+      const tabs = new Set([...operation.targets.map(target => target.source.tabId),
+        ...(operation.unresolved || []).filter(item => item.stage === 'capture').map(item => item.tabId)]);
+      for (const tabId of tabs) publishBuildInstallEvent('build-continue:status', readBuildContinueStatus(tabId));
       if (operation.phase === 'settled') buildContinueReturnAdmission?.forget(operation.id);
       void scheduleOrchestrationPolicyTimer().catch(error => console.warn('[BuildContinue] policy rearm pending: ' + String(error.code || error.message)));
       if (operation.phase !== 'captured') for (const target of operation.targets) {
@@ -709,6 +722,7 @@ async function verifyVoiceInstallOperation(binding, stage) {
 
 let buildContinueReturnAdmission = null;
 let releaseInstallShutdownBindings = null;
+let releaseBuildContinueShutdownBindings = null;
 function buildContinueReturnSnapshot(operation, target) {
   const view = getOrchestrationRunStore().readRestartReturns(operation.references.runs.map(run => run.runId));
   if (view.known !== true) return view;
@@ -970,6 +984,7 @@ let buildContinuePublication = 0;
 function readBuildContinueStatus(tabId) {
   if (typeof tabId !== 'string' || !tabId) throw Error('build_continue_tab_required');
   return { version: 1, epoch: webServerInstanceId, revision: buildContinuePublication, tabId,
+    captureIssues: { version: 1, items: getBuildContinueOperations().captureIssuesForTab(tabId) },
     targets: getBuildContinueOperations().forTab(tabId).map(target => ({
       operationId: target.operationId, capturedAt: target.capturedAt, phase: target.phase,
       tabId, state: target.state, reason: target.reason || null, active: target.active,
@@ -1115,6 +1130,7 @@ let getAgentExecutionContext = null;
 let userNotificationOutbox = null;
 let getAgentResponseState = null;
 let captureTabInspection = null;
+let captureBuildContinueTabInspection = null;
 let readTabInspectionResponse = null;
 let readAgentObservedResponse = null;
 let readMiniOrchestratorSendAdmission = null;
@@ -9565,6 +9581,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         buildInstall: { version: 1, force: true, interruptionSnapshot: '/api/build-install/interruption-snapshot',
           eligibility: '/api/install-eligibility', source: '/api/build-install/source', callerTurnExcluded: false },
         buildContinue: { version: 2, proofRevision: 2, repeatCapture: 1, command: 'build:i-c', operations: '/api/build-continue/operations',
+          ...(typeof captureBuildContinueTabInspection === 'function' && typeof releaseBuildContinueShutdownBindings === 'function'
+            ? { taskCapture: { version: 1, source: 'main-task-source', shutdownBookends: true } } : {}),
+          captureIssues: { version: 1, inputCreated: false, endpoint: '/api/build-continue/operations/:operationId/dismiss-capture' },
           targetCancellation: { version: 1, endpoint: '/api/build-continue/operations/:operationId/cancel-target', input: false },
           laterInputSupersession: { version: 1, proof: 'independent-native-input-and-natural-final' },
           statusProjection: { version: 1, transport: 'ipc', scope: 'exact-tab', independentOfHistory: true },
@@ -9613,7 +9632,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
           receipts: true, structuredDraft: true, nativeRewindUnchanged: true,
           codexPhysicalSuffix: true, repairOfOperationId: !!savedHistoryOperations.inspectRepair,
-          ...(savedHistoryOperations.selfRewind ? { selfRewind: { version: 1, retainedContext: true, queuedFollowup: true } } : {}) } } : {}),
+          ...(savedHistoryOperations.selfRewind ? { selfRewind: { version: 1, retainedContext: true, queuedFollowup: true,
+            ...(typeof savedHistoryOperations.selfRewind.context?.getRewindContext === 'function' ? { contextSnapshot: 1 } : {}) } } : {}) } } : {}),
         ...(workingDirectoryOperations ? { workingDirectory: require(path.join(srcMainDir, 'working-directory-operation-api')).WORKING_DIRECTORY_CAPABILITY } : {}),
         ...(conversationOwners ? { conversationOwner: { version: 1, providers: ['codex', 'claude'],
           applicability: '/api/terminal-tabs/:tabId/history-operations/:operationId/applicability',
@@ -10354,7 +10374,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (req.method === 'GET' && !contextRoute[2]) {
         tabWorkContext.requireTab(tabId);
         await tabWorkContext.syncLinks();
-        return sendJson(res, 200, { ok: true, context: tabWorkContext.get(tabId) });
+        const wantsSnapshot = parsed.query?.rewindSnapshot === '1';
+        if (wantsSnapshot && typeof tabWorkContext.getRewindContext !== 'function') return sendJson(res, 503, { ok: false, error: 'app_update_required' });
+        return sendJson(res, 200, { ok: true, context: wantsSnapshot ? tabWorkContext.getRewindContext(tabId) : tabWorkContext.get(tabId) });
       }
       if (req.method === 'POST') {
         const body = await readBody(req);
@@ -16075,6 +16097,7 @@ function start({
   getAgentExecutionContext: getAgentExecutionContextFn,
   getAgentResponseState: getAgentResponseStateFn,
   captureTabInspection: captureTabInspectionFn,
+  captureBuildContinueTabInspection: captureBuildContinueTabInspectionFn,
   readTabInspectionResponse: readTabInspectionResponseFn,
   readMessageReturnProof: readMessageReturnProofFn,
   readAgentObservedResponse: readAgentObservedResponseFn,
@@ -16306,7 +16329,13 @@ function start({
         ...claudeDataApi,
         materializeImages: (record, refs) => materializeClaudeSavedHistoryImages(record, refs, historyAssets),
       } : null,
-      resolveSession: tabId => resolveHistorySessionInfo(tabId, 5000),
+      resolveSession: tabId => {
+        const descriptor = findOrchestrationTabDescriptor(tabId);
+        if (descriptor?.tabType === 'claude-sdk') return descriptor;
+        const scope = savedHistoryRuntime.capture(tabId);
+        return { toolType: scope.toolType, sessionId: scope.sessionId, cwd: scope.cwd,
+          projectId: scope.projectId, tabType: descriptor?.tabType, selectionSource: 'saved-history-runtime' };
+      },
       dispatch: (action, payload) => bridgeRequest(action, {
         ...payload, targetProjectId: findOrchestrationTabDescriptor(payload.tabId)?.projectId || null,
       }, 180_000),
@@ -16344,7 +16373,7 @@ function start({
       executor: savedHistoryOperations, transcript: transcriptService,
       getReceipt: runId => agentSendReceiptStore?.get('inbox:' + runId) || null,
       reservedTabId: reservedInboxTabId, ensureOpen: ensureExplicitAgentTabOpen,
-      resolveSession: tabId => resolveHistorySessionInfo(tabId, 5000),
+      resolveSession: tabId => savedHistoryOperations.resolveSession(tabId),
       cleanup: { claim: claimInboxHistoryCleanup },
       readNativeState: tabId => readCodexNativeRewindState?.(tabId),
     });
@@ -16376,6 +16405,7 @@ function start({
   userNotificationOutbox = userNotificationOutboxInstance || null;
   getAgentResponseState = getAgentResponseStateFn || null;
   captureTabInspection = captureTabInspectionFn || null;
+  captureBuildContinueTabInspection = captureBuildContinueTabInspectionFn || null;
   readTabInspectionResponse = readTabInspectionResponseFn || null;
   readMessageReturnProof = readMessageReturnProofFn || null;
   readAgentObservedResponse = readAgentObservedResponseFn || null;
@@ -16422,6 +16452,9 @@ function start({
   if (shutdownSnapshots.INSTALL_BINDING_PROTOCOL === 'voice-install-shutdown-binding-v1') {
     releaseInstallShutdownBindings = shutdownSnapshots.registerInstallShutdownBindings(() => buildContinueOperations?.shutdownBindings() || []);
   }
+  if (typeof shutdownSnapshots.registerBuildContinueShutdownBindings === 'function') {
+    releaseBuildContinueShutdownBindings = shutdownSnapshots.registerBuildContinueShutdownBindings(() => buildContinueOperations?.taskShutdownBindings() || []);
+  }
   registerBridgeReplyHandler();
   ipcMain.removeHandler?.('loop-dependencies:list');
   ipcMain.handle('loop-dependencies:list', () => readLoopDependencies());
@@ -16433,6 +16466,11 @@ function start({
   ipcMain.handle('build-continue:cancel-target', async (_event, request) => {
     await getBuildContinueOperations().cancelTarget(request.operationId, request);
     return { ok: true, snapshot: readBuildContinueStatus(request.tabId) };
+  });
+  ipcMain.removeHandler?.('build-continue:dismiss-capture');
+  ipcMain.handle('build-continue:dismiss-capture', (_event, request) => {
+    const acknowledgement = getBuildContinueOperations().dismissCaptureIssue(request.operationId, request);
+    return { ok: true, acknowledgement, snapshot: readBuildContinueStatus(request.tabId) };
   });
   void readLoopDependencies().catch(error => console.warn('[LoopDependencies] restore pending: ' + String(error.code || error.message)));
   const messageServiceForStart = getTabMessageService();
@@ -16546,6 +16584,7 @@ function writeWebServerDiscovery() {
 
 function stop() {
   releaseInstallShutdownBindings?.(); releaseInstallShutdownBindings = null;
+  releaseBuildContinueShutdownBindings?.(); releaseBuildContinueShutdownBindings = null;
   buildContinueReturnAdmission = null;
   buildInstallStatusClient?.stop();
   buildInstallStatusClient = null;
@@ -16565,6 +16604,7 @@ function stop() {
   ipcMain.removeHandler?.('message-loop-waits:list');
   ipcMain.removeHandler?.('build-continue:status-for-tab');
   ipcMain.removeHandler?.('build-continue:cancel-target');
+  ipcMain.removeHandler?.('build-continue:dismiss-capture');
   releaseAgentResponseCompletion?.();
   releaseAgentResponseCompletion = null;
   const responseObservationStopPromise = responseObservationService?.dispose().catch(() => {}) || Promise.resolve();
@@ -16648,6 +16688,7 @@ function stop() {
   userNotificationOutbox = null;
   getAgentResponseState = null;
   captureTabInspection = null;
+  captureBuildContinueTabInspection = null;
   readTabInspectionResponse = null;
   readMessageReturnProof = null;
   readAgentObservedResponse = null;

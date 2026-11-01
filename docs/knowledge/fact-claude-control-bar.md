@@ -359,6 +359,96 @@ Claude Think, наоборот, остался последней строкой
 
 Пока подтверждение в полёте, клики НЕ блокируются (`data-settings-confirming="1"`, aria-busy): выбор модели во время чтения легален — выбор пользователя побеждает, устаревший ответ дропается по request seq. Смысл отметки здесь — «показанное значение ещё не доказано», не «занято», поэтому она не должна выглядеть как ожидание записи.
 
+## Неполученное подтверждение ≠ отказ настройки (31.10.2026)
+
+Пользователь прислал инцидент `/model claude-opus-5[1m] was not confirmed by Claude;
+reason=wrapper-not-found; wrapper=false; stdout=false`, код
+`claude_setting_outcome_unknown`, и заметил: *«смена модели так же клода устарела,
+надо проверить»*.
+
+Проверено: **формат JSONL Claude не менялся**. На CLI 2.1.316 запись команды
+по-прежнему `type:'user'`, `message.role:'user'`, с текстом
+`<command-name>/model</command-name><command-message>…<command-args>…`, а результат —
+её прямой ребёнок с `<local-command-stdout>`; детектор
+`classifyClaudeStartupSlashRecord` их узнаёт. `wrapper-not-found` возвращается с
+`outcome:'pending'` (`claude-setting-evidence.js`) — это **истёкшее окно чтения**, а
+не вердикт провайдера.
+
+Реальная причина инцидента — время записи. Окна наблюдения 6.5 с + 3.5 с
+(`claude-settings-send.js`), а Claude пишет wrapper по своему расписанию: 0.3 с на
+спокойной вкладке и 30.6 с при занятом Main. Production `tab 6d6fd1718b66`: отказ
+07:38:16.651, затем 19 опросов `wrapper-not-found`, и `success=true reason=jsonl-stdout`
+в 07:38:43.083 с тем же `commandId` — модель **применилась**, а пользователю уже
+показали «не удалось применить модель», то есть обратное факту. На другой вкладке
+`wrapper-not-found` в 07:40:37.497 сменился успехом через 300 мс: один и тот же
+промежуточный статус выглядел то как ошибка, то как норма.
+
+Контракт: `claude_setting_outcome_unknown` — отдельное состояние ожидания
+(`describeClaudeStartupFailure` отдаёт `pending:true`, ControlBar показывает его
+нейтральным тостом, не красной ошибкой). Поздний результат (`lateSettingResult` +
+`waitForProof`) может его закрыть. Настоящие вердикты провайдера — rate limit,
+истёкший логин, 403, отклоняющий stdout — сохраняют прежний текст ошибки и
+никогда не помечаются `pending`. Диагностическая строка (`reason=…`, `wrapper=`,
+`stdout=`) остаётся в копируемом отчёте: короткий текст для человека и
+инцидент-репорт — разные вещи.
+
+Проверка: `src/main/claude-setting-pending-vs-rejected.actual.test.js` (в том числе
+живая форма записей `/model` и `/effort` с этой машины) PRE 1 FAIL → CURRENT 5/5 PASS;
+Claude settings/startup 11 файлов 144/144 PASS. Source/private, приложение не
+запускалось.
+
+## Провалившаяся стартовая настройка не блокирует Send (31.10.2026)
+
+Контракт: проваленная стартовая настройка (`/model`, `/effort`) **сообщается, но не
+навязывается**. Gate `failed` терминален и держится до рестарта процесса, поэтому
+прежняя блокировка превращала один отказ `/model` в вкладку, которая ничего не
+принимает. Решение пользователя: *«эта ошибка не влияет ни на отправку, ни на что…
+последующая вставка в input должна была работать без проблем»*.
+
+Два инцидента, оба сняты одним правилом:
+
+```text
+tab-718f438d  08:27:50  external_editor_timeout → Enter withheld → gate failed
+              08:28:16  Send → agent_send_startup_failed (pid 15603 жив)
+tab-20e4793e  10:45:33  /model → API 429 «model not changed» → gate failed
+              13:06:34 / 13:06:42 / 13:06:59  три Send отклонены, 2 ч 20 мин
+              13:07:02  рестарт очистил gate → отправки снова идут
+```
+
+Отказ навязывали **четыре** места, и снимать нужно было все: снятие одного лишь
+renderer-guard оставляло вкладку мёртвой (Send висел 30 с и падал с
+`agent_send_readiness_timeout`, проверено на настоящей проекции):
+1. `claude-pty-presence.js` — `inputReady` держит только **pending**; `failed` нет.
+2. `agentSendPreparation.ts` — guard `agent_send_startup_failed` удалён.
+3. `claudeStartupDefaultsReady.ts::waitForClaudeStartupDefaultsReadyUntilSettled`
+   (только Send) — «settled» включает `failed`; остановленная/заменённая попытка и
+   `cleared` по-прежнему отклоняют. Общий ограниченный wait отказ сообщает как раньше.
+4. `usePromptQueueRunner.ts` — Run After держит только pending; на `failed` защёлка
+   снимается и владелец будится (`claude-startup-defaults-failed`).
+
+Что сохранено: withhold Enter на недоказанной команде, запрет авто-повтора при
+`PROOF.UNRESOLVED`, явный Retry (`claude:retry-startup-defaults`), отдельная
+stop-политика повторного 403. API `start_ai`/создание вкладки на рабочей вкладке
+отвечают `ready` с `startupDefaultsError` (решение 01.11), а не 409. Цена: отправка может уйти в модель,
+которую Claude не переключил; модель в control bar и карточка настройки показывают
+это состояние явно.
+
+Main по-прежнему отличает локальный недоставленный сбой от вердикта провайдера
+(`startupNotDelivered`, единый владелец — `shared/claude-startup-failure.cjs::
+isClaudeStartupSettingUndelivered`) — для презентации и диагностики, не для блокировки.
+При 429 модель действительно не меняется (Claude пишет «model not changed»),
+применяется следующая успешная попытка.
+
+Байты терминала: отказ настройки теперь пинит raw-окно PTY тем же
+`reportTerminalIncident`, что и Codex (`incidentReason: claude-setting-not-confirmed`,
+`silent` — карточка настройки уже сообщает пользователю). В отчёте — команда, код,
+`proofOutcome`, `undelivered`, generation/attempt.
+
+Проверка: `claude-startup-undelivered-input.actual.test.js`,
+`agentSendStartupNotDelivered.actual.test.mjs`, `claudeStartupSettledWait.actual.test.mjs`,
+`promptQueueStartupFailed.actual.test.mjs`, `claude-setting-failure-bytes.actual.test.js`
+(PRE red → POST green), семейство startup/presence без новых провалов.
+
 ## Отмена залипшего ожидания
 
 Наведение на кружок даёт красный ✕. Для собственной revisioned Codex

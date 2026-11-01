@@ -25,3 +25,10 @@ test('Codex input-limit and exact rejection helpers are packed beside their Main
     assert.doesNotMatch(main, new RegExp("require\\(['\"]\\./" + name + "['\"]\\)"));
   }
 });
+
+test('the observed Rewind context proof helper is packed beside its existing context owner', () => {
+  const context = fs.readFileSync(path.join(root, 'src/main/tab-work-context.js'), 'utf8');
+  assert.ok(packageJson.build.files.includes('src/main/**/*'));
+  assert.match(context, /require\('\.\/tab-work-context-rewind'\)/);
+  assert.ok(fs.existsSync(path.join(root, 'src/main/tab-work-context-rewind.js')));
+});

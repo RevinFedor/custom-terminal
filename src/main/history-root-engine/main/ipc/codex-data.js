@@ -7066,6 +7066,7 @@ function isCodexResponseUserRecord(record) {
 
 function isCodexTurnPreambleRecord(record) {
   const payload = record?.payload || {};
+  if (record?.type === 'world_state') return true;
   if (record?.type === 'turn_context') return true;
   if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
   if (record?.type === 'event_msg' && payload.type === 'user_message') {
@@ -7268,6 +7269,18 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
         kind: 'user',
         turnKey: currentTurnKey,
       });
+      continue;
+    }
+
+    // Codex persists a world-state checkpoint after its contextual fragments.
+    // Do not flush those fragments onto the previous user merely because this
+    // non-visible record separates them from the next canonical input. A bare
+    // checkpoint after a real input (or its late response companion) still
+    // belongs to that input, not to the next turn's preamble.
+    const preambleTail = pending[pending.length - 1]?.record;
+    if (record?.type === 'world_state' && isCodexTurnPreambleRecord(preambleTail)
+      && (preambleTail.__physicalSessionId || sessionId) === (record.__physicalSessionId || sessionId)) {
+      pending.push({ record });
       continue;
     }
 

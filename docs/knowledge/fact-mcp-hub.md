@@ -109,6 +109,24 @@ host wire/authority protocol как отдельный configured Browser MCP-к
 private checks не покрывают старые VR/bridge/loaded-CS или installed handover.
 Enrolled receipt по-прежнему не объявляет историческое UNKNOWN известным.
 
+31Oct: удаление только `KNOWLEDGE_CODEX_MODEL` из default knowledge registration
+изменило общий configuration fingerprint. Следующий bundled hub сохранил released
+ingress, но `hostHeld` отверг старую completed activation по несовпадающему
+configurationDigest: Browser не спавнился, остальные пять MCP работали. Это
+реальный transport hold, в отличие от false-down UI ниже. Возвращён прежний
+compatibility token в resolver; helper по-прежнему исполняет Luna6. Подпись
+включает также status/provenance: перенос тех же args/env в profile entry сам
+по себе меняет её и не восстанавливает старое доказательство. Guard не ослаблен.
+
+После нового прямого поручения выполнен exact-PID normal hub handoff с прежним
+ENV/registration fingerprint, после pending0/known native journal/операционной
+паузы. Startup заново проверил существующие activation/lineage: journal/fence/epoch
+не сбрасывались, release API не вызывался. Первый мгновенный sample ещё видел
+инициализацию четырёх children; поздний tools/list + actual calls подтвердили6/6.
+Финал: same Noted Main/AI SID+PID, same native bridge/storeEpoch/11 records, Browser
+list_browsers/list_tabs/USER_SCRIPT read в том же Яндексе; Chrome offline без действий.
+Это не refresh tool catalog каждого старого Codex и не публикация Browser extension.
+
 SOURCE24.10: ошибка чтения maintenance authority не превращает успешный HTTP
 status хаба в `null/servers:[]`. Controller сохраняет фактические PID/initialize
 всех configured children и возвращает отдельный typed `browserMaintenance.held`.
@@ -191,8 +209,10 @@ Actual private Luna roundtrip выполнен через общий hub, без
   весь MCP-флот (~380 МБ и секунды старта) ради текстового JSON-ответа.
   С30Oct default — `gpt-6-luna`/low; старый environment-default `gpt-5.6-luna`
   нормализуется в helper, explicit per-call модель и остальные ENV-модели сохранены.
-  SOURCE hub config не добавляет второй fallback. Live helper обновляется отдельным
-  idle restart knowledge, без App build/глобального hub restart/перезапуска AI.
+  Совместимый ENV-токен прежней регистрации сохраняется в hub config: он входит
+  в Browser authority fingerprint, хотя фактическую модель уже выбирает helper.
+  Live helper обновляется отдельным idle restart knowledge, без App build/
+  глобального hub restart/перезапуска AI.
 - **electron-mcp** (connection.mjs): синглтон state → `Map clientId → {state,
   lastConnect}` за Proxy; каждый клиент держит СВОЁ CDP-подключение (два клиента
   одновременно на 9236 и 9237 проверены). Колбэки (`disconnected`, `close`,

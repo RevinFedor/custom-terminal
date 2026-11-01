@@ -8,22 +8,35 @@ const { createMiniOrchestratorMcpSender } = require('./mini-orchestrator-mcp');
 const { resolveContextFileRefs } = require('./agent-context-files');
 const PROMPT_ID = 'mini-orchestrator-review';
 const PREFIX = 'mini-orchestrator:';
+const AUTOMATIC_OUTPUT_FORMAT = [
+  'Private prototype review output mode: application-owned automatic return.',
+  'You remain read-only. read_review_iteration only reads the one captured iteration. finish_review is a declarative output record, NOT an MCP tool or an executor: it cannot send, edit, select a recipient, or operate a tab.',
+  'In this private prototype the application may separately forward at most one correction to the same pinned reviewed session through its existing guarded queue. You only return data; earlier read-only instructions still grant no execution tools or direct sending authority.',
+  'Read the captured iteration exactly once. On the second and final response return exactly one finish_review call with exactly these keys: verdict, explanation, correction. No recipient, session, tab, filename, or extra arguments.',
+  'verdict must be ok, needs_correction, or unknown. explanation must be a nonempty string of at most 250000 UTF-16 code units. Only needs_correction may have a nonempty correction, at most 16000 UTF-16 code units; for ok and unknown correction must be exactly the empty string.',
+  'Use needs_correction only for a material evidence-backed unmet part of the original request within its existing scope. A correction is a concise request to repair that gap, not a new task or a prescribed answer. Use unknown if the captured evidence is insufficient. Do not invent a defect to produce a correction.',
+  'This explicit mode replaces only earlier text-only output formatting. It does not expand your read access or grant any additional tools.',
+].join('\n');
 
 // Also used by the offline evidence preparer. It never calls a provider and
 // assembles the SAME live-file instruction as the runtime, without secrets.
-async function resolveMiniOrchestratorInstruction({ prompt, settings, includeFileMetadata = false }) {
+async function resolveMiniOrchestratorInstruction({ prompt, settings, includeFileMetadata = false, automaticCorrections = false }) {
   if (!prompt || !/^gemini-/.test(settings?.model)) throw new Error('mini_reviewer_gemini_prompt_required');
   const files = await resolveContextFileRefs({ refs: prompt.filePaths.map(path => ({ path, role: 'instructions' })),
     maxFileBytes: 256 * 1024, maxTotalBytes: 256 * 1024 });
-  const text = [prompt.content, ...files.map(file => file.text)].filter(Boolean).join('\n\n');
+  const automatic = automaticCorrections === true;
+  const text = [prompt.content, ...files.map(file => file.text), ...(automatic ? [AUTOMATIC_OUTPUT_FORMAT] : [])].filter(Boolean).join('\n\n');
   const hash = createHash('sha256').update(text).digest('hex');
   return { id: prompt.id, name: prompt.name, model: settings.model, thinkingLevel: settings.thinkingLevel,
     revision: prompt.revision + ':' + hash.slice(0, 12), filePaths: files.map(file => file.filePath), text,
+    ...(automatic ? { automaticCorrections: true } : {}),
     ...(includeFileMetadata ? { linkedFiles: files.map(file => ({ path: file.filePath, bytes: file.bytes, sha256: file.sha256 })) } : {}) };
 }
 
 function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, endpointFor, publish,
-  review = createMiniOrchestratorGemini(), sendCorrection, loadPresentation, clearPresentation, log = () => {} }) {
+  automaticCorrections = false, review, sendCorrection, loadPresentation, clearPresentation, log = () => {} }) {
+  const automatic = automaticCorrections === true;
+  const runReview = review === undefined ? createMiniOrchestratorGemini({ automaticCorrections: automatic }) : review;
   const enabled = new Set(), pendingInputs = new Map();
   const settingsByTab = new Map();
   const viewRevisions = new Map();
@@ -46,8 +59,8 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
   }
   function withSettings(tabId, snapshot) {
     const viewRevision = (viewRevisions.get(tabId) || 0) + 1; viewRevisions.set(tabId, viewRevision);
-    try { return { ...snapshot, viewRevision, settings: settingsFor(tabId) }; }
-    catch (error) { return { ...snapshot, viewRevision, settings: { error: String(error.message || error).slice(0, 160) } }; }
+    try { return { ...snapshot, viewRevision, settings: settingsFor(tabId), ...(automatic ? { autoReturn: true } : {}) }; }
+    catch (error) { return { ...snapshot, viewRevision, settings: { error: String(error.message || error).slice(0, 160) }, ...(automatic ? { autoReturn: true } : {}) }; }
   }
   const sameOwner = ({ tabId, owner, turnId }) => {
     const current = readOwner(tabId);
@@ -58,7 +71,7 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
   const ready = args => sameOwner(args) && readOwner(args.tabId)?.ready === true
     && !(pendingInputs.get(args.tabId)?.size > 0);
   const mcpSend = sendCorrection || createMiniOrchestratorMcpSender({ endpointFor });
-  const core = createMiniOrchestrator({ review, sendCorrection: mcpSend,
+  const core = createMiniOrchestrator({ review: runReview, sendCorrection: mcpSend, automaticCorrections: automatic,
     isCurrent: sameOwner, loadPresentation,
     loadLedger: tabId => {
       const raw = db.getAppState('mini-orchestrator-ledger:' + tabId);
@@ -69,7 +82,7 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
       const prompt = systemPromptService.get(PROMPT_ID);
       const settings = settingsFor(tabId);
       if (settings.error) throw new Error(settings.error);
-      return resolveMiniOrchestratorInstruction({ prompt, settings });
+      return resolveMiniOrchestratorInstruction({ prompt, settings, automaticCorrections: automatic });
     }, publish: (tabId, snapshot) => publish?.(tabId, withSettings(tabId, snapshot)),
     log: (action, fields) => log(action, fields),
   });

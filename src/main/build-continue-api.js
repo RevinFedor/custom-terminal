@@ -63,13 +63,21 @@ async function handleBuildContinueApi({ req, res, parsed, service, readBody, sen
         throw Object.assign(Error('build_continue_request_invalid'), { statusCode: 400 });
       }
       const op = await service.capture(body.operationId, body.expectedMainPid);
+      if (op.captureProofVersion === 1) service.prepareTaskShutdown();
       sendJson(res, 200, { ok: true, operation: summary(op), reportUrl: PREFIX + '/' + encodeURIComponent(op.id) });
       quit();
       return true;
     }
-    const match = parsed.pathname.match(/^\/api\/build-continue\/operations\/([^/]+)(\/(?:restore|cancel-target))?$/);
+    const match = parsed.pathname.match(/^\/api\/build-continue\/operations\/([^/]+)(\/(?:restore|cancel-target|dismiss-capture))?$/);
     const id = match && decodeURIComponent(match[1]);
     if (!id || !validId(id)) throw Object.assign(Error('build_continue_request_invalid'), { statusCode: 400 });
+    if (req.method === 'POST' && match[2] === '/dismiss-capture') {
+      const body = await readBody(req);
+      const acknowledgement = service.dismissCaptureIssue(id, body);
+      sendJson(res, 200, { ok: true, acknowledgement,
+        operation: summary(service.get(id)), reportUrl: PREFIX + '/' + encodeURIComponent(id) });
+      return true;
+    }
     if (req.method === 'POST' && match[2] === '/cancel-target') {
       const body = await readBody(req);
       if (body.version !== 2 || !validId(body.requestId) || !body.tabId || !body.handoffId || !body.operationKey

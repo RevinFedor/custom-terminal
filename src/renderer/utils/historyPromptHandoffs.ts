@@ -11,6 +11,7 @@ import { readHistorySendRecovery, removeHistorySendRecovery, hideHistorySendReco
 import { normalizeHistorySendInputTiming } from './historySendTiming.mjs';
 import { compactSendDeliveryIdentity } from '../../shared/compact-send-delivery.cjs';
 import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent, isTabMessageNoInputReceipt } from '../../shared/agent-send-receipt-control.cjs';
+import { externalSendFailureBelongsInHistory } from '../../shared/external-send-presentation.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
@@ -2275,6 +2276,21 @@ export async function runHistoryPromptHandoff(
       ? 'failed'
       : unconfirmedStatus
         || (result?.queued === true ? 'queued' : 'sent');
+    // Fedor31Oct: a programmatic Send from another tab is judged by the SAME
+    // rule as the user's own input, by WHERE it failed — not by who sent it.
+    // Refused before any byte crossed into the PTY (bad arguments, unresolved
+    // target, model+Send pair refused): the user can act on nothing here, so
+    // no card is left behind and the caller gets the error as a tool result.
+    // Reached the terminal and failed there (slash not applied, wrong writer,
+    // audit failure): identical to typing it by hand, so it keeps its card.
+    // `delivery-unknown` is NOT proven no-input and therefore keeps its card.
+    if ((queueStatus === 'failed' || queueStatus === 'cancelled')
+      && !externalSendFailureBelongsInHistory({ source: input.source, receipt: result })) {
+      store.consume(input.tabId, handoffId);
+      return result && typeof result === 'object'
+        ? { ...result, handoffId: result.handoffId || handoffId }
+        : result;
+    }
     store.settle(input.tabId, handoffId, {
       queueStatus,
       // Keep the new exact negative receipt distinguishable from legacy
@@ -2310,6 +2326,13 @@ export async function runHistoryPromptHandoff(
     const beforeSubmit = receipt?.submitted === false;
     const cancelledBeforeSubmit = beforeSubmit && receipt?.deliveryUnknown !== true
       && (receipt?.cancelled === true || cancelledSendIntent(receipt));
+    // Same rule on the thrown path: a transport refusal that never reached the
+    // PTY leaves no card for the user, while an error after input crossed (or
+    // an unknown outcome) keeps its ordinary failure card.
+    if (!externalSendFailureBelongsInHistory({ source: input.source, receipt })) {
+      store.consume(input.tabId, handoffId);
+      throw error;
+    }
     store.settle(input.tabId, handoffId, {
       queueStatus: cancelledBeforeSubmit ? 'cancelled' : beforeSubmit ? 'failed' : 'delivery-unknown',
       reason: cancelledBeforeSubmit ? 'send-cancelled-before-submit'
@@ -2743,6 +2766,20 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       if (current && !historyPromptHandoffAcceptsAuditIdentity(current,
         { sendAttemptId: attemptId, sendOperationKey: operationKey })) {
         return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
+      }
+      // A durable receipt publication/remount must not reintroduce the card
+      // that the same rule suppressed live: this programmatic Send was refused
+      // before any byte reached the PTY. The receipt itself is untouched and
+      // remains readable by handoffId; only its presentation is withheld.
+      if (!externalSendFailureBelongsInHistory({
+        source: typeof receipt.source === 'string' ? receipt.source : null,
+        receipt: { ...receipt, submitted: false },
+      })) {
+        if (current && current.sendOperationKey === operationKey
+          && (!current.sendAttemptId || current.sendAttemptId === attemptId)) {
+          consumeHistoryPromptHandoff(tabId, handoffId);
+        }
+        return { hydrated: false, reason: 'external-send-no-terminal-input' };
       }
       const presentation = receipt.presentationSnapshot || {};
       const handoff = beginHistoryPromptHandoff({ tabId, handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,

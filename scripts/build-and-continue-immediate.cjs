@@ -28,7 +28,12 @@ function logRestoration(operation, log) {
   const summary = restorationSummary(operation);
   log('restoration=' + JSON.stringify(summary));
   for (const target of operation?.targets || []) if (['superseded', 'paused', 'unresolved'].includes(target.state)) {
-    log('not continued tab=' + target.tabId + ' state=' + target.state + ' reason=' + (target.reason || 'unknown'));
+    log('not continued tab=' + (target.tabId || target.source?.tabId) + ' state=' + target.state + ' reason=' + (target.reason || 'unknown'));
+  }
+  for (const issue of operation?.unresolved || []) {
+    const source = issue.source || operation.participants?.find(row => row.source.tabId === issue.tabId)?.source;
+    log('not captured tab=' + issue.tabId + (source?.name ? ' name=' + JSON.stringify(source.name) : '')
+      + ' stage=' + (issue.stage || 'capture') + ' reason=' + (issue.reason || 'unknown'));
   }
   return summary;
 }
@@ -114,4 +119,4 @@ if (require.main === module) main().catch(error => {
   console.error('[build:i-c] ' + error.message + (error.operationId ? ' operation=' + error.operationId : ''));
   process.exitCode = 1;
 });
-module.exports = { runBuildContinue, ENDPOINT, restorationSummary };
+module.exports = { runBuildContinue, ENDPOINT, restorationSummary, logRestoration };

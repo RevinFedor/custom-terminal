@@ -15,13 +15,15 @@ new Function('require', 'module', 'exports', sharedBundle.outputFiles[0].text)(r
 const source = fs.readFileSync(require('node:path').join(__dirname, 'MiniOrchestratorControl.tsx'), 'utf8');
 const code = esbuild.transformSync(source, { loader: 'tsx', format: 'cjs' }).code;
 const moduleStub = { exports: {} };
-vm.runInNewContext(code, { module: moduleStub, exports: moduleStub.exports, window: { require: () => ({ ipcRenderer: {} }) }, require: (name) => {
+vm.runInNewContext(code, { module: moduleStub, exports: moduleStub.exports, document: { body: { ownPortalTarget: true } }, window: { require: () => ({ ipcRenderer: {} }) }, require: (name) => {
   if (name === 'react') return require('react');
   if (name === 'react-dom') return { createPortal: (node, target) => ({ node, target }) };
-  if (name === 'lucide-react') return {};
+  if (name === 'lucide-react') return require('lucide-react');
   if (name === '../../constants/geminiModels') return { GEMINI_MODEL_OPTIONS: [{ value: 'gemini-3.8-flash', label: 'Flash 3.8' }], legacyGeminiModelLabel: () => null };
   if (name === '../../store/useUIStore') return { useUIStore: () => undefined };
   if (name === '../../hooks/usePointerGesture') return {};
+  if (name === './AIConversation/PastedContentPreview') return { default: () => null };
+  if (name === '../../utils/tabMessageSourceJump') return { jumpToTerminalMessageTarget: () => Promise.resolve(true) };
   if (name === '../../utils/miniOrchestratorGeometry.mjs') return require('../../utils/miniOrchestratorGeometry.mjs');
   if (name === '../../utils/historyResponseTiming.mjs') return require('../../utils/historyResponseTiming.mjs');
   if (name.endsWith('.css')) return {};
@@ -29,11 +31,27 @@ vm.runInNewContext(code, { module: moduleStub, exports: moduleStub.exports, wind
   if (name === './HistoryTranscriptPresentation' || name === '@noted/claude-blocks') return shared.exports;
   throw new Error(name);
 } });
-const { miniEntriesToSteps, MiniReviewInputContent, miniPopupLayout, MiniOrchestratorToggle, miniStatusPresentation, miniPhaseLabel, MiniOrchestratorStatus, MiniModelControls } = moduleStub.exports;
+const { miniEntriesToSteps, miniEntriesByRound, MiniReviewInput, MiniReviewInputContent, miniPopupLayout, MiniOrchestratorToggle, miniStatusPresentation, miniPhaseLabel, MiniOrchestratorStatus, MiniModelControls } = moduleStub.exports;
 
 test('source pair and internal notices are not reviewer messages', () => {
   const steps = miniEntriesToSteps([{ id: '1', type: 'request', text: 'question' }, { id: '2', type: 'answer', text: 'answer' }, { id: '3', type: 'notice', text: 'internal' }]);
   assert.equal(steps.length, 0);
+});
+
+test('entries split by round keep every completed review visible instead of only the latest', () => {
+  const entries = [
+    { id: 'i1', type: 'instruction', text: 'rules', round: 1 }, { id: 'q1', type: 'request', text: 'first', round: 1 },
+    { id: 'a1', type: 'answer', text: 'first answer', round: 1 }, { id: 'r1', type: 'review', text: 'first review', round: 1 },
+    { id: 'i2', type: 'instruction', text: 'rules', round: 2 }, { id: 'q2', type: 'request', text: 'second', round: 2 },
+    { id: 'a2', type: 'answer', text: 'second answer', round: 2 }, { id: 'r2', type: 'review', text: 'second review', round: 2 },
+  ];
+  const rounds = miniEntriesByRound(entries);
+  assert.equal(rounds.length, 2);
+  assert.equal(rounds[0].round, 1); assert.equal(rounds[1].round, 2);
+  assert.equal(rounds[0].entries.find(e => e.type === 'review').text, 'first review');
+  assert.equal(rounds[1].entries.find(e => e.type === 'review').text, 'second review');
+  const legacy = miniEntriesByRound([{ id: 'x', type: 'answer', text: 'no round field' }]);
+  assert.equal(legacy.length, 1); assert.equal(legacy[0].round, undefined);
 });
 
 test('Worked footer uses the completed request pair, not current picker state', () => {
@@ -49,29 +67,23 @@ test('actual shared bubble and chips show only compact labels; previews isolate 
     { id: 'q1', type: 'request', text: 'ORIGINAL REQUEST ONE' }, { id: 'q2', type: 'request', text: 'ORIGINAL REQUEST TWO' },
     { id: 'a', type: 'answer', text: 'ORIGINAL **ANSWER**' }, { id: 'n', type: 'notice', text: 'INTERNAL NOTICE' }];
   const sourceRef = { provider: 'codex', sessionId: 'session-exact', turnId: 'turn-exact', jobId: 'job-exact', requestIds: ['q1', 'q2'] };
-  const render = expanded => renderToStaticMarkup(React.createElement(MiniReviewInputContent, { entries, source: sourceRef, expanded, onToggle() {}, onCopy() {} }));
-  const closed = render(null);
+  const render = () => renderToStaticMarkup(React.createElement(MiniReviewInputContent, { entries, source: sourceRef, onInstruction() {}, onIteration() {} }));
+  const closed = render();
   assert.equal((closed.match(/data-message-layout="user"/g) || []).length, 1);
   assert.equal((closed.match(/data-composer-chip-kind=/g) || []).length, 2);
   assert.match(closed, /cb-user-bubble/); assert.match(closed, />Инструкция</); assert.match(closed, />Итерация</);
   const visible = closed.replace(/ title="[^"]*"/g, '');
   assert.doesNotMatch(visible, /\/private\/full\/path|FULL INSTRUCTION|ORIGINAL REQUEST|ORIGINAL ANSWER|INTERNAL NOTICE/);
   assert.match(closed, /\/private\/full\/path/, 'full path is available only in tooltip');
-  const instruction = render('instruction');
-  assert.match(instruction, /FULL INSTRUCTION/); assert.match(instruction, /revision:abcdef123/); assert.match(instruction, /\/private\/full\/path/);
-  assert.doesNotMatch(instruction, /ORIGINAL REQUEST|ORIGINAL ANSWER|INTERNAL NOTICE/);
-  const iteration = render('iteration');
-  assert.doesNotMatch(iteration, /Архив headless-проверки/);
-  assert.match(iteration, /session-exact/); assert.match(iteration, /turn-exact/); assert.match(iteration, /ORIGINAL REQUEST ONE/); assert.match(iteration, /ORIGINAL REQUEST TWO/);
-  assert.match(iteration, /ORIGINAL <strong>ANSWER<\/strong>/); assert.doesNotMatch(iteration, /FULL INSTRUCTION|INTERNAL NOTICE/);
-  assert.doesNotMatch(iteration, /<textarea|contenteditable="true"/);
-  const archiveSource = { ...sourceRef, archived: true, verificationNotes: ['low not max', 'shell disabled', 'compact count: 2', 'x'.repeat(260), 'note5', 'note6', 'note7', 'note8', 'note9'] };
-  const archive = renderToStaticMarkup(React.createElement(MiniReviewInputContent, { entries, source: archiveSource, expanded: 'iteration', onToggle() {}, onCopy() {} }));
-  assert.match(archive, /Архив headless-проверки/);
-  assert.match(archive, /low not max\nshell disabled\ncompact count: 2/);
-  assert.match(archive, /x{240}/); assert.doesNotMatch(archive, /x{241}|note9/);
-  const archiveClosed = renderToStaticMarkup(React.createElement(MiniReviewInputContent, { entries, source: archiveSource, expanded: null, onToggle() {}, onCopy() {} }));
-  assert.doesNotMatch(archiveClosed, /low not max|shell disabled|compact count/);
+  assert.equal(render(), closed, 'click actions never add inline payload or alter bubble markup');
+  const actions = [];
+  const bubble = MiniReviewInputContent({ entries, source: sourceRef, onInstruction: () => actions.push('instruction'), onIteration: () => actions.push('iteration') });
+  const chips = bubble.props.children.props.children;
+  chips[0].props.onClick(); chips[1].props.onClick();
+  assert.deepEqual(actions, ['instruction', 'iteration']);
+  assert.equal(render(), closed, 'both clicks leave bubble markup unchanged');
+  assert.match(source, /createPortal\(<div data-mini-instruction-preview/);
+  assert.doesNotMatch(source, /data-mini-review-iteration|data-mini-review-instruction/);
 });
 
 test('archive label applies only to completed archived presentation', () => {
@@ -79,6 +91,26 @@ test('archive label applies only to completed archived presentation', () => {
   assert.equal(miniPhaseLabel({ phase: 'complete', reviewSource: {} }), 'Готово');
   assert.equal(miniPhaseLabel({ phase: 'reviewing', reviewSource: { archived: true } }), 'Проверяет');
   assert.equal(miniPhaseLabel(null), 'Inactive');
+});
+
+test('instruction portal permits its own interaction and closes only its child preview', () => {
+  const events = [], entries = [{ id: 'i', type: 'instruction', text: 'actual frozen instruction' },
+    { id: 'q', type: 'request', text: 'question' }, { id: 'a', type: 'answer', text: 'answer' }];
+  const tree = MiniReviewInput({ entries, tabId: 'own', source: { provider: 'codex', sessionId: 'sid', turnId: 'turn', requestIds: ['q'] },
+    preview: true, setPreview: value => events.push(['preview', value]), onCopy: text => events.push(['copy', text]) });
+  const portal = tree.props.children[1], overlay = portal.node, content = overlay.props.children;
+  assert.equal(portal.target.ownPortalTarget, true);
+  assert.equal(overlay.props['data-run-after-satellite'], 'true');
+  const event = { stopPropagation: () => events.push(['stop']) };
+  content.props.onMouseDown(event);
+  assert.deepEqual(events, [['stop']], 'clicking inside does not dismiss the preview');
+  content.props.children.props.onCopy('actual frozen instruction');
+  assert.deepEqual(events.at(-1), ['copy', 'actual frozen instruction']);
+  overlay.props.onMouseDown(event);
+  assert.deepEqual(events.at(-1), ['preview', false]);
+  // React portals still participate in their parent's React capture path.
+  // A capture-close on the Mini parent would eat the child's Copy click first.
+  assert.doesNotMatch(source, /onMouseDownCapture=/);
 });
 
 test('read-only tool displays a read receipt without inventing a terminal send', () => {
@@ -115,13 +147,25 @@ test('reviewer has a direct independent switch, not just a chat opener', () => {
     toggleEnabled: () => { calls++; }, error: '' } });
   assert.equal(button.props.role, 'switch');
   assert.equal(button.props['aria-checked'], false);
-  assert.match(button.props['aria-label'], /Inactive/);
-  assert.equal(button.props.children[1].props.children, 'Off');
+  assert.match(button.props['aria-label'], /выключен/);
+  assert.equal(button.props['data-active'], false);
+  assert.equal(Array.isArray(button.props.children), false, 'only one shared glyph, no visible On/Off label');
+  assert.equal(button.props.children.props.size, 13);
   button.props.onClick();
   assert.equal(calls, 1);
+  const active = MiniOrchestratorToggle({ controller: { snapshot: { enabled: true }, pending: false, toggleEnabled() {}, error: '' } });
+  assert.equal(active.props['aria-checked'], true); assert.equal(active.props['data-active'], true);
+  assert.equal(active.props.children.type, button.props.children.type, 'the glyph never changes with mode');
+  assert.equal(active.props.children.props.size, 13);
+  assert.notEqual(active.props.style.color, button.props.style.color);
+  for (const node of [button, active]) {
+    const html = renderToStaticMarkup(node);
+    assert.equal(html.replace(/<[^>]*>/g, '').trim(), '', 'actual SVG switch has no visible text');
+    assert.match(html, /<svg/);
+  }
 });
 
-test('mode label is just On/Off; lifecycle status distinguishes waiting, Gemini, completion and failure', () => {
+test('mode uses the same glyph and active color; lifecycle status distinguishes waiting, Gemini, completion and failure', () => {
   const status = phase => miniStatusPresentation({ enabled: true, phase });
   assert.equal(miniStatusPresentation({ enabled: false, phase: 'reviewing' }), null);
   assert.equal(status('idle'), null); assert.equal(status('collecting').kind, 'waiting');

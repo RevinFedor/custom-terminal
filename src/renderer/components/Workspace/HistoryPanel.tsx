@@ -4361,7 +4361,7 @@ const HistoryCollapsiblePrompt = ({
         toggleExpanded();
       }}
     >
-      {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+      {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} симв.)`}
     </button>
   );
   return (
@@ -5046,7 +5046,7 @@ const HistoryUserPromptContent = ({
         toggleMixedExpanded();
       }}
     >
-      {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+      {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} симв.)`}
     </button>
   ) : null;
 
@@ -13662,17 +13662,33 @@ function HistoryPanel({
     // it and must not inset again.
     sidePanelPinned: historyPinnedForInset,
   });
-  const requestedHistoryScrollUuid = useUIStore((s) => s.historyScrollToUuid);
-  const historyScrollTargetTabId = useUIStore((s) => s.historyScrollTargetTabId);
-  const requestedHistoryToolTarget = useUIStore((s) => s.historyScrollToolTarget);
-  const requestedHistoryScrollGeneration = useUIStore((s) => s.historyScrollRequestGeneration);
-  const historyScrollToolTarget = historyScrollTargetTabId === tabId ? requestedHistoryToolTarget : null;
-  // Persistent panes all stay mounted. A process-global UUID therefore is not
-  // a navigation request — it is an invitation for every hidden History to
-  // consume it. Only the named tab may translate or clear this request.
-  const historyScrollToUuid = historyScrollTargetTabId === tabId
-    ? requestedHistoryScrollUuid
-    : null;
+  // Persistent panes all stay mounted — 67 of them in the 31.10 session. A
+  // process-global UUID therefore is not a navigation request: it is an
+  // invitation for every hidden History to consume it. Only the named tab may
+  // translate or clear this request.
+  //
+  // Each field is read through a selector that applies the
+  // `targetTabId === tabId` test INSIDE the selector, so a seek aimed at
+  // another tab makes this panel's value identical to what it already had
+  // (null / null / 0) and Zustand skips its re-render. Read raw, each of the
+  // 67 panels re-rendered on every Timeline click inside the same task — the
+  // 452ms freeze at 13:37:48.8 UTC, where the dot loader could not paint and
+  // the side panel would not scroll.
+  //
+  // Zustand v5 dropped the second equality argument of `useStore`, so these
+  // must stay separate primitive selectors: returning one fresh object per
+  // call would wake every panel exactly as before. `useShallow` would work
+  // too but allocates per render for a value that is null here 66 times out
+  // of 67.
+  const historyScrollToUuid = useUIStore((s) =>
+    s.historyScrollTargetTabId === tabId ? s.historyScrollToUuid : null);
+  const historyScrollToolTarget = useUIStore((s) =>
+    s.historyScrollTargetTabId === tabId ? s.historyScrollToolTarget : null);
+  const requestedHistoryScrollGeneration = useUIStore((s) =>
+    s.historyScrollTargetTabId === tabId ? s.historyScrollRequestGeneration : 0);
+  // The two remaining readers of the raw id (the pending-jump recovery paths
+  // below) take it from `useUIStore.getState()` at call time, so no component
+  // needs to subscribe to the id itself.
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
@@ -18126,6 +18142,20 @@ function HistoryPanel({
       }
       if (!publicationCurrent() || !authoringCurrent() || !publicationCurrent()
         || getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) !== localOwner) return prev;
+      // One send publishes the same row many times: `sending` alone arrived 6
+      // times for one handoff, and 31% of all LOCAL_APPEND repeats a status the
+      // row already carries. Each repeat used to return a NEW array, so every
+      // History subscriber re-rendered and the grouping memo was re-entered —
+      // that is the 77-134ms task the user feels as "scroll lags a couple of
+      // seconds after Enter". Only the identity above may suppress a write;
+      // this compares what is actually presented, so a real transition
+      // (preparing→sending→sent, chips, audit proof, queue position) still
+      // publishes. Reference equality here means React skips the update
+      // entirely, not that the row was dropped.
+      if (existingIndex >= 0 && nextEntries.length === prev.length
+        && historyEntryPresentationEqual(prev[existingIndex], nextEntries[existingIndex])
+        && nextEntries.every((row, index) => row === prev[index]
+          || historyEntryPresentationEqual(row, prev[index]))) return prev;
       if (!publishHistoryRows(nextEntries, () => publicationCurrent() && authoringCurrent() && publicationCurrent()
         && getLocalPromptMetaOwner(promptHandoffMetaRef.current.get(handoffId)) === localOwner)) return prev;
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
@@ -23675,9 +23705,14 @@ function HistoryPanel({
         });
       });
     };
+    let ignoredLogged = 0;
     const onChanged = (_event: any, detail: any) => {
       if (detail?.sessionId !== sessionId) return;
-      if (detail?.toolType && detail.toolType !== toolType) return;
+      if (detail?.toolType && detail.toolType !== toolType) {
+        if (ignoredLogged++ < 3) historyDiag('TRANSCRIPT_IGNORED tab=' + tabId.slice(-12)
+          + ' session=' + sessionId.substring(0, 8) + ' reason=tool-mismatch detail=' + String(detail.toolType));
+        return;
+      }
       const fileReplaced = detail.fileIdentity && historyFileWasReplaced(physicalFileIdentityRef.current, historyOwnerKey, detail.fileIdentity);
       if (detail.fileIdentity) physicalFileIdentityRef.current = { ownerKey: historyOwnerKey, value: detail.fileIdentity };
       if (fileReplaced) {
@@ -23865,8 +23900,12 @@ function HistoryPanel({
     }
     const scroller = virtuosoScrollerRef.current;
     if (!scroller || !scroller.isConnected) return; // list gone; start effect re-arms
+    // Bounded-window stubs carry the same shell marker but are main's to
+    // hydrate, never this wave's: counting them left the drain test unable to
+    // reach zero, so the wave re-upgraded its own rows forever (one live visit
+    // logged rows=5 upgraded=141207 steps=47238).
     const shellNodes = scroller.querySelectorAll(
-      `[data-history-mount-shell][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+      `[data-history-mount-shell]:not([data-history-row-stub])[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
     );
     if (shellNodes.length === 0) {
       // Zero shells is only "drained" when rows are actually MOUNTED. The

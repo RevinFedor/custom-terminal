@@ -14,6 +14,28 @@ const functions = names => names.map(name => {
   const node=tree.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text===name);assert.ok(node,name);return node.getText(tree);
 }).join('\n');
 
+function actualInboxSourceResolver(executor) {
+  let selected;
+  const visit = node => {
+    if (ts.isNewExpression(node) && node.expression.getText(tree) === 'InboxSavedHistoryOperations') {
+      selected = node.arguments[0].properties.find(property => property.name?.getText(tree) === 'resolveSession');
+    }
+    ts.forEachChild(node, visit);
+  }; visit(tree); assert.ok(selected);
+  return vm.runInNewContext('(' + selected.initializer.getText(tree) + ')', {
+    savedHistoryOperations: executor,
+    resolveHistorySessionInfo: () => ({ toolType: 'codex', sessionId: null }),
+  });
+}
+
+test('actual Inbox factory shares the executor source authority, not transient public read availability', async () => {
+  let selected = { toolType: 'codex', sessionId: 'source', cwd: '/fixture' };
+  const resolver = actualInboxSourceResolver({ resolveSession: () => selected });
+  assert.equal((await resolver('T')).sessionId, 'source');
+  selected = { ...selected, sessionId: 'changed' };
+  assert.equal((await resolver('T')).sessionId, 'changed', 'a new binding is observed, not cached as the original SID');
+});
+
 function cleanupHarness({ closed=false }={}) {
   const events=[],callbacks=[];
   const run={runId:'current-run',tabId:'T',provider:'codex',conversationKey:'chat',sessionId:'source',auditSessionId:'source',
@@ -120,8 +142,9 @@ test('real SQLite atomic ingress+execution receipt reopens unknown, never a new 
   t.after(()=>{if(sql.open)sql.close();fs.rmSync(dir,{recursive:true,force:true});});
   sql.exec('CREATE TABLE app_state (key TEXT PRIMARY KEY,value TEXT,updated_at INTEGER)');
   const db=Object.create(Database.prototype);db.db=sql;
-  const args={db,executor:new SavedHistoryOperations({db,dispatch:async()=>{}}),getReceipt:receipt,reservedTabId:()=> 'T',
-    readNativeState:()=>({pending:false}),ensureOpen:async()=>({descriptor:{}}),resolveSession:async()=>({toolType:'codex',sessionId:'source'}),
+  const executor=new SavedHistoryOperations({db,dispatch:async()=>{},resolveSession:async()=>({toolType:'codex',sessionId:'source'})});
+  const args={db,executor,getReceipt:receipt,reservedTabId:()=> 'T',
+    readNativeState:()=>({pending:false}),ensureOpen:async()=>({descriptor:{}}),resolveSession:actualInboxSourceResolver(executor),
     transcript:{getTimeline:async()=>({success:true,entries:[{uuid:'U',type:'user',content:'text'}]})},
     cleanup:{claim:()=>({runId:'R',validate(){},release(){}})}};
   const wrapper=new InboxSavedHistoryOperations(args);

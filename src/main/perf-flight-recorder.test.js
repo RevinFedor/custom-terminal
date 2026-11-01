@@ -112,7 +112,7 @@ test('system load without an Electron hotspot does not waste a background profil
   assert.equal(captureDecision([], Date.now(), 'sustained-cpu', { ...pressure, appCpu: 150 }).allowed, true);
 });
 
-test('explicit manual capture survives exhausted automatic quota, with one durable slot and no refund', t => {
+test('repeated manual requests retain distinct receipts across reload without refunding exhausted auto quota', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-manual-quota-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = createArtifactStore(dir), now = Date.now();
@@ -122,15 +122,26 @@ test('explicit manual capture survives exhausted automatic quota, with one durab
     fs.utimesSync(store.file(name), new Date(now - 7200000 + i * 700000), new Date(now - 7200000 + i * 700000));
   }
   assert.equal(store.reserveCaptureDetails('incident-' + now + '-1', now, 'ui-click').reason, 'rolling-quota-exhausted');
-  assert.equal(store.reserveCaptureDetails('incident-' + now + '-2', now, 'manual').allowed, true);
-  const reloaded = createArtifactStore(dir);
-  const refused = reloaded.reserveCaptureDetails('incident-' + (now + 1) + '-2', now + 1, 'manual');
-  assert.equal(refused.reason, 'manual-rolling-quota-exhausted');
-  assert.equal(refused.group, 'manual');
-  assert.equal(refused.remaining, 0);
-  assert.equal(reloaded.reserveCaptureDetails('incident-' + (now + 2) + '-2', now + 2, 'ui-click').reason, 'rolling-quota-exhausted');
-  assert.equal(reloaded.entries().filter(e => e.name.endsWith('.capture.json')).length, 5);
-  assert.equal(reloaded.reserveCaptureDetails('incident-' + (now + 86400010) + '-2', now + 86400010, 'manual').allowed, true);
+  const saved = new Map(store.entries().map(e => [e.name, store.read(e.name)]));
+  for (let i = 0; i < 5; i++) {
+    const reloaded = createArtifactStore(dir), id = 'incident-' + (now + i) + '-2';
+    const decision = reloaded.reserveCaptureDetails(id, now + i, 'manual');
+    assert.equal(decision.allowed, true); assert.equal(decision.group, 'manual');
+    assert.equal(decision.remaining, null, 'manual has no daily slot counter');
+    assert.deepEqual(JSON.parse(reloaded.read(id + '.capture.json')),
+      { requestedAt: now + i, kind: 'manual', group: 'manual' });
+    saved.set(id + '.capture.json', reloaded.read(id + '.capture.json'));
+    reloaded.prune(now + i);
+    for (const [name, bytes] of saved) assert.equal(reloaded.read(name), bytes);
+    assert.equal(reloaded.reserveCaptureDetails('incident-' + (now + i) + '-3', now + i, 'ui-click').reason,
+      'rolling-quota-exhausted');
+  }
+  const reloaded = createArtifactStore(dir), first = 'incident-' + now + '-2';
+  const priorStat = fs.statSync(reloaded.file(first + '.capture.json'));
+  assert.throws(() => reloaded.reserveCaptureDetails(first, now + 100, 'manual'), { code: 'EEXIST' });
+  assert.equal(reloaded.read(first + '.capture.json'), saved.get(first + '.capture.json'));
+  assert.equal(fs.statSync(reloaded.file(first + '.capture.json')).mtimeMs, priorStat.mtimeMs);
+  assert.equal(reloaded.entries().filter(e => e.name.endsWith('.capture.json')).length, 9);
 });
 
 test('manual receipt neither consumes nor renews automatic responsiveness slots', () => {
@@ -139,7 +150,159 @@ test('manual receipt neither consumes nor renews automatic responsiveness slots'
   const old = { at: now - 2000, group: 'responsiveness' };
   assert.equal(captureDecision([old, manual], now, 'ui-click').nextEligibleWallMs, old.at + 600000);
   assert.equal(captureDecision([{}, {}, {}, {}, manual], now, 'ui-click').allowed, false);
-  assert.equal(captureDecision([{ at: now - 1 }], now, 'manual').allowed, false);
+  assert.equal(captureDecision([{ at: now - 1 }], now, 'manual').allowed, true);
+});
+
+test('artifact reservations still enforce background2/day and auto4/day after repeated manual captures', t => {
+  const { store, now } = artifactFixture(t);
+  for (let i = 0; i < 5; i++)
+    assert.equal(store.reserveCaptureDetails('incident-' + (now + i) + '-2', now + i, 'manual').allowed, true);
+  function automatic(at, kind) {
+    const id = 'incident-' + at + '-1';
+    const decision = store.reserveCaptureDetails(id, at, kind);
+    if (decision.allowed) fs.utimesSync(store.file(id + '.capture.json'), new Date(at), new Date(at));
+    return decision;
+  }
+  assert.equal(automatic(now - 2100000, 'sustained-cpu').allowed, true);
+  assert.equal(automatic(now - 1400000, 'sustained-cpu').allowed, true);
+  assert.equal(automatic(now, 'sustained-cpu').reason, 'reserved-for-responsiveness');
+  assert.equal(automatic(now - 700000, 'ui-click').allowed, true);
+  assert.equal(automatic(now, 'ui-click').allowed, true);
+  assert.equal(automatic(now + 700000, 'ui-click').reason, 'rolling-quota-exhausted');
+  assert.equal(store.entries().filter(e => e.name.endsWith('.capture.json')).length, 9);
+});
+
+// Execute the actual recorder and artifact store with only clocks, scheduling,
+// process/pressure sampling and the capture callback replaced. All incident and
+// capture receipts below are real filesystem writes; no live profiler is run.
+function flightFixture(t, warm = true) {
+  const vm = require('node:vm');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-flight-manual-'));
+  let wall = Date.now(), mono = 0, pending, requestSequence = 0;
+  class ClockDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [wall])); }
+    static now() { return wall; }
+  }
+  const mod = { exports: {} }, captures = [], logs = [];
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'perf-flight-recorder.js'), 'utf8'), {
+    module: mod, exports: mod.exports, process: { pid: 12345 }, Date: ClockDate, Buffer,
+    require: name => name === 'perf_hooks' ? { performance: { now: () => mono, timeOrigin: wall } }
+      : name === 'os' ? { cpus: () => [{ times: { user: 0, nice: 0, sys: 0, idle: 100, irq: 0 } }], loadavg: () => [0,0,0] }
+      : require(name),
+    setTimeout: fn => (pending = { fn, unref() {} }),
+    clearTimeout: timer => { if (pending === timer) pending = null; },
+  }, { filename: path.join(__dirname, 'perf-flight-recorder.js') });
+  const flight = mod.exports.createFlightRecorder({ directory, mainPid: 42,
+    log: line => logs.push(line), requestCapture: request => captures.push(request),
+    context: () => ({ appPids: [], tabs: [], owner: 'original-context' }),
+    snapshot: () => ({ ok: true, processes: [], skipped: 0 }),
+    pressure: () => ({ sampledAt: wall, available: false, reason: 'fixture' }),
+  });
+  const advance = ms => { wall += ms; mono += ms; };
+  if (warm) advance(60001);
+  t.after(() => { flight.stop(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const read = id => JSON.parse(flight.artifacts.read(id + '.json', 65536));
+  const ids = () => flight.artifacts.entries().filter(e => /^incident-\d+-\d+\.json$/.test(e.name))
+    .map(e => e.name.slice(0, -5));
+  function exhaustAuto() {
+    for (let i = 0; i < 4; i++) {
+      const at = wall - 7200000 + i * 700000, name = 'incident-' + at + '-1.capture.json';
+      flight.artifacts.write(name, { requestedAt: at, kind: 'ui-click', group: 'responsiveness' });
+      fs.utimesSync(flight.artifacts.file(name), new Date(at), new Date(at));
+    }
+  }
+  const request = () => {
+    const token = (++requestSequence).toString(16).padStart(24, '0');
+    return { version: 1, requestId: 'manual-42-' + token, mainPid: 42,
+      owner: { mainPid: 42, windowId: 3, webContentsId: 4, rendererPid: 43,
+        frameProcessId: 5, frameRoutingId: 6, documentToken: token },
+      reason: 'native-help-before-gesture', durationMs: 10000 };
+  };
+  return { flight, captures, logs, advance, tick: () => pending.fn(), read, ids, exhaustAuto,
+    manual: () => flight.requestManualCapture(request()), now: () => wall };
+}
+
+test('manual early-ends only metadata, keeps its events and creates a distinct ID in the same millisecond', t => {
+  const h = flightFixture(t); h.exhaustAuto();
+  h.flight.incident('ui-click', { owner: { rendererPid: 99 }, actionId: 'original-action' });
+  h.flight.incident('ui-lag', { actionId: 'second-action' });
+  const [oldId] = h.ids(), before = h.read(oldId);
+  assert.equal(before.capture.requested, false); assert.equal(h.captures.length, 0);
+  const manual = h.manual();
+  assert.equal(manual.allowed, true); assert.notEqual(manual.id, oldId);
+  const ended = h.read(oldId), own = h.read(manual.id);
+  assert.equal(ended.state, 'early-ended'); assert.equal(ended.complete, false);
+  assert.equal(ended.endReason, 'explicit-manual-request'); assert.equal(ended.endedWallMs, h.now());
+  assert.equal(ended.completedWallMs, undefined);
+  assert.deepEqual(ended.events, before.events); assert.deepEqual(ended.frames, before.frames);
+  assert.deepEqual(ended.context, before.context);
+  assert.equal(own.events.length, 1); assert.equal(own.events[0].kind, 'manual');
+  assert.equal(own.events[0].owner.rendererPid, 43); assert.equal(own.events[0].actionId, undefined);
+  assert.equal(h.captures.length, 1); assert.equal(h.captures[0].id, manual.id);
+  h.advance(20001); h.tick(); h.flight.stop();
+  assert.deepEqual(h.read(oldId), ended, 'later tick/stop must not mark the shortened window complete');
+  assert.equal(h.read(manual.id).complete, true, 'the separate full metadata window still completes normally');
+});
+
+test('metadata-only incident cooldown still blocks auto but not a new explicit manual request', t => {
+  const h = flightFixture(t); h.exhaustAuto();
+  h.flight.incident('ui-click', { actionId: 'old' }); const [oldId] = h.ids();
+  h.advance(20001); h.tick();
+  assert.equal(h.read(oldId).complete, true);
+  h.flight.incident('ui-click', { actionId: 'cooldown' });
+  assert.deepEqual(h.ids(), [oldId]);
+  assert.ok(h.logs.some(line => line.includes('incident-window-cooldown')));
+  const manual = h.manual(); assert.equal(manual.allowed, true); assert.notEqual(manual.id, oldId);
+  assert.equal(h.captures.length, 1); assert.equal(h.captures[0].kind, 'manual');
+});
+
+for (const kind of ['ui-click', 'manual']) test('active requested ' + kind + ' capture cannot be interrupted or adopted by manual', t => {
+  const h = flightFixture(t);
+  const id = kind === 'manual' ? h.manual().id : h.flight.incident(kind, { actionId: 'original' });
+  const before = h.read(id), receipt = h.flight.artifacts.read(id + '.capture.json');
+  const refused = h.manual();
+  assert.equal(refused.allowed, false); assert.equal(refused.incident, id);
+  assert.equal(refused.reason, 'merged-into-active-incident');
+  assert.deepEqual(h.ids(), [id]); assert.deepEqual(h.read(id), before);
+  assert.equal(h.flight.artifacts.read(id + '.capture.json'), receipt);
+  assert.equal(h.captures.length, 1);
+});
+
+test('actual flight permits repeated completed manual captures within the same day and retains all receipts', t => {
+  const h = flightFixture(t), saved = new Map();
+  for (let i = 0; i < 3; i++) {
+    const result = h.manual(); assert.equal(result.allowed, true); assert.equal(saved.has(result.id), false);
+    saved.set(result.id, h.flight.artifacts.read(result.id + '.capture.json'));
+    h.advance(20001); h.tick();
+    assert.equal(h.read(result.id).complete, true);
+  }
+  assert.equal(h.captures.length, 3);
+  assert.equal(new Set(h.captures.map(c => c.requestId)).size, 3, 'these are separate explicit requests');
+  for (const [id, receipt] of saved) assert.equal(h.flight.artifacts.read(id + '.capture.json'), receipt);
+  assert.equal(h.flight.artifacts.reserveCaptureDetails('incident-' + h.now() + '-8', h.now(), 'ui-click').remaining, 3);
+});
+
+test('startup warmup remains a refusal even when manual replaces an uncaptured metadata window', t => {
+  const h = flightFixture(t, false);
+  h.flight.incident('ui-click'); const [oldId] = h.ids();
+  const result = h.manual(); assert.equal(result.allowed, false); assert.equal(result.reason, 'startup-warmup');
+  assert.notEqual(result.id, oldId); assert.equal(h.read(oldId).complete, false);
+  assert.equal(h.captures.length, 0);
+  assert.equal(h.flight.artifacts.entries().some(e => e.name.endsWith('.capture.json')), false);
+});
+
+test('failure to preserve the ended metadata refuses manual without losing the active window', t => {
+  const h = flightFixture(t); h.exhaustAuto(); h.flight.incident('ui-click');
+  const [oldId] = h.ids(), before = h.read(oldId), originalWrite = h.flight.artifacts.write;
+  h.flight.artifacts.write = (name, value, ...args) => {
+    if (name === oldId + '.json' && value.state === 'early-ended') throw Error('fixture-disk-failure');
+    return originalWrite(name, value, ...args);
+  };
+  const refused = h.manual(); assert.equal(refused.allowed, false);
+  assert.equal(refused.reason, 'metadata-window-persist-failed');
+  assert.deepEqual(h.ids(), [oldId]); assert.deepEqual(h.read(oldId), before); assert.equal(h.captures.length, 0);
+  h.flight.artifacts.write = originalWrite;
+  assert.equal(h.manual().allowed, true);
 });
 
 function artifactFixture(t) {
@@ -347,7 +510,7 @@ test('input artifacts expire at24h, remain bounded by shared protection, and nev
   assert.ok(result.bytes <= 5 * 1024 * miB); assert.equal(result.causalBytes, 128);
   assert.equal(store.reserveCaptureDetails('incident-' + now + '-10', now, 'ui-click').remaining, 3);
   assert.equal(store.reserveCaptureDetails('incident-' + now + '-11', now, 'manual').allowed, true);
-  assert.equal(store.reserveCaptureDetails('incident-' + (now + 1) + '-11', now + 1, 'manual').allowed, false);
+  assert.equal(store.reserveCaptureDetails('incident-' + (now + 1) + '-11', now + 1, 'manual').allowed, true);
 });
 
 test('causal share is shared, not a permanent input reservation or a new pool', t => {

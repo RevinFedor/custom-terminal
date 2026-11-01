@@ -98,6 +98,7 @@ import {
 } from '../../store/useWorkspaceStore';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { onTabScopedIpcMessage } from '../../utils/tabScopedIpc';
 import { resolveCenterRightInset, resolveTimelineInset } from '../../utils/surfaceInsets.mjs';
 import {
   resolvePtyAgentOwner,
@@ -2630,18 +2631,29 @@ function Terminal({
       ipcRenderer.send('claude:prompt-boundary-ack', { tabId, seq });
     };
 
-    // Register IPC listeners synchronously
-    ipcRenderer.on('terminal:prompt-ready', handleShellPromptReady);
-    ipcRenderer.on('terminal:data', handleData);
+    // Register IPC listeners synchronously.
+    //
+    // Addressed channels go through the shared dispatcher: main broadcasts to
+    // the window, and with ~116 live terminals every chunk of output from ANY
+    // tab used to call 116 handlers so 115 of them could reject it on their
+    // first line. Measured 02:31 UTC: `terminal:data` held the main thread in
+    // tasks up to 189ms and appeared in 84 long-task attributions (11.9s of
+    // delivery). The dispatcher does one Map lookup and calls only this tab.
+    // `terminal:exit` stays raw: its payload is a bare tabId string, not an
+    // object with `tabId`, so it is not routable by the same rule.
+    const tabScopedSubscriptions = [
+      onTabScopedIpcMessage('terminal:prompt-ready', tabId, handleShellPromptReady),
+      onTabScopedIpcMessage('terminal:data', tabId, handleData),
+      onTabScopedIpcMessage('claude:session-detected', tabId, handleSessionDetected),
+      onTabScopedIpcMessage('claude:process-started', tabId, handleProcessStarted),
+      onTabScopedIpcMessage('claude:tui-ready', tabId, handleTuiReady),
+      onTabScopedIpcMessage('claude:prompt-boundary', tabId, handleClaudePromptBoundary),
+      onTabScopedIpcMessage('claude:status-session-detected', tabId, handleStatusSessionDetected),
+      onTabScopedIpcMessage('claude:bridge-update', tabId, handleBridgeUpdate),
+      onTabScopedIpcMessage('gemini:session-detected', tabId, handleGeminiSessionDetected),
+      onTabScopedIpcMessage('codex:session-detected', tabId, handleCodexSessionDetected),
+    ];
     ipcRenderer.on('terminal:exit', handleExit);
-    ipcRenderer.on('claude:session-detected', handleSessionDetected);
-    ipcRenderer.on('claude:process-started', handleProcessStarted);
-    ipcRenderer.on('claude:tui-ready', handleTuiReady);
-    ipcRenderer.on('claude:prompt-boundary', handleClaudePromptBoundary);
-    ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
-    ipcRenderer.on('claude:bridge-update', handleBridgeUpdate);
-    ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
-    ipcRenderer.on('codex:session-detected', handleCodexSessionDetected);
     void ipcRenderer.invoke('terminal:get-shell-prompt-readiness', tabId)
       .then((readiness: { ready?: boolean } | null) => {
         if (readiness?.ready === true) executePendingActionAtShellPrompt();
@@ -3263,17 +3275,8 @@ function Terminal({
       cancelTerminalWarmInit(tabId);
       isMounted.current = false;
       resizeObserver.disconnect();
-      ipcRenderer.removeListener('terminal:prompt-ready', handleShellPromptReady);
-      ipcRenderer.removeListener('terminal:data', handleData);
+      for (const unsubscribe of tabScopedSubscriptions) unsubscribe();
       ipcRenderer.removeListener('terminal:exit', handleExit);
-      ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
-      ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
-      ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
-      ipcRenderer.removeListener('claude:prompt-boundary', handleClaudePromptBoundary);
-      ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
-      ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);
-      ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
-      ipcRenderer.removeListener('codex:session-detected', handleCodexSessionDetected);
       // Gemini watcher is renderer-owned. Codex session/turn watchers are
       // main-process runtime state and must survive an xterm component unmount;
       // terminal kill/process exit owns their cleanup.

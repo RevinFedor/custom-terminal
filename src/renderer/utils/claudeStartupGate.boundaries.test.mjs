@@ -133,9 +133,12 @@ test('actual lifecycle card and History Copy use short text and full diagnostic 
   assert.match(card.detail, /late-request/);
   const report = failure.formatClaudeStartupFailureReport({ ...state, error: raw });
   let copied;
+  // HistoryPanel writes through its measured clipboard helper, not `clipboard`
+  // directly, so the extracted callback needs that exact collaborator in scope.
   Object.assign(ctx, { activeLifecycle: { ...card, copyText: report }, statusTitle: card.title, statusDescription: card.subtitle,
     statusDetail: card.detail, statusSessionId: null, tabId: 'T', meta: {},
-    clipboard: { writeText: text => { copied = text; } }, setStatusCopied() {},
+    clipboard: { writeText: text => { copied = text; } },
+    writeHistoryClipboardText: text => { copied = text; }, setStatusCopied() {},
     statusCopiedTimerRef: { current: null }, setTimeout: () => 1, clearTimeout() {} });
   vm.runInContext('var copy = ' + nestedFunction(read('../components/Workspace/HistoryPanel.tsx'), 'copyStatusDetails'), ctx);
   ctx.copy();

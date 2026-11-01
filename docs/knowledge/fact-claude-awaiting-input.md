@@ -1,7 +1,7 @@
 # Факт: детерминированная детекция «Claude ждёт ответа на вопрос» (AskUserQuestion)
 
 ## Проблема
-Нужен **детерминированный** сигнal состояния «Claude задал вопрос через `AskUserQuestion` и заблокирован, ждёт ответа человека» — чтобы подсветить таб и проект-таб фиолетовым (отдельно от обычного «AI думает» shimmer'а). Без таймаутов, без polling, без эвристик на PTY — той же архитектурой, что и loader (Stop hook).
+Нужен **детерминированный** сигнal состояния «Claude задал вопрос через `AskUserQuestion` и заблокирован, ждёт ответа человека» — чтобы подсветить вкладку и агрегирующий её чип (в первой версии — проект-таб, сейчас workflow-чип, см. п.4 и п.6) фиолетовым (отдельно от обычного «AI думает» shimmer'а). Без таймаутов, без polling, без эвристик на PTY — той же архитектурой, что и loader (Stop hook).
 
 ## Почему это детерминированно — механика Claude Code
 
@@ -64,8 +64,8 @@ PreToolUse(AskUserQuestion)  ──►  [человек думает, минут
 - На turn-end edge (`Stop`/`StopFailure`, `busy===false`) — если awaiting ещё взведён, сбросить + emit (main-side bookkeeping).
 
 ### 4. Renderer — IPC `claude:awaiting-input { tabId, awaiting }`
-- **`TabBar.tsx`**: `awaitingMap` (как `claudeBusyMap`), проп `isAwaitingInput` в `TabItem`, оверлей `.tab-awaiting-input` (zIndex:1, поверх busy-shimmer'а zIndex:0, под текстом z:5–6). Рендерится в `isVerticalMode`-ветке — там же где busy-shimmer.
-- **`App.tsx`**: `awaitingTabs` Map, per-project `hasAwaitingTab`, проп `isProjectAwaiting` в `ProjectTabItem` → оверлей `.tab-awaiting-input` на всю кнопку проект-таба (zIndex:5, под z-10 текстом).
+- **`TabBar.tsx`**: `awaitingMap` (как `claudeBusyMap`), проп `isAwaitingInput` в `TabItem`, оверлей `.tab-awaiting-input` (zIndex:1, поверх busy-shimmer'а zIndex:0, под текстом z:5–6). Рендерится в `isVerticalMode`-ветке — там же где busy-shimmer. Это строка legacy-списка: она монтируется только пока `organizationReady === false` (fallback `PersistentTabSidebarStack`). При готовой workflow-организации `TabBar` остаётся menu-only владельцем меню (`verticalBody = null`): его `awaitingMap` слушается, но не рисуется. Рамку живой вкладки рисует `TabCard`, см. п.6.
+- **`App.tsx`**: `awaitingTabs` Map (tabId → true) → `SpaceStrip` → `WorkflowActivityBadges` рисует `.tab-awaiting-input` вокруг workflow-чипа при `awaitingCount > 0` (zIndex:3). Прежнего пропа `isProjectAwaiting` у `ProjectTabItem` в коде больше нет; `ProjectTabItem` нигде не инстанцируется, а рамка-агрегат принадлежит workflow, не папке проекта (пин — `WorkflowActivityBadges.wiring.test.mjs`).
 
 ### 5. CSS `.tab-awaiting-input` (globals.css) — бегущая рамка, НЕ заливка
 Финальная форма — тонкая (1.2px) рамка с ярким сегментом, бегущим по периметру таба, поверх еле заметного постоянного кольца. Не заливка фона.
@@ -92,6 +92,20 @@ PreToolUse(AskUserQuestion)  ──►  [человек думает, минут
 
 **Подавление busy-shimmer во время awaiting.** Пока висит вопрос, таб всё ещё `busy` (turn не закончен), поэтому под рамкой иначе пульсировал бы штатный thinking-shimmer фона. Чтобы осталась «только рамка», busy-фон гасится: `{verticalIsAiBusy && !verticalIsAwaiting && (...)}` в TabBar. Process-bar liveness (PTY-жив) остаётся. Логика: вопрос = Claude НЕ думает, а ждёт юзера, поэтому «думающий» фон неуместен.
 
+### 6. Рамка на самой вкладке — общая `TabCard`, не `TabItem`
+
+Симптом: при вопросе фиолетовая рамка горит вокруг «проекта» (workflow-чип в верхней полосе), а строка вкладки в боковом списке и чип вкладки в шапке окна остаются обычными. Событие при этом доходило до renderer: в production-логе вкладка с висящим вопросом получала `[TabBar:Awaiting] awaiting=true`.
+
+Причина — в том, кто рисует вкладку, а не в событии. `TabBar::TabItem` из п.4 живёт только в fallback; при готовой workflow-организации (`Workspace.tsx`: `ConnectedWorkflowSidebar`) строку списка рисует `WorkflowTabSidebar::ReserveCard`, чип окна — `PaneTabChip`, а меню Run After и список скрытых окон — те же компоненты: всё это `Workspace/TabCard.tsx`. Про вопрос `TabCard` не знал.
+
+Исправление: `TabCard` сам спрашивает `utils/claudeAwaitingInput.ts::useTabAwaitingInput(tabId)` и рисует `<span data-tab-awaiting-ring class="tab-awaiting-input noted-infinite-animation">` (`inset:0`, `border-radius:inherit`, zIndex 3 — рядом с синим кольцом Codex-вопроса). CSS и цвет те же `.tab-awaiting-input` из п.5, нового токена нет; пауза скрытых окон берёт класс из `presentationAnimations.css`. Две прежние рамки (`TabItem`, workflow-чип) не менялись.
+
+Почему подписка в модуле, а не проп из `App.awaitingTabs`: чипы окон лежат в закэшированном `PersistentPaneTabLayerHost`, а его `structuralKey` в `TerminalArea` строится из process/busy/paste-busy и не содержит awaiting, поэтому проп не перерисовал бы чип. И событие — переход: модуль слушает со старта renderer и хранит Set, так что карточка, смонтированная посреди вопроса (открыли окно или picker), сразу знает ответ. Будится только подписчик своей вкладки (`useSyncExternalStore`, примитивный boolean), не все карточки. Селектор «активная вкладка» здесь не нужен: рамка обязана гореть и на неактивной вкладке.
+
+Снятие по тому же правилу, что в инварианте ниже: `awaiting:false` и любой `claude:busy-state`, где `resolveAgentBusyPresentation()===false` (кроме `reason:'spinner'`). Esc на вопросе без PostToolUse не оставляет рамку.
+
+Пин — `components/Workspace/tabCardAwaitingInput.actual.test.mjs`: рендерит настоящие `TabCard` и модуль, порядок «событие, затем первый рендер» как в баге; на прежнем `TabCard` 5 из 6 проверок падают.
+
 ## Инвариант awaiting ⊆ busy — почему не трогаем 12 busy:false-сайтов
 
 Вопрос существует только посреди turn'а, значит **awaiting — подмножество busy**. Поэтому вместо правки всех мест где эмитится `busy:false` (interrupt/watchdog/manual-stop/Stop/StopFailure/exit — их 12), **renderer-consumer сам гасит awaiting на любом `claude:busy-state busy:false` edge**:
@@ -102,8 +116,10 @@ PreToolUse(AskUserQuestion)  ──►  [человек думает, минут
 
 ## Известные ограничения
 1. **Хуки читаются Claude при старте сессии.** На уже запущенных табах фича подхватится только после рестарта Claude-процесса; новые табы получают сразу. Идентично тому как подхватывался Stop hook (поведение самого Claude CLI).
-2. **Horizontal layout табов** не показывает awaiting-glow (как и busy-shimmer — он vertical-only by design, `getBgColor` не реагирует на busy). Vertical sidebar — основной режим.
+2. **Legacy horizontal `TabBar`** не показывает awaiting-glow (как и busy-shimmer — он vertical-only by design, `getBgColor` не реагирует на busy). Vertical sidebar — основной режим. Чипы окон (`TabCard`) рамку показывают независимо от layout.
 3. PreToolUse фактически fires за микросекунды ДО появления диалога (между `runPreToolUseHooks` и `canUseTool`). Незаметно — диалог появляется сразу следом.
+4. **Переключатель Ctrl+Tab** (`TabListRows`) рисует строки без `TabCard`: этой рамки, completion-кольца и синего кольца Codex-вопроса там нет.
+5. **Нет стартового снимка.** Флаг живёт в renderer и меняется только переходами. После перезагрузки renderer посреди вопроса рамка (и на вкладке, и на workflow-чипе) вернётся лишь со следующим `claude:awaiting-input`: main это событие заново не шлёт, а `claude:get-presence` отвечает по одной вкладке и для рамки не запрашивается.
 
 ## Мобильное расширение: показ + ответ на вопрос с телефона
 
@@ -159,3 +175,4 @@ HistoryPanel показывает тот же `AskUserQuestion` как инте�
 - [`fact-claude-stop-hook.md`](fact-claude-stop-hook.md) — базовая socket-архитектура (per-PID sock, ack, session_id→tabId), которую эта фича переиспользует целиком.
 - [`fix-claude-aborted-streaming-loader.md`](fix-claude-aborted-streaming-loader.md) — почему `busy:false` гарантированно приходит даже на Esc (JSONL-interrupt-watcher), что и кормит safety-net сброс awaiting.
 - `methodology/дизайн-принципы.md::Authoritative artifact > эвристика` — тот же принцип: хук (authoritative) вместо PTY-эвристики.
+- [`fact-process-bar.md`](fact-process-bar.md) — `TabCard` как единый renderer сигналов вкладки.

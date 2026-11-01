@@ -185,10 +185,15 @@ function waitForAgentReadyTransition({
             finish(manualFailure);
             return;
           }
-          const startupFailure = startupFailureFromStatus(last);
-          if (startupFailure) {
-            finish(startupFailure);
-            return;
+          // Decision 01.11 (Fedor): a failed startup setting is REPORTED in the
+          // returned status (startupDefaultsError / startupFailed / code), not
+          // enforced. A usable tab is ready even though `/model` was refused;
+          // rejecting the whole start made orchestrators treat a working tab as
+          // a failed launch. Real input readiness is still decided below.
+          if (startupFailureFromStatus(last)) {
+            log('[AgentReadyWait] startup setting failed, reported not enforced tab='
+              + String(tabId).slice(-12) + ' code=' + String(last?.startupDefaultsErrorCode
+                || last?.startupErrorCode || '-'));
           }
           if (isAgentInputReady(last) && (!requireWriter || last.writerConfirmed === true)) {
             finish(null, last);

@@ -10,6 +10,13 @@ const source = fs.readFileSync(
   'utf8',
 );
 
+test('наведение на любую кнопку полоски раскрывает очередь', () => {
+  // Полоска целиком принадлежит Run after, поэтому точкой входа служит вся
+  // строка кнопок, а не только оранжевый счётчик: до него иначе надо было
+  // отдельно доцеливаться мышью.
+  assert.match(source, /ref=\{railControlsRowRef\}[\s\S]{0,400}onMouseEnter=\{openQueueHoverPreview\}/);
+});
+
 test('collapsed queue count hover reuses the canonical interactive item list', () => {
   assert.match(source, /ref=\{queueCountButtonRef\}[\s\S]{0,700}onMouseEnter=\{openQueueHoverPreview\}/);
   assert.match(source, /\{\(panelOpen \|\| queueHoverPreviewVisible\) && \(/);
@@ -43,11 +50,16 @@ test('окно под курсором держится геометрией, а
     'таймер закрытия предпросмотра очереди вернулся',
   );
   assert.match(source, /pointInHoverCluster\(\{[\s\S]{0,400}hub: previewRect/);
-  // Счётчик, панель и открытые из неё блоки входят в кластер. Соседние
-  // кнопки rail явно исключены, даже если широкий gap-bridge их перекрывает.
+  // Счётчик, ВСЯ строка кнопок рейла, панель и открытые из неё блоки входят в
+  // кластер: полоска принадлежит этой же очереди, и движение курсора от «0» к
+  // соседней кнопке ведёт к окну, а не прочь от него. Раньше hover владел
+  // только счётчик, и любая соседняя кнопка той же полоски гасила панель.
   assert.match(source, /queueCountButtonRef\.current\?\.getBoundingClientRect\(\)/);
+  assert.match(source, /railControlsRowRef\.current\?\.getBoundingClientRect\(\)/);
+  assert.match(source, /pointInRect\(controlsRowRect, point\.clientX, point\.clientY, HOVER_CLUSTER_PAD\)/);
+  // Остаток рейла (строка мини-оркестратора) к очереди не относится и
+  // по-прежнему закрывает окно.
   assert.match(source, /pointInRect\(railRect, point\.clientX, point\.clientY, 0\)/);
-  assert.match(source, /point\.clientX < countRect\.left \|\| point\.clientX > countRect\.right/);
   assert.doesNotMatch(source, /satellites:[\s\S]{0,100}railRef\.current\?\.getBoundingClientRect\(\)/);
   assert.match(source, /HOVER_CLUSTER_SELECTOR/);
   for (const marker of [

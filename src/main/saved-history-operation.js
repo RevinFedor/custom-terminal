@@ -37,6 +37,7 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
   if (self && (body.kind !== 'rewind' || body.repairOfOperationId
     || !text(self.retainedContext).trim() || self.retainedContext.length > 100000
     || !Number.isSafeInteger(self.expectedContextRevision) || self.expectedContextRevision < 0
+    || self.expectedContextSnapshot !== undefined && !text(self.expectedContextSnapshot)
     || self.coveredContextUpdateIds != null && (!Array.isArray(self.coveredContextUpdateIds) || self.coveredContextUpdateIds.some(id => !text(id)))
     || self.nextPrompt != null && !text(self.nextPrompt).trim())) fail('self_rewind_request_invalid');
   return { tabId, operationId: body.operationId, kind: body.kind, toolType,
@@ -52,6 +53,7 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
     ...(body.repairOfOperationId !== undefined ? { repairOfOperationId: body.repairOfOperationId } : {}),
     ...(self ? { selfRewind: { retainedContext: self.retainedContext,
       expectedContextRevision: self.expectedContextRevision,
+      ...(self.expectedContextSnapshot !== undefined ? { expectedContextSnapshot: self.expectedContextSnapshot } : {}),
       coveredContextUpdateIds: self.coveredContextUpdateIds == null ? null : [...new Set(self.coveredContextUpdateIds)],
       nextPrompt: self.nextPrompt ?? null } } : {}) };
 }
@@ -450,11 +452,26 @@ class SavedHistoryOperations {
       lease.executing = true;
       const info = await this.resolveSession(spec.tabId);
       if (info?.tabType === 'claude-sdk') fail('history_operation_provider_unsupported');
-      if (info?.toolType !== spec.toolType || info.sessionId !== spec.expectedSessionId) fail('history_operation_session_changed');
+      if (info?.toolType !== spec.toolType || info.sessionId !== spec.expectedSessionId) {
+        console.warn('[SavedHistoryOperation] SOURCE_MISMATCH ' + JSON.stringify({ tabId: spec.tabId,
+          operationId: spec.operationId, phase: 'prepare', selectionSource: info?.selectionSource || 'unspecified',
+          expectedProvider: spec.toolType, resolvedProvider: info?.toolType || null,
+          expectedSessionId: spec.expectedSessionId, resolvedSessionId: info?.sessionId || null }));
+        fail('history_operation_session_changed');
+      }
       lease.cwd = info.cwd;
       lease.scope = this.runtime.capture(spec.tabId);
       if (lease.scope.sessionId !== spec.expectedSessionId || lease.scope.toolType !== spec.toolType
-        || lease.scope.stopping) fail('history_operation_owner_changed');
+        || lease.scope.cwd !== info.cwd || info.projectId !== undefined && lease.scope.projectId !== info.projectId
+        || lease.scope.stopping) {
+        console.warn('[SavedHistoryOperation] OWNER_MISMATCH ' + JSON.stringify({ tabId: spec.tabId,
+          operationId: spec.operationId, phase: 'prepare', expectedProvider: info.toolType, provider: lease.scope.toolType,
+          expectedSessionId: info.sessionId, sessionId: lease.scope.sessionId,
+          expectedCwd: info.cwd, cwd: lease.scope.cwd, expectedProjectId: info.projectId,
+          projectId: lease.scope.projectId, stopping: !!lease.scope.stopping }));
+        fail('history_operation_owner_changed');
+      }
+      if (lease.historyInput) this.runtime.assertInput?.(lease.historyInput);
       const timeline = await this.transcript.getTimeline({ tabId: spec.tabId, toolType: spec.toolType, sessionId: spec.expectedSessionId, cwd: info.cwd });
       this.assertScope(lease);
       let mutationSpec = spec;
@@ -511,7 +528,8 @@ class SavedHistoryOperations {
       this.save(lease, { phase: 'preparing', target: draftTarget, contentRevision: timeline.contentRevision || null });
       return { sessionId: spec.expectedSessionId, mutationSessionId: lease.mutationSessionId || spec.expectedSessionId,
         toolType: spec.toolType, cwd: info.cwd, target: draftTarget,
-        ...(spec.selfRewind ? { selfRewind: true, coveredDraftContexts: lease.record.rewindContext.covered } : {}),
+        ...(spec.selfRewind ? { selfRewind: true,
+          coveredDraftContexts: lease.record.rewindContext.draftContexts || lease.record.rewindContext.covered } : {}),
         ...(lease.historyInput ? { historyInput: lease.historyInput } : {}),
         ...(lease.repair ? { incumbentCodexSettingsProof: lease.repair.childSettingsProof } : {}) };
     }

@@ -13,6 +13,10 @@ const mainPath = process.env.CODEX_AUTH_MAIN_SOURCE || path.join(__dirname, 'mai
 const source = fs.readFileSync(mainPath, 'utf8');
 const ast = ts.createSourceFile(mainPath, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
 const wanted = ['createConfiguredCodexAuthProfileRoute', 'getTerminalLifecycleGeneration', 'clearCodexLaunchPayload'];
+// Current Main also clears the Send frame wait; older pinned sources did not
+// have that helper. Extract the real body when present instead of faking it.
+if (ast.statements.some(n => ts.isFunctionDeclaration(n) && n.name?.text === 'clearCodexSendStartupFrameWait'))
+  wanted.push('clearCodexSendStartupFrameWait');
 const functions = wanted.map(name => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
   assert.ok(node, name); return source.slice(node.getStart(ast), node.end);
@@ -30,6 +34,7 @@ function harness() {
   const context = vm.createContext({ path, crypto: require('node:crypto'), process: { env: { NOTED_E2E_TEST: 'true' } },
     isDev: true, srcMainDir: __dirname, terminals, terminalProjects, terminalCommandState, terminalLifecycleEpochs,
     codexLastRunCommandPayload, codexPreclaimedCommandGenerations: new Map(),
+    codexSendStartupFrameWaits: new WeakMap([[terminal, { launchId: 'L1' }]]),
     getMainProcessEnvValue: () => '/fixture/config.json',
     fs: { readFileSync: () => JSON.stringify({ homePath: '/authorized/profile', accountKey: auth.accountKey, fixtureCwd: cwd }), realpathSync: p => p },
     require: name => name.endsWith('e2e-cli-isolation') ? { assertE2ECliIsolation: () => ({ root: '/fixture' }) } : require(name),

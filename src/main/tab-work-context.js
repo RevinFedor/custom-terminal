@@ -15,6 +15,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { fieldsHash, rewindMember, rewindMemberMatches, sealRewindSnapshot, openRewindSnapshot } = require('./tab-work-context-rewind');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { isLocalSlashCommandPrompt } = require('../shared/agent-local-command.cjs');
 const { completionContextText, completionContextPresentation } = require('./orchestration-source-context');
@@ -273,6 +274,22 @@ function changedHunks(before, after, contextLines = FILE_DIFF_CONTEXT_LINES) {
   };
 }
 
+// Fedor31Oct: a context chip tells the reader WHICH files changed and WHERE.
+// It is not a transport for file bodies. On 31Oct a 959-character draft was
+// sent as 2,031,330 characters because two linked files were pasted in full,
+// which then triggered an auto-compact.
+//
+// The cap is in characters because that is what the chip actually writes into
+// the prompt; 200000 characters is ~50K tokens. It is deliberately twice the
+// existing context-update text limit (100000), so every realistic diff passes
+// untouched, and ~10x smaller than the incident.
+//
+// Over the cap the chip keeps its FACTS — path, line range, how many lines
+// changed — and drops only the diff body, pointing at the file instead. The
+// reader can open it; the prompt stays small. Never silently truncate mid-diff:
+// a half-diff reads as if the rest did not change.
+const CONTEXT_CHIP_DIFF_LIMIT = 200000;
+
 function changedFilePresentation(before, after) {
   causal.count('diffs');
   const diff = changedHunks(before, after);
@@ -287,11 +304,20 @@ function changedFilePresentation(before, after) {
         entry.tag === 'eq' ? '  ' + entry.line : entry.tag === 'del' ? '- ' + entry.line : '+ ' + entry.line
       )).join('\n')
   )).join('\n\n');
+  const oversized = text.length > CONTEXT_CHIP_DIFF_LIMIT;
   return {
     ...diff,
     startLine: first.newStart,
     endLine,
-    text,
+    text: oversized
+      ? 'Изменение слишком большое для контекста: ' + text.length
+        + ' символов, предел ' + CONTEXT_CHIP_DIFF_LIMIT + '.\n'
+        + 'Строки ' + first.newStart + '-' + endLine
+        + ', изменённых строк: ' + diff.changedLineCount + '.\n'
+        + 'Текст изменения не передан — прочитайте файл, если он нужен.'
+      : text,
+    ...(oversized ? { diffOmitted: { reason: 'context-chip-diff-limit',
+      characters: text.length, limit: CONTEXT_CHIP_DIFF_LIMIT } } : {}),
   };
 }
 
@@ -615,6 +641,34 @@ function applyDiffHunks(before, hunks) {
   return output.join('\n') + (source.finalNewline ? '\n' : '');
 }
 
+// Every structured file-writing tool of BOTH providers. A tool missing from
+// this set is not recognized as the agent's own edit, so its change is
+// attributed as an external filesystem change and republished as a context
+// chip carrying the whole file — the 31Oct incident where a 959-character
+// draft went out as 2,031,330 characters.
+//
+// `transcript-grep.js` keeps its own lowercase set for a different purpose
+// (searching historical transcripts). Keep both lists in sync when a provider
+// adds a writer; this one decides attribution.
+const AGENT_EDIT_TOOLS = new Set([
+  // Claude Code
+  'Edit', 'MultiEdit', 'Write', 'NotebookEdit',
+  // Codex / generic MCP file writers
+  'edit_file', 'write_file', 'apply_patch',
+]);
+
+function isRecognizedAgentEditTool(tool) {
+  if (typeof tool !== 'string' || !tool) return false;
+  if (AGENT_EDIT_TOOLS.has(tool)) return true;
+  // Codex's writer may prefix the origin; match case-insensitively on the
+  // bare name rather than inventing new tool identities.
+  const bare = tool.includes('__') ? tool.slice(tool.lastIndexOf('__') + 2) : tool;
+  for (const known of AGENT_EDIT_TOOLS) {
+    if (bare.toLowerCase() === known.toLowerCase()) return true;
+  }
+  return false;
+}
+
 function applyOwnedEdit(before, { args = {}, tool = '', diffHunks = null } = {}) {
   if (typeof before !== 'string') return null;
   if (/write/i.test(tool)) return typeof args.content === 'string' ? args.content : null;
@@ -851,10 +905,28 @@ function fileBatchPresentation(changes) {
     : normalized.length + ' ' + pluralRu(normalized.length, 'файл', 'файла', 'файлов');
   const source = fileSourceSummary(normalized);
   const title = subject + ' · ' + hunkLabel + ' · ' + lineLabel;
+  // One chip can carry several files, each individually under the per-file
+  // cap while their sum is not — the 31Oct incident was exactly that (2 files,
+  // 19298 lines). Apply the same cap to the assembled body: keep every file's
+  // facts (path, range, changed lines) and drop the diff bodies together, so
+  // the chip never silently shows some diffs and hides others.
+  const prefix = source.detail ? 'Sources: ' + source.detail + '\n\n' : '';
+  const body = spans.map((entry) => entry.presentation.text).join('\n\n');
+  const overBudget = prefix.length + body.length > CONTEXT_CHIP_DIFF_LIMIT;
+  const summaryBody = spans.map((entry) => {
+    const diff = entry.presentation.diff;
+    return entry.item.path + '\nСтроки ' + diff.startLine + '-' + diff.endLine
+      + ', изменённых строк: ' + diff.changedLineCount + '.';
+  }).join('\n\n');
   return {
     title,
-    text: (source.detail ? 'Sources: ' + source.detail + '\n\n' : '')
-      + spans.map((entry) => entry.presentation.text).join('\n\n'),
+    text: overBudget
+      ? prefix + 'Изменения слишком большие для контекста: ' + (prefix.length + body.length)
+        + ' символов, предел ' + CONTEXT_CHIP_DIFF_LIMIT + '.\n'
+        + 'Текст изменений не передан — прочитайте файлы, если они нужны.\n\n' + summaryBody
+      : prefix + body,
+    ...(overBudget ? { diffOmitted: { reason: 'context-chip-diff-limit',
+      characters: prefix.length + body.length, limit: CONTEXT_CHIP_DIFF_LIMIT } } : {}),
     startLine: normalized.length === 1 ? spans[0].presentation.diff.startLine : null,
     endLine: normalized.length === 1 ? spans[0].presentation.diff.endLine : null,
     sourceTabId: source.sources.length === 1 && !source.unknown ? source.sources[0].tabId : null,
@@ -988,7 +1060,8 @@ class TabWorkContext {
     this.subscriptionInflight = new Map();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tab_work_context (
-        tab_id TEXT PRIMARY KEY, responsibility TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0
+        tab_id TEXT PRIMARY KEY, responsibility TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0,
+        rewind_revision INTEGER NOT NULL DEFAULT 0, rewind_key TEXT
       );
       CREATE TABLE IF NOT EXISTS tab_context_files (
         tab_id TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', hash TEXT,
@@ -1013,6 +1086,10 @@ class TabWorkContext {
         ON tab_context_handoffs(tab_id, payload_hash, status);
     `);
     installTimelineWorkingFileVersions(this.db);
+    const contextColumns = new Set(sqlStatement('tabContext.init.tab_work_context', 'all', () =>
+      this.db.prepare('PRAGMA table_info(tab_work_context)'), statement => statement.all()).map(column => column.name));
+    if (!contextColumns.has('rewind_revision')) this.db.exec('ALTER TABLE tab_work_context ADD COLUMN rewind_revision INTEGER NOT NULL DEFAULT 0');
+    if (!contextColumns.has('rewind_key')) this.db.exec('ALTER TABLE tab_work_context ADD COLUMN rewind_key TEXT');
     const updateColumns = new Set(
       sqlStatement('tabContext.init.tab_context_updates', 'all', () => this.db.prepare('PRAGMA table_info(tab_context_updates)'), statement => statement.all()).map((column) => column.name),
     );
@@ -1080,10 +1157,11 @@ class TabWorkContext {
     if (!clean(tabId) || !this.tab(tabId)) throw fail('tab not found', 404);
   }
 
-  touch(tabId, { notify = true } = {}) {
+  touch(tabId, { notify = true, rewindChanged = true } = {}) {
     const work = () => {
-      sqlStatement('tabContext.touch.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, revision) VALUES (?, 1)
-        ON CONFLICT(tab_id) DO UPDATE SET revision=revision+1`), statement => statement.run(tabId));
+      sqlStatement('tabContext.touch.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, revision, rewind_revision) VALUES (?, 1, ?)
+        ON CONFLICT(tab_id) DO UPDATE SET revision=revision+1,rewind_revision=rewind_revision+?`),
+        statement => statement.run(tabId, rewindChanged ? 1 : 0, rewindChanged ? 1 : 0));
       if (notify && this.onChanged) causal.count('notifications');
       if (notify) this.onChanged?.(this.get(tabId));
     };
@@ -1184,22 +1262,49 @@ class TabWorkContext {
     return updates;
   }
 
-  get(tabId, tab = this.tab(tabId)) {
+  get(tabId, tab = this.tab(tabId), { rewindSnapshot = false } = {}) {
     const work = () => {
       const row = sqlStatement('tabContext.get.tab_work_context', 'get', () => this.db.prepare('SELECT * FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId));
       const updateRows = sqlStatement('tabContext.get.tab_context_updates', 'all', () => this.db.prepare(`SELECT * FROM tab_context_updates
         WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at, rowid`), statement => statement.all(tabId));
       const updates = this.presentUpdates(updateRows);
       const files = sqlStatement('tabContext.get.tab_context_files', 'all', () => this.db.prepare('SELECT path, hash, error FROM tab_context_files WHERE tab_id=? ORDER BY path'), statement => statement.all(tabId));
-      return {
+      const state = {
         tabId, name: tab?.name || null, projectId: tab?.projectId || null,
         responsibility: row?.responsibility || '', revision: row?.revision || 0,
         files, updates, pendingCount: updates.filter((item) => item.status === 'pending').length,
         sessionId: tab?.codexSessionId || tab?.claudeSessionId || null,
         cwd: tab?.cwd || null,
       };
+      if (rewindSnapshot) {
+        let key = row?.rewind_key;
+        if (!key) {
+          sqlStatement('tabContext.rewindSnapshot.key', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id,rewind_key) VALUES (?,?)
+            ON CONFLICT(tab_id) DO UPDATE SET rewind_key=coalesce(rewind_key,excluded.rewind_key)`),
+            statement => statement.run(tabId, crypto.randomBytes(32).toString('hex')));
+          key = sqlStatement('tabContext.rewindSnapshot.keyRead', 'get', () => this.db.prepare(
+            'SELECT rewind_key FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId)).rewind_key;
+        }
+        if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)) throw fail('self_rewind_context_snapshot_invalid', 409);
+        const drafts = updates.flatMap(update => {
+          const value = { id: update.id, textHash: hash(update.text), memberIds: update.memberIds || [update.id] };
+          return update.kind === 'file-batch' ? [value, ...['pending', 'sending'].map(status => ({
+            ...value, id: logicalFileUpdateId(tabId, status) }))] : [value];
+        });
+        state.rewindSnapshot = sealRewindSnapshot({ version: 1, tabId, revision: state.revision,
+          semanticRevision: row?.rewind_revision || 0, responsibilityHash: hash(state.responsibility),
+          filesHash: fieldsHash({ files }), members: updateRows.map(member =>
+            rewindMember(member, this.presentUpdate(member).text, fileChangesFromRow(member))),
+          drafts, groups: updates.map(update => ({ id: update.id, memberIds: update.memberIds || [update.id] })) }, key);
+      }
+      return state;
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.get', { tabId }, work);
+  }
+
+  getRewindContext(tabId) {
+    this.requireTab(tabId);
+    return this.db.transaction(() => this.get(tabId, this.tab(tabId), { rewindSnapshot: true }))();
   }
 
   summaries(tabIds) {
@@ -1286,9 +1391,11 @@ class TabWorkContext {
     const work = () => {
       this.requireTab(tabId);
       if (typeof description !== 'string' || description.length > 12000) throw fail('description must be text up to 12000 characters');
+      const previous = sqlStatement('tabContext.setResponsibility.previous', 'get', () => this.db.prepare(
+        'SELECT responsibility FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId))?.responsibility || '';
       sqlStatement('tabContext.setResponsibility.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, responsibility) VALUES (?, ?)
         ON CONFLICT(tab_id) DO UPDATE SET responsibility=excluded.responsibility`), statement => statement.run(tabId, description.trim()));
-      this.touch(tabId);
+      this.touch(tabId, { rewindChanged: previous !== description.trim() });
       return this.get(tabId);
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.setResponsibility', {}, work);
@@ -1334,21 +1441,62 @@ class TabWorkContext {
         || origin?.operationId !== operationId || origin.sourceSessionId !== record.expectedSessionId) throw fail('self_rewind_context_conflict', 409);
       return { updateId: existing.id, ...origin };
     }
-    const revision = sqlStatement('tabContext.stageRewind.revision', 'get', () => this.db.prepare(
-      'SELECT revision FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId))?.revision || 0;
-    if (revision !== spec.expectedContextRevision) throw fail('self_rewind_context_revision_changed', 409);
-    const ids = spec.coveredContextUpdateIds == null ? sqlStatement('tabContext.stageRewind.snapshot', 'all', () => this.db.prepare(
-      "SELECT id FROM tab_context_updates WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at,rowid"), statement => statement.all(tabId)).map(row => row.id)
-      : spec.coveredContextUpdateIds;
-    const covered = [...new Set(ids)].map(id => {
-      const row = sqlStatement('tabContext.stageRewind.member', 'get', () => this.db.prepare(
-        "SELECT * FROM tab_context_updates WHERE tab_id=? AND id=? AND status IN ('pending','sending')"), statement => statement.get(tabId, id));
-      if (!row) throw fail('self_rewind_context_member_changed', 409);
-      const { status: _status, ...version } = row;
-      return { id, hash: hash(JSON.stringify(version)), textHash: hash(this.presentUpdate(row).text) };
-    });
+    const state = sqlStatement('tabContext.stageRewind.revision', 'get', () => this.db.prepare(
+      'SELECT * FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId));
+    const revision = state?.revision || 0;
+    let covered, draftContexts;
+    if (spec.expectedContextSnapshot) {
+      const snapshot = openRewindSnapshot(spec.expectedContextSnapshot, state?.rewind_key);
+      if (snapshot.version !== 1 || snapshot.tabId !== tabId || snapshot.revision !== spec.expectedContextRevision) {
+        throw fail('self_rewind_context_snapshot_invalid', 409);
+      }
+      const changed = reason => {
+        console.warn('[SelfRewind] CONTEXT_SNAPSHOT_MISMATCH ' + JSON.stringify({ tabId, operationId,
+          expectedRevision: snapshot.revision, revision, expectedSemanticRevision: snapshot.semanticRevision,
+          semanticRevision: state?.rewind_revision || 0, reason }));
+        throw fail('self_rewind_context_revision_changed', 409);
+      };
+      if (revision < snapshot.revision || snapshot.semanticRevision !== (state?.rewind_revision || 0)) changed('semantic-revision');
+      if (snapshot.responsibilityHash !== hash(state?.responsibility || '')) changed('responsibility');
+      const files = sqlStatement('tabContext.stageRewind.files', 'all', () => this.db.prepare(
+        'SELECT path,hash,error FROM tab_context_files WHERE tab_id=? ORDER BY path'), statement => statement.all(tabId));
+      if (snapshot.filesHash !== fieldsHash({ files })) changed('files');
+      const members = new Map(snapshot.members.map(member => [member.id, member]));
+      const active = sqlStatement('tabContext.stageRewind.active', 'all', () => this.db.prepare(
+        "SELECT * FROM tab_context_updates WHERE tab_id=? AND status IN ('pending','sending')"), statement => statement.all(tabId));
+      for (const row of active) {
+        const member = members.get(row.id);
+        if (!member || !rewindMemberMatches(member, row, fileChangesFromRow(row))) changed('member');
+      }
+      const ids = spec.coveredContextUpdateIds == null ? [...members.keys()] : [...new Set(spec.coveredContextUpdateIds.flatMap(id => {
+        if (members.has(id)) return [id];
+        const group = snapshot.groups?.find(group => group.id === id);
+        if (!group) throw fail('self_rewind_context_member_changed', 409);
+        return group.memberIds;
+      }))];
+      covered = ids.map(id => members.get(id));
+      const selected = new Set(ids);
+      draftContexts = [...covered.map(({ id, textHash }) => ({ id, textHash })),
+        ...snapshot.drafts.filter(draft => draft.memberIds.every(id => selected.has(id))).map(({ id, textHash }) => ({ id, textHash }))];
+      if (snapshot.revision !== revision) console.log('[SelfRewind] CONTEXT_SNAPSHOT_CURRENT ' + JSON.stringify({
+        tabId, operationId, expectedRevision: snapshot.revision, revision, reason: 'presentation-only' }));
+    } else {
+      // Old callers retain the strict guard; only an app-issued snapshot can
+      // prove an intervening status change rather than silently dropping it.
+      if (revision !== spec.expectedContextRevision) throw fail('self_rewind_context_revision_changed', 409);
+      const ids = spec.coveredContextUpdateIds == null ? sqlStatement('tabContext.stageRewind.snapshot', 'all', () => this.db.prepare(
+        "SELECT id FROM tab_context_updates WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at,rowid"), statement => statement.all(tabId)).map(row => row.id)
+        : spec.coveredContextUpdateIds;
+      covered = [...new Set(ids)].map(id => {
+        const row = sqlStatement('tabContext.stageRewind.member', 'get', () => this.db.prepare(
+          "SELECT * FROM tab_context_updates WHERE tab_id=? AND id=? AND status IN ('pending','sending')"), statement => statement.get(tabId, id));
+        if (!row) throw fail('self_rewind_context_member_changed', 409);
+        const { status: _status, ...version } = row;
+        return { id, hash: hash(JSON.stringify(version)), textHash: hash(this.presentUpdate(row).text) };
+      });
+    }
     const id = crypto.randomUUID(), origin = { operationId, sourceSessionId: record.expectedSessionId,
-      targetUuid: record.targetUuid, covered };
+      targetUuid: record.targetUuid, covered, ...(draftContexts ? { draftContexts } : {}) };
     sqlStatement('tabContext.stageRewind.insert', 'run', () => this.db.prepare(`INSERT INTO tab_context_updates
       (id,tab_id,source_tab_id,request_key,title,text,kind,status,origin_json,created_at)
       VALUES (?,?,NULL,?,'Контекст после отката',?,'rewind','rewind-held',?,?)`), statement =>
@@ -1370,7 +1518,9 @@ class TabWorkContext {
           "SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status IN ('pending','sending')"), statement => statement.get(member.id, tabId));
         if (!current) continue;
         const { status: _status, ...version } = current;
-        if (hash(JSON.stringify(version)) !== member.hash) { changed.push(member.id); continue; }
+        const matches = member.version === 1 ? rewindMemberMatches(member, current, fileChangesFromRow(current))
+          : hash(JSON.stringify(version)) === member.hash;
+        if (!matches) { changed.push(member.id); continue; }
         sqlStatement('tabContext.commitRewind.supersede', 'run', () => this.db.prepare(
           "UPDATE tab_context_updates SET status='rewind-superseded' WHERE id=? AND tab_id=? AND status IN ('pending','sending')"), statement => statement.run(member.id, tabId));
         superseded.push(member.id);
@@ -1856,7 +2006,7 @@ class TabWorkContext {
           sqlStatement('tabContext.prepare.tab_context_updates.2', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'"), statement => statement.run(id));
         }
       })();
-      if (updates.length) this.touch(tabId);
+      if (updates.length) this.touch(tabId, { rewindChanged: false });
       if (continuationFacts.length) console.log('[OrchestrationContext] prepared tab=' + tabId.slice(-12)
         + ' handoff=' + handoffId + ' facts=' + continuationFacts.length + ' (not result/delivery proof)');
       return { prompt: full, prefix: separatorPrefix, authoringTransport: finalTransport };
@@ -1868,7 +2018,7 @@ class TabWorkContext {
       const sent = sqlStatement('tabContext.confirm.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
       if (!sent || sent.payload_hash !== expectedHash || sent.status === 'merged') return;
       if (sent.status === 'delivered') {
-        if (this.restoreContinuationPresentation(tabId, handoffId)) this.touch(tabId);
+        if (this.restoreContinuationPresentation(tabId, handoffId)) this.touch(tabId, { rewindChanged: false });
         return;
       }
       this.db.transaction(() => {
@@ -1878,7 +2028,7 @@ class TabWorkContext {
         sqlStatement('tabContext.confirm.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='delivered' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
       })();
       this.restoreContinuationPresentation(tabId, handoffId);
-      this.touch(tabId);
+      this.touch(tabId, { rewindChanged: false });
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.confirm', {}, work);
   }
@@ -1921,7 +2071,7 @@ class TabWorkContext {
         for (const id of JSON.parse(sent.update_ids)) changed += sqlStatement('tabContext.activate.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND tab_id=? AND status='pending'"), statement => statement.run(id, tabId)).changes;
         sqlStatement('tabContext.activate.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='preparing' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
       })();
-      if (changed) this.touch(tabId);
+      if (changed) this.touch(tabId, { rewindChanged: false });
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.activate', {}, work);
   }
@@ -2028,7 +2178,7 @@ class TabWorkContext {
         for (const id of JSON.parse(sent.update_ids)) sqlStatement('tabContext.release.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='sending'"), statement => statement.run(id, tabId));
         sqlStatement('tabContext.release.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='failed' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
       })();
-      this.touch(tabId);
+      this.touch(tabId, { rewindChanged: false });
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.release', {}, work);
   }
@@ -2442,13 +2592,20 @@ class TabWorkContext {
         + ' lines=' + acknowledgedLines
         + ' full=' + (coverage.full ? '1' : '0')
         + ' file=' + path.basename(action.filePath));
-      this.touch(tabId);
+      this.touch(tabId, { rewindChanged: false });
     });
   }
 
   observeRecord(detail) {
     const work = () => {
       const { tabId: sourceTabId, sessionId, toolType, message } = detail;
+      // Fedor31Oct: a nested subagent's own file edits must not raise context
+      // chips on the parent tab. Claude marks every subagent record with
+      // isSidechain; its edits belong to the agent's internal work, not to the
+      // user-visible working context of the tab. Without this gate a subagent
+      // rewriting a linked file republished that file as an "external change"
+      // and the next prompt carried its whole body.
+      if (message?.isSidechain === true) return;
       let userText = null;
       if (toolType === 'codex' && message?.type === 'event_msg' && message.payload?.type === 'user_message') {
         userText = message.payload.message;
@@ -2543,7 +2700,7 @@ class TabWorkContext {
           });
           continue;
         }
-        if (step.kind !== 'tool' || !['Edit','MultiEdit','Write','edit_file','write_file'].includes(step.tool)) continue;
+        if (step.kind !== 'tool' || !isRecognizedAgentEditTool(step.tool)) continue;
         const args = step.args || {};
         const filePath = path.resolve(sourceTab?.cwd || '/', args.file_path || args.path || '');
         const operationKey = key + ':' + step.id;

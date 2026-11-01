@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require('typescript');
 const { projectClaudePtyPresence } = require('./claude-pty-presence');
+const { isClaudeStartupSettingUndelivered } = require('../shared/claude-startup-failure.cjs');
 const main = fs.readFileSync(require.resolve('./main'), 'utf8');
 const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
 const declaration = name => ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(ast);
@@ -14,7 +15,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function harness() {
   const events = [], listeners = new Map();
   const ctx = vm.createContext({
-    console: { log() {}, warn() {} }, Date, projectClaudePtyPresence,
+    console: { log() {}, warn() {} }, Date, projectClaudePtyPresence, isClaudeStartupSettingUndelivered,
     terminals: new Map([['T', {}]]), bridgeKnownSessions: new Map([['T', 'S']]),
     claudeTurnBusy: new Map(), claudeLocalCommandWatchers: new Map(),
     claudePromptReady: new Set(['T']), aiStoppingTabs: new Map(),
@@ -53,13 +54,17 @@ function harness() {
   return { ctx, events, listeners, gate: status => ctx.claudeStartupDefaultsGateByTab.set('T', { status, generation: 'L', attemptId: 'A', error: status === 'failed' ? 'API error: 429' : null }) };
 }
 
-test('actual main presence separates a failed setting from a still running launch without allowing idle Send', () => {
+// A failed setting is reported, not enforced: only a PENDING transaction owns
+// the composer. Blocking input made one refused `/model` disable the tab until
+// a restart (2026-10-31, tab 2efc9b9b7a35: a 429 at 10:45:33 refused every send
+// for 2h20m). The typed manual state and the live process stay exactly as before.
+test('actual main presence separates a failed setting from a still running launch', () => {
   const { ctx, gate } = harness();
   for (const [status, expected] of [['pending', 'starting'], ['failed', 'active'], ['ready', 'active'], ['cleared', 'active']]) {
     gate(status);
     const actual = ctx.getClaudePtyRuntimePresence('T');
     assert.equal(actual.status, expected, status);
-    assert.equal(actual.inputReady, ['ready', 'cleared'].includes(status), status);
+    assert.equal(actual.inputReady, status !== 'pending', status);
     assert.equal(actual.manualActionRequired, status === 'failed', status);
     assert.equal(actual.manualActionType, status === 'failed' ? 'claude-startup-settings' : null, status);
   }
@@ -91,7 +96,8 @@ test('actual workflow activity does not turn failed settings into startup or era
   let activity = plain(ctx.computeProjectActivity()).projects;
   assert.equal(activity[0].tabs[0].status, 'active');
   assert.equal(activity[0].streaming, false);
-  assert.equal(activity[0].tabs[0].inputReady, false);
+  assert.equal(activity[0].tabs[0].inputReady, true,
+    'a failed setting is reported, not enforced: the composer stays usable');
   assert.equal(activity[0].tabs[0].manualActionRequired, true);
   assert.equal(activity[0].tabs[0].manualActionType, 'claude-startup-settings');
   ctx.claudeTurnBusy.set('T', true);
@@ -118,12 +124,14 @@ test('readiness after main restart verifies the live process instead of reportin
   assert.equal(result.inputReady, false);
 });
 
-test('failed startup settings expose a typed manual state and never send-ready active', async () => {
+test('failed startup settings expose a typed manual state without disabling input', async () => {
   const { ctx, gate } = harness();
   gate('failed');
   const result = await ctx.readMainAgentStartReadiness('T', 'claude');
   assert.equal(result.status, 'active', 'the provider process remains alive and stoppable');
-  assert.equal(result.inputReady, false);
+  // The API ready-wait still reports agent_startup_defaults_failed from these
+  // same fields; what changed is only that a later Send is not refused.
+  assert.equal(result.inputReady, true);
   assert.equal(result.manualActionRequired, true);
   assert.equal(result.manualActionType, 'claude-startup-settings');
   assert.equal(result.lastNotReady.reason, 'claude_startup_defaults_failed');
@@ -137,7 +145,8 @@ test('actual exact dismissal hides only one explanation, keeps failed proof and 
   const accepted = dismiss({}, { tabId: 'T', generation: 'L', attemptId: 'A' });
   assert.equal(accepted.dismissed, true);
   assert.equal(accepted.gate.status, 'failed');
-  assert.equal(ctx.getClaudePtyRuntimePresence('T').inputReady, false);
+  assert.equal(ctx.getClaudePtyRuntimePresence('T').inputReady, true,
+    'dismissal changes presentation only; input was never the enforcement point');
   assert.equal(ctx.getClaudePtyRuntimePresence('T').status, 'active');
   assert.equal(listeners.get('claude:get-startup-defaults-gate')({}, { tabId: 'T' }).gate.dismissed, true);
   assert.equal(events.at(-1).data.dismissed, true);

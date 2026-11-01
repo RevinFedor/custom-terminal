@@ -296,6 +296,8 @@ Run After (`prompt-queue`) и Loop (`prompt-loop`) являются двумя �
 существующую защиту Run After и при временно неготовом input получает terminal
 failure вместо deferred-ожидания.
 
+**Cold-start latch на стартовых настройках Claude (31.10.2026).** Run After держит владельца, только пока startup-gate `pending` (`/model`/`/effort` должны лечь до первого prompt). `failed` терминален: латч снимается, владелец будится (`claude-startup-defaults-failed`), реальную готовность решает live presence. Раньше `failed` приравнивался к pending, и при зависшем/проваленном `/model` таймер истекал, cold-start валидировался, а fire не наступал никогда (`fix-claude-startup-settled-frame.md`).
+
 **Stale target — lazy validation.** Target валиден если вкладка существует в любом `openProjects` и это не сам owner (`ownerTabId !== targetTabId`). Если target-таб закрыли или он совпал с owner'ом — runner делает `setRunAfterTab(owner, null)` и фоллбэк на own-tab. Не валидируем в store (создало бы зависимость store→workspaceStore). Validation повторяется на каждом busy event и в cold-start subscription.
 
 **UI layout — одна колонка настроек, панель вдвое уже.** Header держит только Run after / Stop after / Post / Loop, каждая строка на всю ширину панели. Прежней левой колонки (глобальный trigger «on tab» + поле задержки) больше нет: условие запуска переехало на конкретный элемент очереди (см. ниже), и половина ширины панели освободилась. Юзер: *«ранафтор мы тоже сокращаем его в 2 раза, потому что нахуй мне это надо»*. Историческая заметка про пропорции колонок (`1fr 1fr` против `90px 1fr`) сохраняет силу для любых будущих двухколоночных строк внутри панели: неравные колонки читаются как «правые кнопки непропорционально огромные».
@@ -623,14 +625,27 @@ Runner реагирует на фронт `busy:true→false` канала `clau
 
 Шрам 2026-06-15: пользователь поставил Run after, первым item ушёл `/compact`, loader Claude корректно погас после compact, но следующий prompt не отправился до ручного действия примерно в 13:30 МСК. Корень был в старом blanket-guard'е: runner видел `reason:'local-command'` и всегда делал `return`, хотя compact уже завершился durable boundary. Поэтому в этой секции важно не возвращать старую формулу «local-command никогда не fire» — она верна для cancel/timeout, но неверна для successful `/compact`.
 
-Codex имеет ту же продуктовую семантику, но другое доказательство: explicit
-`/compact` создаёт собственный task, пишет `compacted` и заканчивает его без
-assistant final. 10.09 в12:34MSK tab754 штатно закончил такой compact, однако
+Codex имеет ту же продуктовую семантику, но другое доказательство: компакт
+создаёт собственный task, пишет `compacted` и заканчивает его без assistant
+final. 10.09 в12:34MSK tab754 штатно закончил такой compact, однако
 общий fan-out успел назвать его `codex-no-final-result` и disarm'ил ожидавшую
 tab4505; dedicated compact owner через1ms отметил `completed`.
-Теперь до fan-out main проверяет active explicit compact, точные session/
+Теперь до fan-out main проверяет компакт этой вкладки, точные session/
 generation/turn и порядок source-offset < compacted-offset < task-complete-offset.
 Только этот доказанный результат даёт натуральное завершение для Run after.
+
+Допуск охватывает **оба** пути компакта, потому что для пользователя и тот и
+другой — часть цепочки очереди: explicit `/compact` (`command='/compact'`) и
+native автокомпакт CLI по собственному token-порогу
+(`source='provider-compaction'`, `command=null` — у него нет команды
+пользователя). Автокомпакт к тому же завершается на своём `compacted` за
+считанные миллисекунды ДО `task_complete`, поэтому проверяется не только
+активная операция, но и уже завершённая — строго с `outcome:'completed',
+reason:'compacted'`. 31.10 именно это и горело: mini `tab-fa70e14d` закончил
+автокомпакт в05:53:49.551, а`task_complete` через26ms ушёл как
+`codex-no-final-result` и выключил Run After с `preserveLoop=0`. Прежние ремонты
+закрывали только explicit-путь. Подробности и границы —
+`fix-compact-logic.md::Шрам: native автокомпакт CLI выключил Run After`.
 `hasFinalResult` остаётся false: финальный ответ и его duration не выдумываются.
 Поздний historical tail не понижает этот же exact turn/timestamp обратно в
 no-final-result; proof относится только к той же process generation.
@@ -708,7 +723,7 @@ in-flight owner. Сохранённые условия и сроки этим cl
 - Окончательный abnormal reason обрабатывается идемпотентно даже без нового `true→false` edge: live-исход текущего turn или восстановленный исход с временем не раньше постановки является достаточным доказательством отмены. Capacity с Main recovery не относится к этому DISARM-классу. Старый catch-up сам по себе не имеет права снимать более новый retry. Это закрывает порядок, где другой false-сигнал пришёл раньше, не создавая обратную гонку после рестарта.
 - **Loader отдельно:** остальные renderer-консьюмеры продолжают получать spinner-сигналы для presentation state; только workflow-map runner'а их игнорирует. Нельзя снова смешивать visual busy и источник результата автоматики.
 - **Натуральные reason-less пути не трогаем:** SDK-форвард и Gemini idle продолжают очередь. Lifecycle cleanup, который означает ненормальный исход (`pty-exit`, `terminal-kill`, `replace`, `close`), должен иметь явный reason и отменять связанные workflow.
-- **Codex, обычный ответ (не доказанный explicit compact выше):** rollout `task_complete` закрывает busy-state, но main сохраняет reason `task_complete` только когда есть непустой `last_agent_message` либо явно привязанный к тому же turn корневой assistant `final_answer`. Если нет обоих доказательств, исход становится `codex-no-final-result`: это «финальный результат не подтверждён», а не угаданный `403`, поэтому связанный Run after disarm'ится, тексты items сохраняются, и никакой следующий Enter не отправляется. `send-command-failed` и `send-command-error` имеют ту же окончательную семантику. `turn_aborted` выключает собственную автоматику Codex-tab'а, но сохраняет внешних owner'ов, которые ждут её будущий успешный ответ после продолжения. Точная причина ошибки может отсутствовать в rollout — см. `fact-codex.md::Loader и App Server`.
+- **Codex, обычный ответ (не доказанный compact выше — ни explicit `/compact`, ни native автокомпакт):** rollout `task_complete` закрывает busy-state, но main сохраняет reason `task_complete` только когда есть непустой `last_agent_message` либо явно привязанный к тому же turn корневой assistant `final_answer`. Если нет обоих доказательств, исход становится `codex-no-final-result`: это «финальный результат не подтверждён», а не угаданный `403`, поэтому связанный Run after disarm'ится, тексты items сохраняются, и никакой следующий Enter не отправляется. `send-command-failed` и `send-command-error` имеют ту же окончательную семантику. `turn_aborted` выключает собственную автоматику Codex-tab'а, но сохраняет внешних owner'ов, которые ждут её будущий успешный ответ после продолжения. Точная причина ошибки может отсутствовать в rollout — см. `fact-codex.md::Loader и App Server`.
 - **Lifecycle aliases канонизируются до workflow-решения:** один Codex completion может прийти сначала как `task_complete`, затем тем же timestamp/turn как renderer-reason `rollout-task_complete`. Это одна квитанция, а не success→failure; префиксированный alias нормализуется и попадает в ту же dedupe identity. Иначе второй false-edge успевал disarm'ить уже совпавший Run after и показывал ложное «завершилась нештатно». Настоящий abnormal-toast остаётся persistent, но передаёт общему Toast полный copy-report с tab/session/UTC+MSK/reason/log lookup.
 - **Codex Escape считается только через rollout-событие:** физическую клавишу `Escape` runner напрямую не парсит. Если Codex записал `turn_aborted`, его собственная автоматика disarm'ится, а внешний Run After продолжает ждать следующего success; если визуально остановился без `turn_aborted`, Claude-style idle-probe fallback для Codex пока не включён. Не добавлять его «для симметрии» без реального симптома — текущая архитектура намеренно держится на high-level JSONL-событиях.
 - **Ручная отмена не является incident.** По уточнению пользователя23.09

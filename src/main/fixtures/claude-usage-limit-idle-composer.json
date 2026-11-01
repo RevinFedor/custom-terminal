@@ -1,0 +1,923 @@
+{
+ "source": "headless-main",
+ "success": true,
+ "synchronizedOutputOpen": false,
+ "writeSeq": 330,
+ "flushedSeq": 330,
+ "cols": 77,
+ "rows": 57,
+ "cursorX": 2,
+ "cursorY": 52,
+ "baseY": 2522,
+ "viewportY": 2522,
+ "bufferType": "normal",
+ "authoritativeFrameCommitted": true,
+ "committedWriteSeq": 330,
+ "lines": [
+  {
+   "row": 2522,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2523,
+   "text": "⏺ Bash(sed -n '44058,44090p' src/main/main.js)",
+   "wrapped": false,
+   "occupiedEndX": 46,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:5159525,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x37",
+    "fg=0:-1,bg=0:-1,bold x4",
+    "fg=50331648:5159525,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 42,
+   "activeByInverse": false
+  },
+  {
+   "row": 2524,
+   "text": "  ⎿  const execAsync = (cmd, timeout = 1000) => {",
+   "wrapped": false,
+   "occupiedEndX": 49,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x36",
+    "fg=50331648:10066329,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 37,
+   "activeByInverse": false
+  },
+  {
+   "row": 2525,
+   "text": "       return new Promise((resolve, reject) => {",
+   "wrapped": false,
+   "occupiedEndX": 48,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x36"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 36,
+   "activeByInverse": false
+  },
+  {
+   "row": 2526,
+   "text": "         const { exec } = require('child_process');",
+   "wrapped": false,
+   "occupiedEndX": 51,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x37"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 37,
+   "activeByInverse": false
+  },
+  {
+   "row": 2527,
+   "text": "     … +30 lines (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 35,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1,dim",
+   "styles": [
+    "fg=0:-1,bg=0:-1,dim x25"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": true,
+   "allTextDim": true,
+   "styleCellCount": 25,
+   "activeByInverse": false
+  },
+  {
+   "row": 2528,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2529,
+   "text": "⏺ Bash(LOG=~/Library/Logs/noted-terminal/production.log; echo \"=== кто",
+   "wrapped": false,
+   "occupiedEndX": 70,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:5159525,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x61",
+    "fg=0:-1,bg=0:-1,bold x4",
+    "fg=50331648:5159525,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 66,
+   "activeByInverse": false
+  },
+  {
+   "row": 2530,
+   "text": "      вызывает psLookup (по beginPerfOp fields) ===\"; grep -oE",
+   "wrapped": false,
+   "occupiedEndX": 62,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x49"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 49,
+   "activeByInverse": false
+  },
+  {
+   "row": 2531,
+   "text": "      'psLookup-[0-9]+:psLookup:[^|]*' \"$LOG\"…)",
+   "wrapped": false,
+   "occupiedEndX": 47,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x40"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 40,
+   "activeByInverse": false
+  },
+  {
+   "row": 2532,
+   "text": "  ⎿  === кто вызывает psLookup (по beginPerfOp fields) ===",
+   "wrapped": false,
+   "occupiedEndX": 58,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x46",
+    "fg=50331648:10066329,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 47,
+   "activeByInverse": false
+  },
+  {
+   "row": 2533,
+   "text": "       99 state=open-scope:tab=18522055",
+   "wrapped": false,
+   "occupiedEndX": 39,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x31"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 31,
+   "activeByInverse": false
+  },
+  {
+   "row": 2534,
+   "text": "       47 state=open-scope:tab=52fbe588",
+   "wrapped": false,
+   "occupiedEndX": 39,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x31"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 31,
+   "activeByInverse": false
+  },
+  {
+   "row": 2535,
+   "text": "     … +12 lines (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 35,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1,dim",
+   "styles": [
+    "fg=0:-1,bg=0:-1,dim x25"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": true,
+   "allTextDim": true,
+   "styleCellCount": 25,
+   "activeByInverse": false
+  },
+  {
+   "row": 2536,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2537,
+   "text": "  Thought for 12s (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 36,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x26",
+    "fg=50331648:10066329,bg=0:-1,bold x3"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 29,
+   "activeByInverse": false
+  },
+  {
+   "row": 2538,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2539,
+   "text": "⏺ Ключевая находка. Проверяю её строго: совпадают ли замирания главного",
+   "wrapped": false,
+   "occupiedEndX": 71,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:16777215,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x61",
+    "fg=50331648:16777215,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 62,
+   "activeByInverse": false
+  },
+  {
+   "row": 2540,
+   "text": "  процесса с запуском переписи процессов.",
+   "wrapped": false,
+   "occupiedEndX": 41,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x35"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 35,
+   "activeByInverse": false
+  },
+  {
+   "row": 2541,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2542,
+   "text": "⏺ Bash(LOG=~/Library/Logs/noted-terminal/production.log; python3 -I - \"$LOG\"",
+   "wrapped": false,
+   "occupiedEndX": 76,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:5159525,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x66",
+    "fg=0:-1,bg=0:-1,bold x4",
+    "fg=50331648:5159525,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 71,
+   "activeByInverse": false
+  },
+  {
+   "row": 2543,
+   "text": "      <<'EOF'",
+   "wrapped": false,
+   "occupiedEndX": 13,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x7"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 7,
+   "activeByInverse": false
+  },
+  {
+   "row": 2544,
+   "text": "      import re,sys…)",
+   "wrapped": false,
+   "occupiedEndX": 21,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x14"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 14,
+   "activeByInverse": false
+  },
+  {
+   "row": 2545,
+   "text": "  ⎿  снимков ps: 261  замираний Main (watchdog): 58  разрывов event loop",
+   "wrapped": false,
+   "occupiedEndX": 72,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x56",
+    "fg=50331648:10066329,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 57,
+   "activeByInverse": false
+  },
+  {
+   "row": 2546,
+   "text": "     : 268",
+   "wrapped": false,
+   "occupiedEndX": 10,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x4"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 4,
+   "activeByInverse": false
+  },
+  {
+   "row": 2547,
+   "text": "     замираний Main, пересекающихся со снимком ps: 10 из 58 = 17%",
+   "wrapped": false,
+   "occupiedEndX": 65,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x50"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 50,
+   "activeByInverse": false
+  },
+  {
+   "row": 2548,
+   "text": "     … +5 lines (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 34,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1,dim",
+   "styles": [
+    "fg=0:-1,bg=0:-1,dim x24"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": true,
+   "allTextDim": true,
+   "styleCellCount": 24,
+   "activeByInverse": false
+  },
+  {
+   "row": 2549,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2550,
+   "text": "  Thought for 51s (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 36,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x26",
+    "fg=50331648:10066329,bg=0:-1,bold x3"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 29,
+   "activeByInverse": false
+  },
+  {
+   "row": 2551,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2552,
+   "text": "⏺ Сильная зацепка: главный поток не вычисляет, а простаивает. Проверяю",
+   "wrapped": false,
+   "occupiedEndX": 70,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:16777215,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x60",
+    "fg=50331648:16777215,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 61,
+   "activeByInverse": false
+  },
+  {
+   "row": 2553,
+   "text": "  счётчики, что занимает поток интерфейса.",
+   "wrapped": false,
+   "occupiedEndX": 42,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x36"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 36,
+   "activeByInverse": false
+  },
+  {
+   "row": 2554,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2555,
+   "text": "⏺ Bash(LOG=~/Library/Logs/noted-terminal/production.log; grep -F",
+   "wrapped": false,
+   "occupiedEndX": 64,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:5159525,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x56",
+    "fg=0:-1,bg=0:-1,bold x4",
+    "fg=50331648:5159525,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 61,
+   "activeByInverse": false
+  },
+  {
+   "row": 2556,
+   "text": "      '[Perf:NativeWindow]' \"$LOG\" | grep -v '\\[R\\]' | tail -1 | grep -oE",
+   "wrapped": false,
+   "occupiedEndX": 73,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x56"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 56,
+   "activeByInverse": false
+  },
+  {
+   "row": 2557,
+   "text": "      '\\{.*\\}' | python3 -I -c '",
+   "wrapped": false,
+   "occupiedEndX": 32,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x21"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 21,
+   "activeByInverse": false
+  },
+  {
+   "row": 2558,
+   "text": "      import…)",
+   "wrapped": false,
+   "occupiedEndX": 14,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x8"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 8,
+   "activeByInverse": false
+  },
+  {
+   "row": 2559,
+   "text": "  ⎿  LayoutCount                        1",
+   "wrapped": false,
+   "occupiedEndX": 41,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x12",
+    "fg=50331648:10066329,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 13,
+   "activeByInverse": false
+  },
+  {
+   "row": 2560,
+   "text": "     LayoutDurationMs                   1",
+   "wrapped": false,
+   "occupiedEndX": 41,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x17"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 17,
+   "activeByInverse": false
+  },
+  {
+   "row": 2561,
+   "text": "     RecalcStyleCount                   47",
+   "wrapped": false,
+   "occupiedEndX": 42,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x18"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 18,
+   "activeByInverse": false
+  },
+  {
+   "row": 2562,
+   "text": "     … +24 lines (ctrl+o to expand)",
+   "wrapped": false,
+   "occupiedEndX": 35,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1,dim",
+   "styles": [
+    "fg=0:-1,bg=0:-1,dim x25"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": true,
+   "allTextDim": true,
+   "styleCellCount": 25,
+   "activeByInverse": false
+  },
+  {
+   "row": 2563,
+   "text": "  ⎿  You've hit your 5-hour limit · resets 11:10pm (Asia/Bangkok)",
+   "wrapped": false,
+   "occupiedEndX": 65,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:16739200,bg=0:-1 x52",
+    "fg=50331648:10066329,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 53,
+   "activeByInverse": false
+  },
+  {
+   "row": 2564,
+   "text": "     /upgrade or /usage-credits to finish what you’re working on.",
+   "wrapped": false,
+   "occupiedEndX": 65,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x52"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 52,
+   "activeByInverse": false
+  },
+  {
+   "row": 2565,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2566,
+   "text": "⏺ Usage limit reached · continuing automatically at 11:10pm · esc to",
+   "wrapped": false,
+   "occupiedEndX": 68,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x57"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 57,
+   "activeByInverse": false
+  },
+  {
+   "row": 2567,
+   "text": "  cancel",
+   "wrapped": false,
+   "occupiedEndX": 8,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x6"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 6,
+   "activeByInverse": false
+  },
+  {
+   "row": 2568,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2569,
+   "text": "✻ Brewed for 11m 40s · done Saturday 10:13 PM",
+   "wrapped": false,
+   "occupiedEndX": 45,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x36"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 36,
+   "activeByInverse": false
+  },
+  {
+   "row": 2570,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2571,
+   "text": "⏺ Automatic continue cancelled · /rate-limit-options to re-arm",
+   "wrapped": false,
+   "occupiedEndX": 62,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x55"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 55,
+   "activeByInverse": false
+  },
+  {
+   "row": 2572,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 2573,
+   "text": "─────────────────────────────────────────────────────────────────────────────",
+   "wrapped": false,
+   "occupiedEndX": 77,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:8947848,bg=0:-1",
+   "styles": [
+    "fg=50331648:8947848,bg=0:-1 x77"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 77,
+   "activeByInverse": false
+  },
+  {
+   "row": 2574,
+   "text": "❯ ",
+   "wrapped": false,
+   "occupiedEndX": 1,
+   "promptCellX": 0,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 1,
+   "activeByInverse": false,
+   "promptSuffixAllDim": false,
+   "promptSuffixHasInverse": false,
+   "promptSuffixHasNonDefaultBg": false,
+   "promptSuffixWrapped": false
+  },
+  {
+   "row": 2575,
+   "text": "─────────────────────────────────────────────────────────────────────────────",
+   "wrapped": false,
+   "occupiedEndX": 77,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:8947848,bg=0:-1",
+   "styles": [
+    "fg=50331648:8947848,bg=0:-1 x77"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 77,
+   "activeByInverse": false
+  },
+  {
+   "row": 2576,
+   "text": "  [Opus 5.5] 25%",
+   "wrapped": false,
+   "occupiedEndX": 16,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:10066329,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x12"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 12,
+   "activeByInverse": false
+  },
+  {
+   "row": 2577,
+   "text": "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+   "wrapped": false,
+   "occupiedEndX": 59,
+   "promptCellX": null,
+   "firstTextStyle": "fg=50331648:16739200,bg=0:-1",
+   "styles": [
+    "fg=50331648:10066329,bg=0:-1 x26",
+    "fg=50331648:16739200,bg=0:-1 x21"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 47,
+   "activeByInverse": false
+  },
+  {
+   "row": 2578,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  }
+ ]
+}

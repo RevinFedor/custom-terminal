@@ -54,6 +54,25 @@ function describeClaudeStartupFailure({
       detail: 'Выполните /login в терминале, затем повторите настройку.',
     };
   }
+  // An unresolved read deadline is NOT a provider rejection. Claude writes the
+  // `/model` or `/effort` wrapper record and its result into the transcript on
+  // its own schedule: observed 0.3s on a quiet tab, but 30.6s while Main was
+  // busy (2026-10-31, tab 6d6fd1718b66 — the command did apply, at
+  // 07:38:43.083, under the same commandId). Saying "не удалось применить"
+  // there tells the user the opposite of what happened, and a late proof may
+  // still arrive and settle it. Keep it a distinct pending state so callers can
+  // present waiting instead of failure; `pending:true` marks exactly that.
+  if (code === 'claude_setting_outcome_unknown') {
+    const target = command.startsWith('/model') ? 'модель'
+      : command.startsWith('/effort') ? 'уровень усилий' : 'настройку';
+    return {
+      code, message, title: 'Settings pending', pending: true,
+      userMessage: 'Claude: ' + target + ' ещё не подтверждена',
+      subtitle: 'Claude пока не подтвердил настройку',
+      detail: 'Команда отправлена, подтверждение из истории Claude ещё не получено.'
+        + ' Это не отказ: настройка могла примениться, и поздний результат обновит состояние.',
+    };
+  }
   return {
     code,
     message,
@@ -64,6 +83,41 @@ function describeClaudeStartupFailure({
     subtitle: 'Настройки Claude не применены',
     detail: 'Выберите другую настройку или повторите позже. Подробности доступны через копирование ошибки.',
   };
+}
+
+// Two different things are both called "a failed startup setting":
+//
+//   1. The provider answered — rate limit, expired login, access denied, an
+//      unknown model. A real request was spent and the user must act first.
+//   2. Nothing was ever delivered. Our own helper (the Ctrl+G external editor)
+//      timed out, so the Enter guard correctly withheld submission. The command
+//      never reached Claude, there is no verdict, and the only consequence is
+//      that the setting is not applied.
+//
+// Withholding Enter is right, and auto-retry after an unresolved delivery stays
+// forbidden. But case 2 must not make a live tab refuse every later Send:
+// incident 2026-10-31, tab 718f438d — `external_editor_timeout` at 08:27:50
+// left pid 15603 alive and the user's 08:28:16 Send was refused anyway.
+//
+// One owner for that distinction, used by Main's presence projection and by the
+// Send guard. Returns true only for a proven-undelivered local failure.
+const STARTUP_NOT_DELIVERED_MARKERS = [
+  'external_editor_timeout',
+  'claude_startup_exact_input_failed',
+  'claude_startup_editor_return_unresolved',
+  'claude_startup_exact_empty_unresolved',
+  'claude-startup-command-not-proven-at-enter',
+  'enter-withheld',
+];
+
+function isClaudeStartupSettingUndelivered(gate = {}) {
+  if (!gate || gate.status !== 'failed') return false;
+  // A found proof means Claude did record the command's result; whatever that
+  // result says, it is not an undelivered command.
+  if (gate.proofOutcome === 'found') return false;
+  return STARTUP_NOT_DELIVERED_MARKERS.some((marker) => text(gate.error).includes(marker)
+    || text(gate.errorCode) === marker
+    || text(gate.reason).includes(marker));
 }
 
 // The short UI text is not the incident record. Keep the full provider reason,
@@ -92,4 +146,4 @@ function describeClaudeRestoreFailure(result = {}) {
   return 'Не удалось запустить Claude. Подробности — в отчёте ошибки.';
 }
 
-module.exports = { CLAUDE_AUTH_EXPIRED_CODE, unwrapClaudeLocalCommandFailure, inferClaudeStartupFailureCode, describeClaudeStartupFailure, formatClaudeStartupFailureReport, describeClaudeRestoreFailure };
+module.exports = { CLAUDE_AUTH_EXPIRED_CODE, STARTUP_NOT_DELIVERED_MARKERS, unwrapClaudeLocalCommandFailure, inferClaudeStartupFailureCode, isClaudeStartupSettingUndelivered, describeClaudeStartupFailure, formatClaudeStartupFailureReport, describeClaudeRestoreFailure };

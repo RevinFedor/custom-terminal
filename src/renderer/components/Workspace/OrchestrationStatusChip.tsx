@@ -37,6 +37,8 @@ import { BuildInstallTracker, BuildInstallPreview } from './BuildInstallTracker'
 import type { BuildInstallSelection } from './BuildInstallTracker';
 import { useBuildContinueStatus } from '../../hooks/useBuildContinueStatus';
 import { BuildContinueTracker, BuildContinuePreview, buildContinueVisible } from './BuildContinueTracker';
+import { BuildContinueCaptureTracker, BuildContinueCapturePreview } from './BuildContinueCaptureTracker';
+import type { BuildContinueCaptureSelection } from './BuildContinueCaptureTracker';
 import type { BuildContinueSelection } from './BuildContinueTracker';
 import { ResearchSourceAction } from './TabMessageSourceChip';
 import { useSelfRewinds } from '../../hooks/useSelfRewinds';
@@ -345,30 +347,38 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const rewinds = useSelfRewinds(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
   const [selectedRecovery, setSelectedRecovery] = useState<BuildContinueSelection | null>(null);
+  const [selectedCapture, setSelectedCapture] = useState<BuildContinueCaptureSelection | null>(null);
   const [selectedInstall, setSelectedInstall] = useState<BuildInstallSelection | null>(null);
   const [selectedRewind, setSelectedRewind] = useState<SelfRewindSelection | null>(null);
   const selectedRewindOperation = rewinds.rows.find(row => row.operationId === selectedRewind?.operationId);
   const selectedInstallJob = installs.jobs.find(job => job.id === selectedInstall?.jobId && job.requestId === selectedInstall.requestId);
   const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
   const selectedRecoveryTarget = recovery.targets.find(target => target.operationKey === selectedRecovery?.operationKey);
-  const closeMessage = useCallback(() => { setSelectedMessage(null); setSelectedRecovery(null); setSelectedInstall(null); setSelectedRewind(null); }, []);
+  const selectedCaptureIssue = recovery.captureIssues.find(issue => issue.operationId === selectedCapture?.operationId
+    && issue.issueId === selectedCapture.issueId);
+  const closeMessage = useCallback(() => { setSelectedMessage(null); setSelectedRecovery(null); setSelectedCapture(null); setSelectedInstall(null); setSelectedRewind(null); }, []);
   const openMessage = useCallback((selection: MessageSelection) => {
     setSettingsOpen(false);
     setSelectedRecovery(null);
+    setSelectedCapture(null);
     setSelectedInstall(null);
     setSelectedRewind(null);
     setSelectedMessage(current => current?.messageId === selection.messageId ? null : selection);
   }, []);
   const openRecovery = useCallback((selection: BuildContinueSelection) => {
-    setSettingsOpen(false); setSelectedMessage(null); setSelectedInstall(null); setSelectedRewind(null);
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedCapture(null); setSelectedInstall(null); setSelectedRewind(null);
     setSelectedRecovery(current => current?.operationKey === selection.operationKey ? null : selection);
   }, []);
+  const openCapture = useCallback((selection: BuildContinueCaptureSelection) => {
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedInstall(null); setSelectedRewind(null);
+    setSelectedCapture(current => current?.operationId === selection.operationId && current.issueId === selection.issueId ? null : selection);
+  }, []);
   const openInstall = useCallback((selection: BuildInstallSelection) => {
-    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedRewind(null);
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedCapture(null); setSelectedRewind(null);
     setSelectedInstall(current => current?.jobId === selection.jobId && current.requestId === selection.requestId ? null : selection);
   }, []);
   const openRewind = useCallback((selection: SelfRewindSelection) => {
-    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedInstall(null);
+    setSettingsOpen(false); setSelectedMessage(null); setSelectedRecovery(null); setSelectedCapture(null); setSelectedInstall(null);
     setSelectedRewind(current => current?.operationId === selection.operationId ? null : selection);
   }, []);
   useEffect(() => {
@@ -387,6 +397,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       setSelectedRecovery(null);
     }
   }, [selectedRecovery, selectedRecoveryTarget]);
+  useEffect(() => { if (selectedCapture && !selectedCaptureIssue) setSelectedCapture(null); }, [selectedCapture, selectedCaptureIssue]);
   const cancelMessage = async (messageId: string) => {
     if (await messages.dismiss(messageId)) {
       setSelectedMessage(current => current?.messageId === messageId ? null : current);
@@ -472,19 +483,21 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     ...installs.jobs.map(job => ({ kind: 'install' as const, job, at: job.startedAt, id: 'install:' + job.id })),
     ...recovery.targets.filter(target => target.route.kind !== 'install-callback').map(target => ({ kind: 'continuation' as const, target,
       at: target.capturedAt, id: 'continuation:' + target.operationId })),
+    ...recovery.captureIssues.map(issue => ({ kind: 'capture-issue' as const, issue,
+      at: issue.capturedAt, id: 'capture:' + issue.operationId + ':' + issue.issueId })),
     ...rewinds.rows.map(operation => ({ kind: 'self-rewind' as const, operation,
       at: operation.createdAt, id: 'self-rewind:' + operation.operationId })),
-  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs, recovery.targets, rewinds.rows]);
+  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads, installs.jobs, recovery.targets, recovery.captureIssues, rewinds.rows]);
   const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
   const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
   const statusInstalls = installs.jobs.filter(buildInstallVisibleInDock);
   const statusRecovery = recovery.targets.filter(buildContinueVisible);
   const statusRewinds = rewinds.rows.filter(selfRewindVisible);
   const miniFeedback = miniOrchestrator?.snapshot?.entries.filter(entry => entry.type === 'tool').at(-1);
-  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || statusRewinds.length > 0
+  const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || recovery.captureIssues.length > 0 || statusRewinds.length > 0
     || hasVisibleMessages || Boolean(messages.listError) || Boolean(rewinds.error) || !!miniFeedback;
   const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
-    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null || selectedRecovery !== null || selectedInstall !== null || selectedRewind !== null);
+    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null || selectedRecovery !== null || selectedCapture !== null || selectedInstall !== null || selectedRewind !== null);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     if (openingLinkedRuns.current.has(run.runId)) return;
@@ -734,6 +747,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
             onOpen={openRewind} onDismiss={rewinds.dismiss} selected={selectedRewind?.operationId === entry.operation.operationId} />;
           if (entry.kind === 'continuation') return <BuildContinueTracker key={entry.id} target={entry.target} error={recovery.error} history
             onOpen={openRecovery} selected={selectedRecovery?.operationKey === entry.target.operationKey} onCancel={recovery.cancel} />;
+          if (entry.kind === 'capture-issue') return <BuildContinueCaptureTracker key={entry.id} issue={entry.issue} error={recovery.error} history
+            onOpen={openCapture} selected={selectedCapture?.operationId === entry.issue.operationId && selectedCapture.issueId === entry.issue.issueId}
+            onDismiss={recovery.dismissCapture} />;
           if (entry.kind === 'install') return <BuildInstallTracker key={entry.id} job={entry.job} stale={installs.stale}
             error={installs.error} history onCancel={installs.cancel} onOpen={openInstall}
             selected={selectedInstall?.jobId === entry.job.id} />;
@@ -913,6 +929,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       {statusRecovery.map(target => <BuildContinueTracker key={target.operationKey} target={target} error={recovery.error}
         disabled={!dock.visible || historyOpen || settingsOpen} onOpen={openRecovery}
         selected={selectedRecovery?.operationKey === target.operationKey} onCancel={recovery.cancel} />)}
+      {recovery.captureIssues.map(issue => <BuildContinueCaptureTracker key={issue.operationId + ':' + issue.issueId} issue={issue} error={recovery.error}
+        disabled={!dock.visible || historyOpen || settingsOpen} onOpen={openCapture}
+        selected={selectedCapture?.operationId === issue.operationId && selectedCapture.issueId === issue.issueId} onDismiss={recovery.dismissCapture} />)}
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list
@@ -952,7 +971,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                 side="left"
                 align="start"
                 boundarySelector="[data-split-pane-queue-host], [data-workspace-prompt-queue-host]"
-                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage) || Boolean(selectedRecovery) || Boolean(selectedInstall) || Boolean(selectedRewind)}
+                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage) || Boolean(selectedRecovery) || Boolean(selectedCapture) || Boolean(selectedInstall) || Boolean(selectedRewind)}
                 always
               >
                 <RequestTrackerRow data-orchestration-active-run={run.runId}
@@ -1068,6 +1087,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         selection={selectedMessage} thread={selectedThread} controller={messages} onClose={closeMessage} previewRef={messagePreviewRef} />}
       {selectedRecovery && selectedRecoveryTarget && <BuildContinuePreview key={tabId + ':' + selectedRecovery.operationKey}
         selection={selectedRecovery} target={selectedRecoveryTarget} error={recovery.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
+      {selectedCapture && selectedCaptureIssue && <BuildContinueCapturePreview key={tabId + ':' + selectedCapture.operationId + ':' + selectedCapture.issueId}
+        selection={selectedCapture} issue={selectedCaptureIssue} error={recovery.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
       {selectedInstall && selectedInstallJob && <BuildInstallPreview key={tabId + ':' + selectedInstall.requestId}
         selection={selectedInstall} job={selectedInstallJob} stale={installs.stale} error={installs.error} onClose={closeMessage} previewRef={messagePreviewRef} />}
       {selectedRewind && selectedRewindOperation && <SelfRewindPreview key={tabId + ':' + selectedRewind.operationId}

@@ -6,8 +6,9 @@ const fs = require('node:fs'), path = require('node:path'), os = require('node:o
 const Module = require('node:module'), { EventEmitter, once } = require('node:events');
 const { NodeSqlite } = require('./fixtures/build-install-posthook.cjs');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
+const { mainCaptureFixture } = require('./fixtures/build-continue-main-capture.cjs');
 
-async function fixture(t, failWrite = false, terminalAttention = null) {
+async function fixture(t, failWrite = false, terminalAttention = null, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'build-continue-http-'));
   const db = new NodeSqlite(path.join(root, 'private.sqlite'));
   db.exec('CREATE TABLE app_state(key TEXT PRIMARY KEY,value TEXT)');
@@ -23,6 +24,8 @@ async function fixture(t, failWrite = false, terminalAttention = null) {
     getAppState: key => { const row = db.prepare('SELECT value FROM app_state WHERE key=?').get(key); return row ? JSON.parse(row.value) : null; },
     setAppState: (key, value) => {
       if (failWrite && key === 'buildContinueOperations.v1') throw Error('controlled cut write failed');
+      if (options.failTaskPreparation && key === 'buildContinueOperations.v1'
+        && value.operations.some(op => op.taskShutdownPreparation)) throw Object.assign(Error('controlled task preparation write failed'), { code: 'controlled_task_prepare_write' });
       db.prepare('INSERT INTO app_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value));
       return { success: true };
     },
@@ -34,27 +37,41 @@ async function fixture(t, failWrite = false, terminalAttention = null) {
       route: { kind: 'local' }, state: terminalAttention, reason: 'continue-not-delivered', handoffId: 'exact-terminal-H',
       operationKey: 'history:worker:exact-terminal-H' }],
   }] });
-  let quitCount = 0;
+  let quitCount = 0, lastShutdownSnapshot = null;
+  const main = options.mainCapture ? mainCaptureFixture({ tabId: 'worker', sessionId: 'A',
+    projectId: 'project', cwd: root, writerSession: options.writerSession || null }) : null;
+  const observation = main ? require('./agent-response-observation-reader').createAgentResponseObservationReader({
+    captureState: () => main.context.captureAgentResponseReadState('worker'),
+    readLifecycle: async () => ({ processStatus: 'found', processName: 'codex', processPid: 'controlled-7' }),
+  }) : null;
   const handlers = new Map(), publications = [];
   const ipcMain = new EventEmitter(); ipcMain.handle = (name, fn) => handlers.set(name, fn);
   ipcMain.removeHandler = name => handlers.delete(name);
   const originalLoad = Module._load;
-  Module._load = function(name, parent, main) {
+  Module._load = function(name, parent, isMain) {
     if (name === 'electron') return { app: { isPackaged: false, getPath: () => root, quit: () => {
       const cut = manager.db.getAppState('buildContinueOperations.v1');
       assert.equal(cut.operations[0].id, 'http-operation-one', 'durable capture precedes Quit'); quitCount++;
+      if (main) {
+        options.beforeQuit?.(main);
+        lastShutdownSnapshot = require('./build-install-continue').createShutdownInterruptedSnapshot(
+          new Map([['worker', { engine: 'codex', sessionId: 'A' }]]), { reason: 'before-quit' });
+      }
     } }, BrowserWindow: { getAllWindows: () => [{ isDestroyed: () => false, webContents: {
       isDestroyed: () => false, send: (channel, value) => publications.push({ channel, value }),
     } }] }, ipcMain };
     if (name === './project-manager' || name === path.join(__dirname, 'project-manager')) return manager;
     if (/\/ipc\/(claude-data|codex-data|settings)$/.test(name)) return {};
-    return originalLoad.call(this, name, parent, main);
+    return originalLoad.call(this, name, parent, isMain);
   };
   delete require.cache[require.resolve('./web-server')];
   const web = require('./web-server'), receipts = createAgentSendReceiptStore(db);
   const context = { provider: 'codex', sessionId: 'A', turnId: 'own-T', generation: 1, processId: null };
   web.start({ sdkSessions: new Map(), agentSendReceiptStore: receipts,
-    captureTabInspection: tabId => ({ tabId, known: true, exists: true, toolType: 'codex',
+    ...(observation ? { getAgentResponseState: tabId => observation.getAgentResponseState(tabId) } : {}),
+    ...(main && options.privateCapture ? { captureBuildContinueTabInspection: tabId => tabId === 'worker'
+      ? main.capture() : { tabId, known: true, exists: true, toolType: 'codex', sessionId: 'P', cwd: root, busy: false, revision: 'idle' } } : {}),
+    captureTabInspection: tabId => main && tabId === 'worker' ? main.publicView() : ({ tabId, known: true, exists: true, toolType: 'codex',
       sessionId: tabId === 'worker' ? 'A' : 'P', cwd: root, revision: 'cut', busy: tabId === 'worker', transitioning: false,
       turn: tabId === 'worker' ? { ...context, active: true } : null,
       executionContext: tabId === 'worker' ? context : null, backgroundWorkCount: 0 }),
@@ -64,7 +81,7 @@ async function fixture(t, failWrite = false, terminalAttention = null) {
     fs.rmSync(root, { recursive: true, force: true }); });
   const deadline = Date.now() + 5000;
   while (!web.getInfo().running) { assert(Date.now() < deadline, 'private HTTP startup deadline'); await new Promise(resolve => setImmediate(resolve)); }
-  return { get quitCount() { return quitCount; }, manager, publications,
+  return { get quitCount() { return quitCount; }, get shutdownSnapshot() { return lastShutdownSnapshot; }, main, manager, publications,
     ipc: (channel, request) => { assert(handlers.has(channel), channel); return handlers.get(channel)({}, request); },
     async api(route, body, token = web.getInfo().token) {
       const response = await fetch('http://127.0.0.1:' + web.getInfo().port + route, {
@@ -95,6 +112,81 @@ test('production capture-quit API freezes only own turns, short ACK/report and r
   assert.equal(h.quitCount, 1, 'metadata inventory never captures or quits');
   const premature = await h.api(result.body.reportUrl + '/restore', { version: 2 });
   assert.equal(premature.body.code, 'build_continue_replacement_required');
+  assert.equal(h.quitCount, 1);
+});
+
+test('actual Main -> Web factory keeps exact private task despite null public writer, old public route remains a negative control', async t => {
+  for (const privateCapture of [false, true]) {
+    await t.test('privateCapture=' + privateCapture, async t => {
+      const h = await fixture(t, false, null, { mainCapture: true, privateCapture });
+      assert.equal(h.main.publicView().executionContext, null);
+      const result = await h.api('/api/build-continue/operations', { version: 2, action: 'capture-quit',
+        operationId: 'http-operation-one', expectedMainPid: process.pid });
+      assert.equal(result.status, 200, JSON.stringify(result));
+      assert.equal(result.body.operation.targetCount, privateCapture ? 1 : 0);
+      assert.equal(h.quitCount, 1);
+      assert.equal(h.main.state.writerSession, null, 'private capture cannot publish a writer');
+      if (privateCapture) {
+        const saved = h.manager.db.getAppState('buildContinueOperations.v1');
+        assert.equal(saved.version, 5);
+        assert.equal(saved.operations[0].targets[0].subject.targetExecutionContext.turnId, 'own-turn');
+        assert.equal(saved.operations[0].taskShutdownEvidence.targets[0].disposition, 'own-turn-interrupted');
+        assert.equal(h.shutdownSnapshot.buildContinueBindings.length, 1);
+        assert.equal((await h.api('/api/me')).body.capabilities.buildContinue.taskCapture.version, 1);
+      }
+    });
+  }
+});
+
+test('capture-only refusal is published with no H/O, exact HTTP/IPC X hides only that face', async t => {
+  const h = await fixture(t, false, null, { mainCapture: true, privateCapture: true, writerSession: 'FOREIGN' });
+  const response = await h.api('/api/build-continue/operations', { version: 2, action: 'capture-quit',
+    operationId: 'http-operation-one', expectedMainPid: process.pid });
+  assert.equal(response.status, 200, JSON.stringify(response)); assert.equal(response.body.operation.targetCount, 0);
+  const before = h.ipc('build-continue:status-for-tab', 'worker');
+  assert.deepEqual(before.targets, []); assert.equal(before.captureIssues.version, 1);
+  const issue = before.captureIssues.items[0];
+  assert.equal(issue.kind, 'capture-unresolved'); assert.equal(issue.inputCreated, false);
+  assert.equal(issue.reason, 'capture-foreign-writer'); assert.equal(issue.handoffId, undefined); assert.equal(issue.operationKey, undefined);
+  assert(h.publications.some(row => row.channel === 'build-continue:status' && row.value.tabId === 'worker'
+    && row.value.captureIssues.items.length === 1), 'zero targets still produces the exact tab publication');
+  const body = { version: 1, tabId: 'worker', issueId: issue.issueId, requestId: 'http-dismiss-capture-one' };
+  const url = response.body.reportUrl + '/dismiss-capture';
+  assert.equal((await h.api(url, body, 'foreign-token')).status, 401);
+  assert.equal((await h.api(url, { ...body, issueId: 'a'.repeat(64) })).status, 409);
+  const dismissed = await h.api(url, body);
+  assert.equal(dismissed.status, 200, JSON.stringify(dismissed));
+  assert.equal(dismissed.body.acknowledgement.issueId, issue.issueId);
+  assert.equal(dismissed.body.acknowledgement.requestId, body.requestId);
+  assert.equal(h.ipc('build-continue:status-for-tab', 'worker').captureIssues.items.length, 0);
+  const repeated = await h.ipc('build-continue:dismiss-capture', { ...body, operationId: issue.operationId });
+  assert.deepEqual(repeated.acknowledgement, dismissed.body.acknowledgement);
+  assert.equal(repeated.snapshot.captureIssues.items.length, 0);
+  assert.equal(dismissed.body.operation.unresolved[0].reason, issue.reason);
+  assert.equal(dismissed.body.operation.targetCount, 0); assert.equal(h.quitCount, 1);
+});
+
+test('private task cut cannot Quit after its strict preflight persistence fails', async t => {
+  const h = await fixture(t, false, null, { mainCapture: true, privateCapture: true, failTaskPreparation: true });
+  const response = await h.api('/api/build-continue/operations', { version: 2, action: 'capture-quit',
+    operationId: 'http-operation-one', expectedMainPid: process.pid });
+  assert.notEqual(response.status, 200); assert.equal(response.body.code, 'controlled_task_prepare_write');
+  assert.equal(h.quitCount, 0); assert.equal(h.main.state.writerSession, null);
+  assert.equal(h.manager.db.getAppState('buildContinueOperations.v1').operations[0].targets.length, 1,
+    'the already accepted intent is not erased or silently recreated');
+});
+
+test('a source/input change between API ACK and actual cut seals the frozen task as refused without retargeting it', async t => {
+  const h = await fixture(t, false, null, { mainCapture: true, privateCapture: true,
+    beforeQuit: main => { main.state.inputRevision++; } });
+  const response = await h.api('/api/build-continue/operations', { version: 2, action: 'capture-quit',
+    operationId: 'http-operation-one', expectedMainPid: process.pid });
+  assert.equal(response.status, 200, JSON.stringify(response));
+  const op = h.manager.db.getAppState('buildContinueOperations.v1').operations[0];
+  assert.equal(op.taskShutdownEvidence.targets[0].disposition, 'owner-or-input-changed');
+  assert.equal(op.taskShutdownEvidence.targets[0].reason, 'capture-input-changed');
+  assert.equal(op.targets[0].subject.targetExecutionContext.turnId, 'own-turn');
+  assert.equal(h.shutdownSnapshot.buildContinueBindings[0].captureDigest, op.captureDigest);
   assert.equal(h.quitCount, 1);
 });
 

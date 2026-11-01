@@ -202,3 +202,33 @@ Claude после нашего exit'а перечитывает файл → в�
 - Имя скрипта **должно начинаться с "code"** (`noted-code-grab`) — Claude classifies basename: если содержит `code|cursor|windsurf|codium|subl|atom`, GUI-path (silent), иначе alt-screen flash. См. `editor.ts:20-30` в декомпиле.
 - `getExternalEditor` в Claude **memoize'ан** — EDITOR должен быть установлен ДО spawn'а Claude. Существующие табы запущенные до изменения env не получат фичу до рестарта Claude процесса.
 - `getExternalEditor` проверяет `VISUAL` ПЕРЕД `EDITOR` — мы инжектим оба для надёжности.
+
+## Сообщение из очереди Claude продолжает ход (01.11.2026)
+
+Сообщение, отправленное в занятую вкладку, Claude ставит в свою очередь. Hook
+`UserPromptSubmit` приходит в момент постановки, с `prompt_id` **активного** хода, и
+`admitClaudeMainHook` законно отбрасывает его (`duplicate-prompt-start`). Дальше
+два поведения Claude, оба видны в dev 01.11:
+
+```text
+merge:   QUEUE_CONSUMED operation=remove  ДО Stop  → сообщение ушло в текущий ход,
+         Stop — настоящий конец (ничего не делаем)
+dequeue: Stop → QUEUE_CONSUMED operation=dequeue ПОСЛЕ границы Stop → новый ход,
+         но без нового UserPromptSubmit → вкладка «свободна», пока Claude работает
+```
+
+Решение пользователя: вкладка занята, пока ход из очереди реально не закончится.
+Main запоминает отброшенный hook (`claudeQueuedPromptSubmits`), на `Stop` фиксирует
+байтовую границу транскрипта, и при `dequeue` нашего сообщения после неё повторно
+подаёт тот же `UserPromptSubmit` в собственный hook-сокет — срабатывает весь штатный
+переход (busy, редьюсер хода для Run After/Loop, превью, наблюдатели). Подаётся
+**без `prompt_id`**: Claude выполняет ход из очереди под новым id, и закреплённый
+старый id делал настоящий `Stop` `prompt-owner-mismatch` → вечный лоадер (пойман в
+dev 18:21:58). Сессия и процесс по-прежнему сверяются. `remove`, `dequeue` до границы,
+чужой текст или ход ещё идёт — ничего не подаётся. Окно ложного idle сокращается с
+длины хода до ~170 мс: Run After на первом `Stop` может начать подготовку, но его
+отправка встанет в очередь Claude после нашего сообщения. Работает для отправок,
+которые проходят аудит приложения; ручной ввод в TUI не покрыт. Логи
+`[ClaudeQueueContinuation] remembered|stop-boundary|dequeue|consumed`. Тест
+`claude-queue-continuation.actual.test.js`.
+

@@ -67,7 +67,7 @@ const CollapsibleText: React.FC<{ id: string; text: string; ctx?: ChatRenderCont
   const preview = text.slice(0, USER_TEXT_COLLAPSED_CHARS).trimEnd();
   const ToggleBtn = (
     <button type="button" onClick={toggle} onMouseDown={(e) => e.preventDefault()} className="cb-collapse-btn">
-      {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+      {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} симв.)`}
     </button>
   );
   return (
@@ -319,7 +319,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
       const secs = m ? Math.round(m.durationMs / 1000) : 0;
       const Toggle = needsCollapse ? (
         <button type="button" onClick={toggle} onMouseDown={(e) => e.preventDefault()} className="cb-compact-toggle">
-          {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+          {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} симв.)`}
         </button>
       ) : null;
       return (

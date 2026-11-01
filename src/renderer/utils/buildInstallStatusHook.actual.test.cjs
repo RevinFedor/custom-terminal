@@ -66,3 +66,17 @@ test('an old cancel result after unmount cannot refresh or mutate the next owner
   assert.equal(h.state(), before);
   assert.equal(h.calls.filter(([name]) => name === 'build-install:status-for-tab').length, 1);
 });
+
+test('actual hook consumes reservation→Job→terminal Main snapshots without a duplicate or pending orphan', async () => {
+  const { createBuildInstallPresentation } = require('../../main/build-install-presentation');
+  const source = { tabId: '753', sessionId: 'S' }, e = { requestId: 'I', fingerprint: 'F', source, state: 'waiting-install', createdAt: 1 };
+  const entries = [e], projector = createBuildInstallPresentation({ owner: { snapshot: () => ({ entries }), canCancelConfirmedWait: () => false }, epoch: 'one-main' });
+  const project = jobs => projector.project({ version: 1, known: true, stale: false, epoch: 'voice', publication: 1, jobs });
+  const initial = project([]), h = await fixture(async () => initial);
+  assert.equal(h.state().jobs.length, 1); assert.equal(h.state().jobs[0].id, 'continuation:I');
+  e.jobId = 'J'; const real = project([{ ...job, continuation: e }]); h.emit(real);
+  assert.equal(h.state().jobs.length, 1); assert.equal(h.state().jobs[0].id, 'J');
+  e.state = 'cancelled'; h.emit(project([]));
+  assert.equal(h.state().jobs.length, 1); assert.equal(h.state().jobs[0].continuation.state, 'cancelled');
+  h.emit(initial); assert.equal(h.state().jobs[0].continuation.state, 'cancelled'); h.cleanup();
+});

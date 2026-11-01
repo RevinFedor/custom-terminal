@@ -50,10 +50,14 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     return refused('invalid-private-capture-options');
   }
   if (armed) durationMs = captureOptions.durationMs;
-  if (manual && (!ownerGuard?.isCurrent() || durationMs !== 10000 || request.durationMs !== 10000)) {
+  if (manual && (!ownerGuard?.isCurrent() || ![10000, 40000].includes(durationMs) || request.durationMs !== durationMs)) {
     log('[Perf:IncidentProfile] id=' + request.id + ' refused=stale-or-invalid-manual-owner');
     return refused('stale-or-invalid-manual-owner');
   }
+  // The native manual controller selects this bounded input preset. Legacy
+  // 10s requests retain their original mode; private options remain private.
+  const manualInput = manual && durationMs === 40000;
+  const scoped = armed || manualInput;
   if (inFlight) {
     log('[Perf:IncidentProfile] id=' + request.id + ' skipped=capture-in-flight');
     try { await saveJson(path.join(directory, request.id + '.profile.json'), {
@@ -69,15 +73,16 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
   const status = { requestedWallMs: request.requestedWallMs, receivedWallMs: Date.now(),
     requestDelayMs: Date.now() - request.requestedWallMs, pid: request.pid, leaseId: lease.id,
     engines: { electron: process.versions.electron, chrome: process.versions.chrome, node: process.versions.node },
-    intendedDurationMs: durationMs, samplingIntervalUs: armed ? 8000 : 1000, errors: [], artifacts: {},
+    intendedDurationMs: durationMs, samplingIntervalUs: scoped ? 8000 : 1000, errors: [], artifacts: {},
     ...(manual ? { kind: 'manual', reason: request.reason, requestId: request.requestId } : {}),
     ...(armed ? { captureMode: 'private-armed' } : {}),
+    ...(manualInput ? { captureMode: 'manual-input' } : {}),
     ...(ownerGuard ? { originalOwner: manual ? request.owner : ownerGuard.owner, ownerAtStart: ownerGuard.current() } : {}),
     triggerStartAbs: Number.isFinite(request.startAbs) ? request.startAbs : null,
     triggerEndAbs: Number.isFinite(request.startAbs) && Number.isFinite(request.durationMs)
       ? request.startAbs + request.durationMs : null,
     actionId: typeof request.actionId === 'string' ? request.actionId.slice(0, 90) : null,
-    coverage: armed ? 'prearmed; exact start/stop brackets per target; clock mapping uncalibrated'
+    coverage: scoped ? 'prearmed; exact start/stop brackets per target; clock mapping uncalibrated'
       : manual ? 'manual-before-next-gesture; no synthetic slow-event; native sample remains independent'
         : 'after-trigger-only; native sample is captured independently' };
   let owned = false, detached = null, mainSession = null, mainOwned = false;
@@ -139,8 +144,8 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     } });
     operations.push(op); return op;
   }
-  const setupUntil = () => armed && firstStartMonoMs !== null ? firstStartMonoMs + 5000 : now() + 3000;
-  const collectionAllowed = () => ownerCurrent() && (!armed || firstStartMonoMs === null
+  const setupUntil = () => scoped && firstStartMonoMs !== null ? firstStartMonoMs + 5000 : now() + 3000;
+  const collectionAllowed = () => ownerCurrent() && (!scoped || firstStartMonoMs === null
     || now() < firstStartMonoMs + Math.min(5000, durationMs));
   const wait = (op, until) => settled(op, { commandDeadline, until, now });
   const check = async (op, until) => {
@@ -166,7 +171,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
   const stopped = () => cpuClean(mainStart, mainStop) && cpuClean(cpuStart, cpuStop)
     && (!traceStart || traceStart.state === 'refused' || (traceEnd?.state === 'ok' && !!traceResolved));
   const stamps = () => ({ clockDomain: 'main-performance-now-ms', timeOriginWallMs: performance.timeOrigin,
-    firstStartMonoMs, plannedStopMonoMs: armed && firstStartMonoMs !== null ? firstStartMonoMs + durationMs : null,
+    firstStartMonoMs, plannedStopMonoMs: scoped && firstStartMonoMs !== null ? firstStartMonoMs + durationMs : null,
     main: { start: timing(mainStart), stop: timing(mainStop) },
     renderer: { start: timing(cpuStart), stop: timing(cpuStop) },
     trace: { start: timing(traceStart), stop: timing(traceEnd), completeMonoMs: traceResolved?.completedMonoMs ?? null,
@@ -209,7 +214,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     }
   }
   async function clockMarker(label, until) {
-    if (!armed || !authority() || traceStart?.state !== 'ok' || traceEnd || traceClockMarkers.some(m => m.label === label)) return;
+    if (!scoped || !authority() || traceStart?.state !== 'ok' || traceEnd || traceClockMarkers.some(m => m.label === label)) return;
     const marker = { label, syncId: 'profile-' + lease.id + '-' + label, before: clockSnapshot(), after: null };
     traceClockMarkers.push(marker);
     const op = command('Tracing.recordClockSyncMarker', () => dbg.sendCommand('Tracing.recordClockSyncMarker', { syncId: marker.syncId }), authority);
@@ -300,9 +305,9 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         // after 7.6s of the real 40s pilot. Isolate CPU profiles and explicit
         // sync sites already cover executed code. Keep input and engine phases;
         // do not claim all scheduler tasks, raster/GPU work or arbitrary marks.
-        const traceCategories = armed ? ['devtools.timeline', 'v8', 'input', 'latencyInfo']
+        const traceCategories = scoped ? ['devtools.timeline', 'v8', 'input', 'latencyInfo']
           : ['toplevel', 'devtools.timeline', 'v8', 'blink', 'cc', 'gpu', 'input', 'latencyInfo', 'blink.user_timing'];
-        if (armed) status.traceScope = 'input; JS callbacks; renderer style/layout/paint; GC; all-thread scheduler and GPU work unclaimed';
+        if (scoped) status.traceScope = 'input; JS callbacks; renderer style/layout/paint; GC; all-thread scheduler and GPU work unclaimed';
         traceStart = command('Tracing.start', () => dbg.sendCommand('Tracing.start', { transferMode: 'ReturnAsStream',
           bufferUsageReportingInterval: 1000,
           traceConfig: { recordMode: 'recordUntilFull', traceBufferSizeInKb: 8192,
@@ -315,18 +320,18 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
       } catch (err) { noteError(err); }
       try { await send('Performance.enable'); status.metricsBefore = await send('Performance.getMetrics'); } catch (err) { noteError(err); }
     }
-    if (armed && (mainStart?.state !== 'ok' || cpuStart?.state !== 'ok' || traceStart?.state !== 'ok'
+    if (scoped && (mainStart?.state !== 'ok' || cpuStart?.state !== 'ok' || traceStart?.state !== 'ok'
       || !authority() || now() >= firstStartMonoMs + Math.min(5000, durationMs))) {
       throw new Error('armed-setup-incomplete');
     }
-    if ((manual || armed) && status.rendererStartedWallMs && authority()) {
+    if ((manual || scoped) && status.rendererStartedWallMs && authority()) {
       assertOwner();
       status.readyWallMs = Date.now(); status.readyMonoMs = now();
       const owner = ownerGuard?.owner || (manual ? request.owner : null) || status.ownerAtStart;
       status.ready = { readyWallMs: status.readyWallMs, readyMonoMs: status.readyMonoMs,
         mainCpu: mainStart?.state === 'ok', rendererCpu: true, trace: traceStart?.state === 'ok',
         leaseId: lease.id, samplingIntervalUs: status.samplingIntervalUs,
-        plannedStopMonoMs: armed ? firstStartMonoMs + durationMs : null,
+        plannedStopMonoMs: scoped ? firstStartMonoMs + durationMs : null,
         targets: [{ role: 'main', pid: process.pid, mainTimeOriginWallMs: performance.timeOrigin,
           osProcessStartIdentity: null, profileId: lease.id + ':main', start: timing(mainStart) },
           { role: 'renderer', pid: status.rendererPid, webContentsId: webContents.id ?? null,
@@ -338,7 +343,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
       let timer;
       try {
         const elapsed = new Promise(resolve => { timer = setTimeout(resolve,
-          armed ? Math.max(0, firstStartMonoMs + durationMs - now()) : durationMs); });
+          scoped ? Math.max(0, firstStartMonoMs + durationMs - now()) : durationMs); });
         await (ownerGuard ? Promise.race([elapsed, ownerGuard.invalidated]) : elapsed); assertOwner();
       } finally { clearTimeout(timer); }
     }
@@ -348,7 +353,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     // deadline. Late receipts advance the same operations outside this report.
     stopUntil = now() + STOP_GRACE_MS;
     await clockMarker('stop', stopUntil);
-    if (armed) status.traceClockMarkers = traceClockMarkers;
+    if (scoped) status.traceClockMarkers = traceClockMarkers;
     if (authority() && ownerCurrent()) try { status.metricsAfter = await send('Performance.getMetrics', {}, stopUntil, false); } catch {}
     await Promise.all([stopCpu('main', stopUntil), stopCpu('renderer', stopUntil), stopTrace(stopUntil)]);
     const exportUntil = now() + EXPORT_MS;
@@ -365,7 +370,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
       try {
         if (!traceResolved.stream) throw new Error('trace-stream-missing');
         assertOwner();
-        if (armed) {
+        if (scoped) {
           const { createTraceProjectionWriter, LIMITS } = require('./perf-trace-projection');
           const incidentDir = await fs.promises.realpath(directory);
           projection = createTraceProjectionWriter({ file: path.join(incidentDir, request.id + '.trace.json'),
@@ -401,7 +406,8 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         let bytes = 0, eof = false, chunks = 0;
         traceRoots = createLayoutRootCollector({ rendererPid: status.rendererPid });
         while (!eof) {
-          if (++chunks > 256 || now() >= exportUntil) throw new Error('trace-export-time-limit');
+          if (++chunks > 256) throw new Error('trace-export-chunk-limit');
+          if (now() >= exportUntil) throw new Error('trace-export-time-limit');
           const part = await send('IO.read', { handle: traceResolved.stream, size: 65536 }, exportUntil, false);
           const data = Buffer.from(part.data, part.base64Encoded ? 'base64' : 'utf8');
           if (bytes + data.length > LIMIT) throw new Error('trace-export-size-limit');
@@ -435,7 +441,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         source: ui.source, moment: ui.moment, elapsedMs: ui.elapsedMs,
         rootIds: ui.trace.roots.length, mappedRoots: ui.roots.filter(root => root.status === 'ok').length,
         animations: ui.animations.length, errors: ui.errors.length, ...(ui.reason ? { reason: ui.reason } : {}) };
-      if (armed) status.uiMetadata.layoutRootCoverage = 'not-collected-in-safe-projection';
+      if (scoped) status.uiMetadata.layoutRootCoverage = 'not-collected-in-safe-projection';
     } catch {
       noteError(new Error('ui-metadata-collection-or-save-failed'));
       status.uiMetadata = { file: request.id + '.ui.json', status: 'failed' };

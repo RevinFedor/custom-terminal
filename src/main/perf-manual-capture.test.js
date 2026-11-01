@@ -50,7 +50,7 @@ function fixture(t, options = {}) {
     }, counts: () => ({ suspends, resumes }) };
 }
 
-test('typed request is fixed10s, exact owner; duplicate request/reply never starts a second recording', async t => {
+test('default request stays10s, exact owner; duplicate request/reply never starts a second recording', async t => {
   const f = fixture(t); assert.equal(f.request(), true);
   assert.equal(validManualRequest(f.requests[0], 99), true);
   for (const patch of [{ durationMs: 60000 }, { mainPid: 1 }, { reason: 'LongTask' }, { version: 2 }, { kind: 'long-task' }]) {
@@ -69,7 +69,24 @@ test('typed request is fixed10s, exact owner; duplicate request/reply never star
   f.controller.handle(f.reply(), f.child); assert.equal(f.captures.length, 1);
 });
 
-test('quota refusal is exact, terminal, and never produces ready/suspend/capture', t => {
+test('input preset selects40s and rejects a mismatched duration reply', async t => {
+  const f = fixture(t);
+  assert.equal(f.controller.request(f.window, { durationMs: 20000 }), false);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.controller.request(f.window, { durationMs: 40000 }), true);
+  assert.equal(f.requests[0].durationMs, 40000);
+  f.controller.handle({ ...f.reply(), durationMs: 10000 }, f.child);
+  assert.equal(f.captures.length, 0); assert.equal(f.logs.at(-1).state, 'unknown');
+  assert.equal(f.controller.request(f.window, { durationMs: 40000 }), false);
+});
+test('input preset retains exact40s through watchdog reply and capture', async t => {
+  const f = fixture(t); f.controller.request(f.window, { durationMs: 40000 });
+  f.controller.handle(f.reply(), f.child);
+  assert.equal(f.captures.length, 1); assert.equal(f.captures[0].durationMs, 40000);
+  assert.equal(f.captures[0].request.durationMs, 40000);
+  f.resolve(retired({ outcome: 'completed' })); await f.flush();
+});
+test('admission refusal is exact, terminal, and never produces ready/suspend/capture', t => {
   const f = fixture(t); f.request();
   f.controller.handle({ t: 'perf-manual-decision', requestId: f.requests[0].requestId,
     allowed: false, reason: 'rolling-quota-exhausted', nextEligibleWallMs: 999, remaining: 0 }, f.child);
@@ -181,15 +198,19 @@ test('watchdog validates request and returns exact admission rejection without i
   f.controller.handle(sent[0], f.child);
 });
 
-test('one native Help item preserves existing menu; click passes the original window and no fallback', () => {
+test('native Help keeps10s and adds40s input once; both preserve the original window', () => {
   class Menu { constructor() { this.items = []; } append(item) { this.items.push(item); } }
   class MenuItem { constructor(data) { Object.assign(this, data); if (Array.isArray(data.submenu)) this.submenu = new Menu(); } }
   let menu = new Menu(); const edit = new MenuItem({ role: 'editMenu' }); menu.append(edit);
   Menu.getApplicationMenu = () => menu; Menu.setApplicationMenu = value => { menu = value; };
-  const windows = [], controller = { request: win => windows.push(win) };
+  const windows = [], options = [], controller = { request: (win, option) => { windows.push(win); options.push(option); } };
   installManualCaptureMenu({ Menu, MenuItem, controller }); installManualCaptureMenu({ Menu, MenuItem, controller });
   assert.equal(menu.items[0], edit); assert.equal(menu.items.length, 2);
-  const items = menu.items[1].submenu.items; assert.equal(items.length, 1);
+  const items = menu.items[1].submenu.items; assert.equal(items.length, 2);
+  assert.equal(items[0].label, 'Record Performance (10 seconds)');
+  assert.equal(items[1].label, 'Record Input Performance (40 seconds)');
   const original = {}; items[0].click(items[0], original); items[0].click(items[0], undefined);
   assert.deepEqual(windows, [original, undefined]);
+  items[1].click(items[1], original);
+  assert.equal(windows[2], original); assert.deepEqual(options[2], { durationMs: 40000 });
 });

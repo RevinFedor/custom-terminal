@@ -440,6 +440,43 @@ function claudeAuditNativePasteMatches(audit, text, hashText = promptAuditFinger
     && (typeof audit?.expectedText !== 'string' || body === audit.expectedText);
 }
 
+// Claude normalizes a submitted prompt to Unicode NFC before it records it in
+// the transcript or reports it to UserPromptSubmit. macOS hands out file paths
+// in NFD (decomposed), so a prompt that contains a dragged/pasted path with a
+// Cyrillic or accented letter reaches Claude one code unit LONGER than Claude
+// records it. Incident 2026-10-31, tab 029152fbe588, handoff mvwj1obz-x6tcv2:
+// the draft path `…/Downloads/временный промпт.md` carried `й` as `и`+U+0306;
+// Claude wrote `й` U+0439, so 584 became 583, the exact length+hash never
+// matched, and a delivered message stayed CONFIRMING forever while holding the
+// input slot (the next send sat in IN APP QUEUE).
+//
+// Canonical equivalence is still an exact identity — only strings Unicode
+// itself declares identical compare equal — and it applies only when
+// normalization actually changed one side, so the exact comparison above stays
+// the authority for every ordinary prompt. The stored text must still hash to
+// the audited identity, so this can never match against an unrelated object.
+function canonicalPromptText(text) {
+  return typeof text === 'string' ? text.normalize('NFC') : '';
+}
+
+function auditTextIntact(text, len, hash, hashText) {
+  return typeof text === 'string' && text.length === Number(len)
+    && hashText(text) === String(hash || '');
+}
+
+function claudeAuditCanonicalTextMatches(audit, value, hashText) {
+  const actual = canonicalPromptText(value);
+  for (const [raw, len, hash] of [
+    [audit?.expectedText, audit?.expectedLen, audit?.expectedHash],
+    [audit?.providerAcceptedText, audit?.providerAcceptedLen, audit?.providerAcceptedHash],
+  ]) {
+    if (!auditTextIntact(raw, len, hash, hashText)) continue;
+    const expected = canonicalPromptText(raw);
+    if (actual === expected && (actual !== value || expected !== raw)) return true;
+  }
+  return false;
+}
+
 function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) {
   const value = typeof text === 'string' ? text : '';
   const hash = hashText(value);
@@ -449,6 +486,7 @@ function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) 
     && hash === String(audit?.providerAcceptedHash || '');
   if (rawMatch || providerMatch) return true;
   if (claudeAuditNativePasteMatches(audit, value, hashText)) return true;
+  if (claudeAuditCanonicalTextMatches(audit, value, hashText)) return true;
 
   // UserPromptSubmit reports Claude's accepted text without the attached
   // images. The canonical JSONL user record later prefixes that exact text
@@ -816,15 +854,15 @@ function selectClaudeLivePromptOwner(
     hashText,
   );
   const isMergedQueuedPayload = (audit) => {
-    const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
-    if (
-      !expectedText
-      || expectedText.length !== Number(audit.expectedLen)
-      || hashText(expectedText) !== String(audit.expectedHash || '')
-      || candidate.text.length <= expectedText.length
-      || !candidate.text.startsWith(expectedText)
-    ) return false;
-    return /\s/u.test(candidate.text.charAt(expectedText.length));
+    const expectedRaw = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
+    if (!expectedRaw || !auditTextIntact(expectedRaw, audit.expectedLen, audit.expectedHash, hashText)) {
+      return false;
+    }
+    // Claude records the merged queue payload in NFC (see canonicalPromptText).
+    const expectedText = canonicalPromptText(expectedRaw);
+    const merged = canonicalPromptText(candidate.text);
+    if (merged.length <= expectedText.length || !merged.startsWith(expectedText)) return false;
+    return /\s/u.test(merged.charAt(expectedText.length));
   };
 
   // A queue carrier has already established the app-owned FIFO position.

@@ -68,6 +68,16 @@ function fixture({ carrier = 'paired', sameRules = false, compact = false } = {}
 }
 
 for (const [name, api] of readers) {
+  test(name + ': rewinding the first real input removes its instructions and checkpoints without deleting session metadata', () => {
+    const { records } = fixture();
+    const target = api.buildCodexTimeline(records, 'checkpoint-fixture').find(entry => entry.content === 'keep');
+    const plan = api.planCodexRangeRewrite(records, 'checkpoint-fixture',
+      target.uuid, target.uuid, null, { toPhysicalEnd: true });
+    assert.equal(plan.success, true, plan.error);
+    assert.deepEqual(plan.outputRecords.map(record => record.type), ['session_meta']);
+    assert.deepEqual(plan.outputRecords[0].payload, records[0].payload);
+  });
+
   for (const carrier of ['paired', 'event-only', 'response-only', 'event-first']) {
     for (const sameRules of [false, true]) {
       test(name + ': Rewind removes exact preamble/full+patch for ' + carrier
@@ -141,5 +151,33 @@ for (const [name, api] of readers) {
     assert.ok(plan.outputRecords.some(record => record.fixtureTag === 'kept-post-turn-state'));
     assert.ok(plan.outputRecords.some(record => record.fixtureTag === 'kept-late-companion'));
     assert.equal(plan.outputRecords.some(record => record.fixtureTag === 'removed-patch-state'), false);
+  });
+
+  test(name + ': a bare checkpoint before a new task is retained when no contextual preamble precedes it', () => {
+    const f = fixture();
+    const cut = f.records.findIndex(record => record.fixtureTag === 'removed-instructions') - 1;
+    f.records.splice(cut, 4); // No new instructions or state; the next task has only its settings.
+    f.records.forEach((record, index) => { record.__line = index; });
+    const target = api.buildCodexTimeline(f.records, 'checkpoint-fixture').find(entry => entry.content === 'remove');
+    const plan = api.planCodexRangeRewrite(f.records, 'checkpoint-fixture',
+      target.uuid, target.uuid, null, { toPhysicalEnd: true });
+    assert.equal(plan.success, true, plan.error);
+    assert.deepEqual(plan.outputRecords.map(record => record.fixtureTag), f.retained.map(record => record.fixtureTag));
+  });
+
+  test(name + ': exact composite source ownership survives identical instructions and physical line numbers', () => {
+    const a = fixture({ sameRules: true });
+    const b = fixture({ sameRules: true });
+    const physical = (records, id) => records.map(record => ({ ...record, __physicalSessionId: id }));
+    const records = [...physical(a.records, 'physical-A'), ...physical(b.records, 'physical-B')];
+    const target = api.buildCodexTimeline(records, 'composite-view').find(entry =>
+      entry.type === 'user' && entry.content === 'remove' && entry.sessionId === 'physical-B');
+    assert.ok(target?.uuid);
+    const plan = api.planCodexRangeRewrite(records, 'composite-view',
+      target.uuid, target.uuid, null, { toPhysicalEnd: true });
+    assert.equal(plan.success, true, plan.error);
+    assert.equal(plan.outputRecords.length, a.records.length + b.retained.length);
+    assert.deepEqual(plan.outputRecords.map(record => [record.type, record.payload]),
+      [...a.records, ...b.retained].map(record => [record.type, record.payload]));
   });
 }

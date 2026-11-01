@@ -19,6 +19,7 @@ function load(file, overrides = {}, globals = {}) {
   const module = { exports: {} };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, file), 'utf8'), {
     module, exports: module.exports, Buffer, process, console, setTimeout, clearTimeout,
+    __dirname, __filename: path.join(__dirname, file),
     require: name => Object.hasOwn(overrides, name) ? overrides[name] : require(name.startsWith('.') ? path.join(__dirname, name) : name),
     ...globals,
   }, { filename: file });
@@ -31,10 +32,12 @@ function directory(t) {
 function flightFixture(t) {
   const dir = path.join(directory(t), 'perf-incidents'), requests = [], logs = [];
   let now = 0, tick, forward;
+  const wallOrigin = Date.now();
   const exports = load('perf-flight-recorder.js', {
     perf_hooks: { performance: { timeOrigin: 1700000000000, now: () => now } },
     os: { cpus: () => [], loadavg: () => [] },
-  }, { setTimeout: fn => { tick = fn; return { unref() {} }; }, clearTimeout() {} });
+  }, { Date: class extends Date { static now() { return wallOrigin + now; } },
+    setTimeout: fn => { tick = fn; return { unref() {} }; }, clearTimeout() {} });
   const flight = exports.createFlightRecorder({ directory: dir, mainPid: process.pid,
     log: x => logs.push(x), context: () => ({}), requestCapture: r => { requests.push(r); forward?.(r); },
     snapshot: () => ({ ok: true, processes: [] }), pressure: () => ({ available: false }) });
@@ -49,12 +52,12 @@ function typedRequest() {
       frameProcessId: 4, frameRoutingId: 5, documentToken: '1234567890abcdef12345678' } };
 }
 
-test('actual flight recorder preserves startup, active/duplicate, incident and group cooldown, rolling quota and stopped rejects', async t => {
+test('actual manual admission preserves startup/active/stopped guards while removing daily and metadata cooldown limits', async t => {
   await t.test('warmup and duplicate', t => {
     const f = flightFixture(t);
     assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'startup-warmup');
     assert.equal(f.requests.length, 0);
-    assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'merged-into-active-incident');
+    assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'startup-warmup');
   });
   await t.test('manual slot remains available after automatic quota exhaustion', t => {
     const f = flightFixture(t); f.advance(61000);
@@ -64,11 +67,11 @@ test('actual flight recorder preserves startup, active/duplicate, incident and g
     }
     const result = f.flight.requestManualCapture(typedRequest());
     assert.equal(result.allowed, true); assert.equal(result.group, 'manual');
-    assert.equal(result.remaining, 0); assert.equal(f.requests.length, 1);
+    assert.equal(result.remaining, null); assert.equal(f.requests.length, 1);
     assert.equal(f.flight.artifacts.entries().filter(e => e.name.endsWith('.capture.json')).length, 5);
     f.advance(100000);
-    assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'manual-rolling-quota-exhausted');
-    assert.equal(f.requests.length, 1);
+    assert.equal(f.flight.requestManualCapture(typedRequest()).allowed, true);
+    assert.equal(f.requests.length, 2);
   });
   await t.test('same admission and new manual kind; duplicate cannot merge/adopt', t => {
     const f = flightFixture(t); f.advance(61000);
@@ -80,9 +83,8 @@ test('actual flight recorder preserves startup, active/duplicate, incident and g
     assert.equal(receipt.kind, 'manual'); assert.equal(receipt.group, 'manual');
     assert.equal(f.flight.requestManualCapture(typedRequest()).allowed, false); assert.equal(f.requests.length, 1);
     f.advance(82000);
-    assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'incident-window-cooldown');
-    f.advance(100000);
-    assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'manual-rolling-quota-exhausted');
+    assert.equal(f.flight.requestManualCapture(typedRequest()).allowed, true);
+    assert.equal(f.requests.length, 2);
     f.flight.stop(); assert.equal(f.flight.requestManualCapture(typedRequest()).reason, 'recorder-stopped');
   });
 });
@@ -123,7 +125,7 @@ function profileFixture(t, options = {}) {
   const inspector = { url: () => undefined, Session };
   const exports = load('perf-incident-profile.js', {}, {
     setTimeout: (fn, ms) => {
-      if (ms !== 10000) return setTimeout(fn, ms);
+      if (ms !== 10000 && !(options.inputPreset && ms > 10000 && ms <= 40000)) return setTimeout(fn, ms);
       const timer = { fn, ms, cancelled: false }; timers.push(timer);
       if (!options.holdDuration) queueMicrotask(fn);
       return timer;
@@ -131,10 +133,11 @@ function profileFixture(t, options = {}) {
   });
   const wc = { debugger: dbg, isDestroyed: () => false, isDevToolsOpened: () => false,
     getOSProcessId: () => 123, getZoomFactor: () => 1 };
-  const request = { ...typedRequest(), t: 'capture', id: 'incident-123-456', pid: 123 };
+  const durationMs = options.inputPreset ? 40000 : 10000;
+  const request = { ...typedRequest(), durationMs, t: 'capture', id: 'incident-123-456', pid: 123 };
   return { dir, calls, ready, wc, guard, timers, exports, inspector,
     resolveStart: () => startResolve(),
-    start: extra => exports.captureIncidentProfile({ request, directory: dir, webContents: wc, durationMs: 10000,
+    start: extra => exports.captureIncidentProfile({ request, directory: dir, webContents: wc, durationMs,
       ownerGuard: guard, inspector, log() {}, onReady: value => ready.push({ value, calls: calls.slice() }), ...extra }) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -224,10 +227,10 @@ test('status save failure cannot report completed and preserves the preexisting 
   assert.equal(f.calls.filter(x => x === 'detach').length, 1);
 });
 
-test('SOURCE Main listener and SOURCE watchdog message handler route manual once through actual recorder admission', async t => {
+for (const durationMs of [10000, 40000]) test('SOURCE menu/Main/watchdog route manual' + durationMs + ' through actual recorder', async t => {
   const f = flightFixture(t); f.advance(61000);
   const child = new EventEmitter(), watchdogProcess = new EventEmitter(); child.connected = true;
-  const profilePort = profileFixture(t);
+  const profilePort = profileFixture(t, { inputPreset: durationMs === 40000 });
   const wc = new EventEmitter(), win = new EventEmitter();
   Object.assign(wc, profilePort.wc, { id: 8, mainFrame: { processId: 4, routingId: 5, osProcessId: 123 },
     isDestroyed: () => false, isLoadingMainFrame: () => false, getOSProcessId: () => 123 });
@@ -260,15 +263,17 @@ test('SOURCE Main listener and SOURCE watchdog message handler route manual once
     + '}}).requestCapture', wdScope);
   f.forward(forward);
   vm.runInContext(body('main.js', '  installManualCaptureMenu({ Menu,', '\n\n'), scope);
-  assert.equal(menu.items.length, 1); assert.equal(menu.items[0].submenu.items.length, 1);
-  const click = menu.items[0].submenu.items[0].click;
+  assert.equal(menu.items.length, 1); assert.equal(menu.items[0].submenu.items.length, 2);
+  const click = menu.items[0].submenu.items[durationMs === 40000 ? 1 : 0].click;
   assert.equal(click(null, win), true);
   await flush(); // The global native-observer retirement is now awaited before capture.
   assert.ok(completion, 'capture starts after all native observers release their owned channels');
-  assert.equal((await completion).outcome, 'completed');
+  const captureResult = await completion;
+  assert.equal(captureResult.outcome, 'completed', JSON.stringify({ errors: captureResult.errors,
+    projection: captureResult.traceProjection }));
   await flush();
   assert.equal(f.requests.length, 1); assert.equal(captures.length, 1);
-  assert.equal(captures[0].webContents, wc); assert.equal(captures[0].durationMs, 10000);
+  assert.equal(captures[0].webContents, wc); assert.equal(captures[0].durationMs, durationMs);
   assert.equal(captures[0].request.t, 'capture'); assert.equal(captures[0].request.kind, 'manual');
   assert.equal(captures[0].ownerGuard.owner.webContentsId, 8);
   assert.equal(counters.suspend, 1); assert.equal(counters.resume, 1);

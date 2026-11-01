@@ -47,7 +47,7 @@ test('synchronized redraw start revokes readiness and exact frame end may renew 
   );
   assert.match(
     mainSource,
-    /function observeClaudeSynchronizedFrameFlushed[\s\S]{0,1800}parseClaudeComposerCurrentFrame\(snapshot\)[\s\S]{0,500}claudePromptStability\.markStable\(/,
+    /function observeClaudeSynchronizedFrameFlushed[\s\S]{0,1800}parseClaudeComposerCurrentFrame\(snapshot\)[\s\S]{0,2600}claudePromptStability\.markStable\(/,
   );
 });
 

@@ -35,7 +35,7 @@ const reviewerDefinition = JSON.parse(await fs.readFile(reviewerDefinitionPath, 
 if (process.env.NOTED_MINI_REVIEW_PROMPT_FILE && !reviewerDefinition.filePaths.includes(path.resolve(process.env.NOTED_MINI_REVIEW_PROMPT_FILE)))
   throw Error('Instruction snapshot pins its linked files; an override needs explicit new preparation.');
 const { resolveMiniOrchestratorInstruction } = require('../src/main/mini-orchestrator-runtime');
-const resolvedReviewer = await resolveMiniOrchestratorInstruction({ prompt: reviewerDefinition, settings: reviewerDefinition });
+const resolvedReviewer = await resolveMiniOrchestratorInstruction({ prompt: reviewerDefinition, settings: reviewerDefinition, automaticCorrections: admission.replayPrepared });
 if (require('node:crypto').createHash('sha256').update(resolvedReviewer.text).digest('hex') !== replay.instruction.sha256)
   console.warn('[MiniDEV] Новые проверки используют текущую связанную инструкцию; сохранённые результаты и snapshots не переписываются.');
 const replayProfilePath = replay.privateProfile?.profileFile && path.isAbsolute(replay.privateProfile.profileFile)
@@ -99,6 +99,7 @@ const env = { ...process.env, NODE_ENV: 'development',
   CODEX_HOME: path.join(root, 'codex'), CLAUDE_CONFIG_DIR: path.join(root, 'claude'), TMPDIR: path.join(root, 'tmp'),
   NOTED_RENDERER_HOST: '127.0.0.1', NOTED_RENDERER_PORT: String(rendererPort), NOTED_WEB_PORT: String(apiPort), NOTED_CDP_PORT: String(cdpPort),
   NOTED_MINI_REVIEW_PROMPT_FILE: promptFile, NOTED_MINI_GEMINI_API_KEY: miniKey,
+  NOTED_MINI_AUTOMATIC_CORRECTIONS: admission.replayPrepared ? '1' : '0',
   NOTED_MINI_READ_ONLY_CODEX: '1' };
 if (replayProfile) env.NOTED_MINI_REPLAY_PROFILE = replayProfilePath;
 else delete env.NOTED_MINI_REPLAY_PROFILE;
@@ -233,14 +234,16 @@ try {
   };
   if (replayProfile?.presentationOnly) {
     const fixture = JSON.parse(await fs.readFile(path.join(root, 'fixture.json'), 'utf8'));
-    if (!fixture.presentationOnly || fixture.guide !== replayProfile.tabId || fixture.cases?.length !== 2)
-      throw Error('Two prepared read-only result tabs are unavailable');
+    if (!fixture.presentationOnly || fixture.guide !== replayProfile.tabId || !Array.isArray(fixture.cases)
+      || fixture.cases.length < 1 || fixture.cases.length > 4 || fixture.cases.length !== replayProfile.cases?.length
+      || fixture.cases.some((item, index) => item.tabId !== replayProfile.cases[index].tabId || item.sessionId !== replayProfile.cases[index].sessionId))
+      throw Error('Prepared read-only result tabs are unavailable');
     // Presentation-only setup. This opens the existing Mini popup; it never
     // starts a provider, sends a prompt or claims a tested native gesture.
     await client.call('Runtime.evaluate', { returnByValue: true,
       expression: `window.dispatchEvent(new CustomEvent('mini-orchestrator:open',{detail:{tabId:${JSON.stringify(replayProfile.tabId)}}}))` }, sessionId);
-    console.log('\n[MiniDEV] Две готовые вкладки: ' + fixture.cases.map(item => item.name).join(' / '));
-    console.log('[MiniDEV] В каждой уже есть настоящий Codex exec и Gemini review. Откройте робота1, если чат закрыт.');
+    console.log('\n[MiniDEV] Готовые вкладки (' + fixture.cases.length + '): ' + fixture.cases.map(item => item.name).join(' / '));
+    console.log('[MiniDEV] Сохранённые ответы Codex и реальные Gemini review уже подготовлены. Откройте робота1, если чат закрыт.');
     console.log('[MiniDEV] Новые модельные запросы не отправлялись; повтор сохраняет ваши изменения.\n');
   } else {
   preparationStage = 'выбор Luna из каталога';

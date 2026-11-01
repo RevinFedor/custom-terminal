@@ -64,6 +64,10 @@ export interface AgentPtyPresence {
   lastNotReady?: any;
   startupFailed?: boolean;
   startupError?: string | null;
+  // Main-proven: the failed startup setting never reached the provider (our
+  // Ctrl+G helper timed out, Enter was withheld). No delivery, no provider
+  // verdict — so this must not block later sends, unlike a real rejection.
+  startupNotDelivered?: boolean;
   manualActionRequired?: boolean;
   manualActionType?: string | null;
   lifecycleWarning?: {

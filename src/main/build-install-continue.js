@@ -7,6 +7,20 @@ const SNAPSHOT_VERSION = 1;
 const SUPPORTED_PROVIDERS = new Set(['claude', 'codex']);
 const INSTALL_BINDING_PROTOCOL = 'voice-install-shutdown-binding-v1';
 let installBindingReader = null;
+let buildContinueBindingReader = null;
+function registerBuildContinueShutdownBindings(reader) {
+  if (typeof reader !== 'function' || buildContinueBindingReader && buildContinueBindingReader !== reader) {
+    throw Error('build_continue_shutdown_binding_owner_conflict');
+  }
+  buildContinueBindingReader = reader;
+  return () => { if (buildContinueBindingReader === reader) buildContinueBindingReader = null; };
+}
+function exactBuildContinueBindings(value) {
+  if (!Array.isArray(value) || value.some(row => typeof row?.operationId !== 'string'
+    || !/^[a-f0-9]{64}$/.test(row.captureDigest || '') || !/^[a-f0-9]{64}$/.test(row.evidenceDigest || ''))
+    || new Set(value.map(row => row.operationId)).size !== value.length) throw Error('build_continue_shutdown_binding_invalid');
+  return value.map(row => ({ operationId: row.operationId, captureDigest: row.captureDigest, evidenceDigest: row.evidenceDigest }));
+}
 function registerInstallShutdownBindings(reader) {
   if (typeof reader !== 'function' || installBindingReader && installBindingReader !== reader) {
     throw Error('install_shutdown_binding_owner_conflict');
@@ -34,6 +48,7 @@ function createShutdownInterruptedSnapshot(entries, {
   // Main still owns the process census and durable snapshot write. The reader
   // only adds identifiers of a cut already committed by the common executor.
   const bindings = exactInstallBindings(installBindings || installBindingReader?.() || []);
+  const buildContinueBindings = exactBuildContinueBindings(buildContinueBindingReader?.() || []);
   const targets = [];
   const unresolved = [];
   const seen = new Set();
@@ -69,6 +84,7 @@ function createShutdownInterruptedSnapshot(entries, {
     targets,
     unresolved,
     ...(bindings.length ? { installBindings: bindings } : {}),
+    ...(buildContinueBindings.length ? { buildContinueBindings } : {}),
   };
 }
 
@@ -166,6 +182,7 @@ function resolveStartupInterruptedSnapshot({
       targets,
       unresolved,
       ...(exactSnapshot.installBindings ? { installBindings: exactInstallBindings(exactSnapshot.installBindings) } : {}),
+      ...(exactSnapshot.buildContinueBindings ? { buildContinueBindings: exactBuildContinueBindings(exactSnapshot.buildContinueBindings) } : {}),
     };
   }
 
@@ -209,6 +226,7 @@ module.exports = {
   SNAPSHOT_VERSION,
   INSTALL_BINDING_PROTOCOL,
   registerInstallShutdownBindings,
+  registerBuildContinueShutdownBindings,
   createShutdownInterruptedSnapshot,
   resolveStartupInterruptedSnapshot,
 };

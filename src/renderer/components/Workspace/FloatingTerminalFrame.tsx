@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BringToFront, Undo2, SquareTerminal, X } from 'lucide-react';
+import { BringToFront, Undo2 } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -350,66 +350,47 @@ export default function FloatingTerminalFrame({
         <div
           data-floating-terminal-titlebar
           style={{
-            height: floating ? 30 : 0,
+            // Высоты нет: полоса больше ничего не показывает, кроме одной
+            // абсолютной кнопки, и прежние 30px отнимали их у терминала.
+            height: 0,
             // The stable PTY stage moves up behind the composer. Its controls
             // must stay at the visible pane top; translating chrome alone
             // keeps the body size/rows and retained xterm untouched.
             position: 'relative',
-            zIndex: 2,
+            // Выше служебного слоя Run after (140) этой же области: иначе его
+            // полоска накрывала кнопку, и нажать её удавалось не всегда.
+            zIndex: 141,
             transform: floating && open && !fullView
               ? `translateY(${-stageOffsets.translateY + HISTORY_TOP_CHROME_INSET}px)` : undefined,
             // НЕ 'visible': явное значение перебивало бы visibility:hidden
             // обёртки окна чужого пространства (TerminalArea) — шапка панели
             // просвечивала бы из скрытого пространства. undefined наследует.
             visibility: floating ? undefined : 'hidden',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 7,
-            padding: '0 6px 0 12px',
-            borderBottom: floating ? '1px solid #333' : 'none',
-            background: '#191919',
-            color: '#8a8a8f',
+            // Сквозной носитель: площадь без фона не должна отнимать у
+            // терминала под ней ни колесо, ни выделение. Клики принимает
+            // только сама кнопка.
+            pointerEvents: 'none',
             flexShrink: 0,
             boxSizing: 'border-box',
           }}
         >
-          {/* Icon only, no tab name: this titlebar labels a SURFACE ("this is
-              the terminal"), not a tab. The tab is already named in the pane
-              header right above, and repeating it here read as a second,
-              competing tab chip. */}
-          <SquareTerminal size={13} />
-          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {fullView ? tabName : null}
-          </div>
+          {/* Одна кнопка вместо прежней полосы.
+              Полоса называла поверхность («это терминал») иконкой, повторяла
+              имя вкладки и добавляла крестик — всё это уже есть в шапке панели
+              прямо над ней, поэтому читалось как вторая, конкурирующая шапка.
+              Осталось единственное действие, которого больше нигде нет:
+              поднять терминал поверх окон. Кнопка абсолютная, поэтому не
+              растягивает ряд и не занимает высоту; фиолетовая заливка отделяет
+              её от содержимого терминала под ней. */}
           <ControlHint label={fullView ? 'Вернуть терминал в окно' : 'Показать терминал поверх окон'}>
             <button type="button" data-terminal-full-view-toggle={tabId || ''}
               aria-label={fullView ? 'Вернуть терминал в окно' : 'Показать терминал поверх окон'}
               onPointerDown={event => event.preventDefault()}
               onClick={fullView ? closeFullView : openFullView}
-              style={{width:24,height:24,border:0,padding:0,background:'transparent',color:fullView?'#c4b5fd':'#8a8a8f',
+              style={{position:'absolute',right:6,top:2,width:24,height:24,padding:0,borderRadius:4,
+                border:'1px solid #a78bfa',background:'#2b2340',color:'#c4b5fd',pointerEvents:'auto',
                 display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
               {fullView ? <Undo2 size={14} /> : <BringToFront size={14} />}
-            </button>
-          </ControlHint>
-          <ControlHint label="Закрыть терминал">
-            <button
-              type="button"
-              aria-label="Hide terminal"
-              onClick={() => { closeFullView(); if (floating) onClose(); }}
-              style={{
-                width: 24,
-                height: 24,
-                border: 0,
-                background: 'transparent',
-                color: '#8a8a8f',
-                padding: 0,
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <X size={14} />
             </button>
           </ControlHint>
         </div>

@@ -260,10 +260,18 @@ export async function prepareAgentRuntimeForSend({
     if (action) throw Object.assign(new Error(action.message), action, {
       submitted: false, pasteWritten: false, enterWritten: false,
     });
-    if (presence?.startupFailed) throw Object.assign(new Error(
-      presence.startupError || runtime.label + ' startup failed before send'), {
-      code: 'agent_send_startup_failed', submitted: false, pasteWritten: false, enterWritten: false,
-    });
+    // A failed startup setting is REPORTED, not enforced: it does not block a
+    // later Send. The failure is terminal and sticky until the process
+    // restarts, so blocking turned one refused `/model` into a tab that could
+    // not receive anything. Incident 2026-10-31, tab 2efc9b9b7a35: a 429 on
+    // `/model` at 10:45:33 refused every send for 2h20m (13:06:34, 13:06:42,
+    // 13:06:59) until a restart cleared the gate at 13:07:02; dismissing the
+    // error did not help and a manual retry hit the same limit. The setting
+    // simply is not applied — the control bar shows the model actually in
+    // effect and the settings card names the exact failure.
+    // Main still marks a never-delivered local failure (`startupNotDelivered`)
+    // apart from a real provider verdict for presentation and diagnostics, and
+    // the separate repeated-403 stop policy is untouched.
   };
   const waitStartupGate = async () => {
     await providerContract.waitForStartupGate(tabId, 'agent-send');

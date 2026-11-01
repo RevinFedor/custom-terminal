@@ -1,5 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
+import { attributeFreeze, recentRendererActivities, markRendererActivity } from './rendererActivityTrail';
 import { reportPerfIncident, setPerfIncidentWriter, sendPerfHeartbeat, createPerfSocketWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
 import { rendererSyncWork, reportRendererSyncWork } from './perfSyncWork.mjs';
@@ -48,6 +48,120 @@ function absNow(): number {
 // Freeze attribution lives in its own dependency-free module so hot paths can
 // leave a mark without importing this probe (and, through it, the stores).
 export { markRendererActivity } from './rendererActivityTrail';
+
+/**
+ * Names the work that arrives from main.
+ *
+ * 63 long tasks totalling 7.7s in one 2-hour boot reported
+ * `during=none-marked recent=none`: nothing in the app claimed them, and the
+ * platform reports `attribution=unknown` for all same-origin script work. The
+ * renderer has 241 separate `ipcRenderer.on` registrations and no shared
+ * dispatcher, so marking them one by one is neither reviewable nor complete.
+ *
+ * Instead this wraps the ONE place every listener goes through — the emitter
+ * on ipcRenderer — so each delivered channel leaves a mark named after the
+ * channel. It changes nothing about delivery: the original listener is called
+ * with the original arguments, its return value is passed through, and a
+ * throwing listener still throws after the mark is closed.
+ *
+ * Sampling: cheap channels fire thousands of times per minute and the trail
+ * only holds 80 entries, so a mark is opened only when the previous delivery
+ * of that channel was slow enough to matter, or periodically. Otherwise a
+ * flood of 0.1ms deliveries would evict the very activity a freeze needs
+ * named.
+ */
+export function installIpcDeliveryAttribution(log: (line: string) => void): void {
+  let ipc: any = null;
+  try { ipc = (window as any).require?.('electron')?.ipcRenderer; } catch { return; }
+  if (!ipc || typeof ipc.on !== 'function' || (ipc as any).__notedIpcAttribution) return;
+
+  const MARK_THRESHOLD_MS = 8;
+  const RESAMPLE_EVERY = 64;
+  const stats = new Map<string, { slowUntil: number; seen: number; worstMs: number }>();
+  const wrapped = new WeakMap<Function, Function>();
+
+  // ipcRenderer is a plain EventEmitter: a listener that throws stops every
+  // later listener of the same event. One faulty subscriber therefore starved
+  // History of `agent-transcript:changed` / `live-message` in production
+  // (01.11: 141 main events, zero History refreshes), and nothing was logged
+  // because the renderer had no error forwarding. Isolate and report instead.
+  const errorCounts = new Map<string, number>();
+  const callIsolated = (channel: string, listener: Function, self: unknown, args: unknown[]) => {
+    try {
+      return listener.apply(self, args);
+    } catch (error: any) {
+      const key = channel + '|' + String(error?.message || error).slice(0, 160);
+      const count = (errorCounts.get(key) || 0) + 1;
+      errorCounts.set(key, count);
+      if (count <= 3 || count % 100 === 0) {
+        log('[IpcListenerError] channel=' + channel + ' count=' + count
+          + ' listener=' + (listener.name || 'anonymous')
+          + ' error=' + String(error?.message || error).slice(0, 300)
+          + ' stack=' + String(error?.stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 400));
+      }
+      return undefined;
+    }
+  };
+
+  const instrument = (channel: string, listener: Function): Function => {
+    const existing = wrapped.get(listener);
+    if (existing) return existing;
+    const instrumented = function (this: unknown, ...args: unknown[]) {
+      let stat = stats.get(channel);
+      if (!stat) { stat = { slowUntil: 1, seen: 0, worstMs: 0 }; stats.set(channel, stat); }
+      stat.seen++;
+      // Mark while this channel is known-slow, and re-sample periodically so a
+      // channel that becomes slow later is not silently trusted forever.
+      const shouldMark = stat.seen <= stat.slowUntil || stat.seen % RESAMPLE_EVERY === 0;
+      if (!shouldMark) return callIsolated(channel, listener, this, args);
+      const startedAt = performance.now();
+      // Diagnostics must never break delivery: 01.11 an unbound name here threw
+      // on every marked event and starved every later subscriber (History).
+      let endMark: () => void = () => {};
+      try { endMark = markRendererActivity('ipc:' + channel); } catch { /* attribution only */ }
+      try {
+        return callIsolated(channel, listener, this, args);
+      } finally {
+        try { endMark(); } catch { /* attribution only */ }
+        const elapsedMs = performance.now() - startedAt;
+        // Keep marking a channel that just cost real time; a cheap one drops
+        // back to periodic sampling.
+        if (elapsedMs >= MARK_THRESHOLD_MS) stat.slowUntil = stat.seen + 16;
+        if (elapsedMs > stat.worstMs) {
+          stat.worstMs = elapsedMs;
+          if (elapsedMs >= 50) {
+            log('[Perf:IpcDelivery] channel=' + channel +
+              ' handlerMs=' + elapsedMs.toFixed(1) +
+              ' deliveries=' + stat.seen + ' ' + getContext());
+          }
+        }
+      }
+    };
+    wrapped.set(listener, instrumented);
+    return instrumented;
+  };
+
+  for (const method of ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'] as const) {
+    const original = ipc[method];
+    if (typeof original !== 'function') continue;
+    ipc[method] = function (this: unknown, channel: string, listener: Function, ...rest: unknown[]) {
+      if (typeof listener !== 'function') return original.call(this, channel, listener, ...rest);
+      return original.call(this, channel, instrument(channel, listener), ...rest);
+    };
+  }
+  // Removal must find the SAME wrapper that was registered, otherwise a
+  // component unmount would leave its listener attached forever.
+  for (const method of ['off', 'removeListener'] as const) {
+    const original = ipc[method];
+    if (typeof original !== 'function') continue;
+    ipc[method] = function (this: unknown, channel: string, listener: Function, ...rest: unknown[]) {
+      const instrumented = typeof listener === 'function' ? wrapped.get(listener) : null;
+      return original.call(this, channel, instrumented || listener, ...rest);
+    };
+  }
+  Object.defineProperty(ipc, '__notedIpcAttribution', { value: true, configurable: true });
+  log('[Perf:Probe] ipcDeliveryAttribution=1 thresholdMs=' + MARK_THRESHOLD_MS + ' resampleEvery=' + RESAMPLE_EVERY);
+}
 
 type LoopSample = {
   abs: number;
@@ -211,6 +325,8 @@ export function installPerfFreezeProbe() {
       onFinalPageHide(() => { delete (window as any).__notedSyncWorkPilot; });
     }
   } catch { /* no private test surface in a browser or ordinary production */ }
+
+  installIpcDeliveryAttribution(log);
 
   const supported = PerformanceObserver.supportedEntryTypes || [];
   log(

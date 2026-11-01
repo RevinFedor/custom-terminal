@@ -5139,6 +5139,10 @@ function Timeline({
   const navigatePreviewRecord = (identity: string | null) => {
     if (!identity || activeTooltipIndex === null) return;
     const index = activeTooltipIndex;
+    // Same synchronous three-write commit as the dot path above; attribute it
+    // so a freeze here is never reported as unnamed work.
+    const endSeekMark = markRendererActivity('timeline-seek:' + tabId.slice(-8));
+    requestAnimationFrame(() => endSeekMark());
     if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
     setHistoryScrollToUuid(identity, tabId);
     setClickedState({ index, status: 'loading' });
@@ -5222,6 +5226,13 @@ function Timeline({
       const index = entries.findIndex(e => e.uuid === entry.uuid);
       const targetUuid = getHistoryPanelTargetUuid(entry, index);
       if (e) e.stopPropagation();
+      // This click writes three store fields in one synchronous commit
+      // (panel-open, seek target, dot state) and every subscriber re-renders
+      // inside the SAME task, before the dot loader can paint. Without a mark
+      // the whole cost landed in `during=none-marked` — a 452ms task at
+      // 13:37:48.8 UTC on the installed build named nothing at all.
+      const endSeekMark = markRendererActivity('timeline-seek:' + tabId.slice(-8));
+      requestAnimationFrame(() => endSeekMark());
       if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
       setHistoryScrollToUuid(targetUuid, tabId);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +

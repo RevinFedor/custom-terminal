@@ -21,6 +21,20 @@ const observe = part('function observeMiniOrchestratorCodex(', 'for (const [chan
 const release = part('async function publishCodexSuppressedCatchUpRelease(', 'function releaseCodexSourceObservationAfterWriterProof(');
 const identity = (s, r, prefix) => `${prefix}-source-${s.sessionId}-${r.__byteOffset}`;
 const tick = () => new Promise(resolve => setImmediate(resolve));
+test('actual Main enables automatic return only for the explicit private DEV flag, not ordinary app or generic E2E', () => {
+  const body = part('function getMiniOrchestratorRuntime(', 'function miniOrchestratorSendFailure(');
+  for (const [env, expected] of [[{}, false], [{ NOTED_MINI_AUTOMATIC_CORRECTIONS: '1' }, false],
+    [{ NOTED_E2E_TEST: 'true' }, false], [{ NOTED_E2E_TEST: 'true', NOTED_MINI_AUTOMATIC_CORRECTIONS: '1' }, false],
+    [{ NOTED_E2E_TEST: 'true', NOTED_MINI_REPLAY_PROFILE: '/own/private/PROFILE.json', NOTED_MINI_AUTOMATIC_CORRECTIONS: '1' }, true]]) {
+    let captured;
+    const context = { process: { env }, path, srcMainDir: __dirname, projectManager: { db: {} }, systemPromptService: {},
+      miniOrchestratorRuntime: null, miniOrchestratorHookRelease: null, readMiniOrchestratorOwner() { return null; },
+      getAgentResponseObservationReader: () => ({ onAgentResponseCompletion: () => () => {} }),
+      require: () => ({ createMiniOrchestratorRuntime: options => { captured = options; return {}; } }) };
+    vm.runInNewContext(body + '\ngetMiniOrchestratorRuntime();', context);
+    assert.equal(captured.automaticCorrections, expected);
+  }
+});
 function fixture({ legacyGate = false, correction = false, legacyCarrierDedup = false } = {}) {
   const terminal = {}, tabId = 'own-mini-tab', generation = 'own-physical:1';
   const state = { tabId, sessionId: 'own-sid', processGeneration: generation, sourceObservationTerminal: terminal,

@@ -20,11 +20,29 @@ export const PREPARE_SCRIPTS = ['build:markdown', 'build:mobile', 'build', 'sign
 export const INSTALL_READY_PREFIX = '[NotedInstall:ready-to-quit] ';
 export const INSTALL_RESULT_PREFIX = '[NotedInstall:result] ';
 
-export function runCommand(command, args, { cwd, signal, capture = false } = {}) {
+// `open` hands the caller's environment to the launched app. When the install
+// runs from an AI session, that session's markers leak into Noted and into
+// every PTY it spawns. 2026-11-01: an install run from a Claude Code Bash tool
+// gave the app CLAUDECODE / CLAUDE_CODE_CHILD_SESSION / CLAUDE_CODE_SESSION_ID
+// / CLAUDE_PID / NOTED_MCP_IDENTITY, and every Claude started in its tabs
+// printed "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION
+// marker": no JSONL, so no Send confirmation, no `/model` proof, no History.
+// Strip exactly those session markers; everything else is passed through.
+const AI_SESSION_ENV_EXACT = new Set(['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'NOTED_MCP_IDENTITY']);
+export function appLaunchEnv(source = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(source || {})) {
+    if (AI_SESSION_ENV_EXACT.has(key) || key.startsWith('CLAUDE_CODE_')) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
+export function runCommand(command, args, { cwd, signal, capture = false, env } = {}) {
   return new Promise((resolve, reject) => {
     checkAbort(signal);
     const grouped = process.platform !== 'win32';
-    const child = spawn(command, args, { cwd, detached: grouped, stdio: ['ignore', capture ? 'pipe' : 'inherit', capture ? 'pipe' : 'inherit'] });
+    const child = spawn(command, args, { cwd, ...(env ? { env } : {}), detached: grouped, stdio: ['ignore', capture ? 'pipe' : 'inherit', capture ? 'pipe' : 'inherit'] });
     let output = '';
     let killTimer;
     const kill = (kind) => {
@@ -298,6 +316,7 @@ export async function buildInstallNotedTerminal({
   earlyQuitSource = null,
   appOwnedQuitSource = null,
   confirmClosedSource = null,
+  inspectQuitSource = null,
   validateContinuationCandidate = null,
   beforeReplace = async () => {},
   onPhase = () => {},
@@ -414,7 +433,23 @@ export async function buildInstallNotedTerminal({
       if (!quitBeforePrepare) {
         if (appOwnedQuitSource) await run('bash', ['scripts/graceful-quit.sh', '20', '--require-graceful', '--wait-only',
           String(appOwnedQuitSource.server.pid)], { cwd: projectDir });
-        else await runStep('bash', ['scripts/graceful-quit.sh', '20'], { signal: undefined });
+        else {
+          // Plain CLI: Quit the exact live Main, re-read right before Quit.
+          // The path-wide wait also matched the detached MCP hub (same
+          // executable): every install waited the full deadline and the
+          // SIGTERM fallback killed the hub that must survive app updates.
+          // An unknown read keeps the legacy path-wide flow.
+          const live = inspectQuitSource
+            ? await Promise.resolve().then(() => inspectQuitSource()).catch(() => null) : null;
+          const pid = live?.status === 'found' && Number.isInteger(live.server?.pid) && live.server.pid > 0
+            ? live.server.pid : null;
+          if (live?.status === 'absent') log('quit skipped: Main already closed; the shared hub is not Main');
+          else {
+            if (!pid) log('quit uses the path-wide fallback: Main identity ' + (live?.status || 'not inspected'));
+            await runStep('bash', ['scripts/graceful-quit.sh', '20', ...(pid ? ['', '', String(pid)] : [])],
+              { signal: undefined });
+          }
+        }
         earlyQuitConfirmed = true;
       }
     }
@@ -434,7 +469,7 @@ export async function buildInstallNotedTerminal({
     step = 'launch';
     launchAttempted = true;
     onPhase({ stage: 'launching', step });
-    await runStep('/usr/bin/open', [installedApp, ...(maintenance?.launchArguments?.() || [])]);
+    await runStep('/usr/bin/open', [installedApp, ...(maintenance?.launchArguments?.() || [])], { env: appLaunchEnv() });
     if (maintenance) {
       step = 'maintenance-complete';
       onPhase({ stage: 'verifying', step });
@@ -488,7 +523,7 @@ export async function buildInstallNotedTerminal({
           previousMoved = false;
         }
         if (await exists(installedApp, fileSystem)) {
-          await run('/usr/bin/open', [installedApp, ...(ownedQuitSource ? maintenance?.launchArguments?.() || [] : [])], { cwd: projectDir });
+          await run('/usr/bin/open', [installedApp, ...(ownedQuitSource ? maintenance?.launchArguments?.() || [] : [])], { cwd: projectDir, env: appLaunchEnv() });
           recovery = { status: 'previous-app-reopened', path: installedApp };
           log('reopened previous installed app at ' + installedApp);
         } else recovery = { status: 'no-previous-app', path: null };
@@ -547,6 +582,7 @@ export async function main({ projectDir = projectRoot, install = buildInstallNot
   }
   try {
     let confirmClosedSource = null;
+    let inspectQuitSource = null;
     if (!nonce && !voiceContinuation) {
       const source = await inspect();
       checkAbort(controller.signal);
@@ -555,9 +591,14 @@ export async function main({ projectDir = projectRoot, install = buildInstallNot
       }
       if (source.status === 'absent') confirmClosedSource = () => inspect();
     }
+    // Plain CLI with a live Main and the ordinary (non-continuation) Voice/MCP
+    // job both re-read the exact Main right before Quit; the continuation
+    // already owns its captured PID and a closed source never receives Quit.
+    if (!voiceContinuation && !confirmClosedSource) inspectQuitSource = () => inspect();
     const result = await install({
       projectDir,
       ...(confirmClosedSource ? { confirmClosedSource } : {}),
+      ...(inspectQuitSource ? { inspectQuitSource } : {}),
       ...(voiceContinuation ? { appOwnedQuitSource: voiceContinuation.source,
         validateContinuationCandidate: voiceContinuation.validateCandidate } : {}),
       signal: controller.signal,

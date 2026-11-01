@@ -47,12 +47,19 @@ unconfigured, но не запускает пакет и не блокирует
 `override_conflict`, остальные сохраняются. Совпадающий путь допустим.
 
 Для knowledge источник default-модели — сам `knowledge-server.mjs`:
-`gpt-6-luna`, Codex exec, effort low. SOURCE hub resolver больше не добавляет
-отдельный fallback модели; явный `KNOWLEDGE_CODEX_MODEL` сохраняется. Обновлённый
+`gpt-6-luna`, Codex exec, effort low. Hub resolver сохраняет прежний registration
+token `KNOWLEDGE_CODEX_MODEL=gpt-5.6-luna` ради Browser authority digest; это не
+фактически исполняемая модель. Явный `KNOWLEDGE_CODEX_MODEL` сохраняется. Обновлённый
 knowledge helper переводит прежний environment-default `gpt-5.6-luna` на Luna6,
 так что старую detached Map не нужно менять ради одной модели. Другие модели ENV
 и explicit per-call model остаются отдельным выбором. Это не разрешение менять
 остальные bindings; после обновления helper достаточно idle restart knowledge.
+
+Не удалять такой compatibility key ради косметической чистоты ENV: общий
+fingerprint включает определения и status/provenance всех соседей. Даже перенос
+идентичной default binding в profile меняет source и подпись. При уже возникшем
+drift нужны восстановление точного descriptor и штатный согласованный handoff;
+нельзя переписывать receipt/journal или обходить held через restart Browser.
 
 Enabled entry сохраняет точные command, порядок args, env, stateful и reapMarker.
 args обязателен; env по умолчанию пустой; stateful по умолчанию true для electron/ios.

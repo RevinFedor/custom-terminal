@@ -24,6 +24,7 @@ import TabLinkedFiles, { useTabLinkedFiles, type LinkedFile } from './TabLinkedF
 import { isLinkedFilePreview } from '../../utils/tabLinkedFiles.mjs';
 import { useLinkedTitleLayout } from '../../utils/tabCardTitleMetrics';
 import { useCodexNativeQuestion } from '../../utils/codexNativeQuestions';
+import { useTabAwaitingInput } from '../../utils/claudeAwaitingInput';
 
 type Activity = { hasProcess: boolean; busy: boolean; inheritedBusy: boolean };
 export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
@@ -71,6 +72,9 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
 }, ref) {
   const [hovered, setHovered] = useState(false);
   const nativeQuestion = useCodexNativeQuestion(tabId);
+  // Claude is blocked on AskUserQuestion. Read per tab, not through a prop chain:
+  // this card is mounted by the sidebar, window chips and pickers alike.
+  const awaitingInput = useTabAwaitingInput(tabId);
   const [attachmentHovered, setAttachmentHovered] = useState(false);
   const cardHovered = hovered && !attachmentHovered;
   const linkedFiles = useTabLinkedFiles(tabId, !!onLinkedFileOpen);
@@ -190,6 +194,9 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     {cornerAdornment}
     {nativeQuestion && <span data-tab-codex-question-ring aria-hidden
       className="tab-codex-question-ring noted-infinite-animation" style={{ zIndex: 3 }} />}
+    {awaitingInput && <span data-tab-awaiting-ring aria-hidden
+      className="tab-awaiting-input noted-infinite-animation"
+      style={{ position: 'absolute', inset: 0, borderRadius: 'inherit', zIndex: 3 }} />}
     {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
     <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={cornerSignalZIndex} muted={muted} />
     <TabContextUpdateBadge active={contextUpdate} zIndex={cornerSignalZIndex} />

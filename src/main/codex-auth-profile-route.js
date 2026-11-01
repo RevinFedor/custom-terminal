@@ -95,6 +95,10 @@ function createCodexAuthProfileRoute({ configuration, readAuth, captureTab, now 
     return { launchId, headers: authorize(tabId, headers, launchId), forwardUrl: parts[2] || '/' };
   }
   return { bind, authorize, authorizeRequest, inspect, readCurrentAuth, launchOverrides,
+    newSessionOptions: cwd => {
+      if (cwd !== fixtureCwd) throw fail('codex_auth_route_scope_mismatch');
+      return { modelProvider: PROVIDER };
+    },
     childEnvironment: () => ({ [ROUTE_ENV]: routeToken }),
     assertCurrent: (tabId, launchId) => { currentBinding(tabId, launchId); readCurrentAuth(); },
     unbind: (tabId, launchId) => bindings.get(tabId)?.launchId === launchId && bindings.delete(tabId),

@@ -104,16 +104,35 @@ function classifyCodexCompactEvidence(record) {
   return { kind: 'none' };
 }
 
-// A successful explicit /compact has a durable compact record, not an
-// assistant final answer. Reuse that operation's exact owner/boundary proof
-// before publishing a generic no-final-result to workflow consumers.
+// A successful compact has a durable compact record, not an assistant final
+// answer. Reuse that operation's exact owner/boundary proof before publishing
+// a generic no-final-result to workflow consumers.
+//
+// Two shapes of the SAME proven result qualify, and both must, because Run
+// after treats a finished compact as part of its chain:
+//   - an explicit `/compact` command operation (`command === '/compact'`);
+//   - a provider/native autocompact phase (`source === 'provider-compaction'`),
+//     which the CLI starts on its own token threshold and which therefore never
+//     carries a user command string.
+// The operation may also already be settled when `task_complete` arrives: the
+// `compacted` record finishes a provider phase immediately, milliseconds before
+// the task callback. A settled operation is accepted only with an exact
+// `outcome:'completed', reason:'compacted'` result. Every identity and ordering
+// guard below is unchanged — they are what stops a foreign, older or still
+// unproven compact from passing as this turn's success.
 function projectCodexCompactTurnOutcome({ outcome, operation, record, state,
   lifecycleGeneration, terminal } = {}) {
+  const provenCompactSource = operation?.command === '/compact'
+    || operation?.source === 'provider-compaction';
+  const activeOrProvenSettled = operation?.active === true
+    || (operation?.active === false && operation.outcome === 'completed'
+      && operation.reason === 'compacted');
   if (outcome?.reason !== 'codex-no-final-result'
     || record?.payload?.type !== 'task_complete'
     || record.payload.error
-    || operation?.active !== true || operation.provider !== 'codex'
-    || operation.command !== '/compact'
+    || !operation || operation.provider !== 'codex'
+    || !activeOrProvenSettled
+    || !provenCompactSource
     || operation.tabId !== state?.tabId
     || !operation.sessionId || operation.sessionId !== state?.sessionId
     || !operation.generation || operation.generation !== state?.processGeneration

@@ -61,17 +61,19 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
   readInstallCallback = async () => null, adoptInstallCallback = async () => false,
   prepareReturns = async () => ({ ready: true }), cancelQueued = () => false,
   send, continueRun, reconcileRunContinuation = async () => {}, getRun, readReceipt, readQueued, readPrepared = () => null,
-  captureOne = null, changed = () => {}, now = Date.now, pid = process.pid, instanceId }) {
+  captureOne = null, captureCutOne = null, hasTaskCaptureShutdownOwner = () => true,
+  changed = () => {}, now = Date.now, pid = process.pid, instanceId }) {
   let saved, poisoned = false, disposed = false;
   const inflight = new Map(), trailing = new Set(), validationWaitReasons = new Map();
   let captureWork = null, captureId = null;
   const capturingTargets = new Set();
+  const captureControls = new Map();
   function load() {
     if (disposed || poisoned) throw failure('build_continue_persistence_unavailable');
     if (!saved) {
       let value;
       try { value = read(); } catch (error) { throw failure('build_continue_journal_unavailable'); }
-      if (value != null && (![1, 2, 3, 4].includes(value.version) || !Array.isArray(value.operations)
+      if (value != null && (![1, 2, 3, 4, 5].includes(value.version) || !Array.isArray(value.operations)
         || !value.operations.every(op => [1, 2].includes(op.version) && validId(op.id) && Number.isInteger(op.sourceMainPid)
           && (Number.isFinite(op.capturedAt) || op.version === 2 && Number.isFinite(op.registeredAt)
             && op.capturedAt === null && ['registered', 'settled'].includes(op.phase))
@@ -80,6 +82,15 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       for (const op of value?.operations || []) if (op.version === 2) {
         if (!sameVoiceInstallBinding(op.installBinding, op.installBinding)
           || op.installBinding.operationId !== op.id) throw failure('build_continue_journal_invalid');
+      }
+      for (const op of value?.operations || []) {
+        const declared = Object.hasOwn(op, 'captureProofVersion');
+        const privateData = op.captureDigest || op.taskShutdownEvidence || op.taskShutdownPreparation
+          || op.participants.some(p => p.captureTaskProof) || op.targets.some(target => target.captureTaskProofVersion);
+        if (declared && op.captureProofVersion !== 1 || !declared && privateData
+          || declared && (value.version < 5 || !/^[a-f0-9]{64}$/.test(op.captureDigest || ''))) {
+          throw failure('build_continue_journal_invalid');
+        }
       }
       saved = copy(value || { version: 1, operations: [] });
     }
@@ -90,7 +101,8 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     const value = copy(load()), index = value.operations.findIndex(op => op.id === operation.id);
     if (operation.version === 2) value.version = Math.max(value.version, 2); // Keep a prior cancellation envelope.
     if (operation.targets.some(target => target.cancellation?.requestedAt)) value.version = Math.max(value.version, 3);
-    if (value.version > 3 || operation.targets.some(target => target.continuationPrompt)) value.version = 4;
+    if (value.version > 3 || operation.targets.some(target => target.continuationPrompt)) value.version = Math.max(value.version, 4);
+    if (operation.captureProofVersion === 1 || operation.unresolved?.some(item => item.presentationDismissal)) value.version = Math.max(value.version, 5);
     // Older readers must reject cancellation they cannot enforce, rather than
     // resurrect an UNKNOWN/pending target after rollback.
     if (index < 0) value.operations.push(copy(operation)); else value.operations[index] = copy(operation);
@@ -98,12 +110,65 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       const ack = write(value);
       if (ack === false || ack?.success === false || ack?.then) throw failure('build_continue_write_unconfirmed');
     } catch (error) { poisoned = true; throw error; }
-    saved = value; changed(copy(operation)); return find(operation.id);
+    saved = value;
+    if (operation.phase !== 'captured' || operation.recoveryCancelledAt) captureControls.delete(operation.id);
+    else for (const target of operation.targets) if (target.cancellation?.requestedAt) captureControls.get(operation.id)?.delete(target.source.tabId);
+    changed(copy(operation)); return find(operation.id);
   }
   function row(id, tabId) {
     const op = find(id), target = op?.targets.find(t => t.source.tabId === tabId);
     if (!op || !target) throw failure('build_continue_target_unknown');
+    assertTaskCaptureFrozen(op);
     return { op, target };
+  }
+  function captureDigestOf(op) {
+    return hash(JSON.stringify([op.id, op.sourceMainPid, op.sourceInstanceId, op.capturedAt,
+      op.participants.map(p => [p.source, p.revision, p.subject, p.captureTaskProof || null])]));
+  }
+  function assertTaskCaptureFrozen(op) {
+    if (op.captureProofVersion !== 1) return;
+    if (captureDigestOf(op) !== op.captureDigest) throw failure('build_continue_task_capture_changed');
+    for (const target of op.targets) {
+      const participant = op.participants.find(p => p.source.tabId === target.source.tabId);
+      if (!participant || ['tabId', 'provider', 'sessionId', 'projectId', 'cwd']
+        .some(key => (participant.source[key] ?? null) !== (target.source[key] ?? null))
+        || target.capturedRevision !== participant.revision
+        || JSON.stringify(target.subject || null) !== JSON.stringify(participant.subject || null)
+        || participant.captureTaskProof?.known === true && target.route.kind !== 'install-callback'
+          && target.captureTaskProofVersion !== 1) throw failure('build_continue_task_capture_changed');
+    }
+  }
+  function captureIssue(op, item) {
+    if (item.stage !== 'capture' || !item.tabId) return null;
+    const participant = op.participants.find(p => p.source.tabId === item.tabId);
+    const source = item.source || participant?.source || { tabId: item.tabId, name: item.tabId };
+    const issueId = hash(JSON.stringify([op.id, item.tabId, item.reason, item.runId || null, source, participant?.revision || null]));
+    return { kind: 'capture-unresolved', version: 1, operationId: op.id, tabId: item.tabId,
+      issueId, capturedAt: op.capturedAt, phase: op.phase, stage: 'capture',
+      reason: item.reason, source: copy(source), active: false, inputCreated: false,
+      ...(item.detail ? { observation: copy(item.detail) } : {}),
+      presentationDismissal: item.presentationDismissal || null };
+  }
+  function captureIssuesForTab(tabId) {
+    return load().operations.flatMap(op => (op.unresolved || []).filter(item => item.tabId === tabId)
+      .map(item => captureIssue(op, item)).filter(item => item && !item.presentationDismissal)).reverse();
+  }
+  function dismissCaptureIssue(id, request = {}) {
+    if (!validId(request.requestId) || request.version !== 1 || !request.tabId
+      || !/^[a-f0-9]{64}$/.test(request.issueId || '')
+      || Object.keys(request).some(key => !['version', 'requestId', 'tabId', 'issueId', 'operationId'].includes(key))
+      || request.operationId != null && request.operationId !== id) throw failure('build_continue_capture_dismiss_invalid');
+    const op = find(id);
+    const item = op?.unresolved?.find(item => item.tabId === request.tabId && captureIssue(op, item)?.issueId === request.issueId);
+    if (!item) throw failure('build_continue_capture_issue_changed');
+    if (item.presentationDismissal) {
+      if (item.presentationDismissal.requestId !== request.requestId) throw failure('build_continue_capture_issue_already_dismissed');
+      return copy(item.presentationDismissal);
+    }
+    item.presentationDismissal = { version: 1, kind: 'capture-unresolved', operationId: id,
+      tabId: request.tabId, issueId: request.issueId, requestId: request.requestId, acknowledgedAt: now() };
+    commit(op);
+    return copy(item.presentationDismissal);
   }
   async function registerInstall(raw) {
     const binding = voiceInstallBinding({ ...raw, sourceMainPid: pid, sourceInstanceId: instanceId });
@@ -138,7 +203,12 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       && (op.phase !== 'restoring' || !op.startupProof || !op.activatedAt || op.sourceMainPid === pid));
     if (pending) throw Object.assign(failure('build_continue_operation_pending'), { operationId: pending.id });
     // Freeze existing Main facts before any asynchronous authority checks.
-    const views = copy(captureTabs()), capturedAt = now();
+    const rawViews = captureTabs(), views = copy(rawViews), capturedAt = now();
+    if (views.some(view => view.captureTaskProof?.version === 1) && !hasTaskCaptureShutdownOwner()) {
+      throw failure('build_continue_task_shutdown_owner_unavailable');
+    }
+    const controls = new Map(rawViews.filter(view => typeof view.captureCurrent === 'function')
+      .map(view => [view.tabId, view.captureCurrent]));
     for (const view of views) if (view.busy === true) capturingTargets.add(view.tabId);
     let timer;
     const [runs, subjects] = await Promise.race([Promise.all([Promise.resolve().then(readRuns),
@@ -175,11 +245,17 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       seen.add(view.tabId);
       const source = { tabId: view.tabId, provider: view.toolType || null, sessionId: view.sessionId || null,
         projectId: view.projectId || null, cwd: view.cwd || null, name: view.name || view.tabId };
+      const current = controls.get(view.tabId)?.();
+      const captureReason = view.captureTaskProof?.known === false ? view.captureTaskProof.reason
+        : view.captureTaskProof?.known === true && !current ? 'capture-task-bookend-unavailable'
+          : current?.current === false && !current.ended ? current.reason : null;
       const participant = { source, busy: view.busy === true ? true : view.busy === false ? false : null,
-        revision: view.revision, subject: view.subject || null };
+        revision: view.revision, subject: view.subject || null,
+        ...(view.captureTaskProof ? { captureTaskProof: copy(view.captureTaskProof) } : {}) };
       op.participants.push(participant);
       const callbackSource = installBinding?.source;
       if (callbackSource?.tabId === view.tabId) {
+        if (current?.current === false && !current.ended && view.captureTaskProof?.known === true) throw failure('voice_install_callback_source_changed');
         if (source.sessionId !== callbackSource.sessionId || source.provider !== callbackSource.toolType
           || source.projectId !== callbackSource.projectId) throw failure('voice_install_callback_source_changed');
         const incoming = runs.filter(run => view.busy === true && view.subject
@@ -198,15 +274,17 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       }
       if (view.busy !== true) continue;
       if (view.known !== true || !['claude', 'codex'].includes(source.provider) || !source.sessionId
-        || !view.subject || !sameTurn(view.subject.targetExecutionContext, view.executionContext)) {
-        op.unresolved.push({ tabId: view.tabId, reason: 'own-turn-proof-unavailable' }); continue;
+        || captureReason || !view.subject || !sameTurn(view.subject.targetExecutionContext, view.executionContext)) {
+        op.unresolved.push({ tabId: view.tabId, stage: 'capture', source,
+          reason: captureReason || 'own-turn-proof-unavailable',
+          ...(view.captureTaskProof?.detail ? { detail: copy(view.captureTaskProof.detail) } : {}) }); continue;
       }
       const incoming = runs.filter(run => (!run.runKind || run.runKind === 'agent') && run.targetTabId === view.tabId
         && !['completed', 'failed', 'cancelled'].includes(run.status)
         && sameTurn(run.targetExecutionContext, view.executionContext));
-      if (incoming.length > 1) { op.unresolved.push({ tabId: view.tabId, reason: 'multiple-own-run-owners' }); continue; }
+      if (incoming.length > 1) { op.unresolved.push({ tabId: view.tabId, stage: 'capture', source, reason: 'multiple-own-run-owners' }); continue; }
       if (installBinding && incoming.some(run => !exactContext(run.targetExecutionContext, view.executionContext))) {
-        op.unresolved.push({ tabId: view.tabId, runId: incoming[0].runId, reason: 'incoming-generation-unproven' }); continue;
+        op.unresolved.push({ tabId: view.tabId, stage: 'capture', source, runId: incoming[0].runId, reason: 'incoming-generation-unproven' }); continue;
       }
       const prior = load().operations.flatMap(previous => previous.phase === 'restoring'
         ? previous.targets.filter(target => target.source.tabId === source.tabId && active(target))
@@ -224,12 +302,15 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
       }
       const suffix = hash(view.tabId).slice(0, 24), handoffId = 'build-continue:' + id + ':' + suffix;
       op.targets.push({ source, subject: copy(view.subject), capturedRevision: view.revision,
+        ...(view.captureTaskProof?.known === true ? { captureTaskProofVersion: 1 } : {}),
         route: incoming.length ? { kind: 'agent', runId: incoming[0].runId } : { kind: 'local' },
         continuationPrompt: restartPromptForView(view), continuationPromptVersion: 1,
         nativeChildren: view.ownBackground?.known === true ? { known: true, count: view.ownBackground.agentCount,
           items: (view.ownBackground.items || []).filter(item => item.kind === 'agent').slice(0, 24),
           truncated: view.ownBackground.truncated === true } : { known: false },
-        handoffId, operationKey: 'history:' + view.tabId + ':' + handoffId, state: 'pending',
+        handoffId, operationKey: 'history:' + view.tabId + ':' + handoffId,
+        state: current?.ended === true ? 'not-needed' : 'pending',
+        ...(current?.ended === true ? { reason: current.reason } : {}),
         ...(prior.length ? { priorOperationIds: [...new Set(prior.map(previous => previous.operationId))] } : {}) });
       const uncertain = inputBlockers.filter(input => input.tabId === source.tabId
         && ['delivery-unknown', 'audit-pending', 'enter-armed', 'submitted-unverified', 'unconfirmed'].includes(input.status || input.state));
@@ -239,15 +320,22 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     }
     if (installBinding && !op.targets.some(target => target.route.kind === 'install-callback')) throw failure('voice_install_callback_source_missing');
     // Async subject readers cannot turn a changed namespace/input owner into the cut.
-    if (installBinding && captureOne) for (const participant of op.participants) {
-      const current = captureOne(participant.source.tabId);
-      if (current?.known !== true || current.revision !== participant.revision) {
+    if (installBinding && (captureCutOne || captureOne)) for (const participant of op.participants) {
+      const current = (captureCutOne || captureOne)(participant.source.tabId);
+      const ended = controls.get(participant.source.tabId)?.().ended === true;
+      if (!ended && (current?.known !== true || current.revision !== participant.revision)) {
         const target = op.targets.find(target => target.source.tabId === participant.source.tabId);
         if (target?.route.kind === 'install-callback') throw failure('voice_install_callback_source_changed');
         if (target) { target.state = 'unresolved'; target.reason = 'capture-owner-changed'; }
       }
     }
-    return copy(commit(op));
+    if (views.some(view => view.captureTaskProof?.version === 1)) {
+      op.captureProofVersion = 1;
+      op.captureDigest = captureDigestOf(op);
+    }
+    captureControls.set(id, controls);
+    try { return copy(commit(op)); }
+    catch (error) { captureControls.delete(id); throw error; }
   }
   function capture(id, expectedMainPid, binding = null) {
     if (!validId(id) || Number(expectedMainPid) !== pid) return Promise.reject(failure('build_continue_source_changed'));
@@ -263,6 +351,7 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     return captureWork;
   }
   function startupProof(op) {
+    assertTaskCaptureFrozen(op);
     if (op.startupProof) return;
     const snapshot = readStartup();
     if (snapshot?.source !== 'exact-shutdown-snapshot' || snapshot.shutdownPid !== op.sourceMainPid
@@ -270,8 +359,25 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     if (op.installBinding && (!op.shutdownEvidence || !snapshot.installBindings?.some(binding =>
       binding.operationId === op.id && binding.bindingDigest === op.installBinding.bindingDigest
       && binding.evidenceDigest === digestShutdown(op.shutdownEvidence)))) throw failure('voice_install_shutdown_unproven');
+    if (op.captureProofVersion === 1 && (op.taskShutdownEvidence?.version !== 1
+      || op.taskShutdownEvidence.operationId !== op.id || op.taskShutdownEvidence.captureDigest !== op.captureDigest
+      || op.taskShutdownEvidence.sourceMainPid !== op.sourceMainPid || op.taskShutdownEvidence.sourceInstanceId !== op.sourceInstanceId
+      || !Array.isArray(op.taskShutdownEvidence.targets)
+      || !snapshot.buildContinueBindings?.some(binding => binding.operationId === op.id
+        && binding.captureDigest === op.captureDigest
+        && binding.evidenceDigest === digestShutdown(op.taskShutdownEvidence)))) {
+      throw failure('build_continue_task_shutdown_unproven');
+    }
     for (const target of op.targets) {
       if (target.route.kind === 'install-callback') continue;
+      if (target.captureTaskProofVersion === 1 && active(target)) {
+        const evidence = op.taskShutdownEvidence.targets.find(row => row.tabId === target.source.tabId);
+        if (evidence?.disposition !== 'own-turn-interrupted') {
+          target.state = evidence?.disposition === 'own-turn-ended' ? 'not-needed' : 'unresolved';
+          target.reason = evidence?.reason || 'capture-task-shutdown-unproven';
+          continue;
+        }
+      }
       if (op.installBinding && active(target)) {
         const evidence = op.shutdownEvidence.targets.find(row => row.tabId === target.source.tabId);
         if (evidence?.disposition !== 'own-turn-interrupted') {
@@ -288,6 +394,38 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     op.startupProof = copy(snapshot);
   }
   const digestShutdown = value => hash(JSON.stringify(value));
+  function taskShutdownEvidence(op) {
+    assertTaskCaptureFrozen(op);
+    const controls = captureControls.get(op.id);
+    if (!controls) throw failure('build_continue_task_capture_unavailable');
+    return { version: 1, operationId: op.id, captureDigest: op.captureDigest,
+      sourceMainPid: op.sourceMainPid, sourceInstanceId: op.sourceInstanceId, capturedAt: now(),
+      targets: op.targets.filter(target => target.captureTaskProofVersion === 1).map(target => {
+        if (target.cancellation?.requestedAt) return { tabId: target.source.tabId, disposition: 'cancelled', reason: 'capture-target-cancelled' };
+        const current = controls.get(target.source.tabId)?.();
+        return { tabId: target.source.tabId, executionContext: copy(target.subject.targetExecutionContext),
+          disposition: current?.current === true ? 'own-turn-interrupted' : current?.ended === true ? 'own-turn-ended' : 'owner-or-input-changed',
+          reason: current?.current === true ? null : current?.reason || 'capture-task-bookend-unavailable' };
+      }) };
+  }
+  // Strict pre-Quit durability probe; this is NOT the actual shutdown seal.
+  function prepareTaskShutdown() {
+    if (!hasTaskCaptureShutdownOwner()) throw failure('build_continue_task_shutdown_owner_unavailable');
+    for (const op of load().operations) if (op.phase === 'captured' && op.captureProofVersion === 1 && op.sourceMainPid === pid) {
+      if (!op.taskShutdownPreparation) { op.taskShutdownPreparation = taskShutdownEvidence(op); commit(op); }
+    }
+  }
+  function taskShutdownBindings() {
+    const bindings = [];
+    for (const op of load().operations) if (op.phase === 'captured' && op.captureProofVersion === 1 && op.sourceMainPid === pid) {
+      // The FIRST pre-stop snapshot owns the cut. Later will-quit passes must
+      // not reinterpret the app's own shutdown Stop as a user cancellation.
+      if (!op.taskShutdownEvidence) { op.taskShutdownEvidence = taskShutdownEvidence(op); commit(op); captureControls.delete(op.id); }
+      bindings.push({ operationId: op.id, captureDigest: op.captureDigest,
+        evidenceDigest: digestShutdown(op.taskShutdownEvidence) });
+    }
+    return copy(bindings);
+  }
   function shutdownEvidence(views) {
     const bindings = [];
     for (const op of load().operations) {
@@ -324,7 +462,7 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
           evidenceDigest: digestShutdown(op.shutdownEvidence) };
       });
   }
-  function prepareShutdown() { return shutdownEvidence(copy(captureTabs())); }
+  function prepareShutdown() { prepareTaskShutdown(); return shutdownEvidence(copy(captureTabs())); }
   const party = (state, source) => state?.known === true && state.exists !== false && state.toolType === source.provider
     && (state.sessionId === source.sessionId || state.acceptedResumeSourceSessionId === source.sessionId)
     && (!source.cwd || !state.cwd || require('node:path').resolve(source.cwd) === require('node:path').resolve(state.cwd));
@@ -987,7 +1125,8 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     }
     return null;
   }
-  return { capture, activate, registerInstall, activateInstall, cancelInstall, shutdownEvidence, prepareShutdown, shutdownBindings, prepareReservation,
+  return { capture, activate, registerInstall, activateInstall, cancelInstall, shutdownEvidence, prepareShutdown, shutdownBindings,
+    prepareTaskShutdown, taskShutdownBindings, captureIssuesForTab, dismissCaptureIssue, prepareReservation,
     restore, reconcile, wake, validate, prepareInput, admit, cancelTarget, messageBinding, recoveryHold, observationBinding, restartHistoryForRun, sourceFollowupBinding, staleLoopAdmission,
     get: id => { const op = find(id); return op ? copy(op) : null; },
     forTab: tabId => {
@@ -1005,7 +1144,7 @@ function createBuildContinueOperations({ read, write, readRuns, captureTabs, rea
     // Capture→Quit belongs to the whole old Main, including idle/late tabs.
     // Existing physical attempts keep their separate native receipts/guards.
     capturing: () => !!captureWork || load().operations.some(op => op.phase === 'captured' && op.sourceMainPid === pid),
-    list: () => copy(load().operations), dispose() { disposed = true; trailing.clear(); validationWaitReasons.clear(); } };
+    list: () => copy(load().operations), dispose() { disposed = true; trailing.clear(); validationWaitReasons.clear(); captureControls.clear(); } };
 }
 
 module.exports = { createBuildContinueOperations, restartReceiptBinding, validId };

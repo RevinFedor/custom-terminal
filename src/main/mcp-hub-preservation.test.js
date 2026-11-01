@@ -41,17 +41,33 @@ function fixture(t) {
 const resolve = f => sourceRequire('./mcp-hub-config').resolveHubConfiguration(f.env);
 const entry = (config, name) => config.status.entries.find(row => row.name === name);
 
-test('profile: knowledge owns its current default model without an independent hub fallback', t => {
+test('profile: Luna default migration preserves the historical host configuration identity', t => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.home, '.claude/mcp'), { recursive: true });
   fs.copyFileSync(f.script, path.join(f.home, '.claude/mcp/knowledge-server.mjs'));
   const normal = resolve(f).serverDefs.knowledge;
-  assert.equal(normal.env.KNOWLEDGE_CODEX_MODEL, undefined);
+  assert.equal(normal.env.KNOWLEDGE_CODEX_MODEL, 'gpt-5.6-luna', 'keep the activated compatibility binding');
   assert.equal(normal.env.KNOWLEDGE_ROUTER_PROVIDER, 'codex');
   assert.equal(normal.env.KNOWLEDGE_CODEX_EFFORT, 'low');
+  const previous = sourceRequire('./mcp-hub-config').resolveHubConfiguration({ ...f.env,
+    KNOWLEDGE_CODEX_MODEL: 'gpt-5.6-luna' });
+  assert.equal(resolve(f).fingerprint, previous.fingerprint, 'a default-model migration must not invalidate Browser activation');
+  assert.deepEqual(normal, previous.serverDefs.knowledge);
   const explicit = sourceRequire('./mcp-hub-config').resolveHubConfiguration({ ...f.env,
     KNOWLEDGE_CODEX_MODEL: 'custom-explicit-model' }).serverDefs.knowledge;
   assert.equal(explicit.env.KNOWLEDGE_CODEX_MODEL, 'custom-explicit-model');
+});
+
+test('profile: identical bindings moved from default into a profile change their authority fingerprint', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.home, '.claude/mcp'), { recursive: true });
+  fs.copyFileSync(f.script, path.join(f.home, '.claude/mcp/knowledge-server.mjs'));
+  const before = resolve(f);
+  f.write({ knowledge: { enabled: true, ...before.serverDefs.knowledge } });
+  const after = resolve(f);
+  assert.deepEqual(after.serverDefs, before.serverDefs);
+  assert.notEqual(after.fingerprint, before.fingerprint, 'profile provenance is part of Browser authority');
+  assert.equal(entry(after, 'knowledge').source, 'profile');
 });
 const request = async (hub, name, method) => (await fetch(`http://127.0.0.1:${hub.actualPort}/mcp/${name}?tab=caller`, {
   method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: {} }),

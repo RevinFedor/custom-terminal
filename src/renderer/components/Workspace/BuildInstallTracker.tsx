@@ -1,25 +1,28 @@
 import type { RefObject } from 'react';
-import { Hammer, LoaderCircle, CircleCheck, CircleAlert, X } from 'lucide-react';
+import { Hammer, LoaderCircle, CircleCheck, CircleAlert, CircleX, X } from 'lucide-react';
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, requestRowLinkStyle } from './RequestTrackerRow';
 import { RequestDetailsPopover } from './RequestDetailsPopover';
 import type { RequestPreviewAnchor } from './RequestDetailsPopover';
-import { buildInstallPresentation } from '../../utils/buildInstallPresentation.mjs';
+import { buildInstallPresentation, buildInstallVisibleInDock } from '../../utils/buildInstallPresentation.mjs';
 import type { BuildInstallJob } from '../../hooks/useBuildInstallStatus';
 import activity from '../../../shared/build-install-activity.cjs';
 
 export type BuildInstallSelection = RequestPreviewAnchor & { jobId: string; requestId: string; history?: boolean };
 
-export function BuildInstallTracker({ job, stale, history = false, onCancel, onOpen, selected = false, disabled = false }: {
+export function BuildInstallTracker({ job, stale, error, history = false, onCancel, onOpen, selected = false, disabled = false }: {
   job: BuildInstallJob; stale: boolean; error?: string | null; history?: boolean; onCancel: (job: BuildInstallJob) => void;
   onOpen: (selection: BuildInstallSelection) => void; selected?: boolean; disabled?: boolean;
 }) {
   const state = buildInstallPresentation(job, stale);
   const pendingContinuation = activity.pending(job.continuation);
-  const Icon = state.spinning ? LoaderCircle : state.color === '#4ade80' ? CircleCheck : CircleAlert;
+  const live = job.running || pendingContinuation;
+  const Icon = state.spinning ? LoaderCircle : !stale && !job.installOutcomeUnknown && (job.cancelled || job.requestCancelledAt)
+    ? CircleX : state.color === '#4ade80' ? CircleCheck : CircleAlert;
   return <div data-build-install-job={job.id} data-request-kind="install" style={{ minWidth: 0, flexShrink: 0, borderBottom: '1px solid #303030' }}>
-    <RequestTrackerRow actions={(job.running || pendingContinuation) && <button type="button"
-      title="Отменить запрос, его ожидания и будущие продолжения"
-      aria-label="Отменить запрос установки"
+    <RequestTrackerRow actions={(live || buildInstallVisibleInDock(job)) && <button type="button"
+      title={error || (live ? 'Отменить запрос, его ожидания и будущие продолжения'
+        : 'Убрать завершённый запрос из активных. История и квитанции сохранятся.')}
+      aria-label={live ? 'Отменить запрос установки' : 'Закрыть запрос установки'}
       disabled={stale || job.requestCancelledAt != null}
       onClick={event => { event.stopPropagation(); onCancel(job); }} style={{ ...requestRowActionStyle,
         opacity: stale || job.requestCancelledAt != null ? 0.5 : 1 }}><X size={13} /></button>}>

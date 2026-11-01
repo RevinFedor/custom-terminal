@@ -232,7 +232,7 @@ async function harness(options = {}) {
   const context = vm.createContext({ console: { log() {}, warn() {} }, fixture: { ui, workspace },
     window: { require: () => ({ ipcRenderer: ipc }), dispatchEvent: event => events.push(['event', event.type]) },
     CustomEvent: class { constructor(type) { this.type = type; } }, module: { exports: {} }, exports: {},
-    setTimeout, clearTimeout, crypto: crypto.webcrypto });
+    setTimeout, clearTimeout, performance, crypto: crypto.webcrypto });
   vm.runInContext(scenarioBundle, context);
   context.executeHistoryRewriteRewindScenario = context.module.exports.executeHistoryRewriteRewindScenario;
   context.executeHistoryDeleteIterationScenario = context.module.exports.executeHistoryDeleteIterationScenario;
@@ -369,9 +369,12 @@ test('actual HTTP/executor/COW removes orphan future after compact and retains t
   } finally { await h.close(); }
 });
 
-for (const projectInstructions of ['same', 'changed']) {
-  test('actual HTTP Rewind removes owned AGENTS and checkpoint, keeps earlier rules: ' + projectInstructions, async () => {
-    const h = await harness({ projectInstructions, stopped: true });
+for (const [projectInstructions, onlyTurn] of [
+  ['same', false], ['same', true], ['changed', false], ['changed', true],
+]) {
+  test('actual HTTP Rewind removes owned AGENTS and checkpoint, keeps earlier rules: ' + projectInstructions
+    + ', onlyTurn=' + onlyTurn, async () => {
+    const h = await harness({ projectInstructions, onlyTurn, stopped: true });
     try {
       assert.equal((await h.post()).status, 202);
       await h.done;
@@ -381,16 +384,15 @@ for (const projectInstructions of ['same', 'changed']) {
       const child = await codex.loadSessionRecords(reply.operation.newSessionId, '/fixture');
       assert.equal(child.success, true, child.error);
       const rules = child.records.filter(record => record.type === 'world_state');
-      assert.equal(rules.length, 1, 'only the retained iteration owns a checkpoint');
-      assert.deepEqual(rules[0].payload, { full: true, state: {
+      assert.deepEqual(rules.map(record => record.payload), onlyTurn ? [] : [{ full: true, state: {
         agents_md: { directory: '/fixture', text: 'rules A' },
-      } });
+      } }], 'only a retained iteration owns a checkpoint');
       const entries = codex.buildCodexFullHistory(child.records, reply.operation.newSessionId);
       const instructions = entries.filter(entry => entry.serviceCarrier === 'project-instructions');
-      assert.equal(instructions.length, 1, 'no orphan from the deleted iteration');
-      assert.match(instructions[0].content, /rules A/);
+      assert.equal(instructions.length, onlyTurn ? 0 : 1, 'no orphan from the deleted iteration');
+      if (!onlyTurn) assert.match(instructions[0].content, /rules A/);
       assert.deepEqual(codex.buildCodexTimeline(child.records, reply.operation.newSessionId)
-        .filter(entry => entry.type === 'user').map(entry => entry.content), ['keep']);
+        .filter(entry => entry.type === 'user').map(entry => entry.content), onlyTurn ? [] : ['keep']);
       assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes, 'original is unchanged');
       assert.equal(h.events.some(event => /paste|send-prompt|rewind-native/.test(event[0])), false);
       assert.equal((await h.post()).operation.idempotent, true);

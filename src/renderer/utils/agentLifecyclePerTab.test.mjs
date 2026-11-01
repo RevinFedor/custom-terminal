@@ -123,7 +123,12 @@ test('движок едет полем сводки, а не разбором з
 });
 
 test('приоритет состояний: остановка → текущий launch/error; interrupted не рисуется', () => {
-  const build = hook.slice(hook.indexOf('return useMemo<AgentLifecycleSummary | null>'));
+  // The summary is assigned to `lifecycle` before it is returned, so anchoring
+  // on `return useMemo<...>` sliced an empty string and silently compared
+  // nothing at all.
+  const anchor = 'useMemo<AgentLifecycleSummary | null>';
+  assert.ok(hook.includes(anchor), 'lifecycle summary memo not found');
+  const build = hook.slice(hook.indexOf(anchor));
   const iStop = build.indexOf("kind: 'stopping'");
   const iStart = build.indexOf("isWarning ? 'warning' : presentation.isError ? 'error' : isInfo ? 'info' : 'starting'");
   assert.ok(iStop >= 0 && iStart >= 0);

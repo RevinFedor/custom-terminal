@@ -272,10 +272,26 @@ test('private options cannot extend manual or accept more than 40s / wrong sampl
   }
 });
 
-test('manual API keeps its 10 second default and 1ms sampling', { timeout: 1000 }, async t => {
+test('legacy manual request keeps its 10 second window and 1ms sampling', { timeout: 1000 }, async t => {
   const f = harness(t);
   const report = await f.capture({ durationMs: 10000,
     request: { id: 'incident-77-1', kind: 'manual', durationMs: 10000, requestedWallMs: Date.now(), owner: f.guard.owner } });
   assert.equal(report.outcome, 'completed'); assert.equal(f.timers.length, 1); assert.equal(f.timers[0].ms, 10000);
   assert.equal(report.samplingIntervalUs, 1000); assert.equal((await report.whenRetired).confirmed, true);
+});
+
+test('native manual40 uses the finite input preset without private options', { timeout: 1000 }, async t => {
+  const f = harness(t, { commandCostMs: 50 });
+  const report = await f.capture({ durationMs: 40000,
+    request: { id: 'incident-77-1', kind: 'manual', durationMs: 40000,
+      requestedWallMs: Date.now(), owner: f.guard.owner } });
+  assert.equal(report.kind, 'manual'); assert.equal(report.captureMode, 'manual-input');
+  assert.equal(report.outcome, 'completed'); assert.equal(f.ready.length, 1);
+  assert.equal(report.samplingIntervalUs, 8000);
+  assert.equal(f.ready[0].plannedStopMonoMs, report.profiles.main.start.issuedMonoMs + 40000);
+  assert.equal(f.timers[0].ms, f.ready[0].plannedStopMonoMs - f.ready[0].readyMonoMs);
+  assert.deepEqual(Array.from(report.traceCategories), ['devtools.timeline', 'v8', 'input', 'latencyInfo']);
+  assert.equal(report.artifacts.trace.format, 'noted-trace-projection-v1');
+  assert.equal(report.traceComplete, true); assert.equal(report.traceProjection.closed.acknowledged, true);
+  assert.equal(f.count('renderer:IO.close'), 1); assert.equal((await report.whenRetired).confirmed, true);
 });

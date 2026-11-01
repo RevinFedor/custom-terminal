@@ -43,6 +43,7 @@ function fixture(t, options = {}) {
     }
     if (method === 'IO.read') {
       reads++;
+      if (options.chunkLimitedTrace) return { data: ' '.repeat(65536), eof: false };
       if (options.overflowTrace) {
         const prefix = reads === 1 ? '{"traceEvents":[\n' + JSON.stringify({ name: 'LocalFrameView::layout', pid: 12,
           args: { endData: { layoutRoots: [{ nodeId: 753 }] } } }) + ',\n' : '';
@@ -120,6 +121,22 @@ test('16 MiB partial export still writes usable trace root IDs and post-capture 
   assert.equal(ui.trace.completeExport, false); assert.equal(ui.trace.bytes, status.traceBytes);
   assert.equal(ui.trace.roots[0].backendNodeId, 753); assert.equal(ui.roots[0].node.tag, 'svg');
   assert.equal(ui.status, 'complete'); assert.ok(fs.statSync(path.join(f.directory, 'incident-123-1.ui.json')).size <= 65536);
+});
+test('256 ordinary chunks retain partial evidence and report chunk limit, not elapsed time', async t => {
+  const f = fixture(t, { chunkLimitedTrace: true });
+  const started = performance.now();
+  const result = await captureIncidentProfile(f);
+  const elapsedMs = performance.now() - started;
+  const status = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.equal(f.calls.filter(x => x === 'IO.read').length, 256);
+  assert.equal(status.traceBytes, 16 * 1024 * 1024);
+  assert.equal(fs.statSync(path.join(f.directory, 'incident-123-1.trace.json')).size, status.traceBytes);
+  assert.equal(status.traceComplete, false);
+  assert.ok(status.errors.includes('trace-export-chunk-limit'));
+  assert.ok(!status.errors.includes('trace-export-time-limit'));
+  assert.ok(elapsedMs < 10000, 'fixture reaches chunk ceiling before the real export deadline');
+  assert.equal(f.calls.filter(x => x === 'IO.close').length, 1);
+  assert.equal((await result.retirement).confirmed, true);
 });
 test('unconfirmed CPU stop records an explicit UI skip', async t => {
   const f = fixture(t, { stopFailed: true });

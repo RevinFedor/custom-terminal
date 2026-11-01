@@ -51,7 +51,20 @@ test('Main is selected before admission without reading RAM or resetting an exis
 });
 test('prepared-result launch only opens the archive; it never starts another model', () => {
   const branch = source.slice(source.indexOf('if (replayProfile?.presentationOnly)'), source.indexOf("preparationStage = 'выбор Luna из каталога'"));
-  assert.match(branch, /fixture\.cases\?\.length !== 2/);
+  assert.match(branch, /fixture\.cases\.length < 1 \|\| fixture\.cases\.length > 4/);
   assert.match(branch, /mini-orchestrator:open/);
   assert.doesNotMatch(branch, /codex:run-command|\/api\/agent-tabs|FIRST-START|modelSelection/);
+  const guard = branch.slice(branch.indexOf('    if (!fixture'), branch.indexOf('    // Presentation-only'));
+  const validate = require('node:vm').runInNewContext('(fixture,replayProfile)=>{' + guard + '; return true;}');
+  const cases = Array.from({ length: 3 }, (_, i) => ({ tabId: 'own-' + i, sessionId: 'sid-' + i }));
+  const profile = { tabId: 'own-0', cases };
+  assert.equal(validate({ presentationOnly: true, guide: 'own-0', cases }, profile), true);
+  assert.equal(validate({ presentationOnly: true, guide: 'own-0', cases: cases.slice(0, 2) }, { ...profile, cases: cases.slice(0, 2) }), true);
+  assert.equal(validate({ presentationOnly: true, guide: 'own-0', cases: cases.slice(0, 1) }, { ...profile, cases: cases.slice(0, 1) }), true, 'a ready Main is not blocked by an optional missing RAM case');
+  for (const count of [0, 5]) {
+    const rows = Array.from({ length: count }, (_, i) => ({ tabId: 't' + i, sessionId: 's' + i }));
+    assert.throws(() => validate({ presentationOnly: true, guide: 'own-0', cases: rows }, { ...profile, cases: rows }), /unavailable/);
+  }
+  assert.throws(() => validate({ presentationOnly: true, guide: 'own-0', cases: cases.map((item, i) => i === 1 ? { ...item, sessionId: 'foreign' } : item) }, profile), /unavailable/);
+  assert.throws(() => validate({ presentationOnly: true, guide: 'foreign', cases }, profile), /unavailable/);
 });

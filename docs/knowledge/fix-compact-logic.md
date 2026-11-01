@@ -159,6 +159,65 @@ handoff/provider/session settlement; listener устанавливается д�
 production witness не является новым live-provider replay. Проверка и границы —
 `../tmp/глобальные-очереди-и-автокомпакт.md`.
 
+#### Шрам: native автокомпакт CLI выключил Run After (31.10.2026)
+
+Пользователь: *«у меня почему-то ранавтор там какого-то хуя выключился»*, *«сессия
+закончила работу, редактор должен был продолжить»*, *«почему мы раньше эту проблему
+не обнаружили? мы же до этого эти ошибки исправляли»*.
+
+Симптом: после успешного сжатия контекста очередь не отправила следующий промпт и
+автоматика выключилась совсем (`preserveLoop=0`), хотя компакт прошёл штатно.
+
+Production mini-оркестратор `tab-fa70e14d` / session `ad6a2307`:
+
+```text
+05:50:50.589  turn_aborted              DISARM, preserveLoop=1 (Loop ещё жив)
+05:50:54.458  task_started              новый turn
+05:50:55.181  CompactOperation active=true source=provider-compaction command=null
+05:53:49.491  compacted (запись6.5MB)
+05:53:49.551  CompactOperation active=false outcome=completed reason=compacted
+              proof=codex-compacted-source-ad6a2307-…-63779023     ← УСПЕХ
+05:53:49.577  task_complete             (без assistant final — норма для компакта)
+05:53:49.618  CodexTurn outcome=codex-no-final-result
+05:53:49.786  PromptQueueRunner reason=codex-no-final-result preserveLoop=0 → DISARM
+```
+
+Причина — **третий путь компакта**, не покрытый прежними ремонтами. Допуск
+`projectCodexCompactTurnOutcome` требовал одновременно `command === '/compact'` и
+`operation.active === true`. Native автокомпакт CLI (порог
+`model_auto_compact_token_limit`, см. `fact-codex.md::Native автокомпакт`) не
+проходил по обеим причинам сразу: у него нет пользовательской команды
+(`source='provider-compaction'`, `command=null`), и `compacted` закрывает операцию
+за **26 мс до** `task_complete`, поэтому активный слот к моменту классификации уже
+пуст. Ремонты 10.09 (tab754) и 15.06 закрывали только explicit `/compact` — это не
+регрессия того фикса, а непокрытый класс.
+
+Что пробовали и почему не подошло:
+- *ослабить проверку `active === true`* — тогда любой давно завершённый компакт этой
+  вкладки сможет выдать себя за результат текущего turn. Отклонено.
+- *принимать `context_compacted` как доказательство* — он остаётся telemetry (см.
+  выше в этом разделе) и приходит и при чужом/старом сжатии. Отклонено.
+- *считать `task_complete` без final успехом для любого Codex* — снимает защиту
+  Root DISARM от настоящих обрывов turn. Отклонено.
+
+Текущий контракт: допуск принимает explicit `/compact` **либо**
+`source='provider-compaction'`; активную **либо** уже settled операцию, но settled
+только с точным `outcome:'completed', reason:'compacted'`. Main при `task_complete`
+смотрит и в ledger завершённых (`latestSettledCodexCompactOperation` — read-only
+обход bounded ledger, ничего не запускает и не перепривязывает). Все прежние guard'ы
+неизменны: tab/session/processGeneration/lifecycle/terminal/`turn_id` и строгий
+порядок `sourceByteOffset < codexCompactedOffset < offset(task_complete)`.
+`hasFinalResult:false` сохранён — финальный ответ не выдумывается, `completionKind`
+остаётся `compact`; это не Goal completion и не Send receipt.
+
+Проверка: `src/main/codex-autocompact-run-after.actual.test.js` (реальный registry
+через публичный API, байт-оффсеты из того же rollout) PRE 2 FAIL → CURRENT 4/4 PASS;
+compact-набор 10 файлов 223/223 PASS. Ловушка прогона: `better-sqlite3` собран под
+Electron ABI 119, под обычным `node` 22 те же файлы дают 53 `ERR_DLOPEN_FAILED`
+(`NODE_MODULE_VERSION 127` против `119`) — это ABI, не регрессия; запускать
+`ELECTRON_RUN_AS_NODE=1 ./node_modules/.bin/electron --test <файлы>`.
+Source/private: приложение не запускалось, installed acceptance не проводилась.
+
 ### Codex local slash: causal start без `user_message`
 
 #### После Resume вставка состоялась, а отдельный delta-reader молчал

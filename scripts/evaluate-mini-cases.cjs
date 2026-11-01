@@ -134,4 +134,5 @@ async function main() {
   await fs.writeFile(path.join(folder, 'LATEST.json'), json({ run, results }), { mode: 0o600 });
   console.log('[HeadlessMini] ready ' + run);
 }
-main().catch(error => { console.error('[HeadlessMini] ' + error.message); process.exitCode = 1; });
+if (require.main === module) main().catch(error => { console.error('[HeadlessMini] ' + error.message); process.exitCode = 1; });
+module.exports = { nativeProof };

@@ -40,15 +40,11 @@ const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
 
 function captureDecision(recent, now, kind = 'unknown', detail = {}) {
-  // An explicit native Help request has one durable 10-second slot per day.
-  // Automatic incidents cannot spend it; it does not refund their four slots.
-  // Both lanes retain the same per-file and total artifact limits.
+  // Explicit diagnostics have no daily quota. Each request still leaves a
+  // receipt, and shares the existing per-file, retention and disk limits.
+  // Manual receipts neither consume nor refund automatic capture slots.
   if (kind === 'manual') {
-    // A corrupt/legacy unclassified receipt cannot prove that slot unspent.
-    const manual = recent.filter(e => e.group === 'manual' || !e.group);
-    if (manual.length) return { allowed: false, reason: 'manual-rolling-quota-exhausted',
-      nextEligibleWallMs: Math.min(...manual.map(e => e.at)) + DAY, remaining: 0, group: 'manual' };
-    return { allowed: true, reason: 'reserved', nextEligibleWallMs: now, remaining: 0, group: 'manual' };
+    return { allowed: true, reason: 'reserved', nextEligibleWallMs: now, remaining: null, group: 'manual' };
   }
   recent = recent.filter(e => e.group !== 'manual');
   const background = kind === 'sustained-cpu';
@@ -306,7 +302,8 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         const causal = causalArtifact(e.name);
         const nativeSample = NATIVE_SAMPLE.test(e.name);
         // Native and heavy receipts are independent, small, and non-evictable
-        // during their quota window, even if their large artifacts are gone.
+        // for their first day, even if their large artifacts are gone. This
+        // preserves automatic quota history and explicit manual audit history.
         if (NATIVE_RECEIPT.test(e.name) && !expired(e)) continue;
         if (HEAVY_RECEIPT.test(e.name) && now - e.at < DAY) continue;
         if (!causal && now - e.at < 120000) continue;
@@ -378,12 +375,18 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
   }
   return { directory, file, write, writeCausal, entries, read, openExclusive, writeExclusive, prune, retentionLedger,
     reserveCaptureDetails(id, now = Date.now(), kind = 'unknown', detail = {}) {
-      const recent = entries().filter(e => HEAVY_RECEIPT.test(e.name) && now - e.at < DAY).map(e => {
+      const recent = kind === 'manual' ? [] : entries().filter(e => HEAVY_RECEIPT.test(e.name) && now - e.at < DAY).map(e => {
         try { return { ...e, group: JSON.parse(read(e.name)).group }; }
         catch { return e; } // Legacy/unreadable receipt still consumes its slot.
       });
       const decision = captureDecision(recent, now, kind, detail);
-      if (decision.allowed) write(id + '.capture.json', { requestedAt: now, kind, group: decision.group });
+      if (decision.allowed) {
+        const receipt = { requestedAt: now, kind, group: decision.group };
+        // Repeated explicit requests get distinct IDs; never replace an old
+        // receipt or renew its timestamp if a caller reuses one.
+        if (kind === 'manual') writeExclusive(id + '.capture.json', receipt);
+        else write(id + '.capture.json', receipt);
+      }
       return decision;
     },
     reserveCapture(id, now = Date.now(), kind = 'unknown') {
@@ -432,11 +435,13 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
         try { const latest=context();if(latest?.causal)active.context={...active.context,causal:latest.causal}; } catch {}
         artifacts.write(active.id + '.json', active);
       }
+      return true;
     }
     catch (err) {
       if (monoNow() - lastWriteErrorAt > 30000) {
         lastWriteErrorAt = monoNow(); log('[Perf:Incident] write-failed error=' + String(err.message).slice(0, 160));
       }
+      return false;
     }
   }
   function incident(kind, detail = {}) {
@@ -447,22 +452,39 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     const now = monoNow();
     if (active) {
       // A pre-gesture request must never adopt a prior/other owner's capture.
-      if (kind === 'manual') return { allowed: false, reason: 'merged-into-active-incident', incident: active.id };
-      if (active.events.length < 24) active.events.push({ kind, ...detail, observedWallMs: Date.now() });
-      else active.omittedEvents = (active.omittedEvents || 0) + 1;
-      if (!active.capture?.requested && kind !== 'sustained-cpu') maybeCapture(kind, detail);
-      else logDecision(kind, detail, { allowed: false, reason: 'merged-into-active-incident', incident: active.id });
-      return null;
+      if (kind === 'manual') {
+        if (active.capture?.requested === true)
+          return { allowed: false, reason: 'merged-into-active-incident', incident: active.id };
+        const previous = active;
+        active = { ...previous, state: 'early-ended', complete: false,
+          endedWallMs: Date.now(), endReason: 'explicit-manual-request' };
+        if (!persist()) {
+          active = previous;
+          return { allowed: false, reason: 'metadata-window-persist-failed', incident: previous.id };
+        }
+        active = null;
+      } else {
+        if (active.events.length < 24) active.events.push({ kind, ...detail, observedWallMs: Date.now() });
+        else active.omittedEvents = (active.omittedEvents || 0) + 1;
+        if (!active.capture?.requested && kind !== 'sustained-cpu') maybeCapture(kind, detail);
+        else logDecision(kind, detail, { allowed: false, reason: 'merged-into-active-incident', incident: active.id });
+        return null;
+      }
     }
     const incidentCooldown = kind === 'sustained-cpu' ? 600000 : 30000;
-    if (now - lastIncident < incidentCooldown) {
+    if (kind !== 'manual' && now - lastIncident < incidentCooldown) {
       const decision = { allowed: false, reason: 'incident-window-cooldown',
         nextEligibleWallMs: Date.now() + incidentCooldown - (now - lastIncident) };
       logDecision(kind, detail, decision);
-      return kind === 'manual' ? decision : null;
+      return null;
     }
     lastIncident = now;
-    const id = 'incident-' + Date.now() + '-' + process.pid;
+    // A metadata window and its replacing manual request can start in the
+    // same millisecond. Keep both records (also after restart/clock rollback).
+    let idWallMs = Date.now(), id = 'incident-' + idWallMs + '-' + process.pid;
+    while (fs.existsSync(artifacts.file(id + '.json')) || fs.existsSync(artifacts.file(id + '.capture.json'))) {
+      id = 'incident-' + (++idWallMs) + '-' + process.pid;
+    }
     active = { id, version: 1, startedWallMs: Date.now(), endsMono: now + 20000,
       coverage: 'current-user-processes; CPU100=one-core; systemBusy100=all-cores',
       complete: false, frames: ring.slice(-30), events: [{ kind, ...detail, observedWallMs: Date.now() }], context: context() };

@@ -277,10 +277,15 @@ count, не меняя число живых процессов или прав�
 
 С30.09 шапка, Run After и список скрытых окон используют ещё и один renderer
 `Workspace/TabCard.tsx`: process/busy/inherited bar, session status, context/Fast,
-pending context, notifications, availability, task lane и label. `PaneTabChip`
+pending context, notifications, availability, task lane, синее кольцо Codex-вопроса,
+рамка AskUserQuestion (`tab-awaiting-input`) и label. `PaneTabChip`
 сохраняет только свои navigation/DnD/rename gestures; picker callers задают
 выбор вместо этих жестов. Sidebar/Ctrl+Tab пока используют общие примитивы и
-правила, перенос всего их interaction слоя не заявлен.
+правила, перенос всего их interaction слоя не заявлен. В текущем коде строка бокового списка
+workflow (`WorkflowTabSidebar::ReserveCard`) тоже рисуется через `TabCard`, а переключатель
+Ctrl+Tab (`TabListRows`) — нет. Поэтому новый сигнал вкладки добавляется в `TabCard`/
+`TabSignals`: рамка AskUserQuestion, написанная только в `TabBar::TabItem` и на workflow-чипе,
+на живых поверхностях вкладки не появлялась (`fact-claude-awaiting-input.md` п.6).
 
 Отступ имени и место полоски считаются в одном
 `resolveTabCardMetrics` и записываются одним `padding`. Отдельный

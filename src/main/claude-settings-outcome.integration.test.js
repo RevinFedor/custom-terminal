@@ -12,6 +12,7 @@ const { createClaudeStartupMainRuntime } = require('./claude-startup-main-runtim
 const { createClaudeSettingsSendRuntime } = require('./claude-settings-send');
 const { parseClaudeStartupSlashCommand } = require('./claude-startup-slash-proof');
 const { projectClaudePtyPresence } = require('./claude-pty-presence');
+const { isClaudeStartupSettingUndelivered } = require('../shared/claude-startup-failure.cjs');
 const { claudeParamsOperationOutcome } = require('./claude-settings-outcome');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -67,6 +68,7 @@ function fixture({ startupSettings = { model: 'unavailable', effort: 'max' }, pr
   const ctx = vm.createContext({
     console: quiet, crypto, path, srcMainDir: __dirname, Date,
     parseClaudeStartupSlashCommand, projectClaudePtyPresence, claudeParamsOperationOutcome,
+    isClaudeStartupSettingUndelivered,
     terminals: new Map([['T', term]]),
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'L' }]]),
     terminalCommandState: new Map([['T', { runSeq: 1 }]]),

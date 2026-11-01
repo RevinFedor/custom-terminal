@@ -83,6 +83,36 @@ whitespace или похожий текст такого права не даю�
 
 Судьбы ожидания: подтверждён → `✅ match`; запись не совпала → кандидат логируется `MISMATCH-CANDIDATE … kept pending` и ожидание ЖИВЁТ дальше (поздний JSONL-flush — норма); timeout → caller получает `success:false, lateReconciliationPending:true` (это «ещё не согласовано», НЕ delivery failure — SEND FAILED из него делать нельзя), само ожидание остаётся до bridge-clear; Enter так и не ушёл в PTY (guard/ошибка до submit) → finally-блок финализирует `claude_submit_not_sent`, чтобы мёртвое ожидание не украло durable-запись у следующей одинаковой отправки; выход Claude → финальный tail-scan, потом evict unconfirmed (`…_unconfirmed_evicted`, presentation sidecar сохраняется при позднем подтверждении). Кап: 32 pending на вкладку / 30 мин. Подробнее в `fix-claude-paste-stuck-queue.md::Защита от регрессий`.
 
+#### Unicode NFC: доставленное сообщение не подтверждалось (31.10.2026)
+
+Claude нормализует отправленный prompt в **NFC** до записи в JSONL и до hook
+`UserPromptSubmit`. macOS отдаёт пути из Finder в **NFD**, поэтому prompt с путём,
+где есть кириллица/диакритика, приходит в Claude на одну кодовую единицу длиннее,
+чем Claude его записывает. Exact len+hash не совпадали никогда: доставленное
+сообщение висело `CONFIRMING` и держало physical input slot, следующее стояло
+`IN APP QUEUE`. Доказано на транскрипте (tab `029152fbe588`, `mvwj1obz-x6tcv2`):
+
+```text
+14:59:32.562  Enter (Claude busy)          14:59:32.624  queue-operation enqueue
+14:59:33.932  type:user, 583 символа       аудит ждал 584, hash 82053fb5b81e2fae
+единственная разница: «й» в …/временный промпт.md — и+U+0306 vs U+0439
+```
+
+`claudeAuditTextMatches` (единый владелец сравнения: hook, transcript, merged queue
+payload) сравнивает **каноническую** форму только если нормализация реально изменила
+одну из сторон, и только для `expectedText`/`providerAcceptedText`, которые всё ещё
+хешируются в audit identity. Это та же точность — равны лишь строки, которые Unicode
+объявляет каноническими эквивалентами; «й» и «и», хвостовой пробел, обрезка — нет.
+`claudeAuditNativePasteMatches` намеренно остался exact. Тест:
+`claude-prompt-audit-nfc.actual.test.js`.
+
+Попутно: hook `UserPromptSubmit` для сообщения, поставленного в очередь Claude
+во время хода, приходит с тем же `prompt_id`, что и активный ход, и
+`admitClaudeMainHook` отбрасывает его как `duplicate-prompt-start` целиком (ход
+верно не перезапускается, но вместе с событием теряется текст). Подтверждение такой
+отправки поэтому идёт через транскрипт — 8-секундный post-timeout scan либо
+удерживаемый observer.
+
 ### Параллельная причина N chip'ов на ручной Cmd+V
 
 Claude теряет свой DEC ?2004 при alt-screen toggle → xterm.js шлёт paste raw → TTYHOG режет → Ink делает N chip. См. секцию 9 ниже и [`fix-paste-bracket-mode-loss.md`](fix-paste-bracket-mode-loss.md). Это **другой** root cause тех же визуальных N chip'ов — наш chunking не задействован, дело в потере dec mode.

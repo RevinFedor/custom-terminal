@@ -45,6 +45,7 @@ const bundle = await build({
     export { HistoryCollapsedGroupRow } from './src/renderer/components/Workspace/HistoryTranscriptPresentation.tsx';
     export { TimelineEntryPreview } from './src/renderer/components/Workspace/TimelineEntryPreview.tsx';
     export { ResearchResultContent } from './src/renderer/components/Workspace/ResearchResultContent.tsx';
+    export { ChatMessage } from './packages/claude-blocks/src/components/ChatMessage.tsx';
   ` }, bundle: true, write: false, platform: 'node', format: 'cjs',
   external: ['react', 'react/*', 'react-dom', 'react-dom/*'],
   alias: { '@noted/claude-blocks': root + 'packages/claude-blocks/src/index.ts' },
@@ -58,7 +59,7 @@ const bundle = await build({
 });
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', bundle.outputFiles[0].text)(require, loaded, loaded.exports);
-const { Markdown, HistoryCollapsedGroupRow, TimelineEntryPreview, HistoryCollapsiblePrompt, HistoryUserPromptContent, ResearchResultContent } = loaded.exports;
+const { Markdown, HistoryCollapsedGroupRow, TimelineEntryPreview, HistoryCollapsiblePrompt, HistoryUserPromptContent, ResearchResultContent, ChatMessage } = loaded.exports;
 const render = (component, props) => renderToStaticMarkup(React.createElement(component, props));
 // Exact 443-character past commentary read through Terminal MCP, turn45/block0
 // of SID912d3cc0… on 16 Oct. Not a fabricated final or a provider request.
@@ -224,6 +225,43 @@ test('the actual mixed service body keeps its leading chip and Markdown even whe
   assert.match(html, /cb-collapse-bottom/);
   assert.doesNotMatch(html, /private attachment body|```text/);
   assert.equal(JSON.stringify(parts), before);
+});
+
+test('expand labels show the full character length in History plain/mixed and shared user/compact renderers', () => {
+  for (const text of ['длинный текст '.repeat(90), 'строка\n'.repeat(180), '🙂 абв '.repeat(180)]) {
+    const label = `Раскрыть полностью (${text.length.toLocaleString()} симв.)`;
+    const parts = [{ kind: 'prompt', chip: { id: 'count-fixture', label: 'context.md', text: 'attachment body' } },
+      { kind: 'text', text }];
+    for (const html of [
+      render(HistoryCollapsiblePrompt, { text }),
+      render(HistoryUserPromptContent, { text, tabId: 'owner', markdown: true, presentationParts: parts }),
+      render(ChatMessage, { entry: { id: 'user-count', kind: 'user', text } }),
+      render(ChatMessage, { entry: { id: 'compact-count', kind: 'compact-summary', text } }),
+    ]) {
+      assert.ok(html.includes(label), label);
+      assert.doesNotMatch(html, /Раскрыть полностью \([^)]*строк/);
+    }
+    assert.doesNotMatch(render(HistoryCollapsiblePrompt, { text, forceExpanded: true }), /Раскрыть полностью/);
+    assert.doesNotMatch(render(ChatMessage, { entry: { id: 'open-count', kind: 'user', text },
+      ctx: { collapse: { isOpen: () => true, toggle() {} } } }), /Раскрыть полностью/);
+  }
+  assert.doesNotMatch(render(HistoryCollapsiblePrompt, { text: 'Короткий текст' }), /Раскрыть полностью/);
+});
+
+test('the four label expressions read length metadata without splitting or iterating message bodies', () => {
+  const shared = fs.readFileSync(root + 'packages/claude-blocks/src/components/ChatMessage.tsx', 'utf8');
+  const expressions = [...panel.matchAll(/`Раскрыть полностью \(\$\{([^}]+)\} симв\.\)`/g),
+    ...shared.matchAll(/`Раскрыть полностью \(\$\{([^}]+)\} симв\.\)`/g)];
+  assert.equal(expressions.length, 4);
+  let reads = 0;
+  const text = { get length() { reads++; return 1234; },
+    split() { throw Error('label must not scan text'); },
+    [Symbol.iterator]() { throw Error('label must not iterate text'); } };
+  for (const match of expressions) {
+    const value = new Function('text', 'return ' + match[1])(text);
+    assert.equal(value, (1234).toLocaleString());
+  }
+  assert.equal(reads, 4);
 });
 
 test('Research prose already uses the shared parser; literal JSON summaries remain literal', () => {

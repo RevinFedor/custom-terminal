@@ -39,6 +39,8 @@ function fixture({ fresh = false } = {}) {
     bridgePidCache: new Map([[28777, 'T']]),
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'launch-1', pid: 28777 }]]),
     admitClaudeMainHook, resolveClaudeHookTab,
+    // Queue-continuation bookkeeping is covered by claude-queue-continuation.actual.test.js.
+    rememberClaudeQueuedPromptSubmit() {}, markClaudeQueuedPromptStopBoundary() {},
     taskCompletionIntents: new TaskCompletionIntentRegistry(), loopTaskCompletionEligibility,
     getAgentResponseObservationReader: () => responseReader,
     taskCompletionOutcomeMeta: require('./task-completion-intent').taskCompletionOutcomeMeta,

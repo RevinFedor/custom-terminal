@@ -13,9 +13,16 @@ const contract = require('./codex-runtime-contract');
 const { projectCodexPolicyRuntime } = require('./codex-runtime-policies');
 const { createCodexRuntimeProjectionStore } = require('./codex-runtime-projection-store');
 const { SessionTranscriptService } = require('./session-transcript-service');
+const { HistoryReadClient } = require('./history-read-client');
+const createNodeProcess = require('./test-helpers/history-node-process.cjs');
 const { PublicHistoryRevisions } = require('./public-history-read');
 const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
 const { beginHttpReadDependency, createHttpReadDiagnostics } = require('./http-read-diagnostics');
+const { runHttpHistoryRead, assertHttpHistoryCurrent, rethrowHistoryTerminal } = require('./history-http-consumer');
+const { currentReadControl, isHistoryReadCancelled } = require('./history-read-control');
+const { sendHistoryJson, sendHistoryNdjson } = require('./history-json-stream');
+const { sendHistoryEntriesStream } = require('./history-credit-http');
+const { applyHistoryEntryWindow } = require('./history-entry-window');
 const api = require('./ipc/codex-data')._api;
 const quiet = { log() {}, warn() {}, error() {} };
 function functions(file, names) {
@@ -32,9 +39,10 @@ const mainCode = functions('main.js', ['getCodexResumeSourceLeaseForTab', 'getCo
   'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary']);
 const webCode = functions('web-server.js', ['checkAuth', 'handleApi', 'resolveHistorySessionInfo']);
 
-async function fixture(t) {
+async function fixture(t, { streamReader = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-empty-read-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let reader = null;
+  t.after(async () => { await reader?.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const sessionsDir = path.join(root, 'sessions'), cwd = path.join(root, 'project'), sessionId = crypto.randomUUID();
   fs.mkdirSync(cwd);
   const created = await api.materializeEmptySession({ sessionId, cwd, sessionsDir });
@@ -79,8 +87,15 @@ async function fixture(t) {
   vm.runInContext(mainCode, ctx);
   assert.equal(ctx.bindCodexResumeReadIdentityLease({ tabId: 'T', sourceSessionId: sessionId, launchId: 'L',
     terminalToken: term, terminalRunSeq: 2, terminalLifecycleGeneration: 'G:2' }), true);
-  const service = new SessionTranscriptService({ getMainWindow: () => null, codexData: { _api: {
+  // The non-delta HTTP path uses the real reader protocol. Only its OS child
+  // transport is adapted for this Node fixture; files/parser/stream are real.
+  if (streamReader) reader = new HistoryReadClient({ sessionsDir,
+    cacheDirectory: path.join(root, 'cache'), memoryBudgetMb: 32,
+    createTransport: data => { const child = createNodeProcess(data); child.unref = () => {}; return child; } });
+  const service = new SessionTranscriptService({ getMainWindow: () => null, historyReader: reader, codexData: { _api: {
     ...api, findCodexSessionFile: (sid, dir) => api.findCodexSessionFile(sid, dir, { sessionsDir }),
+    projectCodexFullHistoryFromFile: (sid, dir, options) =>
+      api.projectCodexFullHistoryFromFile(sid, dir, { ...options, sessionsDir }),
     loadSessionRecords: async (sid, dir) => {
       const found = await api.findCodexSessionFile(sid, dir, { sessionsDir });
       const stat = fs.statSync(found.filePath);
@@ -89,8 +104,14 @@ async function fixture(t) {
         sourceSnapshot: { filePath: found.filePath, size: stat.size, mtimeMs: stat.mtimeMs, sessionId: sid, linkKind: 'end' } };
     },
   } } });
-  const sendJson = (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
-  const web = vm.createContext({ url, crypto, console: quiet, require: () => ({}), token: 'fixture', path,
+  // Use the real History encoder and consumer lifetime. Missing terminal
+  // errors must not be swallowed as renderer/empty-history fallback.
+  const sendJson = (res, status, data) => sendHistoryJson(res, status, data);
+  const web = vm.createContext({ url, crypto, console: quiet, srcMainDir: __dirname,
+    require: id => id === path.join(__dirname, 'working-directory-operation-api') ? require(id) : {},
+    workingDirectoryOperations: null, token: 'fixture', path,
+    assertHttpHistoryCurrent, rethrowHistoryTerminal, currentReadControl,
+    sendHistoryNdjson, sendHistoryEntriesStream, applyHistoryEntryWindow,
     beginHttpReadDependency, httpReadDiagnostics: createHttpReadDiagnostics({ serviceId: 'empty-read-fixture', log() {} }),
     handleDictationClipboardHttp: async () => false, workflowOrganizationHttp: async () => false,
     handleStorageMaintenance: async () => false, storageMaintenance: null,
@@ -111,8 +132,12 @@ async function fixture(t) {
 
 test('actual ready broadcast→main read lease→HTTP returns settled empty History without a writer/first Send', async t => {
   const h = await fixture(t);
-  const server = http.createServer((req, res) => h.web.handleApi(req, res, url.parse(req.url, true), new Map())
-    .catch(e => h.web.sendJson(res, 500, { error: e.message })));
+  const server = http.createServer((req, res) => runHttpHistoryRead(req, res,
+    () => h.web.handleApi(req, res, url.parse(req.url, true), new Map()))
+    .catch(e => {
+      if (isHistoryReadCancelled(e) || res.headersSent) { res.destroy(); return; }
+      return h.web.sendJson(res, 500, { error: e.message });
+    }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }));
   const read = async revision => {
@@ -169,18 +194,29 @@ test('file append/in-place ABA and wrong runtime owner revoke empty read at O(st
 });
 
 test('a late empty response cannot clear newer same-SID History after empty-source becomes a live writer', async t => {
-  const h = await fixture(t); h.ready();
-  let entered, release;
+  const h = await fixture(t, { streamReader: true }); h.ready();
+  let entered, release, didEnter = false;
   const started = new Promise(resolve => entered = resolve), held = new Promise(resolve => release = resolve);
-  const getHistory = h.service.getHistory.bind(h.service);
-  h.service.getHistory = async payload => { const result = await getHistory(payload); entered(); await held; return result; };
-  const server = http.createServer((req, res) => h.web.handleApi(req, res, url.parse(req.url, true), new Map())
-    .catch(e => h.web.sendJson(res, 500, { error: e.message })));
+  t.after(() => release());
+  // Ordinary HTTP History now uses the real stream API. Do not manufacture a
+  // stream or switch to delta=1 just to satisfy the old getHistory hold.
+  const openHistoryStream = h.service.openHistoryStream.bind(h.service);
+  h.service.openHistoryStream = async (...args) => {
+    const stream = await openHistoryStream(...args); didEnter = true; entered(); await held; return stream;
+  };
+  const server = http.createServer((req, res) => runHttpHistoryRead(req, res,
+    () => h.web.handleApi(req, res, url.parse(req.url, true), new Map()))
+    .catch(e => {
+      if (isHistoryReadCancelled(e) || res.headersSent) { res.destroy(); return; }
+      return h.web.sendJson(res, 500, { error: e.message });
+    }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }));
   const pending = fetch('http://127.0.0.1:' + server.address().port + '/api/terminal-tabs/T/history?view=history&last=80',
     { headers: { authorization: 'Bearer fixture' } });
-  await started;
+  await Promise.race([started, pending.then(async response => {
+    if (!didEnter) throw new Error('history request returned before controlled hold: ' + response.status + ' ' + await response.text());
+  })]);
   // The SID/project do NOT change. Reproduce the exact stronger read-owner
   // observation after the initial snapshot, without a provider Send/Enter.
   h.web.resolveHistorySessionInfo = async () => ({ toolType: 'codex', sessionId: h.sessionId, cwd: h.cwd,

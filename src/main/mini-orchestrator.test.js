@@ -24,6 +24,81 @@ function setup(overrides = {}) {
 }
 function start(c) { c.setEnabled('t', true); c.observeInput({ tabId: 't', owner, inputId: 'in', text: 'request' }); c.beginTurn({ tabId: 't', owner, turnId: 'turn' }); }
 function finish(c) { return c.complete({ tabId: 't', owner, turnId: 'turn', answerId: 'a', answer: 'answer', complete: true, sourceVerified: true }); }
+function automatic(overrides = {}) { return setup({ automaticCorrections: true,
+  loadInstruction: async () => ({ id: 'i', text: 'actual auto format', automaticCorrections: true }),
+  review: async () => ({ text: 'The second required result is missing.', verdict: 'needs_correction', correctionPrompt: 'Add the second result within the original scope.' }), ...overrides }); }
+test('trusted automatic result forwards once through existing persisted writer and publishes critique first', async () => {
+  let c, count = 0;
+  const f = automatic({ sendCorrection: async request => {
+    count++; assert.equal(c.snapshot('t').entries.find(x => x.type === 'review').text, 'The second required result is missing.');
+    assert.equal(c.validateSend({ tabId: 't', handoffId: request.handoffId }), true);
+    assert.equal(request.tabId, 't'); assert.deepEqual(request.owner, owner);
+    assert.match(request.prompt, /не новое поручение пользователя/);
+    return { status: 'queued', handoffId: request.handoffId };
+  } }); c = f.c; start(c); await finish(c); await finish(c);
+  assert.equal(count, 1); assert.equal(c.snapshot('t').entries.find(x => x.name === 'send_prompt').status, 'queued');
+});
+test('automatic OK and unknown never send, and readonly mode cannot gain writes from returned fields', async () => {
+  for (const verdict of ['ok', 'unknown']) {
+    const f = automatic({ review: async () => ({ text: 'Honest result', verdict }) }); start(f.c); await finish(f.c); assert.equal(f.sends.length, 0);
+  }
+  const f = setup({ review: async () => ({ text: 'Forged fields', verdict: 'needs_correction', correctionPrompt: 'must not send' }) });
+  start(f.c); await finish(f.c); assert.equal(f.sends.length, 0);
+});
+test('malformed automatic proposal, stale owner, persistence failure and Off cannot forward', async () => {
+  for (const result of [{ text: 'x', verdict: 'needs_correction' }, { text: 'x', verdict: 'needs_correction', correctionPrompt: 'x'.repeat(16001) }, { text: 'x', verdict: 'ok', correctionPrompt: 'x' }]) {
+    const f = automatic({ review: async () => result }); start(f.c); await finish(f.c); assert.equal(f.sends.length, 0); assert.equal(f.c.snapshot('t').phase, 'error');
+  }
+  const gate = deferred(), entered = deferred();
+  const f = automatic({ review: async () => { entered.resolve(); await gate.promise; return { text: 'late', verdict: 'needs_correction', correctionPrompt: 'late' }; } });
+  start(f.c); const done = finish(f.c); await entered.promise; f.c.setEnabled('t', false); gate.resolve(); await done; assert.equal(f.sends.length, 0);
+  const broken = automatic({ persist: () => { throw Error('disk'); } }); start(broken.c); await finish(broken.c); assert.equal(broken.sends.length, 0);
+});
+test('duplicate automatic feedback is not replayed and current navigation skips carried task context', async () => {
+  const f = automatic(); start(f.c); await finish(f.c);
+  const handoffId = f.sends[0].handoffId;
+  f.c.beginTurn({ tabId: 't', owner, turnId: 'next' });
+  f.c.observeInput({ tabId: 't', owner, inputId: 'actual-correction', text: f.sends[0].prompt, turnId: 'next', correctionHandoffId: handoffId });
+  await f.c.complete({ tabId: 't', owner, turnId: 'next', answerId: 'a2', answer: 'changed but still incomplete', complete: true, sourceVerified: true });
+  const state = f.c.snapshot('t');
+  assert.equal(f.sends.length, 1); assert.equal(state.correctionState, 'no-progress');
+  assert.equal(state.reviewSource.navigationRequestId, 'actual-correction');
+  assert.deepEqual(state.reviewSource.requestIds, ['in', 'actual-correction']);
+});
+test('new completed answer with a distinct evidence-backed correction is not disabled by a one-root cap', async () => {
+  let round = 0;
+  const f = automatic({ review: async () => ({ text: 'Review', verdict: 'needs_correction', correctionPrompt: 'Distinct detail ' + (++round) }) });
+  start(f.c); await finish(f.c);
+  f.c.beginTurn({ tabId: 't', owner, turnId: 'next' });
+  f.c.observeInput({ tabId: 't', owner, inputId: 'correction', text: f.sends[0].prompt, turnId: 'next', correctionHandoffId: f.sends[0].handoffId });
+  await f.c.complete({ tabId: 't', owner, turnId: 'next', answerId: 'a2', answer: 'new answer with new information', complete: true, sourceVerified: true });
+  assert.equal(f.sends.length, 2); assert.equal(new Set(f.sends.map(x => x.handoffId)).size, 2);
+});
+test('a new real user clarification does not inherit a previous automatic root dedup key', async () => {
+  const f = automatic(); start(f.c); await finish(f.c);
+  f.c.beginTurn({ tabId: 't', owner, turnId: 'next' });
+  f.c.observeInput({ tabId: 't', owner, inputId: 'correction', text: f.sends[0].prompt, turnId: 'next', correctionHandoffId: f.sends[0].handoffId });
+  f.c.observeInput({ tabId: 't', owner, inputId: 'new-human', text: 'New explicit requirement', turnId: 'next' });
+  await f.c.complete({ tabId: 't', owner, turnId: 'next', answerId: 'a2', answer: 'new response', complete: true, sourceVerified: true });
+  assert.equal(f.sends.length, 2);
+});
+test('completed rounds accumulate in presentation instead of overwriting the previous review, bounded to a small window', async () => {
+  let round = 0;
+  const { c } = setup({ review: async () => { round++; return { text: 'review #' + round }; } });
+  c.setEnabled('t', true);
+  for (let i = 1; i <= 6; i++) {
+    c.observeInput({ tabId: 't', owner, inputId: 'in' + i, text: 'request ' + i });
+    c.beginTurn({ tabId: 't', owner, turnId: 'turn' + i });
+    await c.complete({ tabId: 't', owner, turnId: 'turn' + i, answerId: 'a' + i, answer: 'answer ' + i, complete: true, sourceVerified: true });
+  }
+  const entries = c.snapshot('t').entries;
+  const reviews = entries.filter(x => x.type === 'review').map(x => x.text);
+  const rounds = new Set(entries.map(x => x.round));
+  assert.deepEqual(reviews, ['review #3', 'review #4', 'review #5', 'review #6'], 'oldest rounds are evicted, not every round but the most recent');
+  assert.equal(rounds.size, 4);
+  assert.equal(entries.filter(x => x.type === 'instruction').length, 4, 'each surviving round keeps its own instruction block');
+  assert.equal(Object.keys(c.snapshot('t').roundSources).length, 4);
+});
 test('default off, input before turn, duplicate completion', async () => {
   const { c } = setup(); assert.equal(c.observeInput({ tabId: 't', owner, inputId: 'x', text: 'x' }), false);
   start(c); assert.equal(await finish(c), true); assert.equal(await finish(c), false); assert.equal(c.snapshot('t').phase, 'complete');
@@ -73,7 +148,10 @@ test('settled ledger eviction is persisted, unknown attempt is retained', async 
   assert.equal(saved.length, 64); assert.ok(saved.some(x => x.identity === 'old0')); assert.ok(!saved.some(x => x.identity === 'old1'));
 });
 test('feedback carries latest sent corrections and notices stay bounded', async () => {
-  let feedback; const ledger = Array.from({ length: 6 }, (_, i) => ({ identity: 'old' + i, jobId: 'j' + i, attempted: true, settled: true, feedback: 'f' + i, receipt: { status: 'sent' } }));
+  const rootHash = require('node:crypto').createHash('sha256').update(JSON.stringify([{ inputId: 'in', text: 'request' }])).digest('hex');
+  const ownerKey = JSON.stringify(['codex', 's', 'g']);
+  let feedback; const ledger = Array.from({ length: 6 }, (_, i) => ({ identity: 'old' + i, jobId: 'j' + i, attempted: true, settled: true, rootHash, ownerKey, feedback: 'f' + i, receipt: { status: 'sent' } }));
+  ledger.push({ identity: 'foreign-task', jobId: 'other', attempted: true, settled: true, rootHash: 'different-task', ownerKey, feedback: 'unrelated', receipt: { status: 'sent' } });
   const { c } = setup({ loadLedger: () => ledger, review: async x => { feedback = x.previousFeedback; return { text: 'ok' }; } });
   start(c); await finish(c); assert.deepEqual(feedback, ['f2', 'f3', 'f4', 'f5']);
   for (let i = 0; i < 100; i++) c.invalidate('t', 'notice'); assert.equal(c.snapshot('t').entries.filter(x => x.type === 'notice').length, 1);

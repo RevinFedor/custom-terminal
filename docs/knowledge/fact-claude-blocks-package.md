@@ -44,6 +44,15 @@ presentation-компонент не решает, жив ли агент и г�
 Timeline answer/summary; ordinary user input, tool digests и JSON excerpts
 остаются буквальными. Raw Copy/UUID/time/hydration не меняются. Новый размер
 подписи требует новой measured-layout identity, но не нового физического UUID.
+SOURCE31Oct `Markdown.renderLink` — optional host renderer уже разобранного,
+санитизированного `<a>`, без IPC/Zustand/навигации внутри shared package.
+Noted передаёт его только в живой/сохранённый assistant prose для синей
+подчёркнутой ссылки на exact итерацию (`#noted-message?...`); существующий host
+message-reference navigator владеет open/reveal/scroll/receipt/cancellation.
+В preview этот callback не вызывается; code остаётся literal, обычные user/другие
+hosts без callback сохраняют прежний renderer и стандартные file/web ссылки.
+Полный wire и отличие от малинового Rewind-контекста —
+`fact-terminal-mcp.md::Saved-history Rewind через MCP`.
 Legacy-shape'ы (`FileAction`/string — Gemini/старый кэш) сохранены как
 фоллбэк, рендерятся в исходном порядке (turn чередует Bash→Edit→Task). Пакетные
 компоненты **context-free** (ноль зависимостей от Zustand/контекста) — поэтому

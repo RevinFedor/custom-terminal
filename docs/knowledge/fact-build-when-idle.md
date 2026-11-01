@@ -75,6 +75,24 @@ lock защищает от одновременно работающих уст�
 
 Run After `after app restart` отслеживает identity нового Electron main, а не имя install-команды. `build:install`/alias `build:i`, ожидающий `build:i-obs` и `build:i-cont` удовлетворяют его после замены и открытия приложения; обычный Quit/Open тоже. Package-only build либо отказ сборки до замены не удовлетворяет условие. Возврат `continue`/AI-hop callback и такой queue-item — отдельные явно настроенные сообщения, одно не заменяет другое. Готовность Resume ограничивает физическую отправку карточки, но прошлый assistant outcome не является дополнительным условием запуска; подробности — `fact-prompt-queue.md::Overlay UI`.
 
+## Запуск приложения не наследует маркеры AI-сессии (01.11.2026)
+
+`/usr/bin/open` передаёт запускаемому приложению окружение вызывающего процесса.
+Установка, запущенная из Bash-инструмента внешней Claude Code сессии, отдала Noted
+`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`,
+`NOTED_MCP_IDENTITY` — а дальше их унаследовал каждый PTY. Каждый Claude во вкладках
+печатал `⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker`:
+нет JSONL → нет подтверждения Send, нет proof `/model`, нет History. Проверить у
+живого процесса: `ps eww -p <main pid> | tr ' ' '\n' | grep -E '^CLAUDE'` (печатать
+только имена, без значений).
+
+`build-install-noted-terminal.mjs::appLaunchEnv` убирает ровно маркеры сессии
+(`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `NOTED_MCP_IDENTITY`) на
+обоих путях запуска (обычный и повторное открытие после сбоя); остальное окружение,
+включая намеренные `ANTHROPIC_MODEL`/`NOTED_*`, проходит без изменений. Тест в
+`scripts/build-install-noted-terminal.test.mjs`. Ручной перезапуск из AI-сессии —
+только с чистым env (`env -i HOME USER LOGNAME SHELL TMPDIR PATH … open`).
+
 ## Замок установки: владелец, а не просто каталог (12.09)
 
 `build:install` берёт замок `mkdir /Applications/.noted-terminal-install-lock`:
@@ -262,6 +280,41 @@ notification handoff и UNKNOWN не пересоздаются. Входяще�
 существующий orchestration owner; второй generic `continue` поверх него запрещён.
 Пассивное наблюдение само не отправляет input: exact restart связывает старый
 subject с доказанным continuation, сохраняя отдельное evidence/provenance.
+
+SOURCE31Oct разделяет pre-cut task capture и публичный writer proof. После
+`process-proof-unknown` живой принятый TaskCompletionIntent и enrolled native
+watcher того же task/source/terminal/run/lifecycle не теряют свой private subject
+лишь потому, что public response DTO отозвал executionContext. Bare saved SID,
+busy или число детей такого subject не создают. Отдельный Main getter используется
+ТОЛЬКО census/cut; общий `captureOne`, response reader и input/Goal/Stop/FIFO gates
+остаются публичными прежними ports. Writer refinement и обычный output допустимы,
+но task/input/Stop/source/owner replacement во время await не ретаргетят снимок.
+
+Новый proof хранится в envelope5 (читает1–5, не понижает4/5). До Quit выполняется
+strict durability preflight; первый настоящий pre-stop snapshot повторяет исходный
+Main bookend, сохраняет task evidence и `buildContinueBindings` с capture/evidence
+digest. Поздний will-quit не переписывает cut после собственного Stop. После
+restart closure не восстанавливается из текущего task: нужна exact shutdown-связь.
+Native final исходного хода означает not-needed, не успех whole Goal или новый
+Continue. Исторические операции не backfill/replay; process restoration не является
+разрешением на отправку. Это Source/private контракт, не installed приёмка.
+
+Отказ ДО появления target публикуется отдельным `captureIssues.items` в обычном
+per-tab Build snapshot и будит эту вкладку даже при targets0. Discriminant
+`capture-unresolved`/inputCreatedfalse не имеет H/O/attempt и не разрешает Retry
+Send. CLI называет tab/name/stage/reason. Его X — presentation-only exact
+operation/tab/issueId/requestId с durable acknowledgement; это не cancel-target,
+не Stop/restore и не правка причины отказа. Новый capture другого cut не скрывается.
+Backend ports — `build-continue:dismiss-capture` и `/operations/:id/dismiss-capture`;
+Build renderer принимает эту additive projection отдельно от обычных targets.
+SOURCE31Oct renderer показывает такой отказ красной статичной строкой с именем
+вкладки и X, даже если targets пуст и active=false. Клик открывает ровно эту ошибку
+в общем боковом `RequestDetailsPopover`; hover не открывает панель, Research этой
+вкладки не подмешиваются. Детали сообщают, что Continue не создавался, и показывают
+исходные task/op/reason без вымышленных H/O. X требует совпадения operation/tab/
+issue/request и durable ACK; ok без этих данных не скрывает строку. Потеря ответа
+сохраняет тот же requestId; поздний ответ не меняет новый epoch или другую вкладку.
+Исходный отказ остаётся в журнале операции после закрытия уведомления.
 
 SOURCE26Oct: новый capture сохраняет русский текст «Продолжай работу…» вместе
 с исходными идентификаторами видимых внутренних субагентов. Модель возобновляет
@@ -624,6 +677,26 @@ Build Continue; hover не раскрывает детали. Старое inlin
 просмотр; X карточки по-прежнему адресно отменяет запрос. UI не меняет receipt,
 callback/natural-final guards и не выполняет повторную отправку.
 
+X доступен и у завершённого failed install, который остаётся attention-карточкой.
+Шрам31Oct4875: old failed job был виден по ok=false, а X проверял только running/
+pending-continuation; результат невозможно было убрать. Закрытие адресует тот же
+request/job через прежнюю отмену, затем scoped refresh убирает его из live dock.
+Исторические error/callback/receipt сохраняются; новый compiler не запускается.
+
+Источник запроса резервируется раньше, чем Voice выдаёт Job ID. Временная строка
+`continuation:<requestId>` и последующий Job — одно событие: renderer заменяет её
+только при том же requestId, fingerprint и source tab/session. Шрам31Oct: merge
+по разным row ID оставлял две плашки и синий orphan даже после отмены реального
+Job. Авторитетный terminal continuation также обновляет retained row, когда Job
+уже отсутствует в bounded cache. Пустой/старый/чужой snapshot не снимает ожидание;
+квитанции, результат установки и сохранённая история этим merge не меняются.
+
+Ручной Stop в Voice сохраняет причину пользовательской отмены. Завершённая отмена
+показывается серым статическим значком, включая время обработки её уведомления;
+ещё работающий driver показывает остановку. Callback отмены сообщает, кто её
+запросил, и не наследует failurePrompt настоящей ошибки. Уже frozen callback
+не переписывается; неизвестный исход применения приложения остаётся отдельным.
+
 Confirmed audit той же доставки может позже получить canonical UUID или alias.
 Build Install сохраняет исходный callback binding, но принимает это обогащение,
 только если прежние адреса входят в current audit того же O/H/A, session,
@@ -686,11 +759,22 @@ compiler без terminal receipt остаётся unknown и не respawn'итс
 primary result переживает потерю close ACK. Поздний canonical callback receipt
 можно принять пассивным чтением после deadline, без нового Send.
 
-`force=false` у Voice job не гарантирует отсутствие OS fallback: обычный driver
-вызывает `graceful-quit.sh 20`, чей поиск по пути packaged app может сопоставить
-также detached MCP hub. Exact-PID `--require-graceful --wait-only` — отдельная
-граница helper, используемая capture-quit flow; она сама не выдаёт install admission
-и не доказывает отсутствие незавершённого ввода.
+`force=false` у Voice job не гарантирует отсутствие OS fallback: после срока
+`graceful-quit.sh 20` всё ещё шлёт SIGTERM/SIGKILL. Но с 01.11 обычный driver (plain
+CLI с живым Main и не-continuation Voice/MCP job) прямо перед Quit заново читает
+точный Main через `inspectProdServer` и передаёт его PID: ожидание и fallback-сигнал
+касаются только этого процесса. Шрам 01.11 20:05 UTC: Main закрыл каналы через ~2 с
+после Quit, а поиск по пути packaged app находил detached MCP hub (тот же executable).
+Каждая установка ждала все 20 с, и SIGTERM убивал хаб, который должен переживать
+обновление (`fact-mcp-hub.md`). Повторное чтение даёт `absent` → Quit не нужен, хабу он
+не шлётся. `unknown`/ошибка чтения → прежний поиск по пути. Скрипт по PID дополнительно
+сверяет, что процесс всё ещё Main (защита от переиспользования PID). Rollback после
+неудачного запуска новой версии по-прежнему использует поиск по пути. Exact-PID
+`--require-graceful --wait-only` — отдельная граница helper, используемая capture-quit
+flow; она сама не выдаёт install admission и не доказывает отсутствие незавершённого
+ввода. Тесты: `graceful-quit.wiring.test.mjs` (синтетические Main и хаб под
+вымышленным именем приложения; скрипт из HEAD убивает хаб и при переданном PID),
+`build-install-closed-main.test.mjs`.
 
 Шрам24Oct: ошибка process discovery внутри observe может закончить job ещё до
 compiler. `terminal_process_observation_unknown` при `pid/stage/installResult:null`

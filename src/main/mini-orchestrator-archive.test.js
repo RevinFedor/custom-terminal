@@ -21,3 +21,20 @@ test('foreign or write-tool archives are rejected and cannot become active', () 
     assert.equal(c.snapshot('own').entries.length, 0); c.dispose();
   }
 });
+test('two genuinely completed rounds of the same archived chat show their full request-answer-critique-correction-reverdict chain', () => {
+  const roundEntries = (label) => ['instruction', 'request', 'answer', 'review'].map((type, i) => ({ id: label + i, type, text: label + '-' + type }));
+  const a = { version: 1, tabId: 'own', completed: true, rounds: [
+    { source: { provider: 'codex', sessionId: 'sid-1', turnId: 'turn-1', generation: 'g1', requestIds: ['sid-1_user'] }, entries: roundEntries('r1') },
+    { source: { provider: 'codex', sessionId: 'sid-2', turnId: 'turn-2', generation: 'g2', requestIds: ['sid-2_user'] }, entries: roundEntries('r2') },
+  ] };
+  const c = createMiniOrchestrator({ loadPresentation: () => a });
+  const s = c.snapshot('own');
+  assert.equal(s.phase, 'complete'); assert.equal(s.entries.length, 8);
+  assert.deepEqual(s.entries.map(e => e.round), [1, 1, 1, 1, 2, 2, 2, 2]);
+  assert.equal(s.entries.find(e => e.round === 1 && e.type === 'review').text, 'r1-review');
+  assert.equal(s.entries.find(e => e.round === 2 && e.type === 'review').text, 'r2-review');
+  assert.equal(Object.keys(s.roundSources).length, 2);
+  assert.equal(s.roundSources['1'].sessionId, 'sid-1'); assert.equal(s.roundSources['2'].sessionId, 'sid-2');
+  assert.equal(s.reviewSource.sessionId, 'sid-2', 'the top-level reviewSource is the latest round, for legacy readers');
+  c.dispose();
+});

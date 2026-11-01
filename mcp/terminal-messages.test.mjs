@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import vm from 'node:vm';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 
 const source = readFileSync(new URL('./terminal-server.mjs', import.meta.url), 'utf8');
@@ -52,7 +53,7 @@ function harness({ respond, env = {} } = {}) {
       return { ok: response.status >= 200 && response.status < 300, status: response.status, text: async () => JSON.stringify(response.body) };
     },
   });
-  vm.runInContext(executable + '\npickWebInstance = testPickInstance; readSharedToken = () => "test-token"; globalThis.dispatch = handleRequest;', context);
+  vm.runInContext(executable + '\npickWebInstance = testPickInstance; pickInstance = () => ({ port: 43211 }); readSharedToken = () => "test-token"; globalThis.dispatch = handleRequest;', context);
   let nextId = 0;
   return {
     calls, targets, events,
@@ -76,21 +77,23 @@ function assertStructured(result) {
 
 test('rewind_self is caller-bound, retains the context cut and delegates its sole followup to the app', async () => {
   const args = { operationId: 'self-op', expectedSessionId: 'S', targetUuid: 'user-before-deploy',
-    retainedContext: 'Deployment succeeded; files and server changes remain.', expectedContextRevision: 7,
+    retainedContext: 'Deployment succeeded; files and server changes remain.', expectedContextRevision: 7, expectedContextSnapshot: 'observed-proof',
     coveredContextUpdateIds: ['old-member'], nextPrompt: 'Inspect the result without redeploying.' };
   const h = harness({ respond: call => ({ status: call.method === 'POST' ? 202 : 200,
     body: call.endpoint === '/api/me' ? { capabilities: { savedHistory: { version: 1, receipts: true,
       structuredDraft: true, operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true,
-      selfRewind: { version: 1 } } } } : { ok: true, operation: { operationId: 'self-op', tabId: owner.tabId,
+      selfRewind: { version: 1, contextSnapshot: 1 } } } } : { ok: true, operation: { operationId: 'self-op', tabId: owner.tabId,
         expectedSessionId: 'S', targetUuid: args.targetUuid, kind: 'rewind', toolType: 'codex', state: 'running', pending: true } } }) });
   const schema = (await h.list()).find(tool => tool.name === 'rewind_self').inputSchema;
   assert.equal(schema.additionalProperties, false); assert.equal(schema.properties.tabId, undefined);
+  assert.equal(schema.required.includes('expectedContextSnapshot'), true);
   const result = assertStructured(await h.call('rewind_self', args));
   assert.equal(result.operationId, 'self-op'); assert.equal(result.tabId, owner.tabId);
   assert.match(result.guidance, /Finish this old turn/); assert.match(result.guidance, /Do not send it yourself/);
   assert.equal(h.calls.length, 2);
   assert.equal(h.calls[1].endpoint, '/api/terminal-tabs/' + owner.tabId + '/self-rewind');
   assert.deepEqual(h.calls[1].body.selfRewind, { retainedContext: args.retainedContext, expectedContextRevision: 7,
+    expectedContextSnapshot: args.expectedContextSnapshot,
     coveredContextUpdateIds: ['old-member'], nextPrompt: args.nextPrompt });
   assert.equal(h.calls[1].body.sourceMeta.tabId, owner.tabId);
   const forged = await h.call('rewind_self', { ...args, tabId: 'another-tab' });
@@ -108,9 +111,9 @@ test('rewind_self on an older backend refuses before POST; no use of ordinary Re
 });
 
 test('self Rewind pre-admission rejection and lost ACK remain distinguishable with the original recovery ID', async () => {
-  const args = { operationId: 'fixed-id', expectedSessionId: 'S', targetUuid: 'u', retainedContext: 'Facts', expectedContextRevision: 2 };
+  const args = { operationId: 'fixed-id', expectedSessionId: 'S', targetUuid: 'u', retainedContext: 'Facts', expectedContextRevision: 2, expectedContextSnapshot: 'observed-proof' };
   const capability = { capabilities: { savedHistory: { version: 1, receipts: true, structuredDraft: true,
-    operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true, selfRewind: { version: 1 } } } };
+    operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true, selfRewind: { version: 1, contextSnapshot: 1 } } } };
   for (const lost of [false, true]) {
     const h = harness({ respond: call => {
       if (call.endpoint === '/api/me') return { status: 200, body: capability };
@@ -124,6 +127,87 @@ test('self Rewind pre-admission rejection and lost ACK remain distinguishable wi
     assert.equal(result.structuredContent.receiptRead.tabId, owner.tabId);
     assert.equal(h.calls.length, 2, 'no automatic read/retry/followup');
   }
+});
+
+test('context reader requests the observed snapshot, and a new app rejects a missing proof without POST', async () => {
+  const capability = { capabilities: { savedHistory: { version: 1, receipts: true, structuredDraft: true,
+    operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true, selfRewind: { version: 1, contextSnapshot: 1 } } } };
+  const h = harness({ respond: call => ({ status: 200, body: call.endpoint === '/api/me' ? capability
+    : { ok: true, context: { revision: 7, rewindSnapshot: 'opaque-proof' } } }) });
+  const observed = assertStructured(await h.call('get_tab_context', {}));
+  assert.equal(observed.context.rewindSnapshot, 'opaque-proof');
+  assert.equal(h.calls[0].endpoint, '/api/terminal-tabs/' + owner.tabId + '/work-context?rewindSnapshot=1');
+  const currentRead = await h.call('current_context', {});
+  assert.ok(!currentRead.isError, JSON.stringify(currentRead));
+  const current = assertStructured(currentRead);
+  assert.equal(current.workingContext.rewindSnapshot, 'opaque-proof');
+  assert.equal(h.calls.filter(call => call.endpoint.endsWith('/work-context?rewindSnapshot=1')).length, 2);
+  const missing = await h.call('rewind_self', { operationId: 'never-posted', expectedSessionId: 'S', targetUuid: 'U',
+    retainedContext: 'Facts', expectedContextRevision: 7 });
+  assert.equal(missing.isError, true); assert.equal(h.calls.some(call => call.method === 'POST'), false);
+});
+
+test('actual MCP -> context/self routes -> real SQLite snapshot admits status-only drift, not a mocked success', async t => {
+  const require = createRequire(import.meta.url);
+  let db;
+  try { const Sqlite = require('better-sqlite3'); db = new Sqlite(':memory:'); }
+  catch (error) {
+    if (error.code === 'ERR_DLOPEN_FAILED') { t.skip('Run this native SQLite case with E28 ELECTRON_RUN_AS_NODE=1'); return; }
+    throw error;
+  }
+  const { TabWorkContext } = require('../src/main/tab-work-context');
+  const { SavedHistoryOperations } = require('../src/main/saved-history-operation');
+  const { promptAuditFingerprint } = require('../src/main/prompt-audit-fingerprint');
+  const ts = require('typescript');
+  const context = new TabWorkContext({ db, listTabs: () => [{ ...owner, commandType: 'codex', codexSessionId: 'S' }] });
+  t.after(async () => { await context.syncing; for (const watcher of context.watchers.values()) watcher.close(); db.close(); });
+  db.exec('CREATE TABLE app_state(key TEXT PRIMARY KEY,value TEXT,updated_at INTEGER)');
+  const store = { db, getAppState: key => {
+    const row = db.prepare('SELECT value FROM app_state WHERE key=?').get(key); return row ? JSON.parse(row.value) : null;
+  }, setAppState: (key, value) => db.prepare('INSERT INTO app_state VALUES(?,?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)) };
+  const dispatches = [];
+  const service = new SavedHistoryOperations({ db: store, dispatch: async (...args) => {
+    dispatches.push(args);
+    throw Object.assign(new Error('Controlled executor not dispatched; no Stop or provider input'), { dispatched: false });
+  },
+    selfRewind: { context, send: () => assert.fail('no native/extra task allowed in this admission fixture') } });
+  const web = readFileSync(new URL('../src/main/web-server.js', import.meta.url), 'utf8');
+  const ast = ts.createSourceFile('web.js', web, ts.ScriptTarget.Latest, true);
+  const statements = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi').body.statements;
+  const at = statements.findIndex(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => item.name.getText(ast) === 'contextRoute'));
+  const selfAt = statements.findIndex(node => ts.isExpressionStatement(node) && node.getText(ast).includes('self-rewind$/'));
+  assert.ok(at >= 0 && selfAt >= 0);
+  const route = vm.runInNewContext('(async(req,res,parsed)=>{let m;\n'
+    + [statements[at], statements[at + 1], statements[selfAt], statements[selfAt + 1]].map(node => node.getText(ast)).join('\n') + '})', {
+    tabWorkContext: context, savedHistoryOperations: service, decId: decodeURIComponent,
+    readBody: async req => req.body, sendJson: (res, status, body) => Object.assign(res, { status, body }),
+  });
+  const h = harness({ respond: async call => {
+    if (call.endpoint === '/api/me') return { status: 200, body: { capabilities: { savedHistory: { version: 1,
+      receipts: true, structuredDraft: true, operations: ['rewind'], providers: ['codex'], codexPhysicalSuffix: true,
+      selfRewind: { version: 1, contextSnapshot: 1 } } } } };
+    const url = new URL(call.endpoint, 'http://owned-fixture'), result = {};
+    await route({ method: call.method, body: call.body }, result, { pathname: url.pathname, query: Object.fromEntries(url.searchParams) });
+    return result;
+  } });
+  const update = context.publish(owner.tabId, { text: 'Known factual result', requestId: 'known' });
+  const prepared = await context.prepare(owner.tabId, 'old-delivery', 'Original task');
+  const observed = assertStructured(await h.call('get_tab_context', {})).context;
+  assert.ok(observed.rewindSnapshot); context.confirm(owner.tabId, 'old-delivery', promptAuditFingerprint(prepared.prompt));
+  const result = assertStructured(await h.call('rewind_self', { operationId: 'context-snapshot-real', expectedSessionId: 'S', targetUuid: 'U',
+    retainedContext: 'Known factual result; no repetition of the old task', expectedContextRevision: observed.revision,
+    expectedContextSnapshot: observed.rewindSnapshot }));
+  assert.equal(result.operation.phase, 'accepted'); assert.equal(result.operation.historyMutated, false);
+  assert.equal(service.read(owner.tabId, 'context-snapshot-real').rewindContext.covered[0].id, update.updateId);
+  assert.equal(db.prepare('SELECT status FROM tab_context_updates WHERE id=?').get(update.updateId).status, 'delivered');
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(dispatches.length, 1, 'the sole existing executor is dispatched once, not run by this test');
+  context.publish(owner.tabId, { text: 'New fact absent from the observed summary', requestId: 'unseen' });
+  const rejected = await h.call('rewind_self', { operationId: 'unseen-facts-never-dispatched', expectedSessionId: 'S', targetUuid: 'U',
+    retainedContext: 'Only the earlier facts', expectedContextRevision: observed.revision, expectedContextSnapshot: observed.rewindSnapshot });
+  assert.equal(rejected.isError, true);
+  assert.equal(rejected.structuredContent.code, 'self_rewind_context_revision_changed');
+  assert.equal(rejected.structuredContent.mutationAttempted, false);
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(dispatches.length, 1, 'new facts fail before the executor');
 });
 
 test('inspect_tabs actual dispatcher is two GETs, strict bounds and update-required without fallback', async () => {
@@ -413,8 +497,14 @@ test('send_prompt pending and unknown results point to the reader without anothe
     const h = harness({ respond: () => ({ status: 202, body: { ...status, handoffId: 'original-handoff' } }) });
     const result = await h.call('send_prompt', { tabId: 'recipient', prompt: 'Original text' });
     assert.equal(result.isError, undefined);
-    assert.ok(result.content[0].text.includes('get_send_receipt({"tabId":"recipient","handoffId":"original-handoff"})'));
-    assert.match(result.content[0].text, /changed\/empty text/);
+    // send_prompt is now a structured tool: the human guidance moved into
+    // `summary`, and the pending/unknown phase is reported as fields so the
+    // caller no longer has to parse prose. The guidance itself is unchanged.
+    const data = assertStructured(result);
+    assert.ok(data.summary.includes('get_send_receipt({"tabId":"recipient","handoffId":"original-handoff"})'));
+    assert.match(data.summary, /changed\/empty text/);
+    assert.equal(data.reachedTerminal, true, 'pending/unknown is never a proven no-input');
+    assert.equal(data.handoffId, 'original-handoff');
     assert.equal(h.calls.length, 1);
     assert.equal(h.calls[0].endpoint, '/api/terminal-tabs/recipient/send');
   }
@@ -423,7 +513,12 @@ test('send_prompt pending and unknown results point to the reader without anothe
 test('ordinary send_prompt delivery and editable-draft behavior are not redefined', async () => {
   const h = harness({ respond: () => ({ status: 200, body: { status: 'queued', queued: true, handoffId: 'send-key' } }) });
   const result = await h.call('send_prompt', { tabId: 'recipient', prompt: 'Original text' });
-  assert.equal(result.content[0].text, 'Prompt sent to tab recipient through Project API scenario layer. Status: queued (queued). Handoff: send-key');
+  const delivered = assertStructured(result);
+  assert.equal(delivered.summary,
+    'Prompt sent to tab recipient through Project API scenario layer. Status: queued (queued). Handoff: send-key');
+  assert.equal(delivered.status, 'queued');
+  assert.equal(delivered.queued, true);
+  assert.equal(delivered.handoffId, 'send-key');
   assert.deepEqual(h.calls.map((call) => call.endpoint), ['/api/terminal-tabs/recipient/send']);
   const rejectedDraft = await h.call('send_prompt', { tabId: 'recipient', prompt: 'draft', submit: false, files: [{ path: '/source.txt' }] });
   assert.equal(rejectedDraft.isError, true);

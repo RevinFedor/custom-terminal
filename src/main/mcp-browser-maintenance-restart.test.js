@@ -98,6 +98,20 @@ test('changed configuration does not inherit the historical activation', async t
   assert.throws(() => f.host.assertEntry('browser'), { code: 'RESEARCH_MAINTENANCE_HELD' });
 });
 
+test('restoring the exact activated configuration preserves the original release and epoch', async t => {
+  const f = await fixture(t);
+  const original = f.host.current();
+  f.restart({ configurationDigest: p.digest({ configuration: 'unrelated-knowledge-default-change' }) });
+  assert.equal(f.host.status().held, true);
+  assert.throws(() => f.host.assertEntry('browser'), { code: 'RESEARCH_MAINTENANCE_HELD' });
+  f.restart();
+  assert.equal(f.host.status().held, false);
+  assert.equal(f.host.assertEntry('browser').kind, 'cooperative');
+  assert.equal(f.host.current().ingressEpoch, original.ingressEpoch);
+  assert.deepEqual(f.host.current().holds, original.holds, 'no journal or receipt rewriting');
+  assert.deepEqual(f.host.current().ingressBasis, original.ingressBasis);
+});
+
 for (const [name, edit] of [
   ['missing ancestor', host => { host.lineage = []; }],
   ['wrong ancestor process', host => { host.lineage[0].process.birth += ':different'; }],

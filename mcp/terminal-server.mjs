@@ -573,6 +573,24 @@ async function httpApiPost(target, endpoint, body, presentationSource = null) {
       error.toolDetails = json;
       error.code = json.code || json.error;
     }
+    // A refused Send must reach the CALLING session as a machine-readable
+    // result, not only as an 'HTTP 409: ...' string. The user's own History no
+    // longer shows a card for a prompt that never reached the terminal, so this
+    // is the one place left that has to explain the refusal. Scalars only:
+    // never echo the persisted prompt back to the caller.
+    if (/\/send$/.test(endpoint)) {
+      error.toolDetails = {
+        ...(error.toolDetails || {}),
+        code: json.code || 'send_failed',
+        tabId: json.tabId || json.targetTabId,
+        handoffId: json.handoffId,
+        submitted: json.submitted === true,
+        ...(json.submitted === false ? { pasteWritten: false, enterWritten: false } : {}),
+        ...(json.deliveryUnknown === true ? { deliveryUnknown: true } : {}),
+        ...(json.status ? { status: json.status } : {}),
+        reachedTerminal: json.submitted === true || json.deliveryUnknown === true,
+      };
+    }
     throw error;
   }
   return json;
@@ -1085,6 +1103,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'import_external_conversation',
   'observe_external_turn',
   'continue_external_research',
+  'send_prompt',
   'send_message', 'reply_to_message', 'get_message', 'cancel_message', 'get_send_receipt',
   'notify_user', 'get_user_notification',
   'reconcile_send_receipt', 'release_send_queue_head',
@@ -1096,7 +1115,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
 const TOOLS = [
   {
     name: 'rewind_self',
-    description: 'Only on the user\'s explicit instruction, rewind THIS full session with the existing saved-history executor. Save a concise factual retainedContext first: code/server changes, deployment outcome, findings, constraints and unresolved effects; Rewind does not undo files or external actions. Resolve the requested iteration to an exact user UUID, never guess by index/text. Read current_context/get_tab_context first; pass its expectedContextRevision and retain all notes from that snapshot. By default all observed updates are covered; explicit coveredContextUpdateIds can narrow the set. Those old chips are superseded only after binding; later changed/new updates remain. With no nextPrompt the removed prompt is restored as a draft beside a Rewind context chip; with nextPrompt the app queues ONE ordinary model task after Rewind through the existing FIFO. No native menu or AI-summary mode. Choose operationId before calling. This is the LAST tool action of the old turn: finish immediately after acceptance; the app owns Stop/rewrite/Resume/followup. Lost ACK/UNKNOWN must be read by the SAME tabId/operationId using get_history_operation, never rerun or send the followup yourself. Requires savedHistory.selfRewind.version:1 in the loaded app.',
+    description: 'Only on the user\'s explicit instruction, rewind THIS full session with the existing saved-history executor. Save a concise factual retainedContext first: code/server changes, deployment outcome, findings, constraints and unresolved effects; Rewind does not undo files or external actions. Resolve the requested iteration to an exact user UUID, never guess by index/text. To SHOW a proposed target before mutation, use the blue navigation-only Markdown link described by list_turns; clicking it is NOT Rewind. Read current_context/get_tab_context after final working-file edits; copy revision and rewindSnapshot from that SAME observation into expectedContextRevision/expectedContextSnapshot and incorporate its notes. Do not refresh the proof behind an old summary. Delivery/read acknowledgement alone does not invalidate the signed snapshot; new facts or composition changes fail before Stop. By default all observed updates are covered; explicit coveredContextUpdateIds can narrow the set. Old chips are superseded only after binding; later changed/new updates remain. With no nextPrompt the removed prompt is restored as a draft beside a Rewind context chip; with nextPrompt the app queues ONE ordinary model task through the existing FIFO. Choose operationId before calling. This is the LAST tool action of the old turn: finish immediately after acceptance; the app owns Stop/rewrite/Resume/followup. Lost ACK/UNKNOWN must be read by the SAME tabId/operationId using get_history_operation, never rerun or send the followup yourself. Requires savedHistory.selfRewind:{version:1,contextSnapshot:1} in the loaded app; no native-menu/raw-history fallback.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {
       operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' },
       expectedSessionId: { type: 'string', minLength: 1 }, targetUuid: { type: 'string', minLength: 1 },
@@ -1108,9 +1127,10 @@ const TOOLS = [
         required: ['physicalSessionId', 'rawUuid'], additionalProperties: false },
       retainedContext: { type: 'string', minLength: 1, maxLength: 100000 },
       expectedContextRevision: { type: 'integer', minimum: 0 },
+      expectedContextSnapshot: { type: 'string', minLength: 1, description: 'Copy workingContext.rewindSnapshot/context.rewindSnapshot from the SAME current_context/get_tab_context observation. Opaque app proof; do not reconstruct it or fetch a new snapshot behind an old summary.' },
       coveredContextUpdateIds: { type: ['array', 'null'], items: { type: 'string', minLength: 1 }, description: 'Normally omit: retain and supersede ALL updates in the observed expectedContextRevision snapshot. Explicit IDs restrict coverage to those incorporated in retainedContext.' },
       nextPrompt: { type: 'string', minLength: 1, description: 'Optional NEW model task, not a local slash command. Omit for Rewind only; never send it again after acceptance.' },
-    }, required: ['operationId', 'expectedSessionId', 'targetUuid', 'retainedContext', 'expectedContextRevision'] },
+    }, required: ['operationId', 'expectedSessionId', 'targetUuid', 'retainedContext', 'expectedContextRevision', 'expectedContextSnapshot'] },
   },
   {
     name: 'inspect_tabs',
@@ -1767,7 +1787,7 @@ const TOOLS = [
   },
   {
     name: 'list_turns',
-    description: 'Map turns inside one already-selected session; this is not a cross-session search tool. Use search_sessions first for topic/feature lookup, then call list_turns only when its match preview is insufficient to reconstruct chronology. Inspect one session at a time, normally with kind="user", from="latest_compact" or from="end", and a small page; paginate only as evidence requires. Never call it across several candidate sessions just to find a phrase, and never repeat the same call with unchanged arguments. Returns zero-based iterationIndex values, compact boundaries, previews, block sizes, UUIDs, tools, notes, and docs markers; read full content only through targeted turn tools.',
+    description: 'Map turns inside one already-selected session; this is not a cross-session search tool. Use search_sessions first for topic/feature lookup, then call list_turns only when its match preview is insufficient to reconstruct chronology. Inspect one session at a time, normally with kind="user", from="latest_compact" or from="end", and a small page; paginate only as evidence requires. Never call it across several candidate sessions just to find a phrase, and never repeat the same call with unchanged arguments. Returns zero-based iterationIndex values, compact boundaries, previews, block sizes, UUIDs, tools, notes, and docs markers; read full content only through targeted turn tools. When asked to identify/show a Rewind iteration, put a readable label in ordinary answer Markdown, NOT code/backticks: [Iteration N - short prompt](#noted-message?tabId=T&provider=codex&sessionId=S&messageId=U). Substitute exact public tab/provider/entry.sessionId/entry.uuid and URL-encode values; retain available physicalSessionId,rawUuid,viewOwnerSessionId,transcriptSegmentId,sourceIdentity. A display number is never an address. This requires the updated desktop History link adapter; it only navigates/highlights, never Rewind/Stop/Send, and does not authorize mutation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2537,7 +2557,7 @@ async function callTool(name, args) {
       const target = projectHint(args, tabId);
       const endpoint = '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/work-context';
       const result = name === 'get_tab_context'
-        ? await httpApiGet(target, endpoint)
+        ? await httpApiGet(target, endpoint + '?rewindSnapshot=1')
         : name === 'set_tab_responsibility'
           ? await httpApiPost(target, endpoint + '/responsibility', { description: args.description })
           : await httpApiPost(target, endpoint + '/updates', {
@@ -2841,7 +2861,7 @@ async function callTool(name, args) {
       let workspace = null;
       let workingContext = null;
       try {
-        const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/work-context');
+        const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/work-context?rewindSnapshot=1');
         workingContext = result.context;
       } catch {}
       try {
@@ -3652,19 +3672,33 @@ async function callTool(name, args) {
           },
           buildSourceMeta(),
         );
+        // Structured result: the refusal path now carries machine-readable
+        // toolDetails, so the success/pending paths must stay parseable too.
+        // The human sentence is kept as `summary` for the reading model.
+        const receiptHint = result.handoffId
+          ? ' Read only get_send_receipt(' + JSON.stringify({ tabId: args.tabId, handoffId: result.handoffId }) + ').'
+          : ' No handoffId was returned; recover the original receipt before any retry.';
         if (result.status === 'delivery-unknown' || result.deliveryUnknown === true) {
-          return 'Prompt delivery state is unknown for tab ' + args.tabId
-            + '; do not retry with a new operation or changed/empty text to check status.'
-            + (result.handoffId ? ' Read only get_send_receipt(' + JSON.stringify({ tabId: args.tabId, handoffId: result.handoffId }) + ').' : ' No handoffId was returned; recover the original receipt before any retry.');
+          return JSON.stringify({ ok: true, status: 'delivery-unknown', deliveryUnknown: true,
+            reachedTerminal: true, tabId: args.tabId, handoffId: result.handoffId || null,
+            summary: 'Prompt delivery state is unknown for tab ' + args.tabId
+              + '; do not retry with a new operation or changed/empty text to check status.' + receiptHint,
+          }, null, 2);
         }
         if (result.status === 'audit-pending' || result.auditPending === true) {
-          return 'Prompt Enter crossed in tab ' + args.tabId
-            + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff or send changed/empty text to check status.'
-            + (result.handoffId ? ' Read only get_send_receipt(' + JSON.stringify({ tabId: args.tabId, handoffId: result.handoffId }) + ').' : ' No handoffId was returned; recover the original receipt before any retry.');
+          return JSON.stringify({ ok: true, status: 'audit-pending', auditPending: true,
+            submitted: true, reachedTerminal: true, tabId: args.tabId, handoffId: result.handoffId || null,
+            summary: 'Prompt Enter crossed in tab ' + args.tabId
+              + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff or send changed/empty text to check status.' + receiptHint,
+          }, null, 2);
         }
-        return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent')
-          + (result.queued ? ' (queued)' : '')
-          + (result.handoffId ? '. Handoff: ' + result.handoffId : '');
+        return JSON.stringify({ ok: true, status: result.status || 'sent',
+          queued: result.queued === true, submitted: result.submitted === true,
+          reachedTerminal: true, tabId: args.tabId, handoffId: result.handoffId || null,
+          summary: 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: '
+            + (result.status || 'sent') + (result.queued ? ' (queued)' : '')
+            + (result.handoffId ? '. Handoff: ' + result.handoffId : ''),
+        }, null, 2);
       }
 
       if (Array.isArray(args.files) && args.files.length > 0) {
@@ -3681,6 +3715,9 @@ async function callTool(name, args) {
       const result = target.port
         ? await httpPostOnPort(target.port, '/terminal/ai-prompt', body)
         : await httpPost('/terminal/ai-prompt', body, target.cwd);
+      // Editable draft keeps its original plain-text contract: it never
+      // submits, so it has no receipt/handoff to report and existing callers
+      // (including actual MCP draft integration tests) read this exact line.
       return 'Prompt pasted as editable draft into tab ' + args.tabId + '. Status: ' + result.status;
     }
 
@@ -3915,9 +3952,10 @@ async function callTool(name, args) {
     case 'rewind_self': {
       const tabId = PARENT_TAB_ID();
       if (EXTERNAL_MODE || !tabId) throw Object.assign(new Error('Self Rewind requires the calling full Noted Terminal session'), { code: 'self_rewind_caller_required' });
-      const { retainedContext, expectedContextRevision, coveredContextUpdateIds = null, nextPrompt, ...targetArgs } = args;
+      const { retainedContext, expectedContextRevision, expectedContextSnapshot, coveredContextUpdateIds = null, nextPrompt, ...targetArgs } = args;
       if (typeof retainedContext !== 'string' || !retainedContext.trim() || retainedContext.length > 100000
         || !Number.isSafeInteger(expectedContextRevision) || expectedContextRevision < 0
+        || expectedContextSnapshot !== undefined && (typeof expectedContextSnapshot !== 'string' || !expectedContextSnapshot)
         || coveredContextUpdateIds !== null && (!Array.isArray(coveredContextUpdateIds) || coveredContextUpdateIds.some(id => typeof id !== 'string' || !id))
         || nextPrompt !== undefined && (typeof nextPrompt !== 'string' || !nextPrompt.trim())) throw historyArgumentError('Invalid retained context, revision, covered member IDs or nextPrompt');
       if (Object.keys(targetArgs).some(key => !['operationId', 'expectedSessionId', 'targetUuid', 'toolType',
@@ -3927,11 +3965,12 @@ async function callTool(name, args) {
       try {
         const target = projectHint({}, tabId);
         const capability = await ensureSavedHistorySupport(target, request.toolType, request);
-        if (capability.selfRewind?.version !== 1) throw Object.assign(new Error('Update Noted Terminal for retained-context Self Rewind; no fallback was attempted'), { code: 'app_update_required' });
+        if (capability.selfRewind?.version !== 1 || capability.selfRewind.contextSnapshot !== 1) throw Object.assign(new Error('Update Noted Terminal for observed-context Self Rewind snapshots; no fallback was attempted'), { code: 'app_update_required' });
+        if (!expectedContextSnapshot) throw historyArgumentError('Read current_context/get_tab_context and pass its rewindSnapshot together with that observation revision');
         mutationAttempted = true;
         const result = requireHistoryOperationResponse(await httpApiPost(target,
           '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/self-rewind', { ...request,
-            selfRewind: { retainedContext, expectedContextRevision, coveredContextUpdateIds, nextPrompt: nextPrompt ?? null },
+            selfRewind: { retainedContext, expectedContextRevision, expectedContextSnapshot, coveredContextUpdateIds, nextPrompt: nextPrompt ?? null },
             sourceMeta: buildSourceMeta() }), tabId, operationId, 'rewind', request);
         return JSON.stringify({ ...result, tabId, operationId,
           guidance: 'Finish this old turn now. The app owns Rewind and the optional single followup. Do not send it yourself, poll, or retry unknown. For explicit recovery read get_history_operation with this SAME tabId/operationId.' });

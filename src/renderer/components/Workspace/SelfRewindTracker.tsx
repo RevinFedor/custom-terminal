@@ -37,15 +37,17 @@ export const selfRewindVisible = (operation: SelfRewindOperation) => !operation.
 function errorLabel(error: string) {
   const labels: Record<string, string> = {
     self_rewind_context_revision_changed: 'Рабочий контекст изменился до принятия отката',
+    self_rewind_context_snapshot_invalid: 'Не удалось подтвердить сохранённый снимок контекста',
     self_rewind_context_member_changed: 'Версия обновления рабочего контекста изменилась',
     self_rewind_owner_changed: 'Владелец ввода или сессия изменились',
     history_operation_owner_changed: 'Сессия изменилась во время операции',
-    history_operation_session_changed: 'Выбранная сессия больше не является текущей',
+    history_operation_session_changed: 'Не удалось подтвердить выбранную сессию до начала отката',
     history_operation_interrupted: 'Приложение не подтвердило завершение операции',
     terminal_draft_conflict: 'В терминале появился другой черновик',
     terminal_draft_unknown: 'Не удалось проверить черновик терминала',
   };
-  return labels[error] || error;
+  const code = Object.keys(labels).find(key => error === key || error.endsWith(': ' + key));
+  return code ? labels[code] : error;
 }
 
 export function SelfRewindTracker({ operation, history = false, selected = false, onOpen, onDismiss }: {

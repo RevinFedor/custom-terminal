@@ -16,6 +16,3 @@
 .mini-review-input-chips { display:flex; flex-wrap:wrap; gap:5px; align-items:center; }
 .mini-review-input-chips .cb-composer-chip { max-width:100%; flex:0 1 auto; }
 .mini-review-iteration-chip { color:#78c78c; border-color:#365d42; background:#19281e; }
-.mini-review-input-preview { margin-top:6px; max-height:360px; overflow:auto; min-width:0; }
-.mini-review-source-meta { font-size:.78em; color:#999; white-space:pre-wrap; overflow-wrap:anywhere; padding:3px 0; }
-.mini-review-input-preview pre { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; margin:3px 0; }

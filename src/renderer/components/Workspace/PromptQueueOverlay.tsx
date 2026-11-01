@@ -1055,6 +1055,10 @@ export function PromptQueueOverlay({
   const recheckQueueHoverRef = useRef<(point: { clientX: number; clientY: number } | null) => void>(() => {});
   const queueCountButtonRef = useRef<HTMLButtonElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
+  // Строка кнопок внутри рейла — своя геометрия, отдельно от колонки целиком:
+  // колонка включает ещё и строку мини-оркестратора, которая к очереди Run
+  // after не относится и удерживать её панель не должна.
+  const railControlsRowRef = useRef<HTMLDivElement>(null);
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -3111,9 +3115,10 @@ export function PromptQueueOverlay({
     if (!point) { closeQueueHoverPreview(); return; }
     if (hasOwnedClickPopup(panelRef.current)) return;
     const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
+    const controlsRowRect = railControlsRowRef.current?.getBoundingClientRect() ?? null;
     const railRect = railRef.current?.getBoundingClientRect() ?? null;
     const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
-    const parentRects = [countRect, previewRect,
+    const parentRects = [countRect, controlsRowRect, previewRect,
       ...Array.from(queueHoverPreviewPanelRef.current?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || [])
         .map(el => el.getBoundingClientRect())];
     if (hoverReturnRef.current.holds(point, parentRects.some(rect => pointInRect(rect, point.clientX, point.clientY, 2)))) return;
@@ -3121,17 +3126,23 @@ export function PromptQueueOverlay({
     // fractional pixel. Honour its padded rect before excluding the rail:
     // otherwise a real enter at the left edge immediately closes the preview.
     if (pointInRect(countRect, point.clientX, point.clientY, HOVER_CLUSTER_PAD)) return;
-    // Only the orange count owns hover. The wide bridge can cover sibling
-    // controls, but the thin rail border directly below the count remains a
-    // path into the panel rather than an accidental close strip.
-    if (pointInRect(railRect, point.clientX, point.clientY, 0)
-      && (!countRect || point.clientX < countRect.left || point.clientX > countRect.right)) {
+    // Полоска из пяти кнопок — одно целое, и пока курсор внутри неё, панель
+    // держится. Раньше hover принадлежал только оранжевому счётчику, а любая
+    // соседняя кнопка той же полоски закрывала панель: движение мыши от «0» к
+    // History проходило по кнопкам и гасило окно, к которому человек и вёл
+    // курсор. Закрытие осталось за уходом с полоски — это по-прежнему явный
+    // жест, а не случайный проход по соседней кнопке.
+    if (pointInRect(controlsRowRect, point.clientX, point.clientY, HOVER_CLUSTER_PAD)) return;
+    // Остаток рейла (строка мини-оркестратора под кнопками) к очереди не
+    // относится: он закрывает панель, как и прежде.
+    if (pointInRect(railRect, point.clientX, point.clientY, 0)) {
       closeQueueHoverPreview();
       return;
     }
     if (!previewRect) return;
     const satellites: (DOMRect | null)[] = [
       countRect,
+      controlsRowRect,
       ...Array.from(queueHoverPreviewPanelRef.current?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || [])
         .map((el) => el.getBoundingClientRect()),
       ...Array.from(document.querySelectorAll<HTMLElement>(HOVER_CLUSTER_SELECTOR))
@@ -4203,6 +4214,11 @@ export function PromptQueueOverlay({
           style={{ order: -1, position: 'relative', zIndex: 2, display: 'flex', flexDirection: 'column', gap: 2 }}
         >
         <div
+          ref={railControlsRowRef}
+          // Наведение на ЛЮБУЮ кнопку полоски раскрывает Run after. Раньше
+          // точкой входа был только оранжевый счётчик, и до него надо было
+          // попасть мышью — хотя вся полоска принадлежит этой же очереди.
+          onMouseEnter={openQueueHoverPreview}
           style={{
             // Horizontal row of always-available controls ABOVE the panel.
             // The measured gap below is occupied by border-mounted Post/Loop
@@ -4351,7 +4367,20 @@ export function PromptQueueOverlay({
             </button>
           </ControlHint>
         </div>
-        <div style={{ alignSelf: 'flex-end' }}><MiniOrchestratorControl controller={miniOrchestrator} /></div>
+        </div>}
+        {/* Мини-оркестратор — не часть очереди Run after, поэтому он стоит
+            отдельной строкой ПОСЛЕ её панели, а не между ней и полоской кнопок.
+            Раньше он лежал внутри рейла, а рейл целиком идёт перед панелью
+            (`order: -1`), потому что полоска кнопок — постоянный орган
+            управления и должна быть сверху. Робот ехал вместе с ней и при
+            раскрытой панели оказывался зажат между кнопками и панелью, читаясь
+            как её часть. Теперь это сосед панели с `order: 1` — он всегда
+            последний, независимо от того, раскрыта она или нет.
+            Отрицательный отступ при закрытой панели возвращает прежние 2px:
+            общий зазор колонки (11) рассчитан на расстояние до панели, а
+            вплотную под кнопками робот стоял тесно. */}
+        {!embedded && <div style={{ alignSelf: 'flex-end', order: 1, marginTop: panelAttached ? 0 : 2 - COLLAPSED_RAIL_GAP }}>
+          <MiniOrchestratorControl controller={miniOrchestrator} />
         </div>}
       </div>
 

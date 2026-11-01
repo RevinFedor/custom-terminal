@@ -6,19 +6,36 @@ import { HistoryTranscriptPresentation, type HistoryTranscriptStep } from './His
 import { GEMINI_MODEL_OPTIONS, legacyGeminiModelLabel } from '../../constants/geminiModels';
 import { useUIStore } from '../../store/useUIStore';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
-import { fitMiniPanel, resizeMiniPanel, moveMiniPanel } from '../../utils/miniOrchestratorGeometry.mjs';
+import { fitMiniPanel, resizeMiniPanel, moveMiniPanel, createMiniPanelPersistence } from '../../utils/miniOrchestratorGeometry.mjs';
 import { historyResponseTailLabel } from '../../utils/historyResponseTiming.mjs';
 import { ComposerChip, ConversationMessage } from '@noted/claude-blocks';
+import PastedContentPreview from './AIConversation/PastedContentPreview';
+import { jumpToTerminalMessageTarget } from '../../utils/tabMessageSourceJump';
+import { miniReviewTarget, navigateMiniReview } from '../../utils/miniOrchestratorGeometry.mjs';
 import './MiniOrchestratorControl.css';
 
 const { ipcRenderer } = window.require('electron');
 type ReviewMeta = { model: string; requestedModel?: string; modelSource?: 'request' | 'response'; thinkingLevel: string; startedAt: number; finishedAt: number; durationMs: number };
-type ReviewSource = { provider: string; sessionId: string; generation: string; turnId: string; answerId: string; jobId: string; requestIds: string[]; archived?: boolean; verificationNotes?: string[] };
-type Entry = { id: string; type: 'instruction' | 'request' | 'answer' | 'review' | 'tool' | 'notice'; text: string; name?: string; filePath?: string; promptRevision?: string | number; status?: string; reviewMeta?: ReviewMeta; receipt?: { status?: string; handoffId?: string; operationKey?: string; attemptId?: string; error?: string; sessionId?: string; turnId?: string; requestCount?: number } };
+type ReviewSource = { provider: string; sessionId: string; generation: string; turnId: string; answerId: string; jobId: string; requestIds: string[]; navigationRequestId?: string; archived?: boolean; verificationNotes?: string[] };
+type Entry = { id: string; type: 'instruction' | 'request' | 'answer' | 'review' | 'tool' | 'notice'; text: string; name?: string; filePath?: string; promptRevision?: string | number; status?: string; reviewMeta?: ReviewMeta; receipt?: { status?: string; handoffId?: string; operationKey?: string; attemptId?: string; error?: string; sessionId?: string; turnId?: string; requestCount?: number }; round?: number };
 export type MiniSnapshot = { tabId: string; enabled: boolean; revision: number; viewRevision?: number; phase: 'off' | 'idle' | 'collecting' | 'reviewing' | 'sending' | 'complete' | 'error' | 'unknown'; jobId?: string; error?: string; entries: Entry[];
+  autoReturn?: boolean; correctionState?: 'no-progress';
   activeReview?: { model: string; thinkingLevel: string; startedAt: number };
   reviewSource?: ReviewSource;
+  roundSources?: Record<string, ReviewSource>;
   settings?: { model?: string; thinkingLevel?: string; revision?: string; thinkingLevels?: string[]; error?: string } };
+
+/** Entries carry a round number once a turn completes; older presentation
+ * snapshots have none, so they are a single implicit round. */
+export function miniEntriesByRound(entries: Entry[]): Array<{ round: number | undefined; entries: Entry[] }> {
+  const order: Array<number | undefined> = [];
+  const byRound = new Map<number | undefined, Entry[]>();
+  for (const entry of entries) {
+    if (!byRound.has(entry.round)) { byRound.set(entry.round, []); order.push(entry.round); }
+    byRound.get(entry.round)!.push(entry);
+  }
+  return order.map(round => ({ round, entries: byRound.get(round)! }));
+}
 
 const bounded = (value: unknown) => typeof value === 'string' ? value.slice(0, 240) : '';
 export function miniEntriesToSteps(entries: Entry[]): HistoryTranscriptStep[] {
@@ -43,15 +60,26 @@ export function miniEntriesToSteps(entries: Entry[]): HistoryTranscriptStep[] {
   });
 }
 
-export function MiniReviewInput({ entries, source, onCopy }: { entries: Entry[]; source?: ReviewSource; onCopy?: (text: string) => void }) {
-  const [expanded, setExpanded] = useState<'instruction' | 'iteration' | null>(null);
-  return <MiniReviewInputContent entries={entries} source={source} onCopy={onCopy} expanded={expanded}
-    onToggle={kind => setExpanded(value => value === kind ? null : kind)} />;
+export function MiniReviewInput({ entries, source, tabId, onCopy, preview, setPreview, onNavigated }: { entries: Entry[]; source?: ReviewSource; tabId: string; onCopy?: (text: string) => void; preview: boolean; setPreview: (open: boolean) => void; onNavigated?: () => void }) {
+  const instruction = entries.find(entry => entry.type === 'instruction');
+  const target = miniReviewTarget(tabId, source);
+  return <>
+    <MiniReviewInputContent entries={entries} source={source} onInstruction={() => setPreview(true)} onIteration={() => {
+      void navigateMiniReview(target, value => jumpToTerminalMessageTarget(value, 'mini:' + value.messageId.slice(0, 96)), onNavigated,
+        () => useUIStore.getState().showToast(target ? 'Не удалось показать итерацию в History' : 'Точная ссылка на итерацию недоступна', 'warning'));
+    }} />
+    {preview && instruction && createPortal(<div data-mini-instruction-preview data-run-after-satellite="true" onMouseDown={event => { event.stopPropagation(); setPreview(false); }}
+      onClick={event => event.stopPropagation()} style={{ position: 'fixed', zIndex: 120, inset: 0, display: 'grid', placeItems: 'center' }}>
+      <div onMouseDown={event => event.stopPropagation()} style={{ width: 'min(600px, calc(100vw - 32px))' }}>
+        <PastedContentPreview text={instruction.text} onCopy={onCopy} onClose={() => setPreview(false)} maxHeight="min(60vh, 500px)" />
+      </div>
+    </div>, document.body)}
+  </>;
 }
 
-export function MiniReviewInputContent({ entries, source, onCopy, expanded, onToggle }: {
-  entries: Entry[]; source?: ReviewSource; onCopy?: (text: string) => void;
-  expanded: 'instruction' | 'iteration' | null; onToggle: (kind: 'instruction' | 'iteration') => void;
+export function MiniReviewInputContent({ entries, source, onInstruction, onIteration }: {
+  entries: Entry[]; source?: ReviewSource;
+  onInstruction: () => void; onIteration: () => void;
 }) {
   const instruction = entries.find(entry => entry.type === 'instruction');
   const requests = entries.filter(entry => entry.type === 'request');
@@ -62,22 +90,10 @@ export function MiniReviewInputContent({ entries, source, onCopy, expanded, onTo
   return <ConversationMessage layout="user" entryUuid={source?.jobId} contentClassName="mini-review-input">
     <div className="mini-review-input-chips" data-mini-review-input>
       <ComposerChip kind="prompt" label="Инструкция" meta={`v${version}`} title={[instruction.name, instruction.filePath, revision].filter(Boolean).join('\n')}
-        aria-expanded={expanded === 'instruction'} onClick={() => onToggle('instruction')} />
+        onClick={onInstruction} />
       <ComposerChip kind="paste" className="mini-review-iteration-chip" label="Итерация" meta={source?.turnId.slice(0, 8) || '—'}
-        title={title} aria-expanded={expanded === 'iteration'} onClick={() => onToggle('iteration')} />
+        title={title} onClick={onIteration} />
     </div>
-    {expanded === 'instruction' && <div className="mini-review-input-preview" data-mini-review-instruction>
-      <div className="mini-review-source-meta">{[instruction.filePath, 'Версия: ' + revision].filter(Boolean).join('\n')}</div>
-      <pre>{instruction.text}</pre>
-    </div>}
-    {expanded === 'iteration' && <div className="mini-review-input-preview" data-mini-review-iteration>
-      <div className="mini-review-source-meta">{[title, 'Запросов: ' + requests.length, source?.requestIds.join('\n'),
-        ...((source?.verificationNotes || []).slice(0, 8).map(note => bounded(note)))].filter(Boolean).join('\n')}</div>
-      <HistoryTranscriptPresentation onCopy={onCopy} steps={[
-        ...requests.map(entry => ({ id: entry.id, kind: 'message' as const, role: 'user' as const, text: entry.text, contextLabel: 'Запрос исходной итерации' })),
-        { id: answer.id, kind: 'message', role: 'assistant', text: answer.text, contextLabel: 'Ответ основной модели · объект проверки' },
-      ]} />
-    </div>}
   </ConversationMessage>;
 }
 
@@ -154,13 +170,13 @@ export type MiniController = ReturnType<typeof useMiniOrchestrator>;
 export function MiniOrchestratorToggle({ controller }: { controller: MiniController }) {
   const enabled = controller.snapshot?.enabled === true;
   return <button type="button" role="switch" aria-checked={enabled}
-    data-mini-orchestrator-toggle aria-label={`Мини-оркестратор · ${enabled ? 'Active' : 'Inactive'}`}
-    title={controller.error || `${enabled ? 'Выключить' : 'Включить'} проверку ответов мини-оркестратором`}
+    data-mini-orchestrator-toggle data-active={enabled} aria-label={`Мини-оркестратор · ${enabled ? 'включён' : 'выключен'}`}
+    title={controller.error || `${enabled ? 'Выключить' : 'Включить'} проверку ответов мини-оркестратором${controller.snapshot?.autoReturn ? ' · не более одной корректировки на ответ в DEV' : ''}`}
     disabled={controller.pending} onClick={() => void controller.toggleEnabled()}
     style={{ height: 26, padding: '0 6px', display: 'inline-flex', alignItems: 'center', gap: 4,
       borderRadius: 5, border: `1px solid ${enabled ? '#39854b' : '#444'}`, background: enabled ? '#193922' : '#171717',
       color: enabled ? '#80db92' : '#aaa', fontSize: 10, whiteSpace: 'nowrap', cursor: controller.pending ? 'default' : 'pointer' }}>
-    <Bot size={13} /><span>{enabled ? 'On' : 'Off'}</span>
+    <Bot size={13} />
   </button>;
 }
 
@@ -177,6 +193,7 @@ export function miniStatusPresentation(snapshot: MiniSnapshot | null) {
 }
 
 export function miniPhaseLabel(snapshot: MiniSnapshot | null) {
+  if (snapshot?.enabled && snapshot.correctionState === 'no-progress') return 'Повтор не отправлен';
   if (snapshot?.phase === 'complete' && snapshot.reviewSource?.archived) return 'Готово · архив';
   return { off: 'Inactive', idle: 'Готов', collecting: 'Ожидаем завершения', reviewing: 'Проверяет', sending: 'MCP-отправка', complete: 'Готово', error: 'Ошибка', unknown: 'Не подтверждено' }[snapshot?.phase || 'off'];
 }
@@ -202,6 +219,7 @@ export function miniPopupLayout(anchor: { right: number; bottom: number }, viewp
 
 type PanelFrame = ReturnType<typeof miniPopupLayout>;
 const panelMemory = new Map<string, { frame: PanelFrame; detached: boolean }>();
+const panelPersistence = createMiniPanelPersistence((channel: string, value: unknown) => ipcRenderer.invoke(channel, value));
 const rememberPanel = (tabId: string, frame: PanelFrame, detached: boolean) => {
   panelMemory.delete(tabId); panelMemory.set(tabId, { frame, detached });
   if (panelMemory.size > 60) panelMemory.delete(panelMemory.keys().next().value!);
@@ -237,11 +255,16 @@ export function MiniModelControls({ controller }: { controller: MiniController }
 export function MiniOrchestratorControl({ controller }: { controller: MiniController }) {
   const { snapshot, error, clear } = controller;
   const [open, setOpen] = useState(false);
+  // undefined/'legacy' identify which round's instruction chip opened the preview.
+  const [instructionPreviewRound, setInstructionPreviewRoundState] = useState<number | 'legacy' | null>(null);
+  const instructionPreviewRef = useRef<number | 'legacy' | null>(null);
+  const setInstructionPreviewRound = (value: number | 'legacy' | null) => { instructionPreviewRef.current = value; setInstructionPreviewRoundState(value); };
   const root = useRef<HTMLDivElement>(null);
   const popup = useRef<HTMLDivElement>(null);
   const [layout, setLayout] = useState<ReturnType<typeof miniPopupLayout> | null>(null);
   const { start: startGesture, stop: stopGesture } = usePointerGesture();
   const gestureActive = useRef(false), frameRef = useRef<PanelFrame | null>(null);
+  const geometryEdit = useRef(0);
   const detached = useRef(panelMemory.get(controller.tabId)?.detached || false);
   const body = useRef<HTMLDivElement>(null), followBottom = useRef(true);
   const historyFontSize = useUIStore(s => s.historyFontSize);
@@ -269,7 +292,7 @@ export function MiniOrchestratorControl({ controller }: { controller: MiniContro
       }, onEnd: () => {
         if (previewRaf.current !== null) { cancelAnimationFrame(previewRaf.current); previewRaf.current = null; }
         gestureActive.current = false; handle.removeAttribute('data-resize-handle-active');
-        if (moved) { applyFrame(frame); rememberPanel(controller.tabId, frame, detached.current); }
+        if (moved) { geometryEdit.current++; applyFrame(frame); rememberPanel(controller.tabId, frame, detached.current); panelPersistence.write(controller.tabId, { frame, detached: detached.current }); }
       } });
   };
   useEffect(() => {
@@ -281,6 +304,8 @@ export function MiniOrchestratorControl({ controller }: { controller: MiniContro
   }, [controller.tabId]);
   useLayoutEffect(() => {
     if (!open) return;
+    let live = true;
+    const editAtRead = geometryEdit.current;
     const update = () => {
       if (gestureActive.current) return;
       const bounds = root.current?.getBoundingClientRect();
@@ -296,10 +321,15 @@ export function MiniOrchestratorControl({ controller }: { controller: MiniContro
     // The control rail is fixed relative to its composer. Do not read layout
     // on every wheel event inside the retained History/reviewer transcript.
     update(); window.addEventListener('resize', update);
+    void panelPersistence.read(controller.tabId).then(saved => {
+      if (!live || !saved || gestureActive.current || geometryEdit.current !== editAtRead) return;
+      rememberPanel(controller.tabId, saved.frame, saved.detached); update();
+    });
     const outside = (event: MouseEvent) => {
+      if (instructionPreviewRef.current !== null) { setInstructionPreviewRound(null); return; }
       if (!root.current?.contains(event.target as Node) && !popup.current?.contains(event.target as Node)) setOpen(false);
     };
-    const key = (event: KeyboardEvent) => { if (event.key === 'Escape') setOpen(false); };
+    const key = (event: KeyboardEvent) => { if (event.key === 'Escape') { if (instructionPreviewRef.current !== null) setInstructionPreviewRound(null); else setOpen(false); } };
     const presentation = (event: Event) => {
       const detail = (event as CustomEvent).detail;
       if (detail?.tabId === controller.tabId) { if (detail.presented === false) setOpen(false); else update(); }
@@ -313,12 +343,12 @@ export function MiniOrchestratorControl({ controller }: { controller: MiniContro
     window.addEventListener('mousedown', outside);
     window.addEventListener('keydown', key);
     window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, presentation);
-    return () => { stopGesture(); resize.disconnect(); moved.disconnect(); window.removeEventListener('resize', update); window.removeEventListener('mousedown', outside); window.removeEventListener('keydown', key); window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, presentation); };
+    return () => { live = false; setInstructionPreviewRound(null); stopGesture(); resize.disconnect(); moved.disconnect(); window.removeEventListener('resize', update); window.removeEventListener('mousedown', outside); window.removeEventListener('keydown', key); window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, presentation); };
   }, [open, controller.tabId]);
   useLayoutEffect(() => {
     if (open && followBottom.current && body.current) body.current.scrollTop = body.current.scrollHeight;
   }, [open, snapshot?.entries]);
-  const steps = useMemo(() => open ? miniEntriesToSteps(snapshot?.entries || []) : [], [open, snapshot]);
+  const rounds = useMemo(() => open ? miniEntriesByRound(snapshot?.entries || []) : [], [open, snapshot]);
   const busy = snapshot?.phase === 'reviewing' || snapshot?.phase === 'sending';
   const phaseLabel = miniPhaseLabel(snapshot);
   return <div ref={root} style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
@@ -346,11 +376,18 @@ export function MiniOrchestratorControl({ controller }: { controller: MiniContro
         {(error || snapshot?.error || snapshot?.settings?.error) && <div role="alert" style={{ fontSize: 11, color: '#ef7777' }}>{error || snapshot?.error || snapshot?.settings?.error}
           {snapshot?.settings?.error === 'mini_settings_unconfirmed' && <button type="button" onClick={() => void controller.setSettings(snapshot.settings!.model!, snapshot.settings!.thinkingLevel!)}>Retry save</button>}
         </div>}
-        {!steps.length && !snapshot?.entries.some(entry => entry.type === 'answer') && <div style={{ color: '#999', fontSize: 11 }}>{snapshot?.enabled ? 'Ожидаем новый запрос и завершённый ответ основной сессии.' : 'Включите «🤖 Off» в полосе над кнопкой робота, затем отправьте новый запрос.'}</div>}
-        <MiniReviewInput key={snapshot?.reviewSource?.jobId || snapshot?.entries.find(entry => entry.type === 'answer')?.id}
-          entries={snapshot?.entries || []} source={snapshot?.reviewSource} onCopy={copyTranscript} />
-        <HistoryTranscriptPresentation steps={steps} isTurnBusy={busy} className="mini-orchestrator-transcript"
-          onCopy={copyTranscript} />
+        {!rounds.length && <div style={{ color: '#999', fontSize: 11 }}>{snapshot?.enabled ? 'Ожидаем новый запрос и завершённый ответ основной сессии.' : 'Включите проверку кнопкой с роботом в полосе управления, затем отправьте новый запрос.'}</div>}
+        {rounds.map(({ round, entries: roundEntries }) => {
+          const source = round !== undefined ? snapshot?.roundSources?.[round] : snapshot?.reviewSource;
+          const isLastRound = round === rounds.at(-1)?.round;
+          const roundKey = round ?? 'legacy';
+          return <React.Fragment key={roundKey}>
+            <MiniReviewInput tabId={controller.tabId} entries={roundEntries} source={source} onCopy={copyTranscript}
+              preview={instructionPreviewRound === roundKey} setPreview={open => setInstructionPreviewRound(open ? roundKey : null)} onNavigated={() => setOpen(false)} />
+            <HistoryTranscriptPresentation steps={miniEntriesToSteps(roundEntries)} isTurnBusy={busy && isLastRound} className="mini-orchestrator-transcript"
+              onCopy={copyTranscript} />
+          </React.Fragment>;
+        })}
       </div>
     </div>, document.body)}
   </div>;

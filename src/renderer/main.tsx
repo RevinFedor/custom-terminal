@@ -269,16 +269,30 @@ const rendererBootstrapWindow = window as typeof window & {
 
 if (!rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted) {
   rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted = true;
-  void Promise.all([
-    import('./App'),
-    import('./utils/perfFreezeProbe'),
-    import('./store/useRewindOperationStore'),
-  ]).then(([
+  // Uncaught renderer errors were invisible in production logs. Forward them
+  // with a tag so a broken IPC subscriber or effect is diagnosable.
+  window.addEventListener('error', (event) => {
+    console.error('[RendererError] ' + String(event?.message || event?.error || 'error').slice(0, 300)
+      + ' at=' + String(event?.filename || '').split('/').pop() + ':' + String(event?.lineno || 0)
+      + ' stack=' + String(event?.error?.stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 400));
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason: any = (event as PromiseRejectionEvent)?.reason;
+    console.error('[RendererError] unhandledrejection ' + String(reason?.message || reason).slice(0, 300)
+      + ' stack=' + String(reason?.stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 400));
+  });
+  // The probe wraps ipcRenderer listeners (attribution + isolation of a
+  // throwing subscriber). Install it BEFORE App's modules register theirs.
+  void import('./utils/perfFreezeProbe').then(({ installPerfFreezeProbe }) => {
+    installPerfFreezeProbe();
+    return Promise.all([
+      import('./App'),
+      import('./store/useRewindOperationStore'),
+    ]);
+  }).then(([
     { default: App },
-    { installPerfFreezeProbe },
     { installRewindOperationIpcBridge },
   ]) => {
-    installPerfFreezeProbe();
     installRewindOperationIpcBridge(window.require('electron').ipcRenderer);
 
     // Mount React app (no StrictMode - conflicts with xterm.js)

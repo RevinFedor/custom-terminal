@@ -2679,7 +2679,12 @@ function ClaudeControlBar({
       failedCommand: error?.failedCommand };
     const failure = describeClaudeStartupFailure(fields);
     const report = formatClaudeStartupFailureReport(fields);
-    showToast(failure.userMessage, 'error', 8000, true, report, undefined, undefined, tabId, undefined, report);
+    // A pending proof is not a rejection: the command may well have applied and
+    // a late transcript read can still confirm it. Showing it as a red error
+    // told the user "не удалось применить модель" for settings that did apply.
+    const pending = (failure as { pending?: boolean }).pending === true;
+    showToast(failure.userMessage, pending ? 'info' : 'error', pending ? 4000 : 8000,
+      true, report, undefined, undefined, tabId, undefined, report);
   };
   const setEffortOnPTY = async (
     level: string,

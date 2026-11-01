@@ -1132,8 +1132,12 @@ export function restoreComposerDraftFromHistoryPresentation({
  * Use the existing envelope parser so nested paste bodies and unrelated bytes
  * remain untouched; this never reserializes or normalizes the user's draft. */
 export function removeRewindCoveredDraftContext({ text = '', chips = [] }, covered, fingerprint) {
-  const versions = new Map((covered || []).map(member => [member.id, member.textHash]));
-  const matches = (id, body) => !!id && !!versions.get(id) && fingerprint(body) === versions.get(id);
+  const versions = new Map();
+  for (const member of covered || []) {
+    if (!versions.has(member.id)) versions.set(member.id, new Set());
+    versions.get(member.id).add(member.textHash);
+  }
+  const matches = (id, body) => !!id && !!versions.get(id)?.has(fingerprint(body));
   const ranges = parsePastedContentParts(text, { includeSourceRanges: true })
     .filter(part => part.kind === 'prompt-wrapper' && matches(part.contextUpdateId, part.text))
     .map(part => part.sourceRange).sort((a, b) => b.start - a.start);

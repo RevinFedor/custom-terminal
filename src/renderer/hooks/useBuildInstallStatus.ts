@@ -6,6 +6,7 @@ export type BuildInstallJob = {
   id: string; requestId: string; revision?: number; startedAt: number; phase: string; stage?: string;
   force?: boolean; running: boolean; ok: boolean | null; cancelled?: boolean; requestCancelledAt?: number | null; error?: string | null;
   installOutcomeUnknown?: boolean; returnTo?: { tabId: string; sessionId?: string };
+  cancellation?: { origin: string; surface: string; phase?: string; requestedAt: number };
   callback?: { status: string; error?: string }; wait?: { blockers?: { tabId: string; name?: string; kind?: string }[]; preservedExternalWaits?: unknown[] };
   interruptionReport?: { tabs: unknown[]; mcp: unknown[]; unknown: string[] };
   continuation?: { requestId: string; jobId: string; fingerprint: string; state: string;
@@ -27,7 +28,8 @@ export function useBuildInstallStatus(tabId: string) {
       if (epoch === snapshot.epoch && snapshot.publication < publication) return;
       epoch = snapshot.epoch; publication = snapshot.publication;
       setState(previous => {
-        const jobs = mergeBuildInstallJobs(previous.jobs, snapshot.jobs || [], tabId);
+        const jobs = mergeBuildInstallJobs(previous.jobs, snapshot.jobs || [], tabId,
+          snapshot.continuationsKnown === true ? snapshot.continuations || [] : []);
         const stale = snapshot.stale !== false, error = snapshot.error || null;
         return jobs === previous.jobs && stale === previous.stale && error === previous.error ? previous : { jobs, stale, error };
       });

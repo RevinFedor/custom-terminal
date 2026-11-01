@@ -303,7 +303,9 @@ test('post-TUI startup-settings readiness wakes the same Project API wait', asyn
   assert.equal(events.listenerCount(READINESS_CHANGED_EVENT), 0);
 });
 
-test('startup-settings failure rejects immediately instead of timing out', async () => {
+// Decision 01.11 (Fedor): a failed startup setting is reported, not enforced.
+// A usable tab resolves ready WITH the failure fields; it is not a failed launch.
+test('a failed startup setting on a usable tab resolves ready and keeps the failure fields', async () => {
   const events = new EventEmitter();
   let status = {
     toolType: 'claude',
@@ -320,9 +322,10 @@ test('startup-settings failure rejects immediately instead of timing out', async
 
   status = {
     toolType: 'claude',
-    status: 'starting',
-    inputReady: false,
+    status: 'active',
+    inputReady: true,
     startupDefaultsError: '/effort max was not confirmed',
+    startupFailed: true,
     manualActionRequired: true,
     manualActionType: 'claude-startup-settings',
   };
@@ -332,10 +335,28 @@ test('startup-settings failure rejects immediately instead of timing out', async
     status: 'failed',
   });
 
-  await assert.rejects(waiting, (error) => {
-    assert.equal(error.code, 'agent_startup_defaults_failed');
-    assert.equal(error.statusCode, 409);
-    assert.equal(error.status, status);
+  const ready = await waiting;
+  assert.equal(ready.inputReady, true);
+  assert.equal(ready.startupDefaultsError, '/effort max was not confirmed',
+    'the caller still learns that the setting was not applied');
+});
+
+test('a failed startup setting on a tab without input still waits instead of claiming ready', async () => {
+  const events = new EventEmitter();
+  const status = {
+    toolType: 'claude',
+    status: 'starting',
+    inputReady: false,
+    startupDefaultsError: '/model x was not confirmed',
+    startupFailed: true,
+  };
+  await assert.rejects(waitForAgentReadyTransition({
+    tabId: 'tab-failed-no-input',
+    timeoutMs: 1_000,
+    eventBus: events,
+    readStatus: async () => status,
+  }), (error) => {
+    assert.equal(error.code, 'agent_ready_timeout');
     return true;
   });
 });

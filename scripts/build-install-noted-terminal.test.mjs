@@ -614,3 +614,31 @@ test('уборка выживает сбой удаления и не рушит
   assert.equal(result.ok, true, 'место не важнее уже установленного приложения');
   assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
 });
+
+// 2026-11-01: an install run from a Claude Code Bash tool passed that session's
+// markers through `open` into Noted; every Claude in its tabs then printed
+// "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker".
+test('the launched app never inherits an AI session\'s markers', async () => {
+  const { appLaunchEnv } = await import('./build-install-noted-terminal.mjs');
+  const env = appLaunchEnv({
+    HOME: '/Users/x', PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', SHELL: '/bin/zsh',
+    CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_SESSION_ID: 's',
+    CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_MESSAGING_TOKEN: 't', CLAUDE_PID: '1',
+    CLAUDE_EFFORT: 'max', NOTED_MCP_IDENTITY: '||/x|',
+    ANTHROPIC_MODEL: 'opus[1m]', NOTED_WEB_PORT: '7878',
+  });
+  for (const leaked of ['CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+    'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_PID', 'CLAUDE_EFFORT',
+    'NOTED_MCP_IDENTITY']) {
+    assert.equal(env[leaked], undefined, leaked + ' must not reach the launched app');
+  }
+  // Ordinary user environment, including deliberate app/provider settings, passes through.
+  for (const kept of ['HOME', 'PATH', 'LANG', 'SHELL', 'ANTHROPIC_MODEL', 'NOTED_WEB_PORT']) {
+    assert.ok(env[kept], kept + ' is preserved');
+  }
+  const fs = await import('node:fs');
+  const source = fs.readFileSync(new URL('./build-install-noted-terminal.mjs', import.meta.url), 'utf8');
+  const launches = source.match(/run(?:Step)?\('\/usr\/bin\/open'[^\n]*/g) || [];
+  assert.ok(launches.length >= 2, 'both launch paths are covered');
+  for (const line of launches) assert.match(line, /env: appLaunchEnv\(\)/, line);
+});

@@ -931,8 +931,16 @@ async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
     };
   }
   if (agent === 'claude') {
+    // Only a PENDING startup transaction holds the queue: `/model` and
+    // `/effort` must land before the first prompt. A FAILED one is terminal and
+    // is reported, not enforced — the setting is simply not applied, and the
+    // tab is otherwise usable. Treating `failed` as "not ready" left Run After
+    // latched forever (2026-10-31: the timer on three tabs expired at 16:10,
+    // each validated its cold start, and none ever fired), the same blanket
+    // block the Send guard used to apply. The live presence read below still
+    // decides real input readiness.
     const gate = getClaudeStartupDefaultsGateSnapshot(ownerTabId);
-    if (claudeQueueStartupPending.has(ownerTabId) || gate?.status === 'pending' || gate?.status === 'failed') {
+    if (claudeQueueStartupPending.has(ownerTabId) || gate?.status === 'pending') {
       return {
         ready: false,
         status: gate?.status || 'starting',
@@ -3704,13 +3712,18 @@ export function usePromptQueueRunner() {
     const claudeStartupGateHandler = (event: Event) => {
       const detail = (event as CustomEvent<{ tabId?: string; status?: string }>).detail || {};
       if (!detail.tabId) return;
-      if (detail.status === 'pending' || detail.status === 'failed') {
+      if (detail.status === 'pending') {
         claudeQueueStartupPending.add(detail.tabId);
         return;
       }
       if (detail.status === 'ready') {
         claudeQueueStartupPending.delete(detail.tabId);
         signalQueueOwnerReadiness(detail.tabId, 'claude-startup-defaults-ready');
+      } else if (detail.status === 'failed') {
+        // Terminal outcome: release the latch and wake the waiting owner. The
+        // setting is not applied; presence still decides whether input is ready.
+        claudeQueueStartupPending.delete(detail.tabId);
+        signalQueueOwnerReadiness(detail.tabId, 'claude-startup-defaults-failed');
       } else if (detail.status === 'cleared') {
         claudeQueueStartupPending.delete(detail.tabId);
       }

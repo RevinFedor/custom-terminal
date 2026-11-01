@@ -1,10 +1,78 @@
 'use strict';
 
-function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () => {} } = {}) {
+// A launch that never paints another synchronized frame leaves the startup
+// transaction waiting forever: `/model` is never written, the gate stays
+// `pending`, and the tab shows "configuring Claude" with no terminal state.
+// Production 2026-10-31 (tabs d1718b66 / 029152fbe588 / 2efc9b9b7a35): Claude
+// reached its 5-hour usage limit and printed the limit notice plus
+// "IDE extension install failed" OUTSIDE a synchronized-output pair, so
+// `markStable` was never reached even though the composer was idle and the
+// process alive. The working tab in the same window logged 5250 frame events;
+// each stuck tab logged one `open` and nothing else.
+//
+// The wait is therefore bounded. A deadline does not authorize input: it
+// resolves `ready:false` with its own reason, so the existing caller keeps
+// refusing paste/Enter and the transaction can fail visibly and be retried
+// instead of hanging. Each readiness or activity signal re-arms the deadline,
+// so an actively repainting launch is never cut short.
+const DEFAULT_PROMPT_STABILITY_TIMEOUT_MS = 45000;
+
+function createClaudePromptStabilityRegistry({
+  now = () => Date.now(),
+  log = () => {},
+  timeoutMs = DEFAULT_PROMPT_STABILITY_TIMEOUT_MS,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (handle) => clearTimeout(handle),
+} = {}) {
   const byTab = new Map();
+  const finiteTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? Number(timeoutMs)
+    : null;
+
+  function cancelDeadline(entry) {
+    if (!entry?.deadlineTimer) return;
+    try { clearTimer(entry.deadlineTimer); } catch {}
+    entry.deadlineTimer = null;
+    entry.deadlineAt = null;
+  }
+
+  // The deadline exists only while something is actually waiting. Re-arming on
+  // every signal measures silence since the last observed frame, not time
+  // since the wait began.
+  function armDeadline(entry) {
+    if (!entry || finiteTimeoutMs === null) return;
+    cancelDeadline(entry);
+    if (entry.waiters.size === 0) return;
+    const generation = entry.generation;
+    entry.deadlineAt = now() + finiteTimeoutMs;
+    entry.deadlineTimer = setTimer(() => {
+      const current = byTab.get(entry.tabId) || null;
+      if (current !== entry || current.generation !== generation) return;
+      entry.deadlineTimer = null;
+      entry.deadlineAt = null;
+      if (entry.waiters.size === 0) return;
+      log('[ClaudePromptStable] deadline tab=' + String(entry.tabId).slice(-12)
+        + ' gen=' + generation
+        + ' waiters=' + entry.waiters.size
+        + ' busy=' + entry.busy
+        + ' activityEpoch=' + entry.activityEpoch
+        + ' promptEpoch=' + entry.promptEpoch
+        + ' afterMs=' + finiteTimeoutMs);
+      resolveWaiters(entry, {
+        ready: false,
+        generation,
+        reason: entry.busy
+          ? 'prompt-stability-timeout-busy'
+          : 'prompt-stability-timeout-no-frame',
+        timedOut: true,
+        afterMs: finiteTimeoutMs,
+      });
+    }, finiteTimeoutMs);
+  }
 
   function resolveWaiters(entry, result) {
     if (!entry) return;
+    cancelDeadline(entry);
     for (const resolve of Array.from(entry.waiters)) {
       try { resolve(result); } catch {}
     }
@@ -49,6 +117,8 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       promptEpoch: 0,
       result: null,
       waiters: new Set(),
+      deadlineTimer: null,
+      deadlineAt: null,
     };
     byTab.set(tabId, entry);
     log('[ClaudePromptStable] open tab=' + String(tabId).slice(-12)
@@ -68,6 +138,7 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       log('[ClaudePromptStable] prompt-ignored-busy tab=' + String(tabId).slice(-12)
         + ' gen=' + generation
         + ' reason=' + reason);
+      armDeadline(entry);
       return false;
     }
     entry.ready = true;
@@ -91,6 +162,7 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       + ' gen=' + generation
       + ' activityEpoch=' + entry.activityEpoch
       + ' reason=' + reason);
+    armDeadline(entry);
     return true;
   }
 
@@ -107,6 +179,7 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       + ' busy=' + entry.busy
       + ' busyEpoch=' + entry.busyEpoch
       + ' reason=' + reason);
+    armDeadline(entry);
     return true;
   }
 
@@ -132,7 +205,10 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
         lease: { ...entry.result.lease },
       });
     }
-    return new Promise((resolve) => entry.waiters.add(resolve));
+    return new Promise((resolve) => {
+      entry.waiters.add(resolve);
+      armDeadline(entry);
+    });
   }
 
   function validate(tabId, generation, lease, { allowFrameAdvance = false } = {}) {
@@ -184,6 +260,9 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       busyEpoch: entry.busyEpoch,
       promptEpoch: entry.promptEpoch,
       result: entry.result ? { ...entry.result } : null,
+      waiters: entry.waiters.size,
+      deadlineAt: entry.deadlineAt || null,
+      timeoutMs: finiteTimeoutMs,
     };
   }
 
@@ -201,4 +280,5 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
 
 module.exports = {
   createClaudePromptStabilityRegistry,
+  DEFAULT_PROMPT_STABILITY_TIMEOUT_MS,
 };

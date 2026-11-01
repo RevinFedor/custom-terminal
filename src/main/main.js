@@ -314,6 +314,9 @@ const {
   projectClaudePtyPresence,
 } = require(path.join(srcMainDir, 'claude-pty-presence'));
 const {
+  isClaudeStartupSettingUndelivered,
+} = require(path.join(srcMainDir, '../shared/claude-startup-failure.cjs'));
+const {
   inspectClaudeProviderFatalFrame,
 } = require(path.join(srcMainDir, 'claude-provider-fatal-state'));
 const {
@@ -659,6 +662,8 @@ function getMiniOrchestratorRuntime() {
   const { createMiniOrchestratorRuntime } = require(path.join(srcMainDir, 'mini-orchestrator-runtime'));
   miniOrchestratorRuntime = createMiniOrchestratorRuntime({ db: projectManager.db, systemPromptService,
     readOwner: readMiniOrchestratorOwner,
+    automaticCorrections: process.env.NOTED_E2E_TEST === 'true' && !!process.env.NOTED_MINI_REPLAY_PROFILE
+      && process.env.NOTED_MINI_AUTOMATIC_CORRECTIONS === '1',
     ...(process.env.NOTED_E2E_TEST === 'true' && process.env.NOTED_MINI_REPLAY_PROFILE ? {
       loadPresentation: tabId => projectManager.db.getAppState('mini-orchestrator-archive:' + tabId),
       clearPresentation: tabId => projectManager.db.setAppState('mini-orchestrator-archive:' + tabId, null),
@@ -3191,6 +3196,8 @@ const transcriptService = createSessionTranscriptService({
           + ' source=' + settlementConfirmation.result.sourceIdentity
           + ' settlementOffset=' + String(recordByteOffset ?? '-')
           + ' presentationSaved=' + presentationSaved);
+        settleClaudeQueuedPromptOnDequeue(tabId, { operation: record?.operation,
+          byteOffset: recordByteOffset, actualText: settlementConfirmation.actualText });
         finishClaudePasteAudit(tabId, settlementConfirmation.audit, {
           ...settlementConfirmation.result,
           presentationSaved,
@@ -4551,6 +4558,21 @@ function readCodexProviderCompactionEvidence(state, record) {
     if (stat.dev !== boundary.dev || stat.ino !== boundary.ino || stat.size < boundary.sourceByteOffset) return rejected('source-file-replaced');
   } catch { return rejected('source-stat-unavailable'); }
   return { tabId, active, owner, proof, boundary };
+}
+
+// The newest already-settled Codex compact of this tab, for the window where a
+// provider/native autocompact closed on its `compacted` record just before the
+// generic `task_complete` callback arrives. This is a read-only lookup over the
+// registry's own bounded ledger: it starts nothing, rebinds nothing and gives
+// no input/writer authority. The caller still proves owner, turn and byte order.
+function latestSettledCodexCompactOperation(tabId) {
+  const settled = compactOperations.snapshot(tabId, 'codex')?.settled;
+  if (!Array.isArray(settled) || !settled.length) return null;
+  for (let index = settled.length - 1; index >= 0; index -= 1) {
+    const operation = settled[index];
+    if (operation?.outcome === 'completed' && operation.reason === 'compacted') return operation;
+  }
+  return null;
 }
 
 function bindCodexProviderCompactionEvidence(state, record) {
@@ -7174,6 +7196,8 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
           }
           if (meta?.synchronizedFrameEnd === true) {
             observeClaudeSynchronizedFrameFlushed(tabId, state, seq);
+          } else {
+            scheduleClaudeSettledFrameObservation(tabId, state);
           }
         },
         onError: (error) => {
@@ -7722,6 +7746,10 @@ function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
   if (!state) return;
   terminalHeadlessMirrors.delete(tabId);
   state.disposed = true;
+  if (state.claudeSettledFrameTimer) {
+    clearTimeout(state.claudeSettledFrameTimer);
+    state.claudeSettledFrameTimer = null;
+  }
   try { observeTerminalRaw(terminalRawWindow, 'end', state.rawPhysicalTerminal, 'mirror-disposed'); } catch {}
   observeTerminalIo(state.redrawTrace, 'end', 'mirror-disposed');
   state.codexSlashInputDiagnostic?.record('mirror-disposed', { writeSeq: state.writeSeq,
@@ -11886,11 +11914,14 @@ function logProviderProxyHttpLifecycle(tabId, targetPath, event) {
 function createConfiguredCodexAuthProfileRoute() {
   const configPath = getMainProcessEnvValue('NOTED_CODEX_AUTH_PROFILE_CONFIG');
   if (!configPath) return null;
-  if (!isDev || process.env.NOTED_E2E_TEST !== 'true' || !path.isAbsolute(configPath)) {
+  if (process.env.NOTED_E2E_TEST !== 'true' || !path.isAbsolute(configPath)) {
     throw new Error('codex_auth_profile_requires_explicit_private_test_target');
   }
-  const configuration = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   const isolation = require(path.join(srcMainDir, 'e2e-cli-isolation')).assertE2ECliIsolation(process.env);
+  const configuration = isDev ? JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    : require(path.join(srcMainDir, 'codex-auth-profile-target')).readPackagedAuthProfileConfiguration({
+      configPath, appPath: app.getAppPath(), isolation,
+    });
   const fixture = fs.realpathSync(configuration.fixtureCwd);
   if (!fixture.startsWith(isolation.root + path.sep)) throw new Error('codex_auth_profile_fixture_outside_lease');
   return require(path.join(srcMainDir, 'codex-auth-profile-route')).createCodexAuthProfileRoute({
@@ -13151,20 +13182,42 @@ const claudePromptStability = createClaudePromptStabilityRegistry({
   log: (message) => console.log(message),
 });
 
-function observeClaudeSynchronizedFrameFlushed(tabId, expectedState, writeSeq) {
+// Returns the reason it did not mark the prompt stable, or 'marked'. The
+// synchronized-frame path ignores the result (it runs on every frame); the
+// settled-output path logs it, because that path only runs while a startup
+// transaction is waiting and an unexplained refusal there is a hung tab.
+function observeClaudeSynchronizedFrameFlushed(tabId, expectedState, writeSeq, trigger = 'sync-frame-end') {
   const launch = claudeLaunchGenerationByTab.get(tabId) || null;
-  if (!launch?.generation || getHeadlessTerminalMirror(tabId) !== expectedState) return;
-  if (
-    expectedState.failed === true
-    || expectedState.redrawTrace?.synchronizedOutputOpen === true
-    || Number(expectedState.flushedSeq || 0) !== Number(expectedState.writeSeq || 0)
-    || Number(writeSeq || 0) !== Number(expectedState.flushedSeq || 0)
-  ) return;
-  if (claudeTurnBusy.get(tabId) === true || aiStoppingTabs.has(tabId)) return;
+  if (!launch?.generation) return 'no-launch-generation';
+  if (getHeadlessTerminalMirror(tabId) !== expectedState) return 'mirror-replaced';
+  if (expectedState.failed === true) return 'mirror-failed';
+  if (expectedState.redrawTrace?.synchronizedOutputOpen === true) return 'sync-frame-open';
+  if (Number(expectedState.flushedSeq || 0) !== Number(expectedState.writeSeq || 0)
+    || Number(writeSeq || 0) !== Number(expectedState.flushedSeq || 0)) return 'output-not-flushed';
+  if (claudeTurnBusy.get(tabId) === true) return 'turn-busy';
+  if (aiStoppingTabs.has(tabId)) return 'stopping';
 
   const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'claude-prompt-stability');
-  if (!snapshot?.success || snapshot.synchronizedOutputOpen === true) return;
+  if (!snapshot?.success) return 'snapshot-unavailable';
+  if (snapshot.synchronizedOutputOpen === true) return 'snapshot-sync-open';
+  const proof = parseClaudeComposerCurrentFrame(snapshot);
+  const composerProven = proof.proofOutcome === 'found' || proof.proofOutcome === 'absent';
+  // The text heuristics below look for an ACTIVE picker/menu. Claude draws a
+  // picker in place of the composer, so when the current frame is a proven
+  // composer only its own region (top border and below) can hold one; the
+  // conversation above it is history. Reading the whole viewport made history
+  // look like a dialog: the 5-hour-limit notice "…continuing automatically at
+  // 11:10pm · esc to cancel" plus the idle "❯" matched the Rewind-menu
+  // heuristic, so `/model` was never written and the tab hung in "Configuring
+  // claude…" (2026-11-01, tab 6d6fd1718b66, outcome=dialog-visible on every
+  // frame). Without a proven composer — a real Rewind menu or model picker
+  // replaces it — the whole-screen check stays exactly as before.
+  const promptRow = Number(proof.promptRow);
+  const dialogLines = composerProven && Number.isFinite(promptRow)
+    ? snapshot.lines.filter((line) => Number(line?.row) >= promptRow - 1)
+    : snapshot.lines;
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  const dialogText = dialogLines.map((line) => line?.text || '').join('\n');
   if (
     claudeTrustFolderPromptHintTabs.has(tabId)
     || inspectClaudeTrustFolderPromptSnapshot(snapshot).visible === true
@@ -13172,20 +13225,57 @@ function observeClaudeSynchronizedFrameFlushed(tabId, expectedState, writeSeq) {
     || claudeAutoModeDefaultPromptHintTabs.has(tabId)
     || inspectClaudeAutoModeDefaultPromptSnapshot(snapshot).visible === true
     || looksLikeClaudeAutoModeDefaultPromptText(visibleText)
-    || looksLikeClaudeRewindMenuText(visibleText)
-    || /(?:Change effort level|Switch model\?)/i.test(visibleText)
-  ) return;
-  const proof = parseClaudeComposerCurrentFrame(snapshot);
+    || looksLikeClaudeRewindMenuText(dialogText)
+    || /(?:Change effort level|Switch model\?)/i.test(dialogText)
+  ) return 'dialog-visible';
   if (
-    proof.proofOutcome !== 'found'
-    && proof.proofOutcome !== 'absent'
+    !composerProven
     && proof.exactCaptureRecommended !== true
-  ) return;
+  ) return 'composer-not-proven:' + String(proof.proofOutcome || 'unknown');
   claudePromptStability.markStable(
     tabId,
     launch.generation,
-    'current-composer-frame:' + writeSeq,
+    (trigger === 'output-settled' ? 'settled-composer-frame:' : 'current-composer-frame:') + writeSeq,
   );
+  return 'marked';
+}
+
+// The prompt-stability proof above used to run only at the END of a
+// synchronized-output frame. Claude does not always paint its last frame that
+// way: on 2026-10-31 a resumed launch printed the 5-hour usage-limit notice
+// outside a synchronized pair and then sat at an idle composer. Every input of
+// the proof was satisfied — composer parsed as `absent`, sync closed,
+// writeSeq == flushedSeq == 330 — yet nothing ever ran it, so `/model` was
+// never written, the gate stayed `pending` ("Configuring claude…" forever) and
+// the Run After send waited on it until the user gave up (tabs 6d6fd1718b66,
+// 029152fbe588, 2efc9b9b7a35).
+//
+// After an ordinary (non-synchronized) flush, run the SAME proof once output
+// goes quiet — but only while a startup transaction is actually waiting and
+// the prompt is not already stable, so this never re-stamps a lease someone
+// holds. Every guard of the proof still applies; the debounce only waits for
+// the output burst to end, it is not a readiness timeout.
+const CLAUDE_SETTLED_FRAME_DEBOUNCE_MS = 300;
+
+function scheduleClaudeSettledFrameObservation(tabId, state) {
+  if (!state || state.failed === true) return;
+  const pending = claudePromptStability.snapshot(tabId);
+  // No waiter, or already stable: nothing is blocked, so do no work at all.
+  if (!pending || pending.waiters < 1 || pending.ready === true) return;
+  if (state.claudeSettledFrameTimer) clearTimeout(state.claudeSettledFrameTimer);
+  state.claudeSettledFrameTimer = setTimeout(() => {
+    state.claudeSettledFrameTimer = null;
+    const current = claudePromptStability.snapshot(tabId);
+    if (!current || current.waiters < 1 || current.ready === true) return;
+    if (current.generation !== pending.generation) return;
+    const outcome = observeClaudeSynchronizedFrameFlushed(
+      tabId, state, Number(state.flushedSeq || 0), 'output-settled');
+    console.log('[ClaudePromptStable] settled-output tab=' + String(tabId).slice(-12)
+      + ' gen=' + current.generation
+      + ' waiters=' + current.waiters
+      + ' seq=' + Number(state.flushedSeq || 0)
+      + ' outcome=' + outcome);
+  }, CLAUDE_SETTLED_FRAME_DEBOUNCE_MS);
 }
 
 function currentClaudeFrameHasStashMarker(tabId) {
@@ -13740,11 +13830,58 @@ const claudeStartupMainRuntime = createClaudeStartupMainRuntime({
     };
   },
   proveCommand: (context) => waitForClaudeStartupSlashProofInMain(context),
-  publishGate: (payload) => publishClaudeStartupDefaultsGate(
-    payload,
-    { notifyRenderer: true },
-  ),
+  publishGate: (payload) => {
+    captureClaudeSettingFailureBytes(payload);
+    return publishClaudeStartupDefaultsGate(payload, { notifyRenderer: true });
+  },
 });
+
+// Codex pins the raw PTY byte window at the exact moment a control action
+// fails, so the report shows what the terminal actually printed around the
+// input. A Claude setting had no such capture: the log kept only the short
+// `error=` line, so "429 · model not changed" and "Set model to Opus 5" were
+// indistinguishable after the fact, and the two-hour block of 2026-10-31 had to
+// be reconstructed from scattered lines. Same observation-only contract: this
+// pins an already-recorded window and never writes input, retries a command or
+// settles a receipt.
+function captureClaudeSettingFailureBytes(payload = {}) {
+  if (payload?.status !== 'failed') return;
+  const tabId = String(payload?.tabId || '');
+  if (!tabId) return;
+  try {
+    void reportTerminalIncident('claude-setting:' + tabId + ':'
+      + String(payload.attemptId || '-') + ':' + String(payload.resultRevision || '-'), {
+      tabId,
+      toolType: 'claude',
+      incidentReason: 'claude-setting-not-confirmed',
+      // The settings card already tells the user about this failure; a second
+      // toast would only repeat it. The byte window is for the report.
+      silent: true,
+      context: {
+        failedCommand: payload.failedCommand || null,
+        errorCode: payload.errorCode || null,
+        error: payload.error || null,
+        // `unresolved` means our read deadline expired, `absent` that Claude
+        // recorded no result, `found` that it did. Only `found` is a verdict.
+        proofOutcome: payload.proofOutcome || null,
+        undelivered: isClaudeStartupSettingUndelivered({
+          status: 'failed', error: payload.error, errorCode: payload.errorCode,
+          reason: payload.reason, proofOutcome: payload.proofOutcome,
+        }),
+        generation: payload.generation || null,
+        attemptId: payload.attemptId || null,
+        reason: payload.reason || null,
+        userRetryable: payload.userRetryable === true,
+        coverage: 'raw PTY bytes around the setting command; not proof that'
+          + ' Claude applied or rejected it',
+      },
+    });
+  } catch (error) {
+    // Diagnostics must never break the gate publication itself.
+    console.warn('[ClaudeSettingBytes] capture failed tab=' + tabId.slice(-12)
+      + ' reason=' + String(error?.message || error));
+  }
+}
 
 function ensureClaudeStartupSettingsInMain(tabId, generation, trigger, sessionIdHint = null) {
   try {
@@ -14457,6 +14594,7 @@ function clearBridgeTab(tabId, reason = 'process_exited') {
   const wasLocalBusy = claudeLocalCommandWatchers.has(tabId);
   if (wasTurnBusy) emitClaudeAbnormalTurnEnd(tabId, reason);
   clearClaudeEditableLastPrompt(tabId, 'bridge-clear');
+  claudeQueuedPromptSubmits.delete(tabId);
   const questionExit = clearClaudeQuestionStateOnProcessExit({
     tabId,
     awaitingByTab: claudeAwaitingInput,
@@ -17271,6 +17409,95 @@ const CLAUDE_HOOK_DISCOVERY_FILE = path.join(CLAUDE_HOOK_DISCOVERY_DIR, 'claude-
 // Kept for backward compat during the rollout; once new hook script ships to
 // all users this can be removed.
 const CLAUDE_HOOK_SOCK_LEGACY = '/tmp/noted-terminal-claude-hook.sock';
+
+// A message sent into a busy Claude tab is queued by Claude itself. Claude
+// fires UserPromptSubmit for it at ENQUEUE time with the active turn's
+// prompt_id, which admitClaudeMainHook correctly drops as a duplicate start.
+// When that turn ends (Stop) Claude immediately runs the queued message as a
+// new turn — but with no new UserPromptSubmit, so the tab showed idle while
+// Claude worked and Run After/Loop saw a false completion. Reproduced in dev
+// 2026-11-01: Stop 18:14:59.161 → dequeue 18:14:59.304 → real end 18:15:00.208.
+//
+// Decision 01.11 (Fedor): the tab is busy until that queued turn really ends.
+// We replay the dropped UserPromptSubmit through the SAME hook socket once the
+// transcript proves the queued message was dequeued AFTER the Stop, so the full
+// existing turn-start path runs (busy, turn reducer, preview, watchers) and
+// the continuation's own Stop (same prompt_id) ends it. A dequeue before the
+// Stop's byte boundary means Claude merged the message into the running turn:
+// nothing is replayed, so this can never leave a loader without an end.
+const claudeQueuedPromptSubmits = new Map(); // tabId -> { msg, stopBoundary, at }
+
+function rememberClaudeQueuedPromptSubmit(tabId, msg, reason) {
+  if (reason !== 'duplicate-prompt-start' || !tabId) return;
+  if (typeof msg?.prompt !== 'string' || !msg.prompt || msg.synthetic) return;
+  claudeQueuedPromptSubmits.set(tabId, { msg: { ...msg }, stopBoundary: null, at: Date.now() });
+  console.log('[ClaudeQueueContinuation] remembered tab=' + String(tabId).slice(-12)
+    + ' promptId=' + JSON.stringify(msg.prompt_id ?? null) + ' chars=' + msg.prompt.length);
+}
+
+function markClaudeQueuedPromptStopBoundary(tabId, msg) {
+  const entry = claudeQueuedPromptSubmits.get(tabId);
+  if (!entry || entry.stopBoundary !== null) return;
+  if (msg?.session_id && entry.msg.session_id && msg.session_id !== entry.msg.session_id) {
+    claudeQueuedPromptSubmits.delete(tabId);
+    return;
+  }
+  let boundary = null;
+  try {
+    if (typeof msg?.transcript_path === 'string' && msg.transcript_path) {
+      boundary = fs.statSync(msg.transcript_path).size;
+    }
+  } catch {}
+  entry.stopBoundary = Number.isFinite(boundary) ? boundary : null;
+  console.log('[ClaudeQueueContinuation] stop-boundary tab=' + String(tabId).slice(-12)
+    + ' boundary=' + String(entry.stopBoundary ?? 'unknown'));
+  if (entry.stopBoundary === null) claudeQueuedPromptSubmits.delete(tabId);
+}
+
+function settleClaudeQueuedPromptOnDequeue(tabId, { operation, byteOffset, actualText } = {}) {
+  const entry = claudeQueuedPromptSubmits.get(tabId);
+  if (!entry) return 'no-entry';
+  // Any consumption of the queued message closes the entry. `remove` means
+  // Claude took it into the RUNNING turn (dev 2026-11-01 18:27:58, before the
+  // Stop): that Stop is the real end, so nothing is replayed.
+  claudeQueuedPromptSubmits.delete(tabId);
+  if (operation !== 'dequeue') {
+    console.log('[ClaudeQueueContinuation] consumed tab=' + String(tabId).slice(-12)
+      + ' operation=' + String(operation || '-') + ' outcome=merged-into-running-turn');
+    return 'merged-into-running-turn';
+  }
+  const sameText = typeof actualText === 'string'
+    && actualText.normalize('NFC') === entry.msg.prompt.normalize('NFC');
+  let outcome;
+  if (claudeTurnBusy.get(tabId) === true) outcome = 'merged-into-running-turn';
+  else if (!sameText) outcome = 'different-message';
+  else if (entry.stopBoundary === null || !Number.isFinite(Number(byteOffset))) outcome = 'boundary-unknown';
+  else if (Number(byteOffset) < entry.stopBoundary) outcome = 'dequeued-before-stop';
+  else outcome = 'replay';
+  console.log('[ClaudeQueueContinuation] dequeue tab=' + String(tabId).slice(-12)
+    + ' offset=' + String(byteOffset ?? '-') + ' boundary=' + String(entry.stopBoundary ?? '-')
+    + ' outcome=' + outcome);
+  if (outcome !== 'replay') return outcome;
+  try {
+    const client = net.createConnection(CLAUDE_HOOK_SOCK);
+    client.setEncoding('utf8');
+    // Without prompt_id: Claude runs the dequeued message under a NEW prompt
+    // id, not the one it reported at enqueue time. Pinning the enqueue id made
+    // the continuation's real Stop a `prompt-owner-mismatch`, so busy never
+    // ended (dev 2026-11-01 18:21:58, tab abd928b26bc7). Session and process
+    // are still matched; prompt ids are compared only when both ends have one.
+    client.on('connect', () => client.write(JSON.stringify({
+      ...entry.msg, prompt_id: null, ts: Date.now(), synthetic: 'claude-queue-dequeue',
+    }) + '\n'));
+    client.on('data', () => { try { client.end(); } catch {} });
+    client.on('error', (error) => console.warn('[ClaudeQueueContinuation] replay failed tab='
+      + String(tabId).slice(-12) + ' error=' + String(error?.code || error?.message || error)));
+  } catch (error) {
+    console.warn('[ClaudeQueueContinuation] replay failed tab=' + String(tabId).slice(-12)
+      + ' error=' + String(error?.message || error));
+  }
+  return outcome;
+}
 const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
 const claudePostEnterResolutionWaiters = new Map(); // tabId → Set<audit>
 
@@ -17538,6 +17765,62 @@ function captureTabInspection(tabId) {
       revision: tabBackgroundWorkRevisionByTab.get(tabId) || 0, items: items.slice(0, 24), truncated: items.length > 24 },
     revision: JSON.stringify([state.revision, status, liveLifecycle, turnId, outcome,
       tabBackgroundWorkRevisionByTab.get(tabId), items]) };
+}
+
+// Build captures interrupted task ownership, not the public writer/read view.
+// Keep this private port separate: no consumer may use it to authorize input.
+function captureBuildContinueTabInspection(tabId) {
+  const view = captureTabInspection(tabId);
+  if (view.toolType !== 'codex' || view.busy !== true) return view;
+  const terminal = terminals.get(tabId) || null;
+  const watcher = codexTurnWatchers.get(tabId) || null;
+  const proofs = require(path.join(srcMainDir, 'build-continue-proofs'));
+  const readFacts = () => {
+    const owner = captureConversationOwner(tabId);
+    return {
+      view: { known: owner?.known === true && owner.archived !== true && !sdkSessions.has(tabId), exists: true }, owner,
+      turn: taskCompletionIntents.getTurn(tabId), watcher: codexTurnWatchers.get(tabId),
+      writer: getCodexWriterProofSnapshot(tabId), terminal: terminals.get(tabId),
+      lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      inputRevision: getTerminalInputRevision(tabId), stopRevision: getTerminalStopRevision(tabId),
+      command: terminalCommandState.get(tabId), stopping: aiStoppingTabs.has(tabId),
+      inputPending: !!ptyActiveWriteOperation.get(terminals.get(tabId)) || codexPromptInFlight.has(tabId),
+    };
+  };
+  const initial = readFacts(), proof = proofs.captureBuildContinueCodexTask(initial);
+  const boundary = { inputRevision: initial.inputRevision, stopRevision: initial.stopRevision,
+    lifecycleGeneration: initial.lifecycleGeneration, runSeq: initial.runSeq,
+    projectId: initial.owner?.projectId, cwd: initial.owner?.cwd, terminalId: initial.owner?.terminalId,
+    nativeInputOffset: initial.watcher?.loopCanonicalInputOffset ?? null };
+  return { ...view, executionContext: proof.known ? proof.executionContext : null,
+    revision: proof.known ? proof.revision : view.revision,
+    captureTaskProof: proof,
+    // The operation keeps this read bookend only until the old Main's cut.
+    // It is never serialized, accepted from a caller, or rebuilt after restart.
+    captureCurrent: () => {
+      if (terminals.get(tabId) !== terminal || codexTurnWatchers.get(tabId) !== watcher) {
+        return { current: false, reason: 'capture-physical-source-replaced' };
+      }
+      const facts = readFacts(), current = proofs.captureBuildContinueCodexTask(facts);
+      if (facts.stopRevision !== boundary.stopRevision) return { current: false, reason: 'capture-stop-revision-changed' };
+      if (facts.inputRevision !== boundary.inputRevision) return { current: false, reason: 'capture-input-changed' };
+      if (facts.lifecycleGeneration !== boundary.lifecycleGeneration || facts.runSeq !== boundary.runSeq) return { current: false, reason: 'capture-physical-generation-changed' };
+      if (facts.owner?.projectId !== boundary.projectId || facts.owner?.cwd !== boundary.cwd
+        || facts.owner?.terminalId !== boundary.terminalId) return { current: false, reason: 'capture-execution-owner-changed' };
+      if ((facts.watcher?.loopCanonicalInputOffset ?? null) !== boundary.nativeInputOffset) return { current: false, reason: 'capture-native-input-changed' };
+      if (proof.known && !facts.turn?.active && facts.watcher?.busy === false && facts.watcher.outcomeKnown === true
+        && facts.watcher.currentTurnId === proof.executionContext.turnId
+        && facts.watcher.lastOutcomeTurnId === proof.executionContext.turnId
+        && facts.watcher.lastOutcomeReason === 'task_complete' && facts.watcher.lastOutcomeHasFinalResult === true
+        && (!facts.writer?.sessionId || facts.writer.sessionId === proof.executionContext.sessionId)
+        && facts.watcher.sourceObservationTerminal === terminal && facts.watcher.sourceObservationRunSeq === facts.runSeq
+        && proofs.buildContinueTaskBoundary(facts) === proof.sourceRevision) {
+        return { current: false, ended: true, reason: 'capture-own-turn-ended' };
+      }
+      return current.known && current.revision === proof.revision
+        ? { current: true } : { current: false, reason: current.known ? 'capture-task-or-input-changed' : current.reason };
+    } };
 }
 
 async function readTabInspectionResponse(tabId, state) {
@@ -19921,7 +20204,11 @@ function startClaudeHookServer() {
             + ' event=' + event + ' reason=' + hookAdmission.reason
             + ' agentId=' + JSON.stringify(msg.agent_id ?? null)
             + ' promptId=' + JSON.stringify(msg.prompt_id ?? null));
+          rememberClaudeQueuedPromptSubmit(tabId, msg, hookAdmission.reason);
           continue;
+        }
+        if (event === 'Stop' || event === 'StopFailure') {
+          markClaudeQueuedPromptStopBoundary(tabId, msg);
         }
 
         const hookEventTs = Date.now();
@@ -27005,6 +27292,7 @@ app.whenReady().then(async () => {
       readAgentContinuationOriginalProof,
       getAgentResponseState: tabId => getAgentResponseObservationReader().getAgentResponseState(tabId),
       captureTabInspection,
+      captureBuildContinueTabInspection,
       readTabInspectionResponse,
       readMessageReturnProof: (source, receipt) => getMessageReturnProofs().read(source, receipt),
       readAgentObservedResponse: request => getAgentResponseObservationReader().readAgentObservedResponse(request),
@@ -35207,6 +35495,16 @@ ipcMain.handle('agent:dismiss-send-receipt-presentation', async (_event, input =
       require(path.join(srcMainDir, 'web-server')).projectQueuedSendReceipt(record),
     );
   }
+  // Decision 01.11 (Fedor): the X on an UNCONFIRMED card always hides it. The
+  // card can show UNCONFIRMED while Main still owns an in-flight/preparing
+  // attempt — e.g. the scenario IPC already answered delivery-unknown at its
+  // deadline (2026-10-31 run-after-pq-mvwjv179: the X did nothing for minutes).
+  // Hiding stays presentation only: it neither cancels the attempt nor changes
+  // delivery, and a late outcome still settles the same receipt.
+  if (input.unknownOnly === true && !unknownPresentation && !unknownPresentationAlreadyHidden
+    && ['in-flight', 'preparing'].includes(record.state)) {
+    unknownPresentation = true;
+  }
   if (input.unknownOnly === true && ((!unknownPresentation && !unknownPresentationAlreadyHidden)
     || (input.operationKey !== undefined && input.operationKey !== record.operationKey)
     || input.attemptId !== record.attemptId)) {
@@ -35473,6 +35771,8 @@ ipcMain.handle('agent:record-history-context', async (_event, input = {}) => {
           sessionId: targetSessionId,
           sessionAuthority,
           cwd,
+          ...(toolType === 'codex' && !targetSessionId && codexAuthProfileRoute
+            ? codexAuthProfileRoute.newSessionOptions(cwd) : {}),
           prompt,
           imagePaths: normalizedPresentationSnapshot?.imagePaths || [],
           model: typeof input.model === 'string' ? input.model : null,
@@ -36037,6 +36337,7 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
   const launch = claudeLaunchGenerationByTab.get(tabId) || null;
   const startupGate = currentClaudeStartupDefaultsGate(tabId);
   const startupGatePending = startupGate?.status === 'pending';
+  const startupNotDelivered = isClaudeStartupSettingUndelivered(startupGate);
   const projected = projectClaudePtyPresence({
     hasTerm,
     hasBridge,
@@ -36050,6 +36351,7 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     startupIntentFresh,
     startupGatePending,
     startupGateFailed: startupGate?.status === 'failed',
+    startupGateNotDelivered: startupNotDelivered,
   });
   return {
     ...projected,
@@ -36065,6 +36367,10 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     startupError: startupGate?.status === 'failed' ? startupGate.error || startupGate.reason || 'Claude settings failed' : null,
     startupErrorCode: startupGate?.status === 'failed' ? startupGate.errorCode || null : null,
     startupFailedCommand: startupGate?.failedCommand || null,
+    // Proven-undelivered local failure vs. a real provider verdict; the shared
+    // classifier above owns that distinction and both the composer projection
+    // and the Send guard read it. Incident 2026-10-31 08:27:50 tab 718f438d.
+    startupNotDelivered,
     manualActionRequired: startupGate?.status === 'failed',
     manualActionType: startupGate?.status === 'failed' ? 'claude-startup-settings' : null,
     providerProcessAlive: evidence.providerProcessAlive === true,
@@ -36175,6 +36481,7 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
     startupError: runtimePresence.startupError,
     startupErrorCode: runtimePresence.startupErrorCode,
     startupFailedCommand: runtimePresence.startupFailedCommand,
+    startupNotDelivered: runtimePresence.startupNotDelivered === true,
     manualActionRequired: runtimePresence.manualActionRequired === true,
     manualActionType: runtimePresence.manualActionType || null,
     conversationMaterialized,
@@ -44813,7 +45120,14 @@ ipcMain.handle('app:get-startup-interrupted-snapshot', () => (
 ));
 
 let promptQueueAssetGcTimer = null;
+// Nothing in the store is collectable until it is `minAgeMs` old (30 days), so
+// a queue save creates no urgency. Coalescing to one sweep per hour keeps the
+// inventory reads (measured 96.4s of Main wall time in one day, 84% of all work
+// named inside Main stalls, with zero files removed) off the interactive path.
+const PROMPT_QUEUE_ASSET_GC_INTERVAL_MS = 60 * 60 * 1000;
+let promptQueueAssetGcLastRunMs = 0;
 async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save') {
+  promptQueueAssetGcLastRunMs = Date.now();
   try {
     require(path.join(srcMainDir, 'replay-asset-ownership')).adoptCompletedQueueTransfers(projectManager.db.db);
     const referenced = collectReferencedAssetIds(queueState);
@@ -44839,10 +45153,17 @@ async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save'
 
 function schedulePromptQueueAssetGc(queueState, reason = 'state-save') {
   if (promptQueueAssetGcTimer) clearTimeout(promptQueueAssetGcTimer);
+  const sinceLast = Date.now() - promptQueueAssetGcLastRunMs;
+  const delay = Math.max(1000, PROMPT_QUEUE_ASSET_GC_INTERVAL_MS - sinceLast);
   promptQueueAssetGcTimer = setTimeout(() => {
     promptQueueAssetGcTimer = null;
-    void garbageCollectPromptQueueAssets(queueState, reason);
-  }, 1000);
+    // Re-read the committed queue: the caller's snapshot is up to an hour old
+    // by now, and a stale inventory must never decide what can be deleted.
+    void garbageCollectPromptQueueAssets(
+      projectManager.db.getAppState('promptQueueByTab') ?? queueState,
+      reason,
+    );
+  }, delay);
 }
 
 ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = {}) => {
@@ -45152,7 +45473,9 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, request = {}) =
       let created = null;
       let materializationCommitted = false;
       try {
-        created = await materialize({ cwd: exactCwd });
+        created = await materialize({ cwd: exactCwd,
+          ...(codexAuthProfileRoute?.newSessionOptions(exactCwd) || {}),
+        });
         // No await between this cancellation check and the existing owner CAS.
         // Do not throw a cancellation after a successful CAS: catch unlinks
         // created.filePath and must never delete an already-bound session.
@@ -57201,7 +57524,15 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     emitCodexHistoryLiveTurnBoundary(state, record, event);
   }
   const turnOutcome = projectCodexCompactTurnOutcome({
-    operation: compactOperations.getActive(state.tabId, 'codex'),
+    // A provider/native autocompact finishes on its `compacted` record, which
+    // can land milliseconds BEFORE this `task_complete`. Looking only at the
+    // active slot then found nothing and published a generic
+    // `codex-no-final-result`, which disarmed Run after on a compact that had
+    // actually succeeded. Fall back to the most recent settled compact of this
+    // exact tab; projectCodexCompactTurnOutcome re-checks every owner, turn and
+    // byte-order guard before accepting it.
+    operation: compactOperations.getActive(state.tabId, 'codex')
+      || latestSettledCodexCompactOperation(state.tabId),
     record, state,
     lifecycleGeneration: getTerminalLifecycleGeneration(state.tabId),
     terminal: terminals.get(state.tabId),

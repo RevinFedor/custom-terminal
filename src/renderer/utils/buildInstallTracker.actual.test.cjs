@@ -74,3 +74,26 @@ test('install opens its exact event only by click and keeps cancellation separat
   find(tree, n => n.props['aria-label'] === 'Отменить запрос установки').props.onClick({ stopPropagation() {} });
   assert.deepEqual(cancels, [job]); assert.equal(opens.length, 1);
 });
+
+test('known user Stop is grey/static with a cancellation icon while its already-delivered response finishes', async () => {
+  const { BuildInstallTracker } = await trackerModule();
+  const job = { id: 'J', requestId: 'I', ok: null, running: false, cancelled: true,
+    cancellation: { origin: 'user', surface: 'voice-record-desktop' }, callback: { status: 'sent' },
+    continuation: { state: 'waiting-callback-turn', inheritedActive: false } };
+  const html = renderToStaticMarkup(React.createElement(BuildInstallTracker, { job, stale: false, onOpen() {}, onCancel() {} }));
+  assert.match(html, /color:#a3a3a3/); assert.match(html, /lucide-circle-x/);
+  assert.doesNotMatch(html, /animate-spin|lucide-circle-check/);
+});
+
+test('a finished failed install has one enabled X bound to its original Job/request, even with a cancelled continuation', async () => {
+  const { BuildInstallTracker } = await trackerModule(), calls = [];
+  const job = { id: 'timvmcxfrhb6233435', requestId: 'mcp-wire-repair-4875-noted-preserving-20261024-v1',
+    phase: 'finished', running: false, ok: false, error: 'terminal_process_observation_unknown',
+    callback: { status: 'sent' }, continuation: { state: 'cancelled' } };
+  const tree = BuildInstallTracker({ job, stale: false, onOpen() { assert.fail('X cannot open preview'); }, onCancel: j => calls.push(j) });
+  const html = renderToStaticMarkup(tree);
+  assert.match(html, /aria-label="Закрыть запрос установки"/); assert.doesNotMatch(html, /disabled=""/);
+  function find(n) { if (!n?.props) return null; if (n.props['aria-label'] === 'Закрыть запрос установки') return n;
+    return [n.props.actions, ...React.Children.toArray(n.props.children)].map(find).find(Boolean); }
+  find(tree).props.onClick({ stopPropagation() {} }); assert.deepEqual(calls, [job]);
+});

@@ -425,7 +425,7 @@ class HistoryPreparedCache {
           } catch { diagnostic.errorCount++; }
         }
       }
-      const files = [...families.values()].filter(item => {
+      let files = [...families.values()].filter(item => {
         if (item.main) {
           // Reuse this existing quota scan. A hot miss never searches old schema
           // directories; this bounded hint is only evidence from the last prune.
@@ -436,6 +436,32 @@ class HistoryPreparedCache {
         this.removeFile(item.file, 'orphan-sidecar', false); diagnostic.removedCount++; return false;
       });
       let size = files.reduce((n, f) => n + f.size, 0);
+      // An obsolete schema directory can never be read again: the parser hash
+      // is part of its own path and a read must match it exactly. Keeping it
+      // until quota pressure left 14.4 GiB from two previous builds inside the
+      // 20 GiB budget, so a new build's own reads evicted each other while the
+      // dead data stayed. The version hint above is already recorded, so the
+      // next miss still reports `version-mismatch` rather than `no-file`.
+      const live = [];
+      for (const item of files) {
+        if (path.dirname(item.file) === this.directory) { live.push(item); continue; }
+        if (this.activeFiles.has(item.file)) { diagnostic.activeCount++; live.push(item); continue; }
+        this.removeFile(item.file, 'obsolete-version', false);
+        size -= item.size;
+        diagnostic.evictedCount++; diagnostic.evictedBytes += item.size;
+        diagnostic.obsoleteEvictedCount = (diagnostic.obsoleteEvictedCount || 0) + 1;
+      }
+      files = live;
+      // Eviction unlinks files but leaves the directory, which is why 54 empty
+      // version folders had accumulated. Only an empty one is removed, so a
+      // directory still holding an active file is never touched.
+      for (const entry of fs.readdirSync(this.baseDirectory, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^v\d+(?:-[a-f0-9]+)?$/.test(entry.name)) continue;
+        const directory = path.join(this.baseDirectory, entry.name);
+        if (directory === this.directory) continue;
+        try { if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory); }
+        catch { diagnostic.errorCount++; }
+      }
       // Obsolete schema first, compact Timeline last. Among heavy files, use
       // OWNER LRU and discard its checkpoint before its ready rows. A global
       // "all checkpoints first" would keep ancient rows while repeatedly
@@ -462,7 +488,14 @@ class HistoryPreparedCache {
       }
       this.diskBytes = size;
       diagnostic.diskBytes = size; diagnostic.fileCount = files.length;
-      if (diagnostic.evictedCount) { diagnostic.outcome = 'evicted'; diagnostic.reason = 'disk-quota'; }
+      if (diagnostic.evictedCount) {
+        diagnostic.outcome = 'evicted';
+        // An obsolete version is collected because it is unreadable, not
+        // because the disk filled up; reporting 'disk-quota' for it would hide
+        // the very condition this sweep exists to prevent.
+        diagnostic.reason = diagnostic.evictedCount > (diagnostic.obsoleteEvictedCount || 0)
+          ? 'disk-quota' : 'obsolete-version';
+      }
       else if (diagnostic.removedCount) { diagnostic.outcome = 'removed'; diagnostic.reason = 'orphan-sidecar'; }
       if (size > this.maxBytes) diagnostic.reason = 'active-files-over-budget';
       if (diagnostic.errorCount) { diagnostic.outcome = 'partial'; diagnostic.reason = 'file-stat-error'; }

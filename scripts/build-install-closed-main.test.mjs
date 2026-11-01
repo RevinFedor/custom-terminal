@@ -149,15 +149,50 @@ test('earlier absence never authorizes replacement if final source is found or u
   }
 });
 
-test('initial unknown refuses before install; a live Main retains the existing Quit flow', async () => {
+test('initial unknown refuses before install; a live Main is quit by its exact PID re-read before Quit', async () => {
   await assert.rejects(cli(() => unknown, () => assert.fail('unknown cannot start install')), /source is not known/);
   const f = fixture(); let checks = 0, result;
-  await cli(() => { checks++; return found; }, async options => {
+  await cli(() => { checks++; f.events.push({ kind: 'inspect' }); return found; }, async options => {
     assert.equal(options.confirmClosedSource, undefined);
     result = await f.execute(options); return result;
   });
-  assert.equal(result.ok, true); assert.equal(checks, 1);
-  assert.deepEqual(f.events.find(e => e.kind === 'quit').args, ['scripts/graceful-quit.sh', '20']);
+  assert.equal(result.ok, true); assert.equal(checks, 2, 'start + immediately before Quit');
+  const kinds = f.events.map(e => e.kind);
+  assert(kinds.lastIndexOf('inspect') > kinds.indexOf('before-quit'));
+  assert(kinds.lastIndexOf('inspect') < kinds.indexOf('quit'));
+  // The detached MCP hub shares the executable path. Only the exact Main PID
+  // is awaited/signalled, so the hub survives (it was SIGTERM'd 01.11 20:05).
+  assert.deepEqual(f.events.find(e => e.kind === 'quit').args, ['scripts/graceful-quit.sh', '20', '', '', '42']);
+});
+
+test('the ordinary Voice/MCP job also gets the exact-Main re-read; a closed source does not', async () => {
+  let seen;
+  await cli(() => found, async options => { seen = options; return { ok: true }; },
+    { NOTED_INSTALL_IDLE_ACK_ID: 'synthetic-voice-job' });
+  assert.equal(typeof seen.inspectQuitSource, 'function');
+  assert.equal(seen.confirmClosedSource, undefined);
+  assert.deepEqual(await seen.inspectQuitSource(), found);
+  await cli(() => absent, async options => { seen = options; return { ok: true }; });
+  assert.equal(seen.inspectQuitSource, undefined);
+  assert.equal(typeof seen.confirmClosedSource, 'function');
+});
+
+test('a pre-Quit re-read decides the Quit: unknown or failed read keeps path-wide, absent skips it', async () => {
+  for (const [label, second, expected] of [
+    ['unknown', () => unknown, ['scripts/graceful-quit.sh', '20']],
+    ['read error', () => { throw Error('synthetic ps failure'); }, ['scripts/graceful-quit.sh', '20']],
+    ['Main already closed', () => absent, null],
+  ]) {
+    const f = fixture(); let checks = 0, result;
+    await cli(() => (++checks === 1 ? found : second()), async options => {
+      result = await f.execute(options); return result;
+    });
+    assert.equal(result.ok, true, label); assert.equal(checks, 2, label);
+    const quit = f.events.find(e => e.kind === 'quit');
+    if (expected) assert.deepEqual(quit?.args, expected, label);
+    else assert.equal(quit, undefined, label + ': nothing to quit, the shared hub is never sent Quit');
+    assert.equal(f.nodes.get(f.installedApp).version, 'new', label);
+  }
 });
 
 test('closed preparation failure/cancellation never reopens the app; replaced validation failure rolls back', async () => {

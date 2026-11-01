@@ -10,7 +10,7 @@ import * as details from '../../utils/orchestrationDetails.mjs';
 import * as projection from '../../utils/orchestrationRunProjection.mjs';
 import { isRequestSuccessPresentation } from '../../utils/requestTrackerVisibility.mjs';
 
-const source = fs.readFileSync(new URL('./OrchestrationStatusChip.tsx', import.meta.url), 'utf8');
+const source = fs.readFileSync(process.env.BUILD_CAPTURE_DOCK_PRE || new URL('./OrchestrationStatusChip.tsx', import.meta.url), 'utf8');
 const rowSource = fs.readFileSync(new URL('./RequestTrackerRow.tsx', import.meta.url), 'utf8');
 const evaluate = (code, require) => {
   const module = { exports: {} };
@@ -53,6 +53,15 @@ const selfRewindRows = evaluate(fs.readFileSync(new URL('./SelfRewindTracker.tsx
   if (name === './TabContextUpdates') return {};
   throw Error(name);
 });
+const captureRows = evaluate(fs.readFileSync(new URL('./BuildContinueCaptureTracker.tsx', import.meta.url), 'utf8'), name => {
+  if (name === 'react') return React;
+  if (name === 'lucide-react') return icons;
+  if (name === './RequestTrackerRow') return rows;
+  if (name === './RequestDetailsPopover') return { RequestDetailsPopover: ({ children }) => React.createElement('aside', null, children) };
+  if (name === './TabMessageSourceChip') return navigation;
+  if (name.endsWith('/useWorkspaceStore')) return { useWorkspaceStore: { getState: () => ({ openProjects: new Map() }) } };
+  throw Error(name);
+});
 const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', sourceTabId: 'source',
   sourceTabName: 'Source session', targetTabId: null, targetTabName: 'ChatGPT · 6-astra',
   targetProjectName: 'SC Desktop', externalResearchProvider: 'chatgpt',
@@ -61,7 +70,7 @@ const base = Object.freeze({ runId: 'saved-run', runKind: 'external-research', s
 
 // Execute the whole component and real row/icon markup. Only retained hook state,
 // dock placement, message transport and Tooltip's overlay host are controlled.
-function render(run, { history = false, tabId = 'source', recoveryTargets = [], selfRewinds = [] } = {}) {
+function render(run, { history = false, tabId = 'source', recoveryTargets = [], captureIssues = [], selfRewinds = [] } = {}) {
   let state = 0;
   const hooks = { ...React,
     useState: initial => {
@@ -82,7 +91,7 @@ function render(run, { history = false, tabId = 'source', recoveryTargets = [], 
     if (name === './TabMessageTracker') return { TabMessageTracker: () => null };
     if (name.endsWith('/useTabMessages')) return { useTabMessages: () => ({ threads: [], listError: null }) };
     if (name.endsWith('/useBuildInstallStatus')) return { useBuildInstallStatus: () => ({ jobs: [] }) };
-    if (name.endsWith('/useBuildContinueStatus')) return { useBuildContinueStatus: () => ({ targets: recoveryTargets, error: null,
+    if (name.endsWith('/useBuildContinueStatus')) return { useBuildContinueStatus: () => ({ targets: recoveryTargets, captureIssues, error: null,
       cancel: () => { throw Error('Display must not cancel recovery'); } }) };
     if (name.endsWith('/useSelfRewinds')) return { useSelfRewinds: () => ({ rows: selfRewinds, error: null,
       dismiss: () => { throw Error('SSR must not dismiss an operation'); } }) };
@@ -90,6 +99,7 @@ function render(run, { history = false, tabId = 'source', recoveryTargets = [], 
     if (name.endsWith('/buildInstallPresentation.mjs')) return { buildInstallVisibleInDock: () => false };
     if (name === './BuildInstallTracker') return { BuildInstallTracker: () => null };
     if (name === './BuildContinueTracker') return continuationRows;
+    if (name === './BuildContinueCaptureTracker') return captureRows;
     if (name.endsWith('/useRequestDockLayout')) return { useRequestDockLayout: () => ({ visible: true }) };
     if (name.endsWith('/tabMessageProjection')) return { tabMessageVisibleInTracker: () => false };
     if (name.endsWith('/requestTrackerVisibility.mjs')) return { isRequestSuccessPresentation };
@@ -162,6 +172,18 @@ test('the real recovery dock does not borrow completed Research details or navig
   const html = render({ ...base, status: 'completed', resultComplete: true, notificationStatus: 'sent' }, { recoveryTargets: [recovery] });
   assert.match(html, /чаты с hh/);
   assert.doesNotMatch(html, /original-task|noted_saved-run|Research завершён|data-external-research-source|data-tooltip-side/);
+});
+
+test('the real dock shows a zero-target capture refusal without pretending it is a failed Send or showing unrelated Research', () => {
+  const issue = { kind: 'capture-unresolved', version: 1, operationId: 'capture-zero-targets', tabId: 'source', issueId: 'a'.repeat(64),
+    capturedAt: 1, phase: 'settled', stage: 'capture', reason: 'own-turn-proof-unavailable', active: false, inputCreated: false,
+    source: { tabId: 'source', name: 'Оптимизация окон' }, presentationDismissal: null };
+  const before = JSON.stringify(issue);
+  const html = render({ ...base, status: 'completed', resultComplete: true, notificationStatus: 'sent' }, { captureIssues: [issue] });
+  assert.match(html, /data-build-capture-row=/, 'capture failures must appear even when no Continue target exists');
+  assert.match(html, /Автопродолжение не создано/); assert.match(html, /Оптимизация окон/);
+  assert.doesNotMatch(html, /data-build-continue-row|data-external-research-source|Research завершён|data-build-capture-details/);
+  assert.equal(JSON.stringify(issue), before);
 });
 
 test('native/observed and incoming requests do not acquire Research browser actions', () => {

@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const ts = require('typescript');
 const liveness = require('./ai-process-liveness');
 const { projectClaudePtyPresence } = require('./claude-pty-presence');
+const { isClaudeStartupSettingUndelivered } = require('../shared/claude-startup-failure.cjs');
 const { createProcessTreeSnapshotSingleFlight } = require('./process-tree-snapshot-single-flight');
 
 const TAB = 'tab-presence-recovery';
@@ -87,6 +88,7 @@ function fixture({ windowSendThrows = false } = {}) {
       error: (...args) => logs.push(['error', ...args]),
     },
     projectClaudePtyPresence,
+    isClaudeStartupSettingUndelivered,
     BrowserWindow: {
       getAllWindows: () => [{
         isDestroyed: () => false,

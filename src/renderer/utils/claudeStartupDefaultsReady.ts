@@ -1,5 +1,6 @@
 import {
   fetchClaudeStartupDefaultsGate,
+  getClaudeStartupDefaultsGateSnapshot,
   waitForClaudeStartupDefaultsReady,
 } from './claudeStartupDefaultsGate';
 import { terminalRegistry } from './terminalRegistry';
@@ -92,5 +93,21 @@ export async function waitForClaudeStartupDefaultsReadyUntilSettled(
   tabId: string,
   label = 'startup-defaults',
 ) {
-  return waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, null, label);
+  try {
+    return await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, null, label);
+  } catch (error) {
+    // "Settled" includes a FAILED transaction. A failed startup setting is
+    // reported, not enforced: the setting is not applied, and the Send that
+    // waited for the transaction proceeds on the proven composer. Without this
+    // the Send guard let the request through and then this wait threw, so the
+    // tab still refused input (incident 2026-10-31, tab 2efc9b9b7a35: a 429 on
+    // `/model` refused every send for 2h20m). A stopped/replaced attempt or a
+    // cleared gate is NOT a failed outcome and still rejects.
+    if (getClaudeStartupDefaultsGateSnapshot(tabId)?.status === 'failed') {
+      console.warn('[ClaudeStartupDefaultsReady] tab=' + tabId.slice(-12)
+        + ' label=' + label + ' settled=failed action=continue-without-setting');
+      return;
+    }
+    throw error;
+  }
 }

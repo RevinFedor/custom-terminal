@@ -100,8 +100,13 @@ Copy сохраняется. После write с неподтверждённо�
 
 ### Изолированный Codex с существующим auth-профилем
 
-Private DEV может читать явно выбранный существующий auth-профиль только внутри
-Main proxy; свой `CODEX_HOME` сохраняет собственные config/rollouts. Копировать
+Private DEV, а в SOURCE31Oct и явно квалифицированный isolated packaged target,
+может читать выбранный existing auth-профиль только внутри Main proxy;
+свой `CODEX_HOME` сохраняет собственные config/rollouts. Packaged opt-in требует
+real isolation root, bounded regular config внутри него и target.appPath,
+совпадающий с фактическим app.getAppPath; обычный packaged запуск этого допуска
+не получает. Конфигурационный FIFO открывается nonblocking и отвергается до
+чтения: одного isFile после блокирующего open недостаточно. Копировать
 production `auth.json` в fixture или заменять caller identity нельзя. Этот маршрут
 включается только явной E2E-конфигурацией, не меняет обычную production-авторизацию.
 URL привязан к исходному launch; admission сохраняет исходные terminal object,
@@ -114,7 +119,7 @@ writer не завершает физическую команду: явное �
 Проверять не только первый HTTP200/auth proof, но HTTP/WS tool continuation после
 очистки startup metadata. Отказ `codex_auth_route_owner_changed` имеет отдельный
 metadata reason; token rotation того же аккаунта не разрешает смену аккаунта.
-См. `codex-auth-profile-route.actual.test.js`; controlled Main/credentials не
+См. `codex-auth-profile-route.actual.test.js` и `codex-auth-profile-target.test.js`; controlled Main/credentials не
 заменяют последующий real-provider прогон.
 
 ## Философия

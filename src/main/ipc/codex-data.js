@@ -6804,6 +6804,7 @@ function isCodexResponseUserRecord(record) {
 
 function isCodexTurnPreambleRecord(record) {
   const payload = record?.payload || {};
+  if (record?.type === 'world_state') return true;
   if (record?.type === 'turn_context') return true;
   if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
   if (record?.type === 'event_msg' && payload.type === 'user_message') {
@@ -7006,6 +7007,18 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
         kind: 'user',
         turnKey: currentTurnKey,
       });
+      continue;
+    }
+
+    // Codex persists a world-state checkpoint after its contextual fragments.
+    // Do not flush those fragments onto the previous user merely because this
+    // non-visible record separates them from the next canonical input. A bare
+    // checkpoint after a real input (or its late response companion) still
+    // belongs to that input, not to the next turn's preamble.
+    const preambleTail = pending[pending.length - 1]?.record;
+    if (record?.type === 'world_state' && isCodexTurnPreambleRecord(preambleTail)
+      && (preambleTail.__physicalSessionId || sessionId) === (record.__physicalSessionId || sessionId)) {
+      pending.push({ record });
       continue;
     }
 
@@ -7383,7 +7396,12 @@ async function replaceCodexSessionFileInPlace({
   }
 }
 
-function buildCodexEmptySessionMetaRecord({ sessionId, cwd, timestamp }) {
+function buildCodexEmptySessionMetaRecord({ sessionId, cwd, timestamp, modelProvider = 'openai' }) {
+  if (typeof modelProvider !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(modelProvider)) {
+    const error = new Error('codex_empty_session_provider_invalid');
+    error.code = 'codex_empty_session_provider_invalid';
+    throw error;
+  }
   return {
     timestamp,
     type: 'session_meta',
@@ -7399,7 +7417,7 @@ function buildCodexEmptySessionMetaRecord({ sessionId, cwd, timestamp }) {
       cli_version: '0.0.0',
       source: 'cli',
       thread_source: 'user',
-      model_provider: 'openai',
+      model_provider: modelProvider,
     },
   };
 }
@@ -7409,6 +7427,7 @@ async function materializeEmptyCodexSession({
   sessionId = null,
   now = new Date(),
   sessionsDir = CODEX_SESSIONS_DIR,
+  modelProvider = 'openai',
 } = {}) {
   const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : null;
   if (!exactCwd) {
@@ -7422,12 +7441,13 @@ async function materializeEmptyCodexSession({
   const timestamp = now.toISOString();
   const { yyyy, mm, dd } = codexDateParts(now);
   const dir = path.join(sessionsDir, yyyy, mm, dd);
-  await fs.promises.mkdir(dir, { recursive: true });
   const records = [buildCodexEmptySessionMetaRecord({
     sessionId: exactSessionId,
     cwd: exactCwd,
     timestamp,
+    modelProvider,
   })];
+  await fs.promises.mkdir(dir, { recursive: true });
 
   let filePath = '';
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -12610,6 +12630,7 @@ function register({ projectManager, transcriptService, historyMutationInput } = 
     effort = null,
     itemId = null,
     onBeforeCommit = null,
+    modelProvider = 'openai',
   } = {}) {
     const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd)
       ? cwd
@@ -12643,7 +12664,7 @@ function register({ projectManager, transcriptService, historyMutationInput } = 
       let fresh = false;
       try {
         if (!exactSessionId) {
-          const materialized = await materializeEmptyCodexSession({ cwd: exactCwd });
+          const materialized = await materializeEmptyCodexSession({ cwd: exactCwd, modelProvider });
           exactSessionId = materialized.sessionId;
           filePath = materialized.filePath;
           fresh = true;

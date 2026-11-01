@@ -9,7 +9,25 @@ const { AgentSendQueue } = require('./agent-send-queue');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm'), ts = require('typescript');
+const { historyReadOwnerFromProjection } = require('./history-read-session');
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+function actualFactorySourceResolver(runtime, publicRead, tabType = 'terminal') {
+  const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const ast = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
+  let selected;
+  const visit = node => {
+    if (ts.isNewExpression(node) && node.expression.getText(ast) === 'SavedHistoryOperations') {
+      selected = node.arguments[0].properties.find(property => property.name?.getText(ast) === 'resolveSession');
+    }
+    ts.forEachChild(node, visit);
+  }; visit(ast); assert.ok(selected);
+  return vm.runInNewContext('(' + selected.initializer.getText(ast) + ')', {
+    savedHistoryRuntime: runtime, resolveHistorySessionInfo: publicRead,
+    findOrchestrationTabDescriptor: () => ({ tabType }),
+  });
+}
 
 function fixture(t, options = {}) {
   const provider = options.toolType || 'codex';
@@ -22,6 +40,8 @@ function fixture(t, options = {}) {
   const state = { terminalToken: {}, projectId: 'P', cwd: '/finite', sessionId: 'S', toolType: provider,
     inputRevision: 1, runSeq: 1, lifecycleGeneration: 'L1', launchId: 'old-launch', inputOwnerLaunchId: 'old-launch',
     isRunning: true, stopping: false, inputReady: true };
+  const publicRead = () => historyReadOwnerFromProjection({ toolType: provider, sessionId: 'S', cwd: '/finite' },
+    { sessionId: null, readSessionId: null, provenWriterSessionId: null, writerConfirmed: false }, true);
   db.compareAndSetTabClaudeSessionId = (_project, _tab, previous, next) => {
     if (state.sessionId !== previous) return false; state.sessionId = next; return true;
   };
@@ -51,7 +71,11 @@ function fixture(t, options = {}) {
     reserveInput: request => gate.reserve(request), assertInput: proof => gate.assert('T', proof, { action: 'mutation' }),
     finishInput: proof => gate.finish(proof), bindInput: (proof, sid) => gate.bound(proof, sid),
     runInput: (proof, action) => gate.run(proof, action), inspectDraft: () => ({ hasDraft: false }) },
-    resolveSession: async () => ({ sessionId: state.sessionId, toolType: provider, cwd: '/finite' }),
+    resolveSession: options.actualFactory
+      ? actualFactorySourceResolver({ capture: () => {
+        const selected = { ...state }; options.afterSourceCapture?.(state); return selected;
+      } }, publicRead, options.tabType)
+      : async () => ({ sessionId: state.sessionId, toolType: provider, cwd: '/finite' }),
     transcript: { getTimeline: async () => ({ success: true, entries: source, contentRevision: 'R', latestSessionId: 'S' }),
       getHistory: async () => ({ success: true, entries: source }),
       loadCodexOperationSource: async () => ({ success: true, records: source }) },
@@ -77,10 +101,12 @@ function fixture(t, options = {}) {
       assert.equal(effects.filter(row => row[0] === 'send-leaf').length, 0);
       return admitted.receipt;
     } } });
+  const observedContext = context.getRewindContext('T');
   const body = { operationId: 'self-1', kind: 'rewind', expectedSessionId: 'S', targetUuid: 'deploy', toolType: provider,
     ...(provider === 'claude' ? { expectedContentRevision: 'R' } : {}),
     selfRewind: { retainedContext: 'Deployment completed. Current code is deployed; do not repeat it.',
-      expectedContextRevision: context.get('T').revision, coveredContextUpdateIds: [covered.updateId],
+      expectedContextRevision: observedContext.revision, expectedContextSnapshot: observedContext.rewindSnapshot,
+      coveredContextUpdateIds: [covered.updateId],
       nextPrompt: options.nextPrompt || null }, sourceMeta: { server: 'terminal', mode: 'internal', tabId: 'T' } };
   async function drive(completing) {
     const request = { tabId: 'T', operationId: body.operationId };
@@ -106,8 +132,37 @@ function fixture(t, options = {}) {
     });
   }
   t.after(async () => { queue.dispose(); await tick(); await context.syncing; sql.close(); });
-  return { sql, db, context, covered, body, state, gate, operations, queue, receipts, effects, dispatched, drive };
+  return { sql, db, context, covered, body, state, gate, operations, queue, receipts, effects, dispatched, drive, publicRead };
 }
+test('actual factory selects the durable Rewind source when the independent public read SID is unavailable', async t => {
+  const h = fixture(t, { actualFactory: true });
+  assert.equal(h.publicRead().sessionId, null);
+  h.operations.acceptSelf('T', h.body); await tick();
+  const result = await h.drive();
+  assert.equal(result.state, 'completed'); assert.equal(result.historyMutated, true);
+  assert.equal(h.effects.filter(row => row[0] === 'rewrite').length, 1);
+  assert.equal(h.effects.filter(row => row[0] === 'send-leaf').length, 0);
+  assert.equal(h.publicRead().sessionId, null, 'selecting a source grants neither a public read nor a confirmed writer');
+});
+test('actual factory still rejects changed source/provider and SDK before any Stop/rewrite', async t => {
+  for (const change of ['session', 'provider', 'sdk']) {
+    const h = fixture(t, { actualFactory: true, tabType: change === 'sdk' ? 'claude-sdk' : 'terminal' });
+    h.operations.acceptSelf('T', h.body); await tick();
+    if (change === 'session') h.state.sessionId = 'another-source';
+    if (change === 'provider') h.state.toolType = 'claude';
+    await assert.rejects(h.operations.step({ tabId: 'T', operationId: 'self-1', phase: 'prepare' }), error =>
+      error.code === (change === 'sdk' ? 'history_operation_provider_unsupported' : 'history_operation_session_changed'));
+    assert.equal(h.effects.length, 0); assert.equal(h.state.isRunning, true);
+    assert.equal(h.operations.read('T', 'self-1').historyMutated, false);
+  }
+});
+test('actual factory cannot mix the selected source cwd with an owner changed across the resolver await', async t => {
+  const h = fixture(t, { actualFactory: true, afterSourceCapture: state => { state.cwd = '/changed'; } });
+  h.operations.acceptSelf('T', h.body); await tick();
+  await assert.rejects(h.operations.step({ tabId: 'T', operationId: 'self-1', phase: 'prepare' }),
+    error => error.code === 'history_operation_owner_changed');
+  assert.equal(h.effects.length, 0); assert.equal(h.state.isRunning, true);
+});
 test('self Rewind only reuses the existing phase protocol and retains context without a new Send', async t => {
   const h = fixture(t); h.operations.acceptSelf('T', h.body); await tick();
   const result = await h.drive(); await tick();

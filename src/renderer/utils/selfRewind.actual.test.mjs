@@ -120,6 +120,18 @@ test('stale hydration cannot resurrect a hidden card or downgrade its confirmed 
   assert.equal(result.presentationHiddenAt, 10); assert.equal(result.followup.receiptState, 'confirmed');
   assert.equal(tracker.selfRewindVisible(result), false);
 });
+test('session and context proof errors get readable labels without rewriting their saved evidence', () => {
+  for (const [code, label] of [['history_operation_session_changed', 'Не удалось подтвердить выбранную сессию до начала отката'],
+    ['self_rewind_context_snapshot_invalid', 'Не удалось подтвердить сохранённый снимок контекста']]) {
+    const operation = { ...base, state: 'failed', historyMutated: false,
+      error: "Error invoking remote method 'saved-history:step': Error: " + code };
+    const raw = JSON.stringify(operation);
+    const html = renderToStaticMarkup(React.createElement(tracker.SelfRewindPreview,
+      { operation, selection: {}, onClose() {}, previewRef: { current: null } }));
+    assert.ok(html.includes(label)); assert.ok(!html.includes(code));
+    assert.doesNotMatch(html, /Error invoking remote method/); assert.equal(JSON.stringify(operation), raw);
+  }
+});
 test('a late dismiss result cannot enter another tab subscription after navigation', async () => {
   const slots = [], cleanups = [];
   let cursor = 0, reply;
@@ -155,16 +167,19 @@ test('the real dock callbacks switch exact sibling selections and close only the
     ts.forEachChild(node, visit);
   };
   visit(ast);
-  const values = { message: { messageId: 'q' }, recovery: { operationKey: 'r' }, install: { jobId: 'i' }, rewind: null, historyOpen: true };
+  const values = { message: { messageId: 'q' }, recovery: { operationKey: 'r' }, capture: { issueId: 'c' },
+    install: { jobId: 'i' }, rewind: null, historyOpen: true };
   const setter = key => value => { values[key] = typeof value === 'function' ? value(values[key]) : value; };
   const context = vm.createContext({ useCallback: fn => fn, setSettingsOpen() {}, setSelectedMessage: setter('message'),
-    setSelectedRecovery: setter('recovery'), setSelectedInstall: setter('install'), setSelectedRewind: setter('rewind') });
+    setSelectedRecovery: setter('recovery'), setSelectedCapture: setter('capture'),
+    setSelectedInstall: setter('install'), setSelectedRewind: setter('rewind') });
   const callbacks = Object.fromEntries([...expressions].map(([name, expression]) => {
     const code = transformSync('globalThis.callback = ' + expression, { loader: 'tsx', format: 'cjs' }).code;
     vm.runInContext(code, context); return [name, context.callback];
   }));
   callbacks.openRewind({ operationId: 'op-1' });
   assert.equal(values.rewind.operationId, 'op-1'); assert.equal(values.message, null); assert.equal(values.recovery, null); assert.equal(values.install, null);
+  assert.equal(values.capture, null, 'the existing Build capture selection is closed, not an absent fixture binding');
   callbacks.openRewind({ operationId: 'op-2' }); assert.equal(values.rewind.operationId, 'op-2');
   callbacks.openMessage({ messageId: 'q2' }); assert.equal(values.rewind, null);
   callbacks.openRewind({ operationId: 'op-2' }); callbacks.closeMessage();

@@ -260,8 +260,11 @@ placement-only «Убрать» остаётся отдельным UI-дейс�
 Явный `send_prompt` с `submit=true` является разрешением вернуть адресованную AI-вкладку в рабочее состояние. Остановленный процесс возобновляется общим send-сценарием; закрытая вкладка сначала восстанавливается в фоне из единственной архивной записи с тем же исходным `tabId`, после чего тот же сценарий поднимает прежнюю Claude/Codex-сессию и выполняет отправку. Архивная запись, рабочая папка и восстановленная вкладка проверяются до Enter. Удалённая запись, два архива с одним identity, другой тип вкладки или недоступная папка дают явную ошибку: создавать «похожую» новую сессию запрещено. Пассивный lifecycle/restart reconcile вкладку не открывает — закрытие пользователем сохраняет силу, пока не придёт новый явный send. `submit=false` остаётся операцией над уже живым composer и сам вкладку не восстанавливает.
 
 `start_ai` подтверждает не только запись launch-команды. Для Claude ответ
-`ready:true/inputReady:true` возможен после TUI prompt **и** ready startup-gate
-для `/model`/`/effort`; для Codex — после доказанной готовности composer и
+`ready:true/inputReady:true` возможен после TUI prompt **и** завершённой (ready
+или failed) startup-транзакции `/model`/`/effort`. С 01.11 (решение пользователя)
+провал настройки на рабочей вкладке не превращается в `agent_startup_defaults_failed`
+409: ответ `ready` несёт `startupDefaultsError`/код, оркестратор видит предупреждение
+«настройка не применена», а не проваленный запуск; для Codex — после доказанной готовности composer и
 проверки запрошенной next-launch пары. Первый TUI edge лишь будит проверку.
 Ожидание закрепляет identity принятого launch до самого первого runtime read:
 готовый replacement не может завершить чужой start_ai. Claude сохраняет
@@ -684,6 +687,16 @@ handoff не перезаписывают друг друга. Если точн
 и не разрешает повторный Enter. Теги журнала: `[ClaudePostEnterForensics]`.
 
 #### Main FIFO принятых Send
+
+Крестик на UNCONFIRMED-карточке (решение 01.11) скрывает её и тогда, когда receipt в Main
+ещё `in-flight`/`preparing` (IPC сценария уже ответил delivery-unknown по сроку): только
+презентация, без отмены попытки и без изменения доставки; поздний исход обновит тот же
+receipt. Раньше Main отвечал `unknown-presentation-changed`, и крестик ничего не делал.
+Слот FIFO и вложения остаются за попыткой (`releasePresentation` для незавершённой — no-op),
+отметка скрытия переживает позднее `settleAttempt`, и карточка не возвращается. Живой
+CONFIRMING без доказательства отмены по-прежнему не скрывается. Тест
+`src/main/history-inflight-dismiss.actual.test.js` (настоящие обработчик, store и очередь):
+PRE 2/3 → POST 5/5.
 
 Обычные программные Send Claude/Codex принимаются без фиксированного лимита
 количества сообщений в backlog приложения. Main `AgentSendQueue` сохраняет
@@ -1498,16 +1511,60 @@ adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. T
 
 SOURCE30Oct `rewind_self` — отдельный own-tab ingress в тот же executor, не второй
 Stop/rewrite/Resume. Требует explicit user instruction и loaded
-`savedHistory.selfRewind.version:1`; старый main отвергается до POST, обычный
+`savedHistory.selfRewind:{version:1,contextSnapshot:1}`; старый main отвергается до POST, обычный
 Rewind/Send не используется как fallback. Calling tab берётся из MCP identity,
 `tabId`/другой получатель не принимаются. Human «четыре итерации» модель сначала
 разрешает в exact public user UUID; wire не угадывает по тексту/индексу.
 
+SOURCE31Oct saved-history factory выбирает исходную durable binding через
+существующий Main `savedHistoryRuntime.capture`, не `resolveHistorySessionInfo`.
+Inbox saved-history adapter берёт тот же resolver своего executor, не отдельную
+копию public read выбора; его audit/conversation/cleanup guards остаются прежними.
+Последний предназначен для public read: его законный `sessionId=null` не доказывает
+смену выбранной сессии. Это не fallback/подтверждение writer; public read resolver
+не меняется. SDK exclusion остаётся по tabType; после await заново сверяются
+provider/SID/cwd/project и input reservation до Timeline read, а перед Stop/write
+прежние exact scope/target/revision/physical/CAS guards. Mismatch логирует scalar
+expected/resolved identity с operationId, без тела контекста. Сам failed receipt
+не оживает от новой версии; новый ремонт не разрешает replay старой попытки.
+
+SOURCE31Oct предложение точки отката можно показать в ответе обычной Markdown
+ссылкой, вне backticks/fence:
+
+```markdown
+[Итерация42 · Запрос о деплое](#noted-message?tabId=T&provider=codex&sessionId=S&messageId=U)
+```
+
+Здесь T/S/U заменяются exact public координатами, query values URL-encoded.
+`messageId=entry.uuid`, `sessionId=entry.sessionId`; composite/resumed сохраняет
+`physicalSessionId/rawUuid/transcriptSegmentId/sourceIdentity` и отдельно
+`viewOwnerSessionId` текущего read-view. Номер/подпись не адрес и не разрешение
+Rewind. Parser ограничивает href16384UTF-16 code units и использует прежний
+`normalizeTerminalMessageTarget`;
+unknown/duplicate fields и неполная identity не становятся целью. Это не GT
+`noted-message-reference` snapshot-block и не новый MCP mutation tool.
+
+Живой и сохранённый assistant prose основной desktop History подключают optional
+host renderer общего Markdown: ссылка синяя+подчёркнутая, click вызывает прежний
+`jumpToTerminalMessageTarget` → exact History reveal/highlight. Timeline/group/
+scroll executor, cancellation и source guards не заменяются. Missing/stale target
+не угадывается по N/тексту/соседней строке; code/preview/ordinary user не получают
+новую навигацию. Малиновый Rewind chip/«После отката» означает другую операцию.
+Требуется обновлённый desktop renderer; изменение skill/help само его не обновляет.
+
 Вызывающая модель передаёт factual `retainedContext` (до100000символов, как
-обычный context update), expectedContextRevision прочитанного workingContext и
-необязательный `nextPrompt`. Изменения файлов/деплой/внешние UNKNOWN не отменяются.
+обычный context update), `expectedContextRevision` и opaque
+`expectedContextSnapshot=rewindSnapshot` ОДНОГО прочитанного workingContext и
+необязательный `nextPrompt`. Перечитывать только proof под старые заметки нельзя.
+Изменения файлов/деплой/внешние UNKNOWN не отменяются.
 Summary и snapshot обновлений durable ДО Stop; по умолчанию покрываются все
 обновления наблюдавшейся revision, optional coveredContextUpdateIds сужает набор.
+SOURCE31Oct UI revision может продвинуться от delivery/verified Read ACK: signed
+snapshot сохраняет исходные exact members/draft hashes и допускает только эти
+bookkeeping-переходы. Новые facts/composition, responsibility/files, ABA и чужой
+proof отказывают до Stop; plain numeric legacy API остаётся строгим. Main пишет
+reason и expected/current UI/semantic revisions в обычные `[SelfRewind]` логи,
+без context bodies. Это не разрешение обходить остальные source/input guards.
 После binding commit новая Rewind-context row активируется в той же SQLite
 транзакции с receipt; старые unchanged версии получают rewind-superseded, не
 delivered/deleted. Поздние IDs/изменившиеся версии сохраняются, старые frozen

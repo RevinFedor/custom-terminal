@@ -6,7 +6,9 @@
 # Used by build:install — replaces the previous unconditional `pkill -f` which
 # sent SIGTERM directly, bypassing Ink and corrupting JSONL transcripts.
 #
-# Usage: scripts/graceful-quit.sh [deadline_seconds=5]
+# Usage: scripts/graceful-quit.sh [deadline_seconds=5] [--require-graceful|''] [--wait-only|''] [main_pid]
+# With main_pid only that exact Main is awaited and, after the deadline,
+# signalled. Without it the legacy path-wide lookup is used.
 
 set -u
 
@@ -15,14 +17,32 @@ REQUIRE_GRACEFUL="${2:-}"
 WAIT_ONLY="${3:-}"
 TARGET_PID="${4:-}"
 APP_NAME="Noted Terminal"
+MAIN_MARKER="/Applications/${APP_NAME}.app/Contents/MacOS/${APP_NAME}"
 QUIT_FALLBACK="none"
+
+# Same classifier as scripts/noted-prod-api.js inspectProdServer: Main is the
+# bundle executable itself, never an Electron helper (--type=) or the detached
+# MCP hub, which shares the executable path and must survive the install.
+is_main_command() {
+  case "$1" in
+    *" --type="*|*mcp-hub.js*) return 1 ;;
+    "${MAIN_MARKER}"|"${MAIN_MARKER} "*) return 0 ;;
+  esac
+  return 1
+}
 
 is_running() {
   if [ -n "${TARGET_PID}" ]; then
     case "${TARGET_PID}" in *[!0-9]*|'') return 1 ;; esac
     # A detached MCP hub may retain the same executable path. Wait only for
     # the exact Main PID captured by the API, without touching its children.
-    if kill -0 "${TARGET_PID}" 2>/dev/null; then return 0; fi
+    if kill -0 "${TARGET_PID}" 2>/dev/null; then
+      # A PID reused by an unrelated process after Main exited is not Main.
+      local target_command
+      target_command="$(ps -p "${TARGET_PID}" -o command= 2>/dev/null)"
+      if [ -n "${target_command}" ] && ! is_main_command "${target_command}"; then return 1; fi
+      return 0
+    fi
     # EPERM is not absence. A fresh process lookup distinguishes it from the
     # expected ESRCH after exit; an unavailable lookup remains running/unknown.
     local target_lookup target_status
@@ -32,6 +52,19 @@ is_running() {
     return 0
   fi
   pgrep -f "/Applications/${APP_NAME}.app" > /dev/null 2>&1
+}
+
+# Fallback signal. With the captured Main PID only that process is signalled.
+# The path-wide pkill also matched the detached MCP hub: every CLI install
+# waited the full deadline and then killed the hub (01.11.2026 20:05 UTC: Main
+# closed its channels ~2 s after Quit, the hub kept the wait alive for 20 s).
+signal_main() {
+  if [ -n "${TARGET_PID}" ]; then
+    if is_running; then kill "-$1" "${TARGET_PID}" 2>/dev/null || true; fi
+    return 0
+  fi
+  if [ "$1" = "KILL" ]; then pkill -9 -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
+  else pkill -f "/Applications/${APP_NAME}.app" 2>/dev/null || true; fi
 }
 
 if ! is_running; then
@@ -85,7 +118,7 @@ while is_running; do
     fi
     echo "[graceful-quit] app did NOT exit in ${DEADLINE}s — falling back to pkill (JSONL of unfinished turns may be lost)"
     QUIT_FALLBACK="SIGTERM"
-    pkill -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
+    signal_main TERM
     sleep 0.5
     break
   fi
@@ -102,7 +135,7 @@ done
 if is_running; then
   echo "[graceful-quit] WARNING: app still running after deadline+SIGTERM; forcing SIGKILL"
   QUIT_FALLBACK="SIGKILL"
-  pkill -9 -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
+  signal_main KILL
 fi
 
 # Приложение больше не запущено — но КАК оно закончилось? Штатный выход и

@@ -6,12 +6,14 @@ const { randomBytes } = require('node:crypto');
 const MANUAL_KIND = 'manual';
 const MANUAL_REASON = 'native-help-before-gesture';
 const MANUAL_DURATION_MS = 10000;
+const MANUAL_INPUT_DURATION_MS = 40000;
 const requestIdPattern = /^manual-\d+-[a-f0-9]{24}$/;
 const positive = n => Number.isSafeInteger(n) && n > 0;
 function validManualRequest(m, mainPid) {
   const o = m?.owner;
   return m?.t === 'perf-manual-request' && m.version === 1 && requestIdPattern.test(m.requestId)
-    && m.kind === MANUAL_KIND && m.reason === MANUAL_REASON && m.durationMs === MANUAL_DURATION_MS
+    && m.kind === MANUAL_KIND && m.reason === MANUAL_REASON
+    && [MANUAL_DURATION_MS, MANUAL_INPUT_DURATION_MS].includes(m.durationMs)
     && Number.isFinite(m.requestedWallMs) && m.mainPid === mainPid && o?.mainPid === mainPid
     && positive(o.windowId) && positive(o.webContentsId) && positive(o.rendererPid)
     && Number.isSafeInteger(o.frameProcessId) && o.frameProcessId >= 0
@@ -83,8 +85,11 @@ function createManualCaptureController({ mainPid, getWatchdog, fromId, capture, 
     // Keep the single-flight latch. A lost request cannot authorize a new one.
     item.pin.dispose();
   };
-  function request(window) {
+  function request(window, { durationMs = MANUAL_DURATION_MS } = {}) {
     if (active) { report('refused', { reason: 'manual-in-flight-or-unknown' }); return false; }
+    if (![MANUAL_DURATION_MS, MANUAL_INPUT_DURATION_MS].includes(durationMs)) {
+      report('refused', { reason: 'invalid-manual-duration' }); return false;
+    }
     const watchdog = getWatchdog();
     if (!watchdog?.connected) { report('refused', { reason: 'watchdog-unavailable' }); return false; }
     let pin;
@@ -92,12 +97,12 @@ function createManualCaptureController({ mainPid, getWatchdog, fromId, capture, 
     catch (error) { report('refused', { reason: error.message }); return false; }
     const request = { t: 'perf-manual-request', version: 1, requestId: 'manual-' + mainPid + '-' + randomBytes(12).toString('hex'),
       mainPid, owner: pin.owner, kind: MANUAL_KIND, reason: MANUAL_REASON,
-      durationMs: MANUAL_DURATION_MS, requestedWallMs: Date.now() };
+      durationMs, requestedWallMs: Date.now() };
     if (!validManualRequest(request, mainPid)) { pin.dispose(); report('refused', { reason: 'invalid-original-owner' }); return false; }
     const item = active = { request, pin, watchdog, state: 'requested', timer: null };
     pin.invalidated.then(reason => { if (active === item && item.state === 'requested') unknown(item, reason); });
     item.timer = schedule(() => unknown(item, 'admission-reply-lost'), 5000); item.timer?.unref?.();
-    report('requested', { durationMs: MANUAL_DURATION_MS });
+    report('requested', { durationMs });
     try { watchdog.send(request, error => { if (error && item.state === 'requested') unknown(item, 'request-delivery-unknown'); }); }
     catch { unknown(item, 'request-delivery-unknown'); }
     return true;
@@ -120,6 +125,7 @@ function createManualCaptureController({ mainPid, getWatchdog, fromId, capture, 
     cancel(item.timer);
     const exact = { ...message, t: 'perf-manual-request' };
     if (!validManualRequest(exact, mainPid) || !/^incident-\d+-\d+$/.test(message.id || '')
+      || message.durationMs !== item.request.durationMs
       || JSON.stringify(message.owner) !== JSON.stringify(item.request.owner) || !item.pin.isCurrent()) {
       unknown(item, 'stale-or-invalid-original-owner'); return true;
     }
@@ -132,7 +138,7 @@ function createManualCaptureController({ mainPid, getWatchdog, fromId, capture, 
         if (resume?.ready) await resume.ready;
         if (!item.pin.isCurrent()) throw new Error('stale-original-owner');
         const result = await capture({ request: message, webContents: item.pin.webContents, directory, log,
-          durationMs: MANUAL_DURATION_MS, ownerGuard: item.pin,
+          durationMs: item.request.durationMs, ownerGuard: item.pin,
           onReady: ready => { if (item.pin.isCurrent()) report('ready', { id: message.id, ...ready }, item); } });
         if (result?.whenRetired) {
           const release = resume; resume = null;
@@ -185,8 +191,12 @@ function installManualCaptureMenu({ Menu, MenuItem, controller }) {
     help.submenu.append(new MenuItem({ id: 'noted-perf-manual', label: 'Record Performance (10 seconds)',
       click: (_item, originalWindow) => controller.request(originalWindow) }));
   }
+  if (!help.submenu.items.some(item => item.id === 'noted-perf-manual-input')) {
+    help.submenu.append(new MenuItem({ id: 'noted-perf-manual-input', label: 'Record Input Performance (40 seconds)',
+      click: (_item, originalWindow) => controller.request(originalWindow, { durationMs: MANUAL_INPUT_DURATION_MS }) }));
+  }
   Menu.setApplicationMenu(menu);
 }
 
-module.exports = { MANUAL_DURATION_MS, validManualRequest, pinManualOwner, createManualCaptureController,
+module.exports = { MANUAL_DURATION_MS, MANUAL_INPUT_DURATION_MS, validManualRequest, pinManualOwner, createManualCaptureController,
   handleManualWatchdogRequest, installManualCaptureMenu };
