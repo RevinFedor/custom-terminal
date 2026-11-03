@@ -4,11 +4,18 @@ const fs = require('node:fs'), path = require('node:path'), vm = require('node:v
 const source = fs.readFileSync(path.join(process.env.ACTUAL_SOURCE_DIR || __dirname, 'main.js'), 'utf8');
 const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
 const names = ['_gracefulShutdownInProgress', '_gracefulShutdownDone', '_gracefulShutdownAiSessions',
-  '_gracefulShutdownLiveTabIds', 'SHUTDOWN_OVERLAY_MIN_VISIBLE_MS'];
+  '_gracefulShutdownLiveTabIds', 'SHUTDOWN_OVERLAY_MIN_VISIBLE_MS',
+  // Cancel state: before-quit reads these on every run, so the slice needs
+  // their real declarations rather than stubs.
+  '_shutdownCancelRequested', '_shutdownCancellable', '_shutdownClosedTabs',
+  '_shutdownSignalledTabIds', '_programmaticQuitRequested'];
 const declarations = names.map(name => ast.statements.find(n => ts.isVariableStatement(n)
   && n.declarationList.declarations.some(d => d.name.getText(ast) === name)).getText(ast));
 const callback = ast.statements.find(n => ts.isExpressionStatement(n) && ts.isCallExpression(n.expression)
   && n.expression.expression.getText(ast) === 'app.on' && n.expression.arguments[0]?.text === 'before-quit').getText(ast);
+// Real helpers the hook calls on the cancel paths.
+const helpers = ['publishShutdownOverlay', 'shutdownCancelled', 'abandonGracefulShutdown']
+  .map(name => ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(ast));
 const tick = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
 
 function fixture(dispose) {
@@ -19,8 +26,11 @@ function fixture(dispose) {
     flushOpenActivityIntervals() {}, augmentShutdownStateFromProcessProof: async (entries, tabs) => ({ recoverableEntries: entries, liveTabIds: tabs }),
     reconcileInterruptedAiSessionEntries: () => ({ cleared: 0, marked: 0 }), formatInterruptedAiSessionIds: () => '',
     proxyGracefulShutdown: async () => {}, terminalRawWindow: { dispose },
+    codexDataModule: { _api: { disposeCodexModelCatalog: async () => ({ settled: true }),
+      reopenCodexModelCatalog: () => true } },
+    markInterruptedAiSessionEntries: () => 0, restoreProviderProxyAfterCancel: async () => {},
     console: { log() {}, error: x => warnings.push(x), warn: x => warnings.push(x) } };
-  vm.runInNewContext(declarations.join('\n') + '\n' + callback, context);
+  vm.runInNewContext(declarations.join('\n') + '\n' + helpers.join('\n') + '\n' + callback, context);
   return { start: () => handler({ preventDefault: () => { prevented++; } }),
     get quits() { return quits; }, get prevented() { return prevented; }, warnings };
 }

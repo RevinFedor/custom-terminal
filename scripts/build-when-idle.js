@@ -24,9 +24,11 @@
 //   PORT=7878              select this verified production port (127.0.0.1)
 
 const http = require('http');
+const path = require('path');
 const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
 const {
+  assertInstallerOutsideNoted,
   inspectProdServer: inspectDiscoveredProdServer,
   readToken,
 } = require('./noted-prod-api');
@@ -115,7 +117,80 @@ function projectBuildInstallBlockers(snapshot) {
   };
 }
 
+// Main emits `kind:'input'` blockers with identity only (tabId/operationKey),
+// so the feed printed "input · (no project) · ?" — and a tab that is busy shows
+// up twice, once as `claude busy` and once as `input busy`. 01Nov: two such
+// rows were delivery-unknown receipts from 29 Sep / 02 Oct on tabs with no
+// process; their native Codex queue died with that lifecycle, yet they kept
+// the wait from ever reaching zero.
+//
+// build:i-obs waits for work that is physically running (see above). A
+// historical unknown delivery on a tab whose process is ABSENT cannot hold
+// pending input, so it is a passive record here — reported, not waited for.
+// A found or unknown process keeps it a blocker. The shared eligibility
+// endpoint is unchanged for every other consumer.
+const UNKNOWN_DELIVERY = new Set(['delivery-unknown', 'evicted-unknown']);
+
+function describeTab(port, token, tabId) {
+  return new Promise((resolve) => {
+    const req = http.get({
+      host: '127.0.0.1', port, path: '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/status',
+      headers: { Authorization: 'Bearer ' + token }, timeout: 3000,
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => (buf += c));
+      res.on('end', () => {
+        try { resolve(res.statusCode === 200 ? JSON.parse(buf) : null); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => req.destroy());
+  });
+}
+
+async function enrichBuildInstallBlockers(snapshot, { describe } = {}) {
+  if (!snapshot || !Array.isArray(snapshot.loaders) || typeof describe !== 'function') return snapshot;
+  const labelled = new Map();
+  for (const l of snapshot.loaders) {
+    if (l?.tabId && (l.project || l.workflow || l.name) && !labelled.has(l.tabId)) {
+      labelled.set(l.tabId, { project: l.project || null, workflow: l.workflow || null, name: l.name || null });
+    }
+  }
+  const loaders = [], passiveInputs = [];
+  for (const l of snapshot.loaders) {
+    if (!l || l.kind !== 'input' || !l.tabId) { loaders.push(l); continue; }
+    let label = labelled.get(l.tabId) || null;
+    let status = null;
+    if (!label || UNKNOWN_DELIVERY.has(l.status)) {
+      status = await describe(l.tabId);
+      if (status) {
+        label = { project: label?.project || (status.cwd ? path.basename(status.cwd) : null),
+          workflow: label?.workflow || status.workflow || null,
+          name: label?.name || status.name || null };
+      }
+    }
+    const next = { ...l, project: l.project || label?.project || null,
+      workflow: l.workflow || label?.workflow || null, name: l.name || label?.name || null };
+    if (UNKNOWN_DELIVERY.has(l.status) && status?.processStatus === 'absent') passiveInputs.push(next);
+    else loaders.push(next);
+  }
+  return { ...snapshot, loaders, passiveInputs };
+}
+
+// One line per tab. A busy tab's `input` twin adds no information over its
+// runtime row, so the runtime kind wins; an input-only blocker keeps its row.
+function groupLoadersByTab(loaders) {
+  const groups = new Map();
+  for (const l of loaders || []) {
+    const key = l?.tabId || ('~' + (l?.kind || '?') + ':' + (l?.status || '?'));
+    const current = groups.get(key);
+    if (!current || (current.kind === 'input' && l.kind !== 'input')) groups.set(key, l);
+  }
+  return [...groups.entries()].map(([key, loader]) => ({ key, loader }));
+}
+
 const KIND_LABEL = {
+  input: C.yellow + 'ввод' + C.reset,
   claude: C.cyan + 'claude' + C.reset,
   'claude-sdk': C.cyan + 'claude-sdk' + C.reset,
   gemini: C.magenta + 'gemini' + C.reset,
@@ -125,9 +200,18 @@ const KIND_LABEL = {
 // Stable per-tab description used both in the live list and in the closed/idle
 // announcements, so "what appeared" and "what went idle" read identically.
 function loaderLabel(l) {
-  const proj = l.project ? C.bold + l.project + C.reset : C.gray + '(no project)' + C.reset;
+  // WHERE the user can find this tab comes first: the workflow, as it is
+  // named in the sidebar. The execution directory is a different fact and is
+  // shown after it, in parentheses, ONLY when the two differ — a tab moved
+  // between workflows keeps its old cwd, and printing just that sent the
+  // user looking in a workflow the tab had already left (reported 02Nov).
+  const where = l.workflow
+    ? C.bold + l.workflow + C.reset + (l.project && l.project !== l.workflow ? C.gray + ' (' + l.project + ')' + C.reset : '')
+    : l.project ? C.bold + l.project + C.reset : C.gray + '(no workflow)' + C.reset;
   const cmd = l.command ? C.gray + ' (' + l.command + ')' + C.reset : '';
-  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + proj + C.gray + ' · ' + C.reset + (l.name || '?') + cmd;
+  const why = l.kind === 'input' && l.status ? C.gray + ' [' + l.status + ']' + C.reset : '';
+  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + where + C.gray + ' · ' + C.reset
+    + (l.name || (l.tabId ? 'tab ' + String(l.tabId).slice(-6) : '?')) + cmd + why;
 }
 function dot(status) {
   return status === 'busy' ? C.green + '●' + C.reset
@@ -148,8 +232,10 @@ function printActiveList(snap) {
 function cancelledError() { return Object.assign(new Error('observer cancelled'), { code: 'INSTALL_CANCELLED' }); }
 
 function waitForIdle(token, { inspect = inspectProdServer, read = getActiveLoaders,
+  enrich = enrichBuildInstallBlockers, describe = describeTab,
   pollMs = POLL_MS, idleConfirm = IDLE_CONFIRM, report = feed, progress = () => {}, signal,
   setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let passiveReported = false;
   return new Promise((resolve, reject) => {
     let previous = new Map(), first = true, streak = 0, lastError = null, serverKey = null, timer, settled = false;
     const finish = (error, proof) => {
@@ -185,18 +271,26 @@ function waitForIdle(token, { inspect = inspectProdServer, read = getActiveLoade
       }
       if (settled || signal?.aborted) return abort();
       if (snap?.error) return unknown('active-loaders unavailable');
+      snap = await enrich(snap, { describe: tabId => describe(server.port, token, tabId) });
+      if (settled || signal?.aborted) return abort();
       snap = projectBuildInstallBlockers(snap);
       if (!snap || typeof snap.idle !== 'boolean' || !Array.isArray(snap.loaders)) return unknown('active-loaders unavailable');
       lastError = null;
-      const current = new Map(snap.loaders.map(loader => [loader.tabId, loaderLabel(loader)]));
+      const grouped = groupLoadersByTab(snap.loaders);
+      const current = new Map(grouped.map(({ key, loader }) => [key, loaderLabel(loader)]));
       if (first) {
         first = false; report(C.gray + 'Connected — ' + (server.pid ? 'pid ' + server.pid : server.cmd) + ' · port ' + server.port + C.reset);
         if (snap.idle) report(C.green + '✓ no install blockers' + C.reset);
-        else { report(C.bold + String(snap.count) + ' active' + C.reset + C.gray + ' — build waits until 0:' + C.reset);
-          for (const loader of snap.loaders) report('  ' + dot(loader.status) + ' ' + loaderLabel(loader)); }
+        else { report(C.bold + String(grouped.length) + ' active' + C.reset + C.gray + ' — build waits until 0:' + C.reset);
+          for (const { loader } of grouped) report('  ' + dot(loader.status) + ' ' + loaderLabel(loader)); }
       } else {
         for (const [id, label] of current) if (!previous.has(id)) report(C.yellow + '＋ ' + now() + '  active  ' + C.reset + label);
         for (const [id, label] of previous) if (!current.has(id)) report(C.green + '✓ ' + now() + '  idle    ' + C.reset + label);
+      }
+      if (!passiveReported && snap.passiveInputs?.length) {
+        passiveReported = true;
+        report(C.gray + 'not waited for (unknown old delivery, tab has no process):' + C.reset);
+        for (const loader of snap.passiveInputs) report(C.gray + '  · ' + C.reset + loaderLabel(loader));
       }
       previous = current;
       streak = snap.idle === true ? streak + 1 : 0;
@@ -271,5 +365,12 @@ async function main() {
   }
 }
 
-module.exports = { waitForIdle, runBuild, projectBuildInstallBlockers, EndpointMissingError };
-if (require.main === module) void main();
+module.exports = { waitForIdle, runBuild, projectBuildInstallBlockers, enrichBuildInstallBlockers,
+  groupLoadersByTab, loaderLabel, EndpointMissingError };
+if (require.main === module) {
+  // Fail before the idle wait: its build:install child would quit this host.
+  let refused = null;
+  try { assertInstallerOutsideNoted('build:i-obs'); } catch (error) { refused = error; }
+  if (refused) { console.error('[build:i-obs] ' + refused.message); process.exitCode = 1; }
+  else void main();
+}

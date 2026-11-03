@@ -316,17 +316,61 @@ const updateQueuedStatus = (
   return changed ? next : entries;
 };
 
+// One JSONL record is one row, even when two deliveries of it describe it
+// differently. A queue row's sourceIdentity prefers the physical byte offset,
+// but the SAME record re-delivered without that offset falls back to the
+// session+timestamp+text form — a different string for the same record. The
+// equality test then missed and appended a second row: the user saw one
+// prompt twice, both `queued`, both carrying the same Message ID
+// (production 01.11, tab 6d6fd1718b66, offset 41443353).
+//
+// So an incoming row is also matched against the aliases an existing row
+// already carries, and every form it was seen under is retained. These are
+// exact identities of one record, never text or time similarity: two prompts
+// with equal text but different records keep different offsets and both stay.
+// A byte offset is the strongest identity a queue row can have: two different
+// records always have different offsets. So when BOTH rows carry one, only
+// that decides — their weaker session+timestamp+text aliases are equal for
+// two identical prompts sent twice and must never merge them.
+const exactQueueIdentity = (value) => (
+  typeof value === 'string' && value.startsWith('claude-queue:offset:') ? value : ''
+);
+
+const sameHistoryQueueRecord = (entry, incoming) => {
+  if (entry?.uuid === incoming.uuid) return true;
+  const entryExact = exactQueueIdentity(entry?.sourceIdentity);
+  const incomingExact = exactQueueIdentity(incoming.sourceIdentity);
+  if (entryExact && incomingExact) return entryExact === incomingExact;
+  const known = new Set([
+    entry?.sourceIdentity,
+    ...(Array.isArray(entry?.sourceIdentityAliases) ? entry.sourceIdentityAliases : []),
+  ].filter(Boolean));
+  if (known.size === 0) return false;
+  if (incoming.sourceIdentity && known.has(incoming.sourceIdentity)) return true;
+  return (Array.isArray(incoming.sourceIdentityAliases) ? incoming.sourceIdentityAliases : [])
+    .some((alias) => alias && known.has(alias));
+};
+
 const upsertByUuidOrSource = (entries, incoming) => {
-  const index = entries.findIndex((entry) => (
-    entry?.uuid === incoming.uuid
-    || (
-      incoming.sourceIdentity
-      && entry?.sourceIdentity === incoming.sourceIdentity
-    )
-  ));
+  const index = entries.findIndex((entry) => sameHistoryQueueRecord(entry, incoming));
   if (index < 0) return [...entries, incoming];
   const next = entries.slice();
-  next[index] = { ...next[index], ...incoming };
+  const existing = next[index];
+  // Keep the primary identity already presented; the newer delivery's own
+  // form becomes an alias so a third delivery in either shape still matches.
+  const aliases = [...new Set([
+    ...(Array.isArray(existing.sourceIdentityAliases) ? existing.sourceIdentityAliases : []),
+    ...(Array.isArray(incoming.sourceIdentityAliases) ? incoming.sourceIdentityAliases : []),
+    existing.sourceIdentity,
+    incoming.sourceIdentity,
+  ].filter(Boolean))].filter((alias) => alias !== existing.sourceIdentity);
+  next[index] = {
+    ...existing,
+    ...incoming,
+    uuid: existing.uuid,
+    ...(existing.sourceIdentity ? { sourceIdentity: existing.sourceIdentity } : {}),
+    ...(aliases.length > 0 ? { sourceIdentityAliases: aliases } : {}),
+  };
   return next;
 };
 
@@ -357,9 +401,16 @@ export function reduceClaudeHistoryPromptCarrier(
       const sessionId = recordSessionId(record, envelope);
       const timestamp = recordTimestamp(record, envelope);
       const sourceIdentity = queueSourceIdentityFrom(record, envelope, text);
+      // The offset-free form of the SAME record, carried alongside, so a later
+      // delivery without a byte offset resolves to this row instead of
+      // creating a second one (see sameHistoryQueueRecord).
+      const fallbackIdentity = queueIdentityFrom({ sessionId, timestamp, text });
       const entry = {
         uuid: sourceIdentity || ('claude-queue:' + hashText(text)),
         sourceIdentity,
+        ...(fallbackIdentity && fallbackIdentity !== sourceIdentity
+          ? { sourceIdentityAliases: [fallbackIdentity] }
+          : {}),
         role: 'queued',
         timestamp,
         content: text,

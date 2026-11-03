@@ -115,8 +115,19 @@ async function main() {
     process.exitCode = result.ok === false ? 1 : 0;
   } finally { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
 }
-if (require.main === module) main().catch(error => {
-  console.error('[build:i-c] ' + error.message + (error.operationId ? ' operation=' + error.operationId : ''));
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  // Refuse BEFORE maintenance begin, capture or Quit. `--resume` only re-registers
+  // restore with the running Main and never closes the app, so it stays allowed.
+  let refused = null;
+  if (process.argv[2] !== '--resume') {
+    try { api.assertInstallerOutsideNoted('build:i-c'); } catch (error) { refused = error; }
+  }
+  if (refused) {
+    console.error('[build:i-c] ' + refused.message);
+    process.exitCode = 1;
+  } else main().catch(error => {
+    console.error('[build:i-c] ' + error.message + (error.operationId ? ' operation=' + error.operationId : ''));
+    process.exitCode = 1;
+  });
+}
 module.exports = { runBuildContinue, ENDPOINT, restorationSummary, logRestoration };

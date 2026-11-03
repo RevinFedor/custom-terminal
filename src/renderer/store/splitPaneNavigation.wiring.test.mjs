@@ -156,7 +156,9 @@ test('closing a TAB empties its pane; only "remove from workspace" deletes the p
   // and the whole pane went with it — the layout collapsed as a side effect of
   // deleting something else.
   const close = block(store, 'let splitSurvivor: SplitPane | null = null;', 'if (workspace.activeTabId === tabId)');
-  assert.match(close, /emptyPaneByClosedTab\(splitPanes, splitFocusedIndex, tabId\)/);
+  // Closing passes stepBack, so the window returns to its own previous tab
+  // instead of parking on nothing; «убрать из окна» keeps the bare call.
+  assert.match(close, /emptyPaneByClosedTab\(splitPanes, splitFocusedIndex, tabId, \{\s*stepBack:/);
   assert.doesNotMatch(close, /removePaneByTab\(/, 'closing a tab must not remove the pane');
   // …while the explicit gesture still removes it.
   const removeFromSplit = block(store, 'removeTabFromSplit: (tabId) => {', '\n  },');

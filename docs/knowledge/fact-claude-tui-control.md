@@ -512,6 +512,35 @@ Terminal правильный выбор — `No, keep bypass permissions`: пр
 Только после этого разрешены startup `/model`/`/effort` и исходный prompt.
 Частичный кадр, старое меню в scrollback и смена поколения ничего не нажимают.
 
+**Шрам 01.11.2026: CLI убрал номера строк — распознаватель промахивался.** На
+чистом `CLAUDE_CONFIG_DIR` (CLI 2.1.316) вкладка умирала на старте: инцидент
+`claude_startup_setting_rejected` / `cursor-before-composer`, `/effort low`
+отвергнут, `inputReady=true`, но Send отвечает `terminal_draft_state_unknown`.
+100% на 5 вкладках подряд (стенд `/private/tmp/ios-e2e-20261101`,
+вкладки `47d11c9e4a45`, `79f746be70ae`, `5c2dce49eb87`). Это следствие: пока
+меню открыто, composer'а на кадре нет. Сохранённый committed-кадр инцидента
+(`fixtures/claude-auto-mode-default-prompt-nonumbers.json`) показывает причину:
+
+```text
+ Make auto mode your default permission mode?
+   ❯ Yes, set auto mode as my default permission mode
+     No, keep bypass permissions          ← номеров 1./2. больше нет
+```
+
+Матчер требовал именно `1.`/`2.` (`/^(?:[❯›>]\s*)?1\.\s*Yes,?\s*set\s+auto\b/`)
+и возвращал `options-missing`, поэтому `handleClaudeAutoModeDefaultPrompt` не
+вызывался — в логе нет ни одной строки `[ClaudeAutoModeDefault]`. Номер теперь
+необязателен (`(?:\d+\.\s*)?`), порядок по-прежнему берётся из фактических
+строк. Вторая часть: decline-строку CLI собирает из ТЕКУЩЕГО режима
+(`No, keep ${indicator}`), не всегда `bypass permissions` — в бинаре это
+`bypass permissions | plan mode | accept edits | auto mode | don't ask`. Матчер
+принимает весь этот список; неизвестный будущий режим остаётся
+`no-option-incomplete`, потому что следом пишется `Enter`, и угадывать нельзя.
+Почему не воспроизводилось на рабочей машине: в `~/.claude.json` уже стоят
+`hasSeenAutoModeEntryWarning` и `hasSeenAutoDefaultNudge`; в свежем профиле их
+нет. Тест `claude-auto-mode-default-prompt.test.js` PRE 9/11 → POST 11/11 (в том
+числе настоящий кадр инцидента и numbered-сборка).
+
 ### Startup defaults `/model` + `/effort` при запуске Claude
 
 В StatusBar справа — app-level defaults для будущей сессии. Для fresh Claude

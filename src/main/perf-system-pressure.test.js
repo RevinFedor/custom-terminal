@@ -28,3 +28,52 @@ test('partial OS query failures preserve independently measured values and expli
   assert.equal(value.swapUsedBytes, 1.5 * 1024 ** 3); assert.equal(value.freeMemoryIsPressure, false);
   assert.ok(!JSON.stringify(value).includes('private stderr'));
 });
+
+test('available RAM counts reclaimable pages, not only fully free ones', () => {
+  // Шрам 02.11: по `os.freemem()` причиной пользовательских лагов трижды была
+  // объявлена нехватка памяти — 154/130/167МБ «свободно». В тот же момент
+  // free+inactive+speculative давало 11.7ГБ: разница в 14 раз, вывод неверный,
+  // настоящая причина зависаний скрыта.
+  //
+  // macOS держит почти всю память занятой намеренно; `inactive` отдаётся
+  // приложению по первому требованию. Решение «мало памяти» принимается по
+  // availableMemoryBytes, а не по freeMemoryBytes.
+  const stat = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+    + 'Pages free: 1000.\nPages active: 500000.\nPages inactive: 400000.\nPages speculative: 2000.\n'
+    + 'Swapins: 0.\nSwapouts: 0.\nPageins: 0.\nPageouts: 0.\n';
+  const value = parseSystemPressure('kern.memorystatus_vm_pressure_level: 1', stat);
+  assert.equal(value.availableMemoryBytes, (1000 + 400000 + 2000) * 16384);
+  assert.ok(value.availableMemoryBytes > 6 * 1024 ** 3,
+    'почти свободная система не должна выглядеть как 16МБ свободных');
+  assert.match(value.availableMemoryBasis, /inactive/,
+    'состав числа назван явно, иначе его снова прочитают как os.freemem()');
+});
+
+test('available RAM stays null when vm_stat does not provide the pages', () => {
+  // Недостающее измерение нельзя подменять нулём: ноль читается как
+  // «памяти нет» и возвращает ровно тот ложный вывод, от которого защищаемся.
+  const value = parseSystemPressure('', 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPageins: 1.\n');
+  assert.equal(value.availableMemoryBytes, null);
+});
+
+test('speculative pages are optional, free+inactive is enough', () => {
+  // На части систем строки speculative нет. Её отсутствие не должно обнулять
+  // всё число.
+  const stat = 'Mach Virtual Memory Statistics: (page size of 4096 bytes)\n'
+    + 'Pages free: 100.\nPages inactive: 900.\n';
+  assert.equal(parseSystemPressure('', stat).availableMemoryBytes, 1000 * 4096);
+});
+
+test('both numbers are reported, the old field keeps its meaning', async () => {
+  // Прежние потребители читают freeMemoryBytes; менять его значение нельзя,
+  // иначе сравнение с историческими логами перестанет работать.
+  const value = await collectSystemPressure({ platform: 'darwin',
+    run: (file, args, options, callback) => callback(null,
+      file.endsWith('vm_stat')
+        ? 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 10.\nPages inactive: 20.\n'
+        : 'kern.memorystatus_vm_pressure_level: 1\n') });
+  assert.equal(typeof value.freeMemoryBytes, 'number', 'прежнее поле на месте');
+  assert.equal(value.availableMemoryBytes, 30 * 16384, 'и новое рядом');
+  assert.notEqual(value.freeMemoryBytes, value.availableMemoryBytes,
+    'это РАЗНЫЕ измерения, а не переименование');
+});

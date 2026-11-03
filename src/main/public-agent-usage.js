@@ -26,6 +26,10 @@ function publicUsageError(error) {
   if (!error) return null;
   const value = typeof error === 'string' ? error : String(error?.code || '') + ' ' + String(error?.message || '');
   if (/auth_read_timeout/i.test(value)) return { code: 'timeout', message: 'Не удалось вовремя проверить источник лимитов.' };
+  // A missing CLI is a broken environment, not a logged-out user. It must be
+  // checked BEFORE the credential/login branch below, whose wording ("login")
+  // its own message would otherwise match and tell the user to sign in again.
+  if (/auth_cli_missing/i.test(value)) return { code: 'usage_unavailable', message: 'Не найден Claude CLI, поэтому текущий аккаунт не читается. Показан сохранённый снимок.' };
   if (/auth_source_unavailable|auth_changed/i.test(value)) return { code: 'usage_unavailable', message: 'Не удалось проверить источник лимитов. Показан сохранённый снимок.' };
   if (/auth_namespace|auth_source_unsupported|account.*mismatch|different.*account/i.test(value)) {
     return { code: 'account_mismatch', message: 'Не удалось подтвердить, что источник лимитов относится к выбранному аккаунту.' };
@@ -60,8 +64,12 @@ function publicUsageWindows(provider, usage) {
     add('five-hour', '5-hour', usage?.five_hour, 300);
     const fable = (Array.isArray(usage?.model_scoped) ? usage.model_scoped : [])
       .find(item => /^fable(?:\s+\d+(?:\.\d+)?)?$/i.test(String(item?.display_name || '').trim()));
-    add('fable', 'Fable', fable, 10080, { modelScope: 'Fable', resetAt: null,
-      resetPolicy: 'shared-weekly', sharedWith: 'weekly' });
+    // A 0% model-scoped limit means the provider no longer bills Fable
+    // separately. Publishing it produced a permanent "100% left" row.
+    if (percent(fable?.utilization) > 0) {
+      add('fable', 'Fable', fable, 10080, { modelScope: 'Fable', resetAt: null,
+        resetPolicy: 'shared-weekly', sharedWith: 'weekly' });
+    }
   }
   return windows;
 }

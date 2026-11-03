@@ -5,6 +5,8 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useAgentSettingsActivity } from '../../hooks/useAgentSettingsActivity';
 import { mergeTabProviderSnapshot, projectTabProviderSnapshot, codexSettingsIntentCancelled, codexSettingsIntentIsWaiting, codexSettingsSelection, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
+import { onTabScopedIpcMessage } from '../../utils/tabScopedIpc';
+import { headerSignals } from '../../utils/tabHeaderSignals';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
 import {
@@ -14,6 +16,11 @@ import {
 import { resolvePaneSurfaceHotkeyTabId } from '../../utils/paneSurfaceHotkeyTarget.mjs';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
+import {
+  isRunAfterCaptureArmed,
+  subscribeRunAfterCaptureArm,
+  toggleRunAfterCaptureArm,
+} from '../../utils/runAfterCaptureArm.mjs';
 import { clearPendingResume, markPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
 import {
   DEEPSEEK_EFFORT_LEVELS,
@@ -880,7 +887,8 @@ function ClaudeControlBar({
       queueRefresh(detail?.reason || 'transcript-change');
     };
 
-    ipcRenderer.on('agent-transcript:changed', onTranscriptChanged);
+    const offTranscriptChanged = onTabScopedIpcMessage(
+      'agent-transcript:changed', claudeSessionId, onTranscriptChanged, { key: 'sessionId' });
     ipcRenderer.invoke('agent-transcript:subscribe', {
       consumerId,
       tabId,
@@ -914,7 +922,7 @@ function ClaudeControlBar({
     return () => {
       disposed = true;
       document.removeEventListener('visibilitychange', onVisibilityChange);
-      ipcRenderer.removeListener('agent-transcript:changed', onTranscriptChanged);
+      offTranscriptChanged();
       ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
     };
   }, [
@@ -1121,11 +1129,24 @@ function ClaudeControlBar({
     setCacheData(null);
     lastPersistedPctRef.current = -1;
     let cancelled = false;
-    ipcRenderer.invoke('tab:get-context-pct', { tabId }).then((r: any) => {
-      const seeded = r?.pct;
-      if (cancelled || typeof seeded !== 'number' || seeded <= 0) return;
-      setContextPct(prev => (prev === 0 ? seeded : prev));
-      lastPersistedPctRef.current = Math.round(seeded);
+    // Один запрос вместо трёх на монтировании шапки. Переход на вкладку
+    // отправлял до 189 операций разом, и первый скролл вставал за ними в
+    // очередь — замерено 345мс при максимальной синхронной блокировке 45мс.
+    // Значения и источники те же; прежние каналы сохранены для остальных
+    // вызывающих. Кэш-статистика засевается здесь же, её отдельный запрос
+    // убран ниже.
+    headerSignals(tabId).then((signals) => {
+      if (cancelled) return;
+      const seeded = signals?.contextPct?.pct;
+      if (typeof seeded === 'number' && seeded > 0) {
+        setContextPct(prev => (prev === 0 ? seeded : prev));
+        lastPersistedPctRef.current = Math.round(seeded);
+      }
+      const stats = signals?.cacheStats;
+      if (stats && typeof stats.ts === 'number') {
+        setCacheData(prev => prev ?? { cacheRead: stats.cacheRead || 0,
+          cacheCreate: stats.cacheCreate || 0, input: stats.input || 0, ts: stats.ts });
+      }
     }).catch(() => {});
 
     const handler = (_: any, data: { tabId: string; sessionId?: string; model: string; contextPct: number | null }) => {
@@ -1156,8 +1177,8 @@ function ClaudeControlBar({
         setContextPct(data.contextPct);
       }
     };
-    ipcRenderer.on('claude:bridge-update', handler);
-    return () => { cancelled = true; ipcRenderer.removeListener('claude:bridge-update', handler); };
+    const offRouted17 = onTabScopedIpcMessage('claude:bridge-update', tabId, handler);
+    return () => { cancelled = true; offRouted17(); };
   }, [claudeSessionId, tabId]);
 
   // SDK tab: context % lives in ClaudeSDKTab local state. It re-emits a window
@@ -1204,8 +1225,9 @@ function ClaudeControlBar({
         setContextPct(data.contextPct);
       }
     };
-    ipcRenderer.on('codex:context-update', handler);
-    return () => ipcRenderer.removeListener('codex:context-update', handler);
+    // Addressed by tabId (the handler's own first line); broadcast delivery
+    // cost up to 1493ms across the retained bars on 04:13 UTC.
+    return onTabScopedIpcMessage('codex:context-update', tabId, handler);
   }, [codexSessionId, tabId, isCodex]);
 
   // Cache cooldown data — two channels, same shape, mutually exclusive by tab type.
@@ -1223,12 +1245,10 @@ function ClaudeControlBar({
   };
   useEffect(() => {
     let cancelled = false;
-    ipcRenderer.invoke('tab:get-cache-stats', { tabId }).then((r: any) => {
-      const s = r?.stats;
-      if (cancelled || !s || typeof s.ts !== 'number') return;
-      // Don't clobber a live event that already landed during the async round-trip.
-      setCacheData(prev => prev ?? { cacheRead: s.cacheRead || 0, cacheCreate: s.cacheCreate || 0, input: s.input || 0, ts: s.ts });
-    }).catch(() => {});
+    // Засев перенесён в общий `tab:get-header-signals` выше: это был второй из
+    // трёх запросов, которые шапка слала одновременно. Подписка на живые
+    // события остаётся здесь — у неё свой жизненный цикл.
+    void cancelled;
 
     const ptyHandler = (_: any, data: { tabId: string; cacheRead: number; cacheCreate: number; input: number; ts: number }) => {
       if (data.tabId !== tabId) return;
@@ -1243,11 +1263,11 @@ function ClaudeControlBar({
       setCacheData(s);
       persistCacheStats(s);
     };
-    ipcRenderer.on('claude:cache-update', ptyHandler);
+    const offRouted1 = onTabScopedIpcMessage('claude:cache-update', tabId, ptyHandler);
     window.addEventListener('sdk-cache-update', sdkHandler);
     return () => {
       cancelled = true;
-      ipcRenderer.removeListener('claude:cache-update', ptyHandler);
+      offRouted1();
       window.removeEventListener('sdk-cache-update', sdkHandler);
     };
   }, [tabId]);
@@ -1259,6 +1279,7 @@ function ClaudeControlBar({
     effort?: string;
     startupModel?: string;
     startupEffort?: string;
+    startupIntentAppliedGeneration?: string;
     codexFastIntent?: boolean;
     codexFastIntentRevision?: number;
     codexSettingsIntentModel?: string;
@@ -1297,8 +1318,8 @@ function ClaudeControlBar({
     const handler = (_: any, data: { tabId: string; state: any }) => {
       if (data.tabId === tabId && data.state) adoptProviderState(data.state);
     };
-    ipcRenderer.on('provider:state-changed', handler);
-    return () => { ipcRenderer.removeListener('provider:state-changed', handler); };
+    const offRouted2 = onTabScopedIpcMessage('provider:state-changed', tabId, handler);
+    return () => { offRouted2(); };
   }, [adoptProviderState, tabId, isSDKTab]);
 
   useEffect(() => {
@@ -1351,9 +1372,9 @@ function ClaudeControlBar({
       if (data.tabId !== tabId) return;
       setThinkLocal(undefined);
     };
-    ipcRenderer.on('terminal:command-finished', onFinished);
+    const offRouted3 = onTabScopedIpcMessage('terminal:command-finished', tabId, onFinished);
     return () => {
-      ipcRenderer.removeListener('terminal:command-finished', onFinished);
+      offRouted3();
     };
   }, [tabId, isSDKTab]);
 
@@ -1630,29 +1651,29 @@ function ClaudeControlBar({
         void refreshSessionActionBlockedStatus('agent-stopping-clear');
       }
     };
-    ipcRenderer.on('terminal:command-started', onCommandStarted);
-    ipcRenderer.on('terminal:command-finished', onCommandFinished);
-    ipcRenderer.on('claude:tui-ready', onClaudeReady);
-    ipcRenderer.on('codex:tui-ready', onCodexReady);
-    ipcRenderer.on('claude:busy-state', onAgentBusy);
-    ipcRenderer.on('codex:busy-state', onAgentBusy);
-    ipcRenderer.on('codex:session-detected', onCodexSessionDetected);
-    ipcRenderer.on('terminal:mcp-ai-tab', onCodexWriterReproven);
-    ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
-    ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
-    ipcRenderer.on('agent:stopping-state', onAgentStopping);
+    const offRouted4 = onTabScopedIpcMessage('terminal:command-started', tabId, onCommandStarted);
+    const offRouted5 = onTabScopedIpcMessage('terminal:command-finished', tabId, onCommandFinished);
+    const offRouted6 = onTabScopedIpcMessage('claude:tui-ready', tabId, onClaudeReady);
+    const offRouted7 = onTabScopedIpcMessage('codex:tui-ready', tabId, onCodexReady);
+    const offRouted8 = onTabScopedIpcMessage('claude:busy-state', tabId, onAgentBusy);
+    const offRouted9 = onTabScopedIpcMessage('codex:busy-state', tabId, onAgentBusy);
+    const offRouted10 = onTabScopedIpcMessage('codex:session-detected', tabId, onCodexSessionDetected);
+    const offRouted11 = onTabScopedIpcMessage('terminal:mcp-ai-tab', tabId, onCodexWriterReproven);
+    const offRouted12 = onTabScopedIpcMessage('codex:tui-not-ready', tabId, onCodexNotReady);
+    const offRouted13 = onTabScopedIpcMessage('codex:tui-manual-action-required', tabId, onCodexManualAction);
+    const offRouted14 = onTabScopedIpcMessage('agent:stopping-state', tabId, onAgentStopping);
     return () => {
-      ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
-      ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
-      ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
-      ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
-      ipcRenderer.removeListener('claude:busy-state', onAgentBusy);
-      ipcRenderer.removeListener('codex:busy-state', onAgentBusy);
-      ipcRenderer.removeListener('codex:session-detected', onCodexSessionDetected);
-      ipcRenderer.removeListener('terminal:mcp-ai-tab', onCodexWriterReproven);
-      ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
-      ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
-      ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
+      offRouted4();
+      offRouted5();
+      offRouted6();
+      offRouted7();
+      offRouted8();
+      offRouted9();
+      offRouted10();
+      offRouted11();
+      offRouted12();
+      offRouted13();
+      offRouted14();
     };
   }, [ptyTransitionEngine, refreshSessionActionBlockedStatus, setSessionActionBlockedStatusIfChanged, tabId]);
   useEffect(() => {
@@ -1719,21 +1740,24 @@ function ClaudeControlBar({
         setIsLocalBusy(false);
       }
     };
-    ipcRenderer.on('claude:paste-busy', handler);
+    const offRouted15 = onTabScopedIpcMessage('claude:paste-busy', tabId, handler);
     const clearOnStarted = clearOnLifecycle('process-started');
     const clearOnClaudeReady = clearOnLifecycle('claude-tui-ready', { onlySessionLifecycle: true });
     const clearOnCodexReady = clearOnLifecycle('codex-tui-ready', { onlySessionLifecycle: true });
     const clearOnFinished = clearOnLifecycle('command-finished');
-    ipcRenderer.on('claude:process-started', clearOnStarted);
-    ipcRenderer.on('claude:tui-ready', clearOnClaudeReady);
-    ipcRenderer.on('codex:tui-ready', clearOnCodexReady);
-    ipcRenderer.on('terminal:command-finished', clearOnFinished);
+    // Routed like the rest: these four used to run in all 24 live control bars
+    // per event, and each run also printed a `match=false` diagnostic line, so
+    // one lifecycle event cost 24 handler calls and 24 log writes. After
+    // routing the handler only runs for its own tab, so `match` is true by
+    // construction — the owner's line is unchanged, the 23 foreign ones are
+    // gone. Routing correctness is covered by tabScopedIpc.test.mjs.
+    const offClearStarted = onTabScopedIpcMessage('claude:process-started', tabId, clearOnStarted);
+    const offClearClaudeReady = onTabScopedIpcMessage('claude:tui-ready', tabId, clearOnClaudeReady);
+    const offClearCodexReady = onTabScopedIpcMessage('codex:tui-ready', tabId, clearOnCodexReady);
+    const offClearFinished = onTabScopedIpcMessage('terminal:command-finished', tabId, clearOnFinished);
     return () => {
-      ipcRenderer.removeListener('claude:paste-busy', handler);
-      ipcRenderer.removeListener('claude:process-started', clearOnStarted);
-      ipcRenderer.removeListener('claude:tui-ready', clearOnClaudeReady);
-      ipcRenderer.removeListener('codex:tui-ready', clearOnCodexReady);
-      ipcRenderer.removeListener('terminal:command-finished', clearOnFinished);
+      offRouted15();
+      offClearStarted(); offClearClaudeReady(); offClearCodexReady(); offClearFinished();
     };
   }, [tabId]);
 
@@ -1767,8 +1791,8 @@ function ClaudeControlBar({
         if (data.busy) setSdkStopping(false); // new turn started → clear the stopping cue
       }
     };
-    ipcRenderer.on('claude:busy-state', handler);
-    return () => { ipcRenderer.removeListener('claude:busy-state', handler); };
+    const offRouted16 = onTabScopedIpcMessage('claude:busy-state', tabId, handler);
+    return () => { offRouted16(); };
   }, [tabId, isSDKTab]);
 
   // Transient "останавливаю процесс…" cue while Edit/Repeat hard-kills the live
@@ -1964,6 +1988,15 @@ function ClaudeControlBar({
   const historyDraftHasAuthoringContent = historyDraftHasText
     || historyDraftImageCount > 0
     || historyDraftChipCount > 0;
+  // «Следующая отправка — в Run after»: взводится правым кликом по этой же
+  // кнопке и живёт в модуле, а не здесь, потому что исполняет её композер, а
+  // снимает перенос (см. utils/runAfterCaptureArm.mjs). Подписка адресная:
+  // взведение в соседней вкладке не перерисовывает эту кнопку.
+  const [runAfterCaptureArmed, setRunAfterCaptureArmed] = useState(() => isRunAfterCaptureArmed(tabId));
+  useEffect(() => {
+    setRunAfterCaptureArmed(isRunAfterCaptureArmed(tabId));
+    return subscribeRunAfterCaptureArm(tabId, setRunAfterCaptureArmed);
+  }, [tabId]);
   // Holding Control previews the exact half that Ctrl+Enter will execute.
   // An open prompt picker owns the keyboard, so suppress the background preview.
   const runAfterCaptureHotkeyPreview = runAfterControlHeld
@@ -2096,12 +2129,22 @@ function ClaudeControlBar({
     && codexModel === quickCodexModel!.id
     && codexEffort === quickCodexEffort;
   const claudeCodeModels = claudeCodeSettings.models;
-  const pendingClaudeModel = isAnthropicPTY
+  // The retained manual pair (decision 01.11) stays stored for every later
+  // launch, so "pending" must mean "not yet applied", not "present". Without
+  // this the control would read "выбор сохранён для следующего запуска"
+  // forever and the amber not-yet-confirmed marker would never clear.
+  const claudeStartupIntentApplied = isAnthropicPTY
+    && !!providerState.startupIntentAppliedGeneration;
+  const pendingClaudeModel = isAnthropicPTY && !claudeStartupIntentApplied
     ? providerState.startupModel
     : undefined;
-  const pendingClaudeEffort = isAnthropicPTY
+  const pendingClaudeEffort = isAnthropicPTY && !claudeStartupIntentApplied
     ? providerState.startupEffort
     : undefined;
+  // What the tab is set to, applied or not: the collapsed caption and the
+  // checked menu row must show the user's own choice, never the global default.
+  const retainedClaudeModel = isAnthropicPTY ? providerState.startupModel : undefined;
+  const retainedClaudeEffort = isAnthropicPTY ? providerState.startupEffort : undefined;
   const fallbackClaudeModel = resolveVisibleClaudeModelId({
     value: null,
     models: claudeCodeSettings.models,
@@ -2120,7 +2163,7 @@ function ClaudeControlBar({
   };
 
   // Model active id
-  const selectedClaudeModel = pendingClaudeModel || confirmedClaudeModel || fallbackClaudeModel;
+  const selectedClaudeModel = retainedClaudeModel || confirmedClaudeModel || fallbackClaudeModel;
   const modelActiveId: string = (() => {
     if (isCodex) return codexModel;
     if (isSDKTab) return sdkModel || 'default';
@@ -2144,7 +2187,7 @@ function ClaudeControlBar({
     if (isCodex) return codexEffort;
     if (isSDKTab) return sdkEffort;
     if (isDeepSeekPTY) return providerState.effort || 'medium';
-    if (isAnthropicPTY) return pendingClaudeEffort || confirmedClaudeEffort || fallbackClaudeEffort;
+    if (isAnthropicPTY) return retainedClaudeEffort || confirmedClaudeEffort || fallbackClaudeEffort;
     return confirmedClaudeEffort;
   })();
 
@@ -3833,7 +3876,7 @@ function ClaudeControlBar({
       const m = codexModels.find(m => m.id === modelActiveId);
       return m?.label || modelActiveId || '—';
     }
-    if (isAnthropicPTY && claudeSessionId && !confirmedClaudeModel && !pendingClaudeModel) {
+    if (isAnthropicPTY && claudeSessionId && !confirmedClaudeModel && !retainedClaudeModel) {
       return 'model';
     }
     const modelOptions = isAnthropicPTY ? claudeCodeModels : activeProvider.models;
@@ -4440,14 +4483,32 @@ function ClaudeControlBar({
               <button
                 type="button"
                 data-prompt-queue-grab-trigger={tabId}
+                data-prompt-queue-grab-armed={runAfterCaptureArmed ? '1' : '0'}
+                aria-pressed={runAfterCaptureArmed}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
                   window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
                     detail: { tabId },
                   }));
                 }}
-                aria-label="Перенести текущий ввод в Run after"
-                title="Перенести текущий ввод в очередь Run after"
+                // Правый клик взводит ожидание вместо немедленного переноса:
+                // следующая отправка этой вкладки — Enter или автоотправка чипа
+                // диктовки — уйдёт в Run after, а не агенту. Второй правый клик
+                // снимает. Своё меню здесь не нужно, поэтому стандартное
+                // гасится: иначе поверх кнопки открылось бы системное.
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const armed = toggleRunAfterCaptureArm(tabId);
+                  console.log('[RunAfterCaptureArm] tab=' + tabId.slice(-12)
+                    + ' armed=' + armed + ' via=context-menu');
+                }}
+                aria-label={runAfterCaptureArmed
+                  ? 'Следующая отправка уйдёт в Run after — правый клик отменяет'
+                  : 'Перенести текущий ввод в Run after'}
+                title={runAfterCaptureArmed
+                  ? 'Следующая отправка уйдёт в Run after (правый клик — отменить)'
+                  : 'Перенести текущий ввод в очередь Run after'}
                 style={{
                   width: 42,
                   height: '100%',
@@ -4478,10 +4539,17 @@ function ClaudeControlBar({
                   event.currentTarget.style.color = '#f3d0c2';
                 }}
               >
-                {runAfterCaptureHotkeyPreview && (
+                {(runAfterCaptureHotkeyPreview || runAfterCaptureArmed) && (
                   <span
                     aria-hidden
-                    className="cb-run-after-hotkey-surface cb-run-after-hotkey-surface-orange"
+                    data-prompt-queue-grab-arm-pulse={runAfterCaptureArmed ? '1' : undefined}
+                    // Ctrl-превью использует общий glow-wash (мягкое дыхание);
+                    // armed-состояние ждёт отправки и обязано читаться без
+                    // подсказки — настоящее мигание фона, тот же язык, что у
+                    // точки диктовки. `cb-run-after-arm-pulse` сама выключает
+                    // унаследованный glow и ставит свою анимацию.
+                    className={'cb-run-after-hotkey-surface cb-run-after-hotkey-surface-orange'
+                      + (runAfterCaptureArmed ? ' cb-run-after-arm-pulse' : '')}
                   />
                 )}
                 <SquareTerminal size={14} strokeWidth={1.9} aria-hidden />

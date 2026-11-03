@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { watchWith } = require('./dir-watch');
 
 // A statusLine bridge can precede its first JSONL. File appearance is only a
 // wake-up: onReady must rerun the normal live PID/cwd/transcript admission.
@@ -42,7 +43,7 @@ function createClaudeBridgeTranscriptRecheck({ onReady, fsImpl = fs, log = conso
       dir = { entries: new Set(), watcher: null };
       directories.set(entry.directory, dir);
       try {
-        dir.watcher = fsImpl.watch(entry.directory, { persistent: false }, (_event, filename) => {
+        dir.watcher = watchWith(fsImpl)(entry.directory, { persistent: false }, (_event, filename) => {
           for (const waiting of [...dir.entries]) {
             if (!filename || String(filename) === path.basename(waiting.transcriptPath)) check(waiting);
           }

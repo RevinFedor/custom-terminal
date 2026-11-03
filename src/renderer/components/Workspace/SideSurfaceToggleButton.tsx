@@ -2,22 +2,52 @@ import React from 'react';
 import { Bot, SquareTerminal } from 'lucide-react';
 import { useUIStore, resolveTabTerminalPrimary } from '../../store/useUIStore';
 import ControlHint from '../UI/ControlHint';
+import ScrollToBottomButton from './ScrollToBottomButton';
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {RIGHT_CLUSTER_INNER_GAP_PX} from '../../utils/controlBarWrap.mjs';
 
 /** The existing stationary queue/composer host stays above the side terminal.
- * A scalar presentation guard also quarantines retained hidden owners. */
-export function StationaryHistorySurfaceToggle({tabId}: {tabId:string}) {
+ * A scalar presentation guard also quarantines retained hidden owners.
+ *
+ * Стрелка вниз стоит ЗДЕСЬ ЖЕ, а не внутри History, хотя и в другом месте по
+ * горизонтали (центр против правого края). Причина общая: низ у этих двух
+ * контейнеров разный — хост кончается у верхней кромки поля ввода, а область
+ * транскрипта ещё выше, над доком чипов субагентов. Пока стрелка жила там, она
+ * вставала выше кнопки раскладки, тем заметнее, чем выше док. Теперь у обеих
+ * один низ, и по вертикали они совпадают.
+ *
+ * Показывает и прячет стрелку по-прежнему сам транскрипт, прямой записью в
+ * стиль: видимость зависит от позиции прокрутки и меняется на каждый её кадр,
+ * поэтому React-состояние здесь означало бы перерисовку панели на каждое
+ * движение колеса. Хост и панель — разные поддеревья, поэтому вместо общего ref
+ * панель находит свой узел по `data-history-scroll-to-bottom-tab` (у соседней
+ * вкладки в том же окне свой). Клик шлёт то же событие прокрутки, что и
+ * горячая клавиша, — владельцем остаётся транскрипт. */
+export function StationaryHistorySurfaceToggle({tabId}:{tabId:string}) {
   const presented=useWorkspaceStore(state=>state.view==='workspace'&&(state.splitPanes.length
     ?state.splitPanes.some(pane=>!pane.displayHidden&&pane.tabId===tabId)
     :state.getEffectiveTabId()===tabId));
   const padding=useUIStore(state=>state.historyHorizontalPadding);
   if(!presented)return null;
-  return <div data-history-side-surface-toggle data-history-side-surface-stationary
-    style={{position:'absolute',bottom:RIGHT_CLUSTER_INNER_GAP_PX,right:padding,zIndex:10,pointerEvents:'auto'}}
-    onMouseDown={event=>event.stopPropagation()}>
-    <SideSurfaceToggleButton tabId={tabId} size={28}/>
-  </div>;
+  return <>
+    {/* Стрелка «в конец» — по ЦЕНТРУ поверхности, кнопка раскладки — у правого
+        края. Это разные по смыслу органы: возврат к последнему сообщению
+        относится ко всему тексту, а не к правому углу, и у края он читался как
+        часть пары с раскладкой. Низ у обоих общий — верхняя кромка поля ввода,
+        поэтому они остаются на одной линии. */}
+    <div data-history-scroll-to-bottom data-history-scroll-to-bottom-tab={tabId}
+      onMouseDown={event=>event.stopPropagation()}
+      style={{display:'none',position:'absolute',bottom:RIGHT_CLUSTER_INNER_GAP_PX,
+        left:'50%',translate:'-50% 0',zIndex:10,pointerEvents:'auto'}}>
+      <ScrollToBottomButton label="Прокрутить History вниз"
+        onClick={()=>window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom',{detail:{tabId}}))}/>
+    </div>
+    <div data-history-side-surface-toggle data-history-side-surface-stationary
+      style={{position:'absolute',bottom:RIGHT_CLUSTER_INNER_GAP_PX,right:padding,zIndex:10,pointerEvents:'auto'}}
+      onMouseDown={event=>event.stopPropagation()}>
+      <SideSurfaceToggleButton tabId={tabId} size={28}/>
+    </div>
+  </>;
 }
 
 /**

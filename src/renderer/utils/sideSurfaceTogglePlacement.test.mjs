@@ -10,6 +10,7 @@ const button = read('src/renderer/components/Workspace/SideSurfaceToggleButton.t
 const history = read('src/renderer/components/Workspace/HistoryPanel.tsx');
 const terminal = read('src/renderer/components/Workspace/Terminal.tsx');
 const rail = read('src/renderer/components/Workspace/PromptQueueOverlay.tsx');
+const arrow = read('src/renderer/components/Workspace/ScrollToBottomButton.tsx');
 
 /**
  * «Выдвинуть вторую поверхность» — пара со стрелкой вниз над полем ввода, у
@@ -27,8 +28,12 @@ test('кнопка одна на две поверхности, а не две �
   // первой правке, и одна поверхность тихо осталась бы с прежним поведением.
   assert.match(history, /import SideSurfaceToggleButton from '\.\/SideSurfaceToggleButton'/);
   assert.match(terminal, /import SideSurfaceToggleButton from '\.\/SideSurfaceToggleButton'/);
+  // Размер задаётся снаружи и обязан совпадать с соседней стрелкой; History
+  // передаёт его именованной константой, терминал — тем же числом.
+  assert.match(terminal, /<SideSurfaceToggleButton\s+tabId=\{tabId\}\s+size=\{28\}\s*\/>/);
+  assert.match(history, /<SideSurfaceToggleButton tabId=\{tabId\} size=\{HISTORY_FLOATING_CONTROL_SIZE_PX\} \/>/);
+  assert.match(history, /const HISTORY_FLOATING_CONTROL_SIZE_PX = 28;/);
   for (const source of [history, terminal]) {
-    assert.match(source, /<SideSurfaceToggleButton\s+tabId=\{tabId\}\s+size=\{28\}\s*\/>/);
     // Ни одна из поверхностей не решает сама, что выдвигать.
     assert.doesNotMatch(source, /data-side-surface-toggle=\{/);
   }
@@ -49,27 +54,38 @@ test('иконка называет выдвигаемую поверхност�
   assert.match(button, /terminalIsPrimary \? Bot : SquareTerminal/);
 });
 
-test('пара над полем: кнопка раскладки у края, стрелка слева от неё', () => {
-  // Стрелка отступает на ширину кнопки + 2px. Числа обязаны совпадать с size=28,
-  // иначе кнопки наедут друг на друга или разъедутся.
-  assert.match(history, /right: mainSurface\s*\n?\s*\? centerRightInset \+ HISTORY_COMPOSER_SIDE_INSET \+ 28 \+ 2/);
-  assert.match(terminal, /right: terminalArrowRightInset \+ 16 \+ \(isTerminalCentre \? 28 \+ 2 : 0\)/);
+test('в терминале стрелка по центру, кнопка раскладки у края, низ общий', () => {
+  // 03Nov, прямое решение Fedor: стрелка «в конец» относится ко всему выводу,
+  // а не к правому углу, поэтому стоит по ЦЕНТРУ терминала — ровно как у
+  // центральной поверхности History. Прежняя пара «слева от раскладки в 2px»
+  // отменена: у края стрелка терялась среди соседних органов.
+  assert.match(terminal, /left: '50%',\s*translate: '-50% 0',/);
+  assert.doesNotMatch(terminal, /right: terminalArrowRightInset \+ 16 \+ \(isTerminalCentre \? 28 \+ 2 : 0\)/);
+  // Кнопка раскладки остаётся у правого края.
+  assert.match(terminal, /data-terminal-side-surface-toggle[\s\S]{0,160}right: terminalArrowRightInset \+ 16,/);
+  // Один и тот же низ: иначе органы встают диагональю.
+  assert.match(terminal, /data-terminal-side-surface-toggle[\s\S]{0,120}bottom: 16,/);
+  assert.match(terminal, /bottom: '16px',/);
+});
+
+test('у центральной поверхности стрелка по центру, кнопка раскладки у края, низ общий', () => {
+  // Разные по смыслу органы: возврат к последнему сообщению относится ко
+  // всему тексту, а не к правому углу. Низ общий — верхняя кромка поля ввода.
+  const stationary = read('src/renderer/components/Workspace/SideSurfaceToggleButton.tsx');
+  assert.match(stationary, /data-history-scroll-to-bottom[\s\S]{0,400}left:'50%',translate:'-50% 0'/);
+  assert.match(stationary, /data-history-scroll-to-bottom[\s\S]{0,400}bottom:RIGHT_CLUSTER_INNER_GAP_PX/);
+  assert.match(stationary, /data-history-side-surface-stationary[\s\S]{0,200}bottom:RIGHT_CLUSTER_INNER_GAP_PX,right:padding/);
 });
 
 test('правый край кнопки совпадает с правым краем рамки поля ввода', () => {
-  // Рамка рисует вертикальную линию, по которой глаз выравнивает всё, что стоит
-  // над ней. Отступ обязан быть ОДНИМ числом на рамку и на кнопку: пока их было
-  // два (16 у рамки, 12 у кнопки), кнопка стояла на 4px правее линии.
-  assert.match(history, /const HISTORY_COMPOSER_SIDE_INSET = 16;/);
-  assert.match(history, /right: centerRightInset \+ HISTORY_COMPOSER_SIDE_INSET,/);
-  // Отступ рамки берётся из ТОЙ ЖЕ константы. Как именно он задан — раньше
-  // `left/right` у абсолютной панели, сейчас `padding` у обычной строки колонки —
-  // не важно; важно, что число одно, иначе кнопка снова встанет мимо линии.
-  assert.match(history, /paddingLeft: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET/);
-  assert.match(history, /paddingRight: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET/);
-  // Прежние независимые числа не должны вернуться ни с одной стороны.
+  // Рамка рисует вертикальную линию, по которой глаз выравнивает всё, что
+  // стоит над ней. Отступ обязан быть ОДНИМ числом на рамку и на кнопку: пока
+  // их было два (16 у рамки, 12 у кнопки), кнопка стояла на 4px правее линии.
+  // Сейчас это общая пользовательская настройка, а не литерал.
+  assert.match(history, /right: historyHorizontalPadding,/);
+  assert.match(history, /paddingLeft: historyHorizontalPadding,/);
+  assert.match(history, /paddingRight: historyHorizontalPadding,/);
   assert.doesNotMatch(history, /right: centerRightInset \+ 12,/);
-  assert.doesNotMatch(history, /paddingLeft: overlayComposer \? 16/);
 });
 
 test('значок масштабируется вместе с квадратом кнопки', () => {
@@ -103,15 +119,42 @@ test('в терминале кнопка есть только когда он �
   // Иначе на экране оказались бы две кнопки одного переключателя: своя у центра
   // и своя у панели, приткнутой сбоку.
   assert.match(terminal, /active && presentedProp && isTerminalCentre &&/);
-  // В боковой History её тоже нет — она принадлежит центральной поверхности.
-  assert.match(history, /\{mainSurface && \(/);
+  // В боковой History её тоже нет — она принадлежит центральной поверхности,
+  // а у центра её держит стационарный хост.
+  assert.match(history, /\{mainSurface && !sideSurfaceToggleHosted && \(/);
 });
 
-test('обе стрелки вниз одного размера', () => {
-  // Одна и та же по смыслу кнопка выглядела в двух поверхностях по-разному:
-  // 28px в History и 36px в терминале.
-  assert.match(terminal, /width: '28px',\s*\n\s*height: '28px',/);
-  assert.match(history, /width: 28,\s*\n\s*height: 28,/);
+test('все стрелки вниз — одна кнопка: один размер, один фон, одна стрелка', () => {
+  // Было три независимых копии разметки, и они разошлись ровно так, как
+  // расходится скопированный стиль: в терминале полупрозрачный серый фон и
+  // символ `↓` текстом, в History — тёмно-серый с фиолетовым шевроном. Серый
+  // почти совпадал с подложкой приложения: рядом с яркой кнопкой раскладки
+  // это читалось как «серый квадратик с чёрточкой» (сообщено 02Nov).
+  for (const source of [history, terminal]) {
+    assert.match(source, /import ScrollToBottomButton from '\.\/ScrollToBottomButton'/);
+    // Ни один вызывающий не рисует свой фон/рамку/значок заново.
+    assert.doesNotMatch(source, /rgba\(60, 60, 60, 0\.85\)/);
+    assert.doesNotMatch(source, /backgroundColor: '#323237'/);
+  }
+  assert.match(read('src/renderer/components/Workspace/SideSurfaceToggleButton.tsx'),
+    /import ScrollToBottomButton from '\.\/ScrollToBottomButton'/);
+  // Размер совпадает с кнопкой раскладки: они стоят парой.
+  assert.match(arrow, /export const SCROLL_TO_BOTTOM_SIZE_PX = 28;/);
+  // Полноценная стрелка: черта + наконечник. Один шеврон в 28px квадрате
+  // выглядит как короткая чёрточка — это и была жалоба.
+  assert.match(arrow, /<path d="M12 4\.5v12\.5" \/>/);
+  assert.match(arrow, /<path d="M6 12\.5 12 19l6-6\.5" \/>/);
+  assert.doesNotMatch(arrow, /^import .*ChevronDown.*from 'lucide-react'/m);
+  assert.doesNotMatch(arrow, /<ChevronDown/);
+  // Фон контрастирует с подложкой, а не повторяет её, и значок в фиолетовой
+  // палитре соседней кнопки.
+  assert.match(arrow, /const BACKGROUND = '#2b2340';/);
+  assert.match(arrow, /const GLYPH = '#c4b5fd';/);
+  // Значок центрирован сеткой, а не базовой линией текста: прежний `↓`
+  // текстом сидел ниже центра квадрата.
+  assert.match(arrow, /display: 'grid',\s*\n\s*placeItems: 'center',/);
+  // Прежний текстовый символ не должен вернуться ни в одной поверхности.
+  for (const source of [history, terminal, arrow]) assert.doesNotMatch(source, /^\s*↓\s*$/m);
 });
 
 test('в боковом рейле копии переключателя не осталось', () => {
@@ -123,6 +166,4 @@ test('в боковом рейле копии переключателя не о
   // который следующий человек примет за работающий.
   assert.doesNotMatch(rail, /secondarySurfaceOpen/);
   assert.doesNotMatch(rail, /const onToggleTerminal/);
-  // Кнопка Timeline на месте — она про другую поверхность.
-  assert.match(rail, /data-rail-surface-toggle="timeline"/);
 });

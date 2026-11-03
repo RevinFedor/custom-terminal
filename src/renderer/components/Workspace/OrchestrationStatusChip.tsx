@@ -80,6 +80,38 @@ const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed', 'unconfirmed
 const MINI_SEND_LABEL: Record<string, string> = {
   sending: 'MCP-отправка', queued: 'в очереди', sent: 'доставлено', unknown: 'не подтверждено', refused: 'не отправлено',
 };
+/** A settled delivery stays visible just long enough to be read, then clears
+ * itself; an unresolved one waits for the user, who can dismiss it by hand. */
+const MINI_SEND_SETTLED_MS = 4000;
+
+/**
+ * Live view of the reviewer send: present while it runs, briefly after it is
+ * delivered, and until dismissed when its outcome is unknown. The underlying
+ * presentation archive keeps every past `tool` entry, so reading it directly
+ * pinned a stale chip on screen for the rest of the session.
+ */
+function useMiniSendFeedback(controller?: import('./MiniOrchestratorControl').MiniController) {
+  const snapshot = controller?.snapshot;
+  const entry = snapshot?.entries.filter(item => item.type === 'tool').at(-1);
+  const phase = snapshot?.phase;
+  const status = entry?.receipt?.status || (phase === 'sending' ? 'sending' : undefined);
+  const live = phase === 'sending';
+  // Identity of this particular delivery: a new entry must reappear even if the
+  // previous one was dismissed or had already faded.
+  const key = entry ? `${controller?.tabId}:${entry.id}:${status || ''}` : null;
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [faded, setFaded] = useState<string | null>(null);
+  useEffect(() => {
+    // A resolved delivery needs no action, so it should not keep taking dock
+    // space; `unknown` and `refused` do need the user and therefore stay.
+    if (!key || live || status !== 'sent') return;
+    const timer = setTimeout(() => setFaded(key), MINI_SEND_SETTLED_MS);
+    return () => clearTimeout(timer);
+  }, [key, live, status]);
+  if (!entry || !key || dismissed === key || faded === key) return null;
+  if (!live && !status) return null;
+  return { ...entry, status, live, dismiss: () => setDismissed(key) };
+}
 
 const STATUS_LABEL: Record<OrchestrationStatus, string> = {
   creating: 'Создание',
@@ -493,7 +525,11 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const statusInstalls = installs.jobs.filter(buildInstallVisibleInDock);
   const statusRecovery = recovery.targets.filter(buildContinueVisible);
   const statusRewinds = rewinds.rows.filter(selfRewindVisible);
-  const miniFeedback = miniOrchestrator?.snapshot?.entries.filter(entry => entry.type === 'tool').at(-1);
+  // The chip reports a send in flight and its outcome, then leaves — like the
+  // message/install trackers beside it. It used to read the last `tool` entry
+  // of the presentation archive, which never empties, so "Рецензент · не
+  // подтверждено" stayed on screen forever and no ✕ could dismiss it.
+  const miniFeedback = useMiniSendFeedback(miniOrchestrator);
   const hasDockEntries = statusRuns.length > 0 || statusInstalls.length > 0 || statusRecovery.length > 0 || recovery.captureIssues.length > 0 || statusRewinds.length > 0
     || hasVisibleMessages || Boolean(messages.listError) || Boolean(rewinds.error) || !!miniFeedback;
   const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
@@ -915,13 +951,19 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} />
       {statusRewinds.map(operation => <SelfRewindTracker key={operation.operationId} operation={operation}
         selected={selectedRewind?.operationId === operation.operationId} onOpen={openRewind} onDismiss={rewinds.dismiss} />)}
-      {miniFeedback && <RequestTrackerRow data-mini-orchestrator-send={miniFeedback.id}>
+      {miniFeedback && <RequestTrackerRow data-mini-orchestrator-send={miniFeedback.id}
+        actions={!miniFeedback.live && <button type="button" data-mini-orchestrator-send-dismiss
+          aria-label="Скрыть отправку рецензента"
+          title="Скрыть у себя. Доставка и запись в History сохраняются."
+          onClick={miniFeedback.dismiss} style={{ ...requestRowActionStyle, color: '#999' }}>
+          <X size={13} />
+        </button>}>
         <button type="button" style={requestRowLinkStyle}
           title="Корректирующая отправка Terminal MCP — без ожидания Reply"
-          onClick={() => window.dispatchEvent(new CustomEvent('mini-orchestrator:open', { detail: { tabId } }))}>
-          <RequestTrackerStatus><Send size={12} color={miniFeedback.receipt?.status === 'sent' ? '#4ade80'
-            : miniFeedback.receipt?.status === 'unknown' ? '#f59e0b' : '#999'} /></RequestTrackerStatus>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Рецензент · {MINI_SEND_LABEL[miniFeedback.receipt?.status || miniFeedback.status || 'unknown'] || 'не подтверждено'}</span>
+          onClick={() => window.dispatchEvent(new CustomEvent('mini-orchestrator:open', { detail: { tabId, toggle: true } }))}>
+          <RequestTrackerStatus><Send size={12} color={miniFeedback.status === 'sent' ? '#4ade80'
+            : miniFeedback.status === 'unknown' ? '#f59e0b' : '#999'} /></RequestTrackerStatus>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Рецензент · {MINI_SEND_LABEL[miniFeedback.status || 'unknown'] || 'не подтверждено'}</span>
         </button>
       </RequestTrackerRow>}
       {statusInstalls.map(job => <BuildInstallTracker key={job.id} job={job} stale={installs.stale} error={installs.error} onCancel={installs.cancel}

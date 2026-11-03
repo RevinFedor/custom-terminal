@@ -78,12 +78,19 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         entryUuid: call.entryUuid || '',
         startedAt: Number(call.startedAt) || 0,
       }));
+    // A held shell task keeps the tab busy for every activity consumer. The
+    // hold is explicit (`hold_background_work`) and needs no release call: the
+    // task leaves `running` on its own terminal notification, TaskStop or the
+    // owning process boundary, and disappears from this list with it.
+    const heldTasks = tasks.filter((task) => state?.heldTaskUseIds?.has(task.toolUseId));
     return {
       tabId,
       sessionId: state?.sessionId || null,
       generation: state?.generation || null,
       count: agents.length,
       taskCount: tasks.length,
+      heldTaskCount: heldTasks.length,
+      heldTasks,
       agents,
       tasks,
       terminalBackgroundToolUseIds: state
@@ -97,6 +104,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
     generation: snapshot.generation,
     agents: snapshot.agents,
     tasks: snapshot.tasks,
+    heldTasks: snapshot.heldTasks,
     terminalBackgroundToolUseIds: snapshot.terminalBackgroundToolUseIds,
   });
 
@@ -125,6 +133,10 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       calls: new Map(),
       stopCalls: new Map(),
       terminalBackgroundToolUseIds: new Set(),
+      // Explicit per-task holds. Bound to this session/generation: a new
+      // binding below replaces the whole state, so a hold never outlives the
+      // process it was taken for.
+      heldTaskUseIds: new Set(),
       seenRecords: new Set(),
     });
     const snapshot = publishIfChanged(exactTabId, previousFingerprint, 'binding-changed', {
@@ -374,6 +386,39 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
     return { applied: true, ...snapshot };
   };
 
+  /**
+   * Hold a live background shell so the tab counts as busy while it runs.
+   *
+   * `taskRef` is what the agent actually has after starting the command: the
+   * task id Claude printed (`bash-7`, `monitor-1`) or the tool_use id. Only a
+   * RUNNING bash/monitor of this exact tab can be held — a finished, unknown
+   * or agent call is refused rather than silently accepted, because a hold
+   * that holds nothing would read as protection.
+   *
+   * No release call exists by design: the task leaves `running` on its own
+   * terminal notification, an explicit TaskStop or the process boundary, and
+   * stops being held with it.
+   */
+  const hold = (tabId, taskRef) => {
+    const exactTabId = normalizeString(tabId);
+    const ref = normalizeString(taskRef);
+    if (!exactTabId || !ref) return { held: false, reason: 'identity-required' };
+    const state = tabs.get(exactTabId);
+    if (!state) return { held: false, reason: 'tab-not-bound' };
+    const match = [...state.calls.entries()].find(([toolUseId, call]) =>
+      call.status === 'running' && (call.kind === 'bash' || call.kind === 'monitor')
+      && (toolUseId === ref || call.taskId === ref));
+    if (!match) return { held: false, reason: 'background-task-not-running' };
+    const [toolUseId, call] = match;
+    if (state.heldTaskUseIds.has(toolUseId)) {
+      return { held: true, repeated: true, toolUseId, taskId: call.taskId || '', ...snapshotFor(exactTabId) };
+    }
+    const previousFingerprint = snapshotFingerprint(snapshotFor(exactTabId));
+    state.heldTaskUseIds.add(toolUseId);
+    const snapshot = publishIfChanged(exactTabId, previousFingerprint, 'background-hold');
+    return { held: true, repeated: false, toolUseId, taskId: call.taskId || '', ...snapshot };
+  };
+
   const clear = (tabId, reason = 'process-ended') => {
     const exactTabId = normalizeString(tabId);
     const existed = tabs.has(exactTabId);
@@ -391,6 +436,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
     bind,
     observe,
     markStopped,
+    hold,
     clear,
     snapshot: snapshotFor,
     list,

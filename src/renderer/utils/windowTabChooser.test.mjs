@@ -465,3 +465,43 @@ test('S3: явная замена в НАЗВАННОМ окне подчиня�
     ['X', 's1', 'B'],
   );
 });
+
+test('закрытая показанная заготовка возвращает окно на прежнюю вкладку', () => {
+  // Двойной клик по пустому месту открыл пунктирную заготовку, человек
+  // передумал и закрыл её. Он ожидает увидеть ту вкладку, что была до клика,
+  // а не остаться на экране «Двойной клик — новая вкладка».
+  const base = [
+    { windowId: 'w1', projectId: 'p1', tabId: 'one', tabs: [{ projectId: 'p1', tabId: 'one' }] },
+    { windowId: 'w2', projectId: 'p2', tabId: 'other', tabs: [{ projectId: 'p2', tabId: 'other' }] },
+  ];
+  const opened = openChooserSlotInPane(base, 0, 's1').panes;
+  assert.equal(opened[0].tabId, '', 'заготовка показана вместо вкладки');
+  assert.equal(opened[0].selectedSlotId, 's1');
+
+  const closed = closeChooserSlot(opened, 0, 's1', { stepBack: () => true });
+  assert.equal(closed.panes[0].tabId, 'one', 'окно вернулось на прежнюю вкладку');
+  assert.equal(paneChooserSlots(closed.panes[0]).length, 0);
+  assert.equal(closed.panes.length, 2, 'оба окна на месте');
+});
+
+test('без stepBack закрытие заготовки по-прежнему оставляет окно пустым', () => {
+  const base = [
+    { windowId: 'w1', projectId: 'p1', tabId: 'one', tabs: [{ projectId: 'p1', tabId: 'one' }] },
+    { windowId: 'w2', projectId: 'p2', tabId: 'other', tabs: [{ projectId: 'p2', tabId: 'other' }] },
+  ];
+  const opened = openChooserSlotInPane(base, 0, 's1').panes;
+  const closed = closeChooserSlot(opened, 0, 's1');
+  assert.equal(closed.panes[0].tabId, '', 'прежнее поведение сохранено');
+});
+
+test('закрытие НЕпоказанной заготовки не меняет показанную вкладку', () => {
+  const base = [
+    { windowId: 'w1', projectId: 'p1', tabId: 'one', tabs: [{ projectId: 'p1', tabId: 'one' }] },
+    { windowId: 'w2', projectId: 'p2', tabId: 'other', tabs: [{ projectId: 'p2', tabId: 'other' }] },
+  ];
+  let panes = openChooserSlotInPane(base, 0, 's1').panes;
+  // Человек вернулся к своей вкладке: заготовка осталась чипом, но не показана.
+  panes = resolveSplitActivation(panes, 0, 'p1', 'one').panes;
+  const closed = closeChooserSlot(panes, 0, 's1', { stepBack: () => true });
+  assert.equal(closed.panes[0].tabId, 'one', 'показанная вкладка не менялась');
+});

@@ -4,10 +4,26 @@ const { createHash } = require('node:crypto');
 const { createMiniOrchestrator } = require('./mini-orchestrator');
 const { createMiniOrchestratorCapture } = require('./mini-orchestrator-capture');
 const { createMiniOrchestratorGemini } = require('./mini-orchestrator-gemini');
+const { createMiniOrchestratorForward } = require('./mini-orchestrator-forward');
 const { createMiniOrchestratorMcpSender } = require('./mini-orchestrator-mcp');
 const { resolveContextFileRefs } = require('./agent-context-files');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const os = require('node:os');
 const PROMPT_ID = 'mini-orchestrator-review';
 const PREFIX = 'mini-orchestrator:';
+// Forward mode keeps the robot a pure condition: the chosen reviewer tab and
+// the user's instruction live in one app-state row per source tab. The default
+// instruction text is the shared prompt file; it is never rewritten from here.
+const FORWARD_INSTRUCTION_FILE = path.join(os.homedir(),
+  'Global-Templates/\u{1F9E9} Code-Patterns/документация/вкладка-проверяющий-ответов.prompt.md');
+const FORWARD_INSTRUCTION_LIMIT = 60000;
+const FORWARD_FALLBACK_INSTRUCTION = [
+  'Ты — проверяющий завершённого ответа соседней вкладки.',
+  'Найди существенный незакрытый запрос пользователя.',
+  'Если всё выполнено — ничего не отправляй.',
+  'Если есть конкретный пробел — отправь ОДНО замечание через send_prompt в указанную вкладку.',
+].join('\n');
 const AUTOMATIC_OUTPUT_FORMAT = [
   'Private prototype review output mode: application-owned automatic return.',
   'You remain read-only. read_review_iteration only reads the one captured iteration. finish_review is a declarative output record, NOT an MCP tool or an executor: it cannot send, edit, select a recipient, or operate a tab.',
@@ -33,13 +49,52 @@ async function resolveMiniOrchestratorInstruction({ prompt, settings, includeFil
     ...(includeFileMetadata ? { linkedFiles: files.map(file => ({ path: file.filePath, bytes: file.bytes, sha256: file.sha256 })) } : {}) };
 }
 
+// One app-state row per source tab: which neighbour reviews it and the user's
+// own instruction override. Absent row means forward mode is simply unset.
+function normalizeForwardTarget(value) {
+  const raw = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return null; } })() : value;
+  if (!raw || typeof raw !== 'object' || typeof raw.reviewerTabId !== 'string' || !raw.reviewerTabId) return null;
+  return { reviewerTabId: raw.reviewerTabId,
+    ...(typeof raw.instruction === 'string' && raw.instruction.trim()
+      ? { instruction: raw.instruction.slice(0, FORWARD_INSTRUCTION_LIMIT) } : {}),
+    revision: Number.isSafeInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0 };
+}
+
+async function readForwardInstructionFile() {
+  const bytes = await fs.readFile(FORWARD_INSTRUCTION_FILE, 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (typeof bytes !== 'string' || !bytes.trim()) return null;
+  return bytes.slice(0, FORWARD_INSTRUCTION_LIMIT);
+}
+
 function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, endpointFor, publish,
-  automaticCorrections = false, review, sendCorrection, loadPresentation, clearPresentation, log = () => {} }) {
+  automaticCorrections = false, review, sendCorrection, loadPresentation, clearPresentation,
+  describeTab = () => ({}), isAiTab = () => true, log = () => {} }) {
   const automatic = automaticCorrections === true;
-  const runReview = review === undefined ? createMiniOrchestratorGemini({ automaticCorrections: automatic }) : review;
+  const forwardReview = createMiniOrchestratorForward({
+    describeSource: ({ tabId, owner }) => {
+      const source = describeTab(tabId) || {};
+      const target = forwardTarget(tabId);
+      const reviewer = target ? describeTab(target.reviewerTabId) || {} : {};
+      return { name: source.name, reviewerName: reviewer.name, provider: owner?.provider };
+    } });
+  const runReview = review === undefined
+    ? async args => (args.instruction?.mode === 'forward' ? forwardReview : createMiniOrchestratorGemini({ automaticCorrections: automatic }))(args)
+    : review;
   const enabled = new Set(), pendingInputs = new Map();
   const settingsByTab = new Map();
+  const forwardByTab = new Map();
   const viewRevisions = new Map();
+  function forwardTarget(tabId) {
+    if (!forwardByTab.has(tabId)) {
+      let value = null;
+      try { value = normalizeForwardTarget(db.getAppState('mini-orchestrator-forward:' + tabId)); } catch { value = null; }
+      forwardByTab.set(tabId, value);
+    }
+    return forwardByTab.get(tabId);
+  }
   const thinkingLevels = ['LOW', 'MEDIUM', 'HIGH'];
   function savedSettings(tabId) {
     if (!settingsByTab.has(tabId)) {
@@ -57,8 +112,22 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
       revision: String(prompt.revision) + ':' + Number(saved.revision || 0), thinkingLevels: [...thinkingLevels],
       ...(saved.saveError ? { error: saved.saveError } : {}) };
   }
+  function forwardPresentation(tabId) {
+    const target = forwardTarget(tabId);
+    if (!target) return {};
+    const reviewer = describeTab(target.reviewerTabId) || {};
+    return { forward: { reviewerTabId: target.reviewerTabId,
+      reviewerName: typeof reviewer.name === 'string' ? reviewer.name.slice(0, 120) : '',
+      reviewerAvailable: isAiTab(target.reviewerTabId) === true,
+      instructionCustom: typeof target.instruction === 'string',
+      revision: 'forward:' + Number(target.revision || 0) + ':' + target.reviewerTabId } };
+  }
   function withSettings(tabId, snapshot) {
     const viewRevision = (viewRevisions.get(tabId) || 0) + 1; viewRevisions.set(tabId, viewRevision);
+    const forward = forwardPresentation(tabId);
+    // Forward mode needs no Gemini model/effort: do not surface a provider
+    // picker whose value cannot apply to a real reviewer tab.
+    if (forward.forward) return { ...snapshot, viewRevision, ...forward, ...(automatic ? { autoReturn: true } : {}) };
     try { return { ...snapshot, viewRevision, settings: settingsFor(tabId), ...(automatic ? { autoReturn: true } : {}) }; }
     catch (error) { return { ...snapshot, viewRevision, settings: { error: String(error.message || error).slice(0, 160) }, ...(automatic ? { autoReturn: true } : {}) }; }
   }
@@ -79,6 +148,18 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
     },
     persist: (tabId, ledger) => db.setAppState('mini-orchestrator-ledger:' + tabId, JSON.stringify(ledger)),
     loadInstruction: async ({ tabId }) => {
+      // Forward mode needs no provider model/key: the reviewer is a real tab.
+      const target = forwardTarget(tabId);
+      if (target) {
+        if (target.reviewerTabId === tabId) throw new Error('mini_forward_self_target');
+        if (isAiTab(target.reviewerTabId) !== true) throw new Error('mini_forward_reviewer_unavailable');
+        const text = target.instruction || await readForwardInstructionFile() || FORWARD_FALLBACK_INSTRUCTION;
+        const reviewer = describeTab(target.reviewerTabId) || {};
+        return { id: PROMPT_ID + ':forward', name: 'Проверяющая вкладка' + (reviewer.name ? ' · ' + reviewer.name : ''),
+          mode: 'forward', text, reviewerTabId: target.reviewerTabId, sourceTabId: tabId,
+          revision: 'forward:' + Number(target.revision || 0) + ':' + target.reviewerTabId,
+          filePaths: target.instruction ? [] : [FORWARD_INSTRUCTION_FILE] };
+      }
       const prompt = systemPromptService.get(PROMPT_ID);
       const settings = settingsFor(tabId);
       if (settings.error) throw new Error(settings.error);
@@ -136,6 +217,40 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
       try { log('settings', { tabId, model, thinkingLevel, settingsRevision: String(next.revision) }); } catch {}
       return withSettings(tabId, core.snapshot(tabId));
     },
+    // Choosing the reviewer tab (or clearing it) is the whole robot condition.
+    setForwardTarget(tabId, { reviewerTabId, instruction, expectedRevision } = {}) {
+      if (['reviewing', 'sending'].includes(core.snapshot(tabId).phase)) throw new Error('mini_forward_busy');
+      const current = forwardTarget(tabId);
+      const currentRevision = current ? 'forward:' + Number(current.revision || 0) + ':' + current.reviewerTabId : 'forward:none';
+      if (expectedRevision !== undefined && expectedRevision !== currentRevision) throw new Error('mini_forward_changed');
+      if (reviewerTabId === null) {
+        forwardByTab.set(tabId, null);
+        try { db.setAppState('mini-orchestrator-forward:' + tabId, null); }
+        catch { forwardByTab.delete(tabId); throw new Error('mini_forward_unconfirmed'); }
+        core.refreshPresentation(tabId);
+        try { log('forward-cleared', { tabId }); } catch {}
+        return withSettings(tabId, core.snapshot(tabId));
+      }
+      if (typeof reviewerTabId !== 'string' || !reviewerTabId) throw new Error('mini_forward_invalid');
+      if (reviewerTabId === tabId) throw new Error('mini_forward_self_target');
+      if (isAiTab(reviewerTabId) !== true) throw new Error('mini_forward_reviewer_unavailable');
+      if (instruction !== undefined && instruction !== null
+        && (typeof instruction !== 'string' || instruction.length > FORWARD_INSTRUCTION_LIMIT)) throw new Error('mini_forward_instruction_invalid');
+      const next = { reviewerTabId, revision: Number(current?.revision || 0) + 1,
+        ...(typeof instruction === 'string' && instruction.trim() ? { instruction } : {}) };
+      forwardByTab.set(tabId, next);
+      try { db.setAppState('mini-orchestrator-forward:' + tabId, next); }
+      catch { forwardByTab.delete(tabId); throw new Error('mini_forward_unconfirmed'); }
+      core.refreshPresentation(tabId);
+      try { log('forward-target', { tabId, reason: reviewerTabId }); } catch {}
+      return withSettings(tabId, core.snapshot(tabId));
+    },
+    forwardInstructionText: async tabId => {
+      const target = forwardTarget(tabId);
+      if (!target) return null;
+      return { text: target.instruction || await readForwardInstructionFile() || FORWARD_FALLBACK_INSTRUCTION,
+        custom: typeof target.instruction === 'string', defaultFile: FORWARD_INSTRUCTION_FILE };
+    },
     setEnabled(tabId, value) {
       if (value) enabled.add(tabId); else { enabled.delete(tabId); pendingInputs.delete(tabId); capture.invalidate(tabId, 'disabled'); }
       return core.setEnabled(tabId, value);
@@ -146,7 +261,7 @@ function createMiniOrchestratorRuntime({ db, systemPromptService, readOwner, end
       return core.clear(tabId);
     },
     rawInput: tabId => { if (enabled.has(tabId)) core.invalidateReview(tabId, 'manual_input'); },
-    dispose() { enabled.clear(); pendingInputs.clear(); settingsByTab.clear(); viewRevisions.clear(); capture.dispose(); core.dispose(); },
+    dispose() { enabled.clear(); pendingInputs.clear(); settingsByTab.clear(); forwardByTab.clear(); viewRevisions.clear(); capture.dispose(); core.dispose(); },
   };
 }
 

@@ -35,7 +35,9 @@ test('before-quit показывает overlay до медленного proxy d
   const at = mainSource.indexOf("app.on('before-quit'");
   const next = mainSource.indexOf("app.on('will-quit'", at);
   const body = mainSource.slice(at, next);
-  const overlayAt = body.indexOf("webContents.send('shutdown:overlay'");
+  assert.match(mainSource, /function publishShutdownOverlay\(payload\)[\s\S]{0,200}webContents\.send\('shutdown:overlay', payload\)/,
+    'оверлей обязан иметь одного отправителя');
+  const overlayAt = body.indexOf('publishShutdownOverlay({ show: true, tabsCount');
   const drainAt = body.indexOf('await proxyGracefulShutdown()');
   assert.ok(overlayAt >= 0 && drainAt > overlayAt,
     'оверлей должен успеть появиться до ожидания сетевых соединений');

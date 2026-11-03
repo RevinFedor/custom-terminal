@@ -49,16 +49,52 @@ if (db) {
 emitDiagnostic('database-ready-end', { configured: !!db });
 // Parsed data is valid for the exact parser/preparation implementation. A
 // source update must not silently reuse a previous version's interpretation.
+//
+// The fingerprint covers the files that decide what a stored row MEANS, not
+// every module the reader happens to load. Hashing all of them made any Main
+// change anywhere rotate the key: the 01.11 17:08 install discarded 101
+// entries / 2.3 GB as `obsolete-version`, and each tab paid a cold read again
+// (2051 ms for 1513 entries). `history-cache-schema-scope.js` owns the list
+// and the reasoning; scope drift falls back to hashing everything, because a
+// key that is too WIDE only costs a rebuild while one that is too NARROW
+// shows rows under the wrong interpretation.
 const schemaHash = crypto.createHash('sha256');
 let sourceModuleCount=0, workerSourceSHA256=null;
 schemaHash.update(process.versions.v8);
 const srcRoot = require('node:path').resolve(__dirname, '..');
-for (const filename of Object.keys(require.cache).filter(name => name.startsWith(srcRoot + require('node:path').sep)
-  && /\.(?:js|cjs)$/.test(name)).sort()) {
-  schemaHash.update(require('node:path').relative(srcRoot, filename));
+const nodePath = require('node:path');
+const loadedSourceFiles = Object.keys(require.cache)
+  .filter(name => name.startsWith(srcRoot + nodePath.sep) && /\.(?:js|cjs)$/.test(name))
+  .sort();
+const { selectHistoryCacheSchemaFiles, assertHistoryCacheScopeLoaded } = require('./history-cache-schema-scope');
+// The worker's own entry module is not always present in `require.cache`
+// (it is the process entry point, not a dependency), yet its bytes decide how
+// rows are built. Include it explicitly so the scope never drifts over it.
+const loadedRelative = loadedSourceFiles.map(name => nodePath.relative(srcRoot, name));
+const selfRelative = nodePath.relative(srcRoot, __filename);
+if (!loadedRelative.includes(selfRelative)) {
+  loadedRelative.push(selfRelative);
+  loadedSourceFiles.push(__filename);
+}
+const scope = selectHistoryCacheSchemaFiles(loadedRelative);
+const scopeDrift = assertHistoryCacheScopeLoaded(scope.missing);
+if (scopeDrift) console.warn('[HistoryPreparedCache] ' + scopeDrift + ' fallback=hash-all-loaded-modules');
+// Scope-aware mode hashes a fixed, auditable set. The drift fallback keeps
+// the previous whole-tree behaviour so a renamed parser can never be reused
+// under a key that no longer reflects it.
+const fingerprintRelative = scopeDrift ? loadedRelative : scope.included;
+// The mode is part of the key: switching between them must not collide.
+schemaHash.update(scopeDrift ? 'scope:all' : 'scope:format-v1');
+const relativeToAbsolute = new Map(loadedRelative.map((rel, index) => [rel, loadedSourceFiles[index]]));
+for (const relative of fingerprintRelative) {
+  const filename = relativeToAbsolute.get(relative);
+  if (!filename) continue;
+  schemaHash.update(relative);
   const sourceBytes=fs.readFileSync(filename);
   schemaHash.update(sourceBytes);sourceModuleCount++;
-  if(filename===__filename)workerSourceSHA256=crypto.createHash('sha256').update(sourceBytes).digest('hex');
+}
+if (workerSourceSHA256 === null) {
+  workerSourceSHA256 = crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex');
 }
 const sourceSchemaSHA256=schemaHash.digest('hex');
 const startupCacheDiagnostics = [];
@@ -390,9 +426,24 @@ const workerGraphBudget = Math.floor((workerData.memoryBudgetMb || 400) * 1024 *
 const virtualGraphBudget = Math.min(128 * 1024 * 1024, Math.floor(workerGraphBudget / 4));
 api.setCodexProjectionRuntimeBudgetBytes(workerGraphBudget - virtualGraphBudget);
 for (const ownership of workerData.ownership || []) recordCodexProcessActionOwnership(ownership);
-// One cold parser at a time; disk-page hits do not join this lane. Thus a
-// visible warm seek can finish while another session yields during cold work.
+// Cold parsers share one memory budget; disk-page hits do not join this lane.
+// Thus a visible warm seek can finish while another session yields during
+// cold work, and a small journal is no longer serialized behind a large one
+// (31.10: a 51-record tab waited 233s behind a large parse).
 const coldLane = createReadAdmission(), coldOwners = new WeakMap();
+// Size of the source this request will parse, when it is already known. The
+// value only relaxes admission, so an unknown size keeps the strict
+// one-at-a-time behaviour rather than guessing something cheaper.
+function coldWeightForContext(context) {
+  const known = Number(context?.sourceSize);
+  if (Number.isFinite(known) && known > 0) return known;
+  const payload = context?.payload;
+  for (const field of ['sourceBytes', 'sourceSize', 'fileSize']) {
+    const value = Number(payload?.[field]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+}
 function retainCold(admission, control, context) {
   if (coldOwners.has(control)) return;
   coldOwners.set(control, admission); admission.owners++;
@@ -408,11 +459,13 @@ async function enterCold() {
   // requests could accumulate full transient graphs while writing in turns.
   if (!coldOwners.has(control)) {
     const queued = stamp();
+    const weight = coldWeightForContext(context);
     context.coldQueuedAbs = queued.abs; context.coldQueuedPerf = queued.perf;
-    context.coldQueueDepth = coldLane.waiting + Number(coldLane.active);
-    requestPhase(context, 'cold-queued', { queueDepth: context.coldQueueDepth });
+    context.coldQueueDepth = coldLane.waiting + coldLane.activeCount;
+    requestPhase(context, 'cold-queued', { queueDepth: context.coldQueueDepth,
+      weightBytes: weight, laneUsedBytes: coldLane.usedBytes });
     const admission = { owners: 0, release: null, promise: null };
-    admission.promise = coldLane.acquire(control).then(release => {
+    admission.promise = coldLane.acquire(control, { weight }).then(release => {
       const admitted = stamp();
       context.coldAdmittedAbs = admitted.abs; context.coldAdmittedPerf = admitted.perf;
       context.coldAdmissionMs = admitted.perf - queued.perf; context.coldRelease = release;

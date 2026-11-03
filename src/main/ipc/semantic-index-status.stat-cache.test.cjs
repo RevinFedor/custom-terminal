@@ -77,6 +77,9 @@ function fixture(t) {
       if (name === 'crypto') return crypto;
       if (name === 'child_process') return { spawn };
       if (name === '../child-process-env') return { buildChildProcessEnv: overrides => overrides };
+      // Слежение за папками идёт через вспомогательный процесс (шрам 03.11);
+      // в стенде его заменяет тот же поддельный fs.watch.
+      if (name === '../dir-watch') return { watch: (...args) => io.watch(...args) };
       throw new Error(`Unexpected dependency: ${name}`);
     },
     process: { env: { KNOWLEDGE_MCP_SERVER: server }, on: (...args) => exit.on(...args) },

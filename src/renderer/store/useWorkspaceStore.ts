@@ -1069,6 +1069,9 @@ interface Tab {
     thinking?: string;
     startupModel?: string;
     startupEffort?: string;
+    // Set once the retained manual pair has been applied by a launch; the
+    // pair itself stays as the tab's preference (decision 01.11).
+    startupIntentAppliedGeneration?: string;
     codexFastIntent?: boolean;
     codexFastIntentRevision?: number;
     codexSettingsIntentModel?: string;
@@ -4306,11 +4309,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   },
 
   closeWindowTabChooser: (paneIndex, slotId) => {
-    const res = closeChooserSlot(get().splitPanes, paneIndex, slotId);
+    const state = get();
+    const res = closeChooserSlot(state.splitPanes, paneIndex, slotId, {
+      stepBack: (candidateProjectId: string, candidateTabId: string) =>
+        !!state.openProjects.get(candidateProjectId)?.tabs.get(candidateTabId),
+    });
     if (!res) return;
     // Уходит ТОЛЬКО заготовка. Окно остаётся на своём месте, фокус не
-    // переезжает, соседний чип автоматически не включается: следующего
-    // владельца тела выбирает явный клик — то же правило, что после «убрать».
+    // переезжает, соседний чип автоматически не включается. Показанная
+    // заготовка возвращает окно на его предыдущую вкладку (та же запись, что
+    // у ⌘[): отказ от выбора обязан вернуть прежний экран, а не оставить пустоту.
     set({ splitPanes: res.panes });
     console.log('[Split] chooserClose pane=' + paneIndex + ' slot=' + slotId);
     get().saveSession();
@@ -7142,14 +7150,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       // вкладка лежит» отвечал «здесь», хотя её уже нет.
       if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
       // Closing a TAB is not "remove this pane from the workspace": the slot the
-      // user built is not part of what they deleted. If the tab was shown, the
-      // pane stays vacant; parked chips remain but none is selected implicitly.
-      // The surviving pane inherits global focus AFTER the workspace cleanup
-      // below (otherwise this project's own LRU fallback would win and the
-      // user would land on a tab that is not even on screen).
+      // user built is not part of what they deleted. The window steps back to
+      // its own previous tab (same entry ⌘[ would reach) and only stays vacant
+      // when that history has nothing showable left; parked chips still require
+      // explicit activation. The surviving pane inherits global focus AFTER the
+      // workspace cleanup below (otherwise this project's own LRU fallback would
+      // win and the user would land on a tab that is not even on screen).
       {
         const { splitPanes, splitFocusedIndex } = get();
-        const splitRes = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
+        const closingState = get();
+        const splitRes = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId, {
+          stepBack: (candidateProjectId: string, candidateTabId: string) =>
+            !!closingState.openProjects.get(candidateProjectId)?.tabs.get(candidateTabId),
+        });
         if (splitRes) {
           // Same question as removeTabFromSplit — "which pane stayed on screen" —
           // so it reads the same answer. This used to re-derive it locally by
@@ -7160,7 +7173,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           // Closing the CONTENT of the focused window never transfers focus to a
           // neighbour. The empty slot is still the keyboard/navigation target;
           // only its own explicit close-window action may remove that slot.
-          const preserveFocusedEmptyPane = splitRes.emptiedIndex === splitRes.focusedIndex;
+          // A pane that stepped back to its previous tab is NOT empty, so it
+          // keeps focus as an ordinary survivor rather than as a held vacancy.
+          const preserveFocusedEmptyPane = splitRes.emptiedIndex === splitRes.focusedIndex
+            && !splitRes.panes[splitRes.focusedIndex]?.tabId;
           if (preserveFocusedEmptyPane) preserveFocusedVacancy = true;
           const focusedAfter = splitRes.panes[splitRes.focusedIndex];
           splitSurvivor = preserveFocusedEmptyPane

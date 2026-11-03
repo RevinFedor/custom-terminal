@@ -287,6 +287,39 @@ test('background Bash is tracked but foreground Bash is not duplicated', () => {
   assert.equal(snapshot.tasks[0].taskId, 'bash-1');
 });
 
+test('current CLI background receipt gives the shell its task id, so its own TaskStop closes it', () => {
+  // Шрам 01Nov (вкладка run-after\build:i-c\loop): CLI 2.1.316 отдаёт ID в
+  // поле `backgroundTaskId` и пишет «Command running in background with ID: …».
+  // Ни то, ни другое не читалось, ID оставался пустым — и TaskStop этого же
+  // шелла не находил свою карточку: значок висел «работает» после смерти
+  // процесса. Оба носителя проверяются раздельно: metadata и текст.
+  for (const [name, result] of [
+    ['metadata', toolResult('toolu_bg', 'Command running in background with ID: bbypdl97l.',
+      { toolUseResult: { backgroundTaskId: 'bbypdl97l' } })],
+    ['acceptance text', toolResult('toolu_bg', 'Command running in background with ID: bbypdl97l. '
+      + 'Output is being written to: /tmp/bbypdl97l.output.')],
+  ]) {
+    const tracker = createClaudeBackgroundAgentActivityTracker({ onChange: () => {} });
+    tracker.bind({ tabId: 'tab-a', sessionId: 'session-a' });
+    tracker.observe({
+      tabId: 'tab-a', sessionId: 'session-a',
+      record: toolCall('Bash', { command: 'npm run dev:mini', run_in_background: true }, 'toolu_bg'),
+    });
+    tracker.observe({ tabId: 'tab-a', sessionId: 'session-a', record: result });
+    assert.equal(tracker.snapshot('tab-a').tasks[0].taskId, 'bbypdl97l', name);
+
+    tracker.observe({
+      tabId: 'tab-a', sessionId: 'session-a',
+      record: toolCall('TaskStop', { task_id: 'bbypdl97l' }, 'toolu_stop'),
+    });
+    tracker.observe({
+      tabId: 'tab-a', sessionId: 'session-a',
+      record: toolResult('toolu_stop', 'Successfully stopped task: bbypdl97l'),
+    });
+    assert.equal(tracker.snapshot('tab-a').taskCount, 0, name + ': карточка обязана погаснуть');
+  }
+});
+
 test('terminal notification closes the exact Monitor and publishes a tombstone', () => {
   const changes = [];
   const tracker = createClaudeBackgroundAgentActivityTracker({ onChange: (value) => changes.push(value) });

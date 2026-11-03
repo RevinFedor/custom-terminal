@@ -12,6 +12,7 @@
 
 const { ipcMain } = require('electron');
 const fs = require('fs');
+const dirWatch = require('../dir-watch');
 const os = require('os');
 const path = require('path');
 
@@ -186,7 +187,7 @@ function startWatching(projectId, projectPath, mainWindow) {
   watchedProjects.set(projectId, state);
 
   try {
-    state.watcher = fs.watch(projectPath, { persistent: true }, (_evt, filename) => {
+    state.watcher = dirWatch.watch(projectPath, { persistent: true }, (_evt, filename) => {
       if (!filename) return;
       // Only react to source + mirror files. Ignore everything else in the root.
       if (filename !== SOURCE_NAME && !MIRROR_NAMES.includes(filename)) return;
@@ -417,7 +418,7 @@ function collectSkillWatchDirs(rootDir) {
 }
 
 function createSkillsWatcher({ dir, kind, rootName = null, recursive = false }) {
-  const watcher = fs.watch(dir, { persistent: true, recursive }, (_evt, filename) => {
+  const watcher = dirWatch.watch(dir, { persistent: true, recursive }, (_evt, filename) => {
     handleSkillsFsEvent(kind, filename, rootName);
   });
   watcher.on('error', (err) => recordSkillsWatchError(`${kind} watch failed ${dir}: ${err.message}`));

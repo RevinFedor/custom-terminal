@@ -52,4 +52,35 @@ function transition(value, { action, operationId } = {}, now = Date.now()) {
   }
   return { value: next, repeated: false, operation: clone(next.operations.find(operation => operation.operationId === operationId)) };
 }
-module.exports = { normalize, activeId, transition, startupFromArgv, startupArguments };
+// A Noted Main that boots under its own install handover is proof that a
+// DIFFERENT Noted install no longer controls this app: the old installer quit
+// the app and never relaunched it. Only one installer owns the app lifecycle,
+// so its stale `active` record would otherwise make every later startup
+// `begin` fail with research_maintenance_busy — forever, because the operator
+// `complete` that clears it also requires that same startup handover first.
+//
+// Scar 01Nov: `npm run build:i-c` was started from a PTY inside Noted. It
+// began install:noted:continue:3b09b59d, quit Main 89986, and died with the
+// PTY it had just closed — no compile, no relaunch, no complete. The user's
+// own reinstall then booted Main 70442 under install:noted:432ed5e8, whose
+// startup begin failed; AutoResume, Resume, every Send and even
+// orchestration:list-active failed with "Another planned maintenance
+// operation is active".
+//
+// The stale record is completed, not deleted: receipts are retained so an old
+// begin can never reopen it. A non-Noted operation (e.g. an SC Desktop
+// install:sc-* window) is NOT touched — a Noted restart proves nothing about
+// another app's installer — so that window keeps its existing busy guard.
+const NOTED_INSTALL_PREFIX = 'install:noted:';
+function supersedeStaleNotedInstall(value, startupOperationId, now = Date.now()) {
+  const next = normalize(value);
+  const active = activeId(next);
+  if (!active || active === startupOperationId
+    || typeof startupOperationId !== 'string' || !startupOperationId.startsWith(NOTED_INSTALL_PREFIX)
+    || !active.startsWith(NOTED_INSTALL_PREFIX)) return { value: next, superseded: null };
+  const stale = next.operations.find(operation => operation.operationId === active);
+  stale.state = 'completed';
+  stale.completedAt = Math.max(now, stale.startedAt);
+  return { value: next, superseded: active };
+}
+module.exports = { normalize, activeId, transition, startupFromArgv, startupArguments, supersedeStaleNotedInstall };

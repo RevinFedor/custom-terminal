@@ -32,7 +32,7 @@ test('Codex absence, zero, unknown and reset-credit availability remain differen
   assert.equal(projectPublicAgentUsage('codex', data).windows[1].usedPct, null);
 });
 
-test('Claude Fable is a shared weekly sublimit and never gets a separate reset, including unknown', () => {
+test('Claude Fable is a shared weekly sublimit and never gets a separate reset; absent and 0% are both omitted', () => {
   const data = sample({ accounts: [account(A, { source: 'anthropic-oauth-api', usage: {
     seven_day: bucket(61), five_hour: bucket(32), model_scoped: [{ display_name: 'Fable', utilization: 99, resets_at: timestamp }],
   } })] });
@@ -40,9 +40,12 @@ test('Claude Fable is a shared weekly sublimit and never gets a separate reset, 
   assert.deepEqual(known.windows.map(row => row.id), ['weekly', 'five-hour', 'fable']);
   assert.equal(known.windows[2].usedPct, 99);
   assert.equal(known.windows[2].resetAt, null); assert.equal(known.windows[2].sharedWith, 'weekly');
+  // Anthropic retired the separate Fable sublimit but still answers 0%, which
+  // used to publish a permanent "100% left" row. Both shapes now omit it.
   data.accounts[0].usage.model_scoped = [];
-  const unknown = projectPublicAgentUsage('claude', data).windows[2];
-  assert.equal(unknown.status, 'unknown'); assert.equal(unknown.usedPct, null); assert.equal(unknown.resetAt, null);
+  assert.deepEqual(projectPublicAgentUsage('claude', data).windows.map(row => row.id), ['weekly', 'five-hour']);
+  data.accounts[0].usage.model_scoped = [{ display_name: 'Fable', utilization: 0, resets_at: timestamp }];
+  assert.deepEqual(projectPublicAgentUsage('claude', data).windows.map(row => row.id), ['weekly', 'five-hour']);
 });
 
 test('allowlisted DTO never exposes auth, home, session, raw billing, reset IDs or provider failure text', () => {
@@ -59,6 +62,22 @@ test('allowlisted DTO never exposes auth, home, session, raw billing, reset IDs 
   assert.doesNotMatch(body, /VERY_SECRET|\/Users|auth\.json|sourceThreadId|verificationUrl|userCode|orgId/);
   assert.equal(result.error.code, 'auth_required'); assert.equal(result.accounts[0].source, 'unknown');
   assert.equal(result.fullResets.items.length, 1);
+});
+
+test('a missing Claude CLI reports a broken environment, never "sign in again"', () => {
+  // The chip blanked after a Dock launch because `claude` was off PATH. Telling
+  // the user to log in would repeat that lie in public form: they ARE logged in.
+  const data = sample({ accounts: [account(A, { usage: { seven_day: bucket(81) },
+    lastError: 'auth_cli_missing: Claude CLI was not found on PATH, so the active login cannot be read' })] });
+  const result = projectPublicAgentUsage('claude', data);
+  assert.equal(result.error.code, 'usage_unavailable');
+  assert.notEqual(result.error.code, 'auth_required');
+  assert.match(result.error.message, /Claude CLI/);
+  // The saved snapshot stays visible — a broken reader does not erase numbers.
+  assert.equal(result.windows[0].usedPct, 81);
+  // A genuinely logged-out CLI keeps its own, different answer.
+  assert.equal(projectPublicAgentUsage('claude', sample({ accounts: [account(A,
+    { lastError: '401 not signed in' })] })).error.code, 'auth_required');
 });
 
 test('selected historical account is not current login; a missing key never silently displays another account', () => {

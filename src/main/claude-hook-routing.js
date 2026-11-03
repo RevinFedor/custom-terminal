@@ -38,14 +38,24 @@ function admitClaudeMainHook({ message = {}, currentTurn = null, currentProcessI
   }
   // Legacy CLI versions do not supply prompt_id. Preserve their hook behavior;
   // compare exact IDs when both ends provide them, never text or elapsed time.
+  //
+  // A turn's prompt_id is NOT stable for its lifetime: Claude can close a turn
+  // under a different id than it opened it with. main.js already carries that
+  // scar for the queue-continuation replay ("Claude runs the dequeued message
+  // under a NEW prompt id"), but the drift also happens on its own, with no
+  // replay involved — production 01.11, tab 95c379a4fb0f: the turn opened as
+  // e04bc4b2 and Claude's real Stop arrived as f13bd3eb. Rejecting it left the
+  // WORKING loader spinning for nine minutes after Claude had gone idle, until
+  // an unrelated new message opened a fresh turn.
+  //
+  // So a prompt-id mismatch alone no longer rejects a terminal event. What
+  // still must match is the conversation and the CLI process; a subagent is
+  // already excluded above by agent_id/agent_transcript_path, which is the
+  // guard that actually keeps a child from settling its parent.
   if (message.event !== 'UserPromptSubmit' && currentTurn?.provider === 'claude') {
     if (message.session_id && currentTurn.sessionId
       && message.session_id !== currentTurn.sessionId) {
       return { accepted: false, reason: 'turn-session-mismatch' };
-    }
-    if (message.prompt_id && currentTurn.providerPromptId
-      && message.prompt_id !== currentTurn.providerPromptId) {
-      return { accepted: false, reason: 'prompt-owner-mismatch' };
     }
     if (Number.isSafeInteger(pid) && pid > 0
       && currentTurn.processId && String(pid) !== String(currentTurn.processId)) {

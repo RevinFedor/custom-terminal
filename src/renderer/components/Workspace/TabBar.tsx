@@ -7901,8 +7901,19 @@ function TabBar({
     const handleMouseDown = (e: MouseEvent) => {
       if (isDraggingTab) return;
       if (dropCooldownRef.current) return;
-      const tabBarEl = scrollContainerRef.current?.parentElement;
-      if (tabBarEl && tabBarEl.contains(e.target as Node)) return;
+      const target = e.target as HTMLElement;
+      // Keep the selection only for a click that actually lands ON a row or a
+      // control. In the horizontal bar the scroller's parent is the 30px strip,
+      // so its bounds already mean "a tab". The vertical sidebar is the whole
+      // column: its empty area below the last tab is still inside that element,
+      // which is why clicking it never cleared the selection. Resolve a row
+      // instead of a container — the empty space belongs to no row.
+      const insideRow = !!target.closest('[data-tab-id], [data-tab-group-id], [data-keep-selection]');
+      if (insideRow) return;
+      if (!isVerticalLayout) {
+        const tabBarEl = scrollContainerRef.current?.parentElement;
+        if (tabBarEl && tabBarEl.contains(e.target as Node)) return;
+      }
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       if ((e.target as HTMLElement).closest('[data-keep-selection]')) return;
       console.log('[TabBar] clearSelection triggered by mousedown outside TabBar', {
@@ -7915,7 +7926,7 @@ function TabBar({
 
     document.addEventListener('mousedown', handleMouseDown);
     return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [menuOnlyForProject, selectedTabIds.length, isDraggingTab, projectId, clearSelection]);
+  }, [menuOnlyForProject, selectedTabIds.length, isDraggingTab, projectId, clearSelection, isVerticalLayout]);
 
   // The host model contains more data than DnD needs (process state, title,
   // active status). Only structural fields participate in the controlled

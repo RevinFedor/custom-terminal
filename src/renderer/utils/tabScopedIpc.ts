@@ -50,15 +50,22 @@ function getIpc(): IpcRendererLike | null {
  * (a retained pane and a visible one), so handlers are held in a Set per tab
  * and each is removed independently.
  */
-export function onTabScopedIpcMessage(channel: string, tabId: string, handler: Handler): () => void {
+export function onTabScopedIpcMessage(channel: string, tabId: string, handler: Handler,
+  options: { key?: string } = {}): () => void {
   const ipc = getIpc();
   if (!ipc) return () => {};
+  // Not every addressed channel is addressed by tabId: `agent-transcript:changed`
+  // carries the session it belongs to, and its subscribers filter on that.
+  // The routing key is part of the channel's identity, so a caller that asks
+  // for a different one must not silently join the existing route.
+  const routeKey = options.key || 'tabId';
+  const routeChannel = routeKey === 'tabId' ? channel : channel + '\u0000' + routeKey;
 
-  let entry = channels.get(channel);
+  let entry = channels.get(routeChannel);
   if (!entry) {
     const byTab = new Map<string, Set<Handler>>();
-    const listener = (event: unknown, payload: TabPayload) => {
-      const target = payload?.tabId;
+    const listener = (event: unknown, payload: any) => {
+      const target = payload?.[routeKey];
       if (typeof target !== 'string') return;
       const handlers = byTab.get(target);
       if (!handlers || handlers.size === 0) return;
@@ -78,7 +85,7 @@ export function onTabScopedIpcMessage(channel: string, tabId: string, handler: H
       }
     };
     entry = { byTab, listener };
-    channels.set(channel, entry);
+    channels.set(routeChannel, entry);
     ipc.on(channel, listener);
   }
 
@@ -90,7 +97,7 @@ export function onTabScopedIpcMessage(channel: string, tabId: string, handler: H
   return () => {
     if (released) return;
     released = true;
-    const current = channels.get(channel);
+    const current = channels.get(routeChannel);
     if (!current) return;
     const set = current.byTab.get(tabId);
     if (!set) return;
@@ -101,7 +108,7 @@ export function onTabScopedIpcMessage(channel: string, tabId: string, handler: H
     // mount would reorder this listener against the other subscribers of the
     // same channel elsewhere in the app.
     if (current.byTab.size === 0) {
-      channels.delete(channel);
+      channels.delete(routeChannel);
       getIpc()?.removeListener(channel, current.listener);
     }
   };

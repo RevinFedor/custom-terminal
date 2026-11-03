@@ -5,6 +5,7 @@ import '@gt-editor/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { generateAITitle } from '../../../utils/generateAITitle';
+import { generateTitleFromPromptWithConfig } from '../../../utils/generateTabTitle';
 import { usePromptsStore } from '../../../store/usePromptsStore';
 import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import CopySessionButton, { ClaudeSparkle } from '../CopySessionButton';
@@ -349,28 +350,24 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         sessionId: targetSessionId, cwd: tabCwd, includeEditing: false, includeReading: false, fromStart: true
       });
       if (!exportResult.success) throw new Error(exportResult.error || 'Export failed');
+      // Описание идёт через общий utility-путь: тот же выбор провайдера, что у
+      // названий вкладок, и та же запись в Settings → AI → Статистика. Своя
+      // копия fetch здесь раньше не логировала вызов вовсе, поэтому описания не
+      // попадали в статистику.
       const descPrompt = getPromptById('description');
-      const descContent = descPrompt?.content || 'Describe this session in 1-2 sentences.';
-      const descModel = descPrompt?.model || 'gemini-3.8-flash';
-      const descThinking = descPrompt?.thinkingLevel || 'NONE';
-      const fullPrompt = descContent + exportResult.content;
-      const apiKey = await getGeminiApiKey();
-      const requestBody: any = {
-        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
-        systemInstruction: { parts: [{ text: '1-2 предложения. Без маркдауна.' }] }
-      };
-      if (descModel.includes('gemini-3') && descThinking !== 'NONE') {
-        requestBody.generationConfig = { thinkingConfig: { thinkingLevel: descThinking } };
-      }
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${descModel}:generateContent?key=${apiKey}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody)
+      const descriptionText = await generateTitleFromPromptWithConfig(exportResult.content, descPrompt, {
+        fallbackPrompt: 'Describe this session in 1-2 sentences.',
+        sourceLabel: 'Сессия',
+        logPrefix: 'Description',
+        taskType: 'description',
+        promptId: 'description',
+        sanitize: (raw: string) => raw.replace(/\n/g, ' ').trim(),
+        useUtilityProvider: true,
       });
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message || 'API Error');
-      const descriptionText = data.candidates[0].content.parts[0].text.replace(/\n/g, ' ').trim();
+      if (!descriptionText) throw new Error('AI не вернул описание');
       // Читаем актуальный tab.notes ИЗ STORE на момент завершения await —
       // не из reactive selector (его значение зафризилось в closure на момент
-      // клика). Если за время Gemini-запроса слайдаут дописал текст —
+      // клика). Если за время запроса слайдаут дописал текст —
       // мы его сохраним, не затрём.
       let currentNotes = '';
       for (const [, workspace] of useWorkspaceStore.getState().openProjects) {

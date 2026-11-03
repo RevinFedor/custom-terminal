@@ -11,6 +11,7 @@ import {
 } from '../../utils/xtermWritePump';
 import ControlHint from '../UI/ControlHint';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
+import ScrollToBottomButton from './ScrollToBottomButton';
 import { requestTerminalFullView } from '../../utils/terminalFullView.mjs';
 import {beginPromptNativeMenuIntent,invalidatePromptNativeMenuSource} from '../../utils/promptNativeMenuIntent.mjs';
 
@@ -4191,49 +4192,25 @@ function Terminal({
       {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
           participates in root stacking context (above Timeline tooltip portal z:10000) */}
       {active && presentedProp && showScrollButton && (
-        <ControlHint label="Прокрутить терминал вниз">
-        <button
+        <ScrollToBottomButton
+          label="Прокрутить терминал вниз"
+          className="pointer-events-auto"
           onClick={scrollToBottom}
-          className="pointer-events-auto flex items-center justify-center cursor-pointer transition-all duration-200 ease-out hover:scale-105"
-	          style={{
-	            position: 'absolute',
-	            bottom: '16px',
-	            // Always at the right edge, shifted left by whatever covers it —
-	            // the same number the Run after strip uses, so the two never end
-	            // up on opposite sides of the same panel. Previously this jumped
-	            // to the LEFT edge when the transcript opened, which read as a
-	            // different button appearing somewhere else.
-	            //
-	            // Слева от кнопки раскладки, в 2px, когда та есть — пара читается
-	            // как один блок из двух кнопок.
-	            right: terminalArrowRightInset + 16 + (isTerminalCentre ? 28 + 2 : 0),
-	            // 28px, как у стрелки History: раньше здесь было 36 и та же по
-	            // смыслу кнопка выглядела в двух поверхностях по-разному.
-	            width: '28px',
-            height: '28px',
-            borderRadius: '6px',
-            backgroundColor: 'rgba(60, 60, 60, 0.85)',
-            backdropFilter: 'blur(8px)',
-            border: '1px solid rgba(255, 255, 255, 0.1)',
-            color: 'rgba(255, 255, 255, 0.8)',
-            fontSize: '15px',
-            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
-            zIndex: 10001
+          style={{
+            position: 'absolute',
+            bottom: '16px',
+            // По ЦЕНТРУ терминала — то же правило, что у стрелки History
+            // (StationaryHistorySurfaceToggle): возврат к последней строке
+            // относится ко всему выводу, а не к правому углу. У края она
+            // читалась как часть пары с кнопкой раскладки и терялась среди
+            // соседних органов.
+            left: '50%',
+            translate: '-50% 0',
+            // OUTSIDE the isolation:isolate wrapper, so this z-index competes
+            // in the root stacking context (above the Timeline tooltip portal).
+            zIndex: 10001,
           }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = 'rgba(80, 80, 80, 0.95)';
-            e.currentTarget.style.color = 'rgba(255, 255, 255, 1)';
-            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'rgba(60, 60, 60, 0.85)';
-            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.8)';
-            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
-          }}
-        >
-          ↓
-        </button>
-        </ControlHint>
+        />
       )}
     </>
   );

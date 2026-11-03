@@ -76,6 +76,35 @@ composer (настоящее меню Rewind или выбор модели) —
 раньше. Структурные инспекторы trust/auto-mode и hint-наборы не менялись. Тест: случай
 настоящего меню Rewind по-прежнему отклоняется.
 
+## Третий симптом того же восстановления: «Claude start failed» без сбоя (01.11.2026)
+
+Пользователь: *«какое-то странное состояние, при том что сессия запустилась,
+сообщение отправилось»*. На восстановлении вкладка получает ДВА запроса на
+запуск: AutoResume и cold-start Run After. Первый поднимает Claude, второй
+приходит позже и видит ту же сессию живой. Отказ правильный — второй writer на
+один transcript его испортит, — но подавался как сбой запуска.
+
+```text
+03:45:47  AutoResume → claude-c; 03:45:50 процесс жив, /model+/effort применены
+03:46:02  Run After  → claude-c → ClaudePrepareResume: owner alive, reason=live-bridge
+          → launch-rejected → красная карточка «Claude start failed»
+03:46:03  тот же Run After увидел active/inputReady и отправил промпт: confirmed
+```
+
+Решение Fedor: «состояния должны складываться». Если живой владелец сессии —
+**эта же вкладка** (`repairResult.ownerTabId === tabId`), результат помечается
+`alreadyLaunching`/`claude_launch_already_live`, и `agentLaunchPreparations.finish`
+получает `joined:true`: подготовка закрывается как `cleared` с reason
+`launch-already-live`, без error. `applyAgentLaunchPreparationSnapshot` на такой
+снимок возвращает `null`, то есть карточка не появляется и прежняя снимается.
+Вызывающий по-прежнему получает `success:false` и ждёт уже идущий запуск —
+join не выдаётся за acceptance. Чужая вкладка или внешний процесс
+(`external-ps-resume`, `pending-resume`, `stopping`) остаются настоящим отказом
+с прежним текстом. Отложенный путь `settleIntentPreparation` не возвращает
+ошибку обратно: при `joined` error обнуляется. Тест
+`src/main/claude-launch-already-live.actual.test.js` 4/4 (настоящий реестр плюс
+настоящий renderer-редьюсер).
+
 ## Что отбросили
 
 - Только 45-секундный ограничитель: модель/effort при этом не применяются никогда,

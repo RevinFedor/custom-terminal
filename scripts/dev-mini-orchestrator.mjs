@@ -88,6 +88,31 @@ for (const name of ['auth.json', 'models_cache.json']) {
   catch (error) { if (error.code !== 'EEXIST') throw error; }
 }
 const cwd = path.join(root, 'fixture');
+// The isolated profile isolates the APP (user data, Claude/Codex config,
+// ports) — not the file system. A tab on this stand reads the real repo for
+// its task, and nothing in its own cwd stops it from WRITING there.
+//
+// Scar 01Nov: a synthetic task ("background shells do not count — make them
+// count like subagents"), meant only to produce a bad answer for the reviewer,
+// was taken literally and patched the live repository, reverting another tab's
+// agreed design. Say in words that the repo is reference material.
+await fs.writeFile(path.join(cwd, 'AGENTS.md'), [
+  '# Тестовый стенд мини-оркестратора',
+  '',
+  'Работай только в этом каталоге.',
+  '',
+  '`' + repo + '` — ТОЛЬКО ДЛЯ ЧТЕНИЯ. Читай его файлы, если задача просит',
+  'разобраться в коде, но НИКОГДА не правь, не создавай и не удаляй в нём файлы:',
+  'это живой репозиторий пользователя, в котором параллельно работают другие',
+  'сессии. Задача вида «исправь X» на этом стенде означает «объясни, как это',
+  'исправить».',
+  '',
+].join('\n'), { mode: 0o600 }).catch(() => {});
+// A private CLAUDE_CONFIG_DIR starts with no decisions recorded, so the Claude
+// CLI opens its first-run dialogs (theme, folder trust, auto-mode) and never
+// reaches an input-ready TUI: every Send then fails with a readiness timeout.
+// Its OAuth tokens also live in the macOS Keychain here, not in a file.
+await prepareIsolatedClaudeProfile(root, cwd);
 try { await fs.writeFile(path.join(root, 'codex/config.toml'), 'model_reasoning_effort = "low"\napproval_policy = "on-request"\nsandbox_mode = "read-only"\n\n[projects.' + JSON.stringify(cwd) + ']\ntrust_level = "trusted"\n', { mode: 0o600, flag: 'wx' }); }
 catch (error) { if (error.code !== 'EEXIST') throw error; }
 const env = { ...process.env, NODE_ENV: 'development',
@@ -118,7 +143,12 @@ await fs.writeFile(path.join(root, 'DEV.json'), JSON.stringify({ root, rendererP
   mode: 'Vite DEV', keyConfigured: !!miniKey, automaticModelPrompts: false }, null, 2), { mode: 0o600 });
 console.log('[MiniDEV] Profile: ' + root);
 console.log('[MiniDEV] Vite http://127.0.0.1:' + rendererPort + ' · API ' + apiPort + ' · CDP ' + cdpPort);
-const child = spawn(devCli, ['dev'], { cwd: repo, env, stdio: ['inherit', 'pipe', 'pipe'] });
+// Scar 01Nov: killing only this launcher left `electron-vite` and its
+// Electron children alive, each with its own Dock icon (three piled up).
+// `pkill -f <profile>` cannot find them: the profile name lives in their env,
+// not in argv. So the launcher leads its own process group and the whole group
+// dies together.
+const child = spawn(devCli, ['dev'], { cwd: repo, env, stdio: ['inherit', 'pipe', 'pipe'], detached: true });
 const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
 let debuggerResolve, debuggerReject;
 const debuggerReady = new Promise((resolve, reject) => { debuggerResolve = resolve; debuggerReject = reject; });
@@ -131,7 +161,17 @@ const forward = (stream, output) => stream.on('data', chunk => {
 forward(child.stdout, process.stdout); forward(child.stderr, process.stderr);
 child.once('error', debuggerReject);
 child.once('exit', () => debuggerReject(Error('DEV exited before preparation')));
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { if (child.exitCode === null) child.kill(signal); });
+let groupStopped = false;
+const stopGroup = (signal) => {
+  if (groupStopped || child.exitCode !== null || !Number.isSafeInteger(child.pid)) return;
+  groupStopped = true;
+  // The group, not the single PID: the launcher's Electron children are what
+  // keeps a stale DEV instance (and its Dock icon) alive.
+  try { process.kill(-child.pid, signal); }
+  catch (error) { if (error.code !== 'ESRCH') try { child.kill(signal); } catch { /* already gone */ } }
+};
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => { stopGroup(signal); });
+process.on('exit', () => stopGroup('SIGTERM'));
 
 function cdpClient(url) {
   const ws = new WebSocket(url), pending = new Map(), listeners = new Set(); let id = 0;
@@ -226,6 +266,11 @@ try {
   const discovery = JSON.parse((await privateFile('web-server-' + mainPid + '.json')).toString('utf8'));
   if (discovery.pid !== mainPid || discovery.port !== apiPort) throw Error('Private API identity mismatch');
   const token = (await privateFile('web-token.txt')).toString('utf8').trim();
+  // A reviewer tab answers its source through Terminal MCP. This private
+  // instance owns no shared hub, and its own HTTP port serves /terminal/tabs,
+  // not JSON-RPC; the real client is the stdio server pointed at THIS
+  // instance's discovery dir, so it never reaches the user's app.
+  await wireIsolatedTerminalMcp(root, cwd, mainPid);
   const api = async (route, body) => {
     const response = await fetch('http://127.0.0.1:' + apiPort + route, { method: body ? 'POST' : 'GET',
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
@@ -308,3 +353,50 @@ try {
   console.error('[MiniDEV] Уже принятый запуск не повторяю. Окно DEV оставлено для ручной проверки; Ctrl+C — остановка.');
 } finally { clearTimeout(startupTimer); client?.close(); }
 const result = await exited; process.exitCode = result.code || 0;
+
+// Seed the "already decided" state a fresh private Claude profile is missing.
+// Copies only dialog flags and the login token; never histories or MCP config.
+async function prepareIsolatedClaudeProfile(root, cwd) {
+  const target = path.join(root, 'claude', '.claude.json');
+  const hostConfigPath = path.join(os.homedir(), '.claude.json');
+  const host = await fs.readFile(hostConfigPath, 'utf8').then(JSON.parse).catch(() => ({}));
+  const current = await fs.readFile(target, 'utf8').then(JSON.parse).catch(() => ({}));
+  for (const key of Object.keys(host)) {
+    if (/^has(Completed|Seen|Ide|Reset)|Onboarding|^theme$|^installMethod$|KeyBindingInstalled$|^optionAsMetaKeyInstalled$|Nudge$|Warning$|DialogBeenShown$/.test(key)) {
+      current[key] = host[key];
+    }
+  }
+  current.hasCompletedOnboarding ??= true;
+  current.theme ??= 'dark';
+  current.projects ??= {};
+  current.projects[cwd] = { ...(current.projects[cwd] || {}), hasTrustDialogAccepted: true,
+    hasClaudeMdExternalIncludesApproved: true, hasClaudeMdExternalIncludesWarningShown: true, allowedTools: [] };
+  await fs.writeFile(target, JSON.stringify(current, null, 2), { mode: 0o600 });
+  const credentials = await new Promise(resolve => {
+    const child = spawn('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = ''; child.stdout.on('data', chunk => { out += chunk; });
+    child.once('exit', code => resolve(code === 0 ? out.trim() : ''));
+    child.once('error', () => resolve(''));
+  });
+  const hostCredentials = await fs.readFile(path.join(os.homedir(), '.claude/.credentials.json'), 'utf8').catch(() => '');
+  const payload = credentials || hostCredentials;
+  if (payload) await fs.writeFile(path.join(root, 'claude', '.credentials.json'), payload, { mode: 0o600 });
+  else console.warn('[MiniDEV] No Claude credentials found; its tabs will ask for /login.');
+}
+
+// Give the private profile a terminal MCP bound to its own discovery dir.
+async function wireIsolatedTerminalMcp(root, cwd, mainPid) {
+  const record = path.join(root, 'discovery', 'mcp-port-' + mainPid);
+  if (!fss.existsSync(record)) { console.warn('[MiniDEV] No MCP discovery record yet; reviewer tabs may lack send_prompt.'); return; }
+  const target = path.join(root, 'claude', '.claude.json');
+  const current = await fs.readFile(target, 'utf8').then(JSON.parse).catch(() => ({}));
+  const server = { type: 'stdio', command: process.execPath,
+    args: [path.join(repo, 'mcp/terminal-server.mjs')],
+    env: { NOTED_DISCOVERY_DIR: path.join(root, 'discovery') } };
+  current.mcpServers = { ...(current.mcpServers || {}), terminal: server };
+  current.projects ??= {};
+  current.projects[cwd] = { ...(current.projects[cwd] || {}), mcpServers: { terminal: server },
+    enabledMcpjsonServers: ['terminal'] };
+  await fs.writeFile(target, JSON.stringify(current, null, 2), { mode: 0o600 });
+  console.log('[MiniDEV] Terminal MCP wired for this private profile only.');
+}

@@ -10,6 +10,7 @@ import {
   DICTATION_CLIPBOARD_NATIVE_TYPE,
   haveSameComposerChips,
   buildPasteChipMarker,
+  buildPasteChipWrapper,
   getPasteMarkerHighlightRanges,
   insertComposerSnapshotAtSelection,
   insertComposerTextAtSelection,
@@ -229,6 +230,43 @@ test('History parser recognizes Claude opaque-id pasted wrappers and preserves n
   assert.deepEqual(presentation.parts.map((part) => part.kind), ['text', 'paste', 'text', 'paste', 'text']);
   assert.equal(presentation.parts[1].text, firstBody, 'image-looking and saved-prompt text stays inside paste');
   assert.equal(presentation.parts[3].text, secondBody, 'context-file-looking text stays inside paste');
+});
+
+test('provider envelope around the WHOLE message renders as ordinary text, not a paste chip', () => {
+  // Claude's own composer wraps any input over 800 chars or two lines, so a
+  // dictated/queued prompt returns wrapped although nothing was pasted.
+  const body = 'продиктованный текст\nвторая строка\nтретья строка\n' + 'x'.repeat(900);
+  const text = `\n\n<pasted_content id="095c">\n${body}\n</pasted_content id="095c">\n`;
+
+  const presentation = buildHistoryComposerPresentationParts({ text });
+  assert.deepEqual(presentation.parts.map((part) => part.kind), ['text'],
+    'whole-message envelope has no "inside" and must not become a chip');
+  assert.equal(presentation.parts[0].text, body, 'body is preserved verbatim for the usual expand control');
+
+  // A real paste keeps its chip: the envelope is surrounded by actual text.
+  const framed = buildHistoryComposerPresentationParts({
+    text: `смотри:\n\n<pasted_content id="095c">\n${body}\n</pasted_content id="095c">\nконец`,
+  });
+  assert.deepEqual(framed.parts.map((part) => part.kind), ['text', 'paste', 'text']);
+  assert.equal(framed.parts[1].text, body);
+
+  // Our own chips are authored by us and always stay chips.
+  const ours = buildHistoryComposerPresentationParts({
+    text: `\n\n<pasted_content>\n${body}\n</pasted_content>\n`,
+  });
+  assert.deepEqual(ours.parts.map((part) => part.kind), ['text', 'paste', 'text']);
+
+  // A message-reference chip is a Noted-authored carrier, never unwrapped.
+  const reference = {
+    version: 1, kind: 'noted-terminal-message', referenceId: '11111111-2222-3333-4444-555555555555',
+    detailsText: body, source: { tabId: 't1', messageId: 'm1', sessionId: 's1', provider: 'claude', tabName: 'Вкладка' },
+  };
+  const referenceChip = { id: 'chip-ref', kind: 'paste', text: body, messageReference: reference };
+  const linked = buildHistoryComposerPresentationParts({
+    text: buildPasteChipWrapper(referenceChip), chips: [referenceChip],
+  });
+  assert.deepEqual(linked.parts.map((part) => part.kind), ['paste']);
+  assert.ok(linked.parts[0].messageReference, 'terminal message reference survives');
 });
 
 test('mismatched opaque paste ids remain literal instead of consuming another wrapper', () => {

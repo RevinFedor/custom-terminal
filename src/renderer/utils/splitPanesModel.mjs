@@ -768,11 +768,13 @@ export function setChooserSlotDirectory(panes, paneIndex, slotId, cwd) {
  * Закрыть заготовку.
  *
  * Уходит ТОЛЬКО она: окно остаётся, его место в раскладке остаётся, остальные
- * чипы и заготовки остаются, фокус не переезжает. Соседа автоматически никто
- * не показывает — следующего владельца тела выбирает явный клик, ровно как
- * после «убрать» обычной вкладки.
+ * чипы и заготовки остаются, фокус не переезжает. С `stepBack` показанная
+ * заготовка возвращает окно на его предыдущую вкладку — ту же запись, куда
+ * ведёт ⌘[: «передумал открывать» обязано вернуть ровно то, что человек видел
+ * до двойного клика. Пусто остаётся, только когда возвращать нечего; остальные
+ * чипы по-прежнему требуют явного клика.
  */
-export function closeChooserSlot(panes, paneIndex, slotId) {
+export function closeChooserSlot(panes, paneIndex, slotId, { stepBack = null } = {}) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
   if (!pane || !paneHoldsChooserSlot(pane, slotId)) return null;
@@ -782,6 +784,19 @@ export function closeChooserSlot(panes, paneIndex, slotId) {
     shownTabId: pane.tabId,
     selectedSlotId: pane.selectedSlotId === slotId ? '' : pane.selectedSlotId,
   });
+  const wasShowing = !pane.tabId && pane.selectedSlotId === slotId;
+  if (stepBack && wasShowing) {
+    const target = paneStepBackTarget(next, paneIndex, stepBack, null);
+    if (target) {
+      const current = next[paneIndex];
+      const strip = paneTabs(current);
+      next[paneIndex] = paneWithTabs(current,
+        strip.some((entry) => entry.tabId === target.tabId)
+          ? strip
+          : [...strip, { projectId: target.projectId, tabId: target.tabId }],
+        target.tabId);
+    }
+  }
   return { panes: next, emptied: isEmptyPane(next[paneIndex]) };
 }
 
@@ -1348,6 +1363,28 @@ export function restorablePaneHistory(panes, paneIndex, tabExists = () => true) 
 }
 
 /**
+ * Куда вернуться окну, которое ТОЛЬКО ЧТО перестало что-либо показывать.
+ *
+ * Отличается от `restorablePaneHistory` ровно одним: чип в ЭТОМ окне не делает
+ * запись недоступной — наоборот, это самый естественный адресат. Тот фильтр
+ * отвечает на вопрос «что предложить вернуть ДОПОЛНИТЕЛЬНО к видимому», а здесь
+ * вопрос другой: «что показать вместо пустоты». Чужое окно по-прежнему держит
+ * вкладку за собой: одна вкладка — одно окно.
+ */
+function paneStepBackTarget(panes, paneIndex, tabExists, excludeTabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane) return null;
+  const elsewhere = new Set(list.flatMap((value, index) => (
+    index === paneIndex ? [] : paneTabs(value).map((entry) => entry.tabId)
+  )));
+  return paneHistory(pane).find((e) => (
+    e && e.tabId && e.tabId !== excludeTabId && !elsewhere.has(e.tabId)
+      && tabExists(e.projectId, e.tabId)
+  )) || null;
+}
+
+/**
  * Middle-click on a pane's shown chip: put the pane's previous tab back
  * instead of emptying the pane. Steps to the first RESTORABLE entry — a dead
  * or elsewhere-visible head does not kill the gesture when an older entry is
@@ -1620,9 +1657,16 @@ export function removePaneByTab(panes, focusedIndex, tabId) {
  * shown, the pane immediately shows nothing; remaining chips stay parked and
  * require explicit activation.
  *
+ * `stepBack` turns this into CLOSING rather than parking: deleting what you
+ * were looking at is not a request to look at nothing, so the window returns to
+ * its own previous tab — the same entry ⌘[ would reach. Pass the "does this tab
+ * still exist" predicate to enable it. Without it the pane just empties, which
+ * is what «убрать из окна» means: that tab lives on in the sidebar, and the
+ * vacant slot deliberately waits for an explicit choice.
+ *
  * Returns null when the tab has no pane.
  */
-export function emptyPaneByClosedTab(panes, focusedIndex, tabId) {
+export function emptyPaneByClosedTab(panes, focusedIndex, tabId, { stepBack = null } = {}) {
   const list = Array.isArray(panes) ? panes : [];
   if (!tabId) return null;
   const idx = paneIndexHoldingTab(list, tabId);
@@ -1633,7 +1677,28 @@ export function emptyPaneByClosedTab(panes, focusedIndex, tabId) {
   // (dropTabFromAllPaneHistories).
   const res = removeTabFromPane(list, idx, tabId);
   if (!res) return null;
-  return { panes: res.panes, focusedIndex: clampIndex(res.panes, focusedIndex), emptiedIndex: idx };
+  let panesAfter = res.panes;
+  // Only the window that was SHOWING it steps back; a pane that merely held the
+  // chip just loses it. A dead entry or one owned by another window is skipped.
+  // The tab being closed is excluded explicitly: removeTabFromPane has just
+  // pushed it in as the NEWEST history entry, and its purge from history runs
+  // later in the close sequence — without that the step back would land right
+  // back on the tab the user just deleted.
+  if (stepBack && list[idx]?.tabId === tabId) {
+    const target = paneStepBackTarget(panesAfter, idx, stepBack, tabId);
+    if (target) {
+      const pane = panesAfter[idx];
+      const strip = paneTabs(pane);
+      const next = panesAfter.slice();
+      next[idx] = paneWithTabs(pane,
+        strip.some((entry) => entry.tabId === target.tabId)
+          ? strip
+          : [...strip, { projectId: target.projectId, tabId: target.tabId }],
+        target.tabId);
+      panesAfter = next;
+    }
+  }
+  return { panes: panesAfter, focusedIndex: clampIndex(panesAfter, focusedIndex), emptiedIndex: idx };
 }
 
 // Remove a pane by position — the only way to close an EMPTY placeholder

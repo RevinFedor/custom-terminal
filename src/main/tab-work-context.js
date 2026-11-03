@@ -1,5 +1,10 @@
 'use strict';
 
+// Сколько не трогать папку, на которой наблюдатель не поднялся. Путь временного
+// стенда могут создать заново, поэтому отметка не вечная; цена пропуска —
+// максимум одно изменение файла до следующей синхронизации.
+const UNAVAILABLE_DIR_TTL_MS = 60_000;
+
 const { causal } = require('./perf-causal-context');
 const { installTimelineWorkingFileVersions } = require('./timeline-working-file-version-schema');
 
@@ -10,6 +15,8 @@ function sqlStatement(siteId, operation, prepare, execute) {
 }
 
 const fs = require('node:fs');
+// Папки — через вспомогательный процесс: см. dir-watch.js (шрам 03.11).
+const dirWatch = require('./dir-watch');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
@@ -1047,6 +1054,9 @@ class TabWorkContext {
     this.archivedTab = archivedTab;
     this.onChanged = onChanged;
     this.watchers = new Map();
+    // dir -> когда `fs.watch` на нём бросил. Защищает от повтора безнадёжной
+    // попытки на каждой синхронизации; подробности — у места записи ниже.
+    this.unavailableDirs = new Map();
     this.reads = new Map();
     this.projectors = new Map();
     this.pendingEdits = new Map();
@@ -1704,12 +1714,18 @@ class TabWorkContext {
       }
       for (const [dir, watcher] of this.watchers) if (!dirs.has(dir)) { causal.count('watchersClosed'); watcher.close(); this.watchers.delete(dir); }
     });
+    // Папка, на которой `fs.watch` только что бросил, не проверяется снова
+    // сразу: пока она остаётся удалённой, повтор стоит системного вызова и
+    // строки в логе на каждой синхронизации, ничего не давая взамен.
+    for (const [dir, failedAt] of this.unavailableDirs) {
+      if (!dirs.has(dir) || Date.now() - failedAt >= UNAVAILABLE_DIR_TTL_MS) this.unavailableDirs.delete(dir);
+    }
     for (const dir of dirs) {
-      if (this.watchers.has(dir)) continue;
+      if (this.watchers.has(dir) || this.unavailableDirs.has(dir)) continue;
       try {
         const files = causal.syncWork('tabContext.syncLinks.watchDirectory', { fileIdentity: dir }, () => {
           causal.count('watchersCreated');
-          const watcher = fs.watch(dir, (_event, name) => causal.syncWork('tabContext.watchEvent', { fileIdentity: dir }, () => {
+          const watcher = dirWatch.watch(dir, (_event, name) => causal.syncWork('tabContext.watchEvent', { fileIdentity: dir }, () => {
             causal.count('watchEvents');
             const paths = sqlStatement('tabContext.watchEvent.paths', 'all', () => this.db.prepare('SELECT DISTINCT path FROM tab_context_files'), statement => statement.all())
               .filter((row) => {
@@ -1729,7 +1745,22 @@ class TabWorkContext {
         for (const file of files) {
           if (path.dirname(file.path) === dir) await this.readFile(file.path);
         }
-      } catch (e) { console.warn('[TabContext] watcher unavailable:', dir, e.message); }
+      } catch (e) {
+        // Папка удалена (временный стенд, убранный каталог прогона) — `fs.watch`
+        // бросает, и в `this.watchers` ничего не попадает. Без отметки об этом
+        // КАЖДАЯ следующая синхронизация повторяет ту же попытку.
+        //
+        // Шрам 02.11 (прод): 2516 бросков за сессию, по 148 на каждую из ~17
+        // мёртвых папок за 102 синхронизации. Каждая попытка — системный вызов
+        // плюс предупреждение в лог, всё на главном потоке, и всё в тех же
+        // окнах, где пользователь видел зависания 1-2с при отправке и скролле.
+        //
+        // Отметка сбрасывается по сроку: папку могут создать заново (тот же
+        // путь стенда в следующем прогоне), и тогда наблюдатель нужен. Срок
+        // короткий — пропустить придётся максимум одно изменение файла.
+        this.unavailableDirs.set(dir, Date.now());
+        console.warn('[TabContext] watcher unavailable:', dir, e.message);
+      }
     }
     for (const id of this.subscriptions.keys()) if (!subscriptionIds.has(id)) {
       await this.transcriptService?.unsubscribe({ consumerId: id });

@@ -30,6 +30,7 @@ import { loopPromptMode } from '../store/usePromptQueueStore';
 import { initializeLoopDependencies, loopDependenciesBlock, loopDependencyEntry,
   loopDependencyResumeText, subscribeLoopDependencies } from '../utils/loopDependencies.mjs';
 import { initializeMessageLoopWaits, messageLoopWaitsBlock, subscribeMessageLoopWaits } from '../utils/messageLoopWaits.mjs';
+import { initializeTabOwnBackgroundWork, subscribeTabOwnBackgroundWork, tabOwnBackgroundWorkBlocks } from '../utils/tabOwnBackgroundWork.mjs';
 import {
   initializeOrchestrationStore,
   isOrchestrationCompletionBlocked,
@@ -590,16 +591,18 @@ function describeQueuesForTriggerLog(triggerTabId: string): string {
   return parts.length > 0 ? parts.join(' | ') : 'none';
 }
 
-// When the per-tab post-prompt toggle is ON and post-prompt text is non-empty,
-// every fired queue item gets the post-prompt appended after a blank-line
-// separator. Empty text is treated as disabled (no glue line, no warning).
-// Single chokepoint: every send-command call from the runner goes through this.
-function withPostPrompt(tabId: string, body: string): string {
-  const q = usePromptQueueStore.getState().getQueue(tabId);
-  if (!q.postPromptEnabled) return body;
-  const post = q.postPromptText;
-  if (!post || !post.trim()) return body;
-  return body + '\n\n' + post;
+// Post-prompt was retired on 03Nov: Loop covers the same per-tab policy slot,
+// and the control was removed from the Run After edge row. Persisted
+// `postPromptEnabled`/`postPromptText` are intentionally no longer read, so an
+// old saved suffix cannot silently keep appending itself to every queue item
+// after its toggle disappeared from the UI.
+//
+// This stays a function rather than being inlined at its seven call sites
+// because they also compare payload identity (`payloadKey`) across restarts:
+// one chokepoint keeps the fired payload and the compared payload equal by
+// construction.
+function withPostPrompt(_tabId: string, body: string): string {
+  return body;
 }
 
 // Module-scoped per-tab previous busy state. Lives OUTSIDE React state so that
@@ -676,6 +679,10 @@ function isTabWorkflowBlocked(tabId: string, waitingItem?: QueuedPrompt | null, 
   return queueShutdownPending || queueManualStopping.has(tabId) || autoCompactCoordinator?.has(tabId) === true
     || capacityWorkflowBlocked(tabId)
     || prevBusyRef.get(tabId) === true
+    // The tab's own async Agent/subagent outlives its parent turn. Main owns
+    // that count (same source as the tab loader and Auto-stop); a finished
+    // parent final is not a finished tab.
+    || tabOwnBackgroundWorkBlocks(tabId)
     || (kind === 'loop' && loopPromptMode(usePromptQueueStore.getState().getQueue(tabId)) === 'own-turn'
       ? isLoopOrchestrationBlocked(tabId)
       || loopDependenciesBlock(tabId, usePromptQueueStore.getState().getQueue(tabId), loopNaturalCausesByOwner.get(tabId))
@@ -1125,6 +1132,7 @@ function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
   if (autoCompactCoordinator?.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)
     || queueSendInflight.has(ownerTabId)
     || deferredOwnerSends.has(ownerTabId)
+    || tabOwnBackgroundWorkBlocks(ownerTabId)
     || isOrchestrationCompletionBlocked(ownerTabId)) return true;
   return hasPendingPromptQueueContinuation(usePromptQueueStore.getState().getQueue(ownerTabId));
 }
@@ -1133,6 +1141,7 @@ function queueOwnerHasPendingContinuationAt(ownerTabId: string, outcomeTs: numbe
   if (autoCompactCoordinator?.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)
     || queueSendInflight.has(ownerTabId)
     || deferredOwnerSends.has(ownerTabId)
+    || tabOwnBackgroundWorkBlocks(ownerTabId)
     || isOrchestrationCompletionBlocked(ownerTabId)) return true;
   const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
   const queuePending = queue.autoRun
@@ -2636,7 +2645,22 @@ export function usePromptQueueRunner() {
     const autoCompactWakeChannels = ['claude:bridge-update', 'codex:context-update', 'agent:readiness-changed'];
     for (const channel of autoCompactWakeChannels) ipcRenderer.on(channel, autoCompactWake);
     const shutdownHandler = (_event: unknown, data: { show?: boolean }) => {
-      if (!data?.show || queueShutdownPending) return;
+      if (!data?.show) {
+        // A CANCELLED quit: the overlay hides and the app keeps running. The
+        // suspension taken below assumed a next app lifetime that will not
+        // happen, so it must be lifted — otherwise every armed Run after and
+        // Loop stays silently inert on a visibly alive app, and nothing in the
+        // UI explains why. Auto-compact observers are NOT recreated: those
+        // were retired when the shutdown began, and their tabs' next natural
+        // outcome arms them again through the normal path.
+        if (!queueShutdownPending) return;
+        queueShutdownPending = false;
+        usePromptQueueStore.getState().resumeWorkflowsAfterCancelledShutdown();
+        flushPromptQueueStoreSync();
+        console.log('[PromptQueueRunner] shutdown cancelled — queues rearmed');
+        return;
+      }
+      if (queueShutdownPending) return;
       queueShutdownPending = true;
       coordinator.dispose();
       flushAutoCompactStoreSync();
@@ -2988,6 +3012,20 @@ export function usePromptQueueRunner() {
         sessionId: data.sessionId || (loopProvider ? getPromptQueueSessionId(data.tabId, loopProvider) : null),
         turnId: data.turnId || data.lastOutcomeTurnId, outcomeTs, inputBoundary: data.loopInputBoundary || null };
       if (loopCause.provider && loopCause.sessionId && loopCause.turnId) loopNaturalCausesByOwner.set(data.tabId, loopCause as any);
+      // The parent turn ended while this tab's OWN async Agent is still
+      // running. That is genuine work of this tab (it holds the tab loader and
+      // already blocks Auto-stop), so the next step waits for it. The outcome
+      // is preserved and replayed from the background-work subscriber below —
+      // never dropped, and never turned into a second natural final.
+      if (tabOwnBackgroundWorkBlocks(data.tabId)) {
+        const current = deferredOrchestrationNaturalOutcomes.get(data.tabId);
+        if (!current || outcomeTs >= current.outcomeTs) {
+          deferredOrchestrationNaturalOutcomes.set(data.tabId, { data, source, outcomeTs, liveOwnArmAt });
+        }
+        console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+          + ' source=' + source + ' has own background work → DEFER workflow outcome');
+        return;
+      }
       if (isOrchestrationCompletionBlocked(data.tabId)) {
         const current = deferredOrchestrationNaturalOutcomes.get(data.tabId);
         if (!current || outcomeTs >= current.outcomeTs) {
@@ -3605,6 +3643,25 @@ export function usePromptQueueRunner() {
       if (latestLoopCauseByOwner.has(tabId)) fireLoopOwner(tabId);
     };
     const unsubscribeMessageLoop = subscribeMessageLoopWaits(releaseMessageLoop);
+    // The tab's own Agent finished. Replay the natural outcome we deferred for
+    // it — through the ordinary arm/FIFO/Goal guards, with its ORIGINAL
+    // outcome timestamp. The end of background work is not itself a final.
+    const releaseOwnBackgroundWork = ({ tabId, active }: { tabId: string; active: boolean }) => {
+      if (active || !tabId || queueShutdownPending || !canProcessWorkflowOutcomes()) return;
+      if (prevBusyRef.get(tabId) === true) return;
+      const deferred = deferredOrchestrationNaturalOutcomes.get(tabId);
+      if (deferred) {
+        deferredOrchestrationNaturalOutcomes.delete(tabId);
+        processSuccessfulWorkflowOutcome(deferred.data, deferred.source + '-own-background-done', deferred.outcomeTs);
+        return;
+      }
+      if (deferredOwnerSends.has(tabId)) retryDeferredOwnerSend(tabId, 'own-background-work-done');
+      else if (latestLoopCauseByOwner.has(tabId)) fireLoopOwner(tabId);
+    };
+    const unsubscribeOwnBackgroundWork = subscribeTabOwnBackgroundWork(releaseOwnBackgroundWork);
+    void initializeTabOwnBackgroundWork(
+      [...usePromptQueueStore.getState().queues.keys()],
+    ).catch(() => {});
     void initializeMessageLoopWaits().then(() => {
       for (const [tabId] of latestLoopCauseByOwner) releaseMessageLoop({ source: { tabId } });
     }).catch(error => console.warn('[PromptQueueRunner] message wait restore pending: ' + String(error.message)));
@@ -3769,6 +3826,7 @@ export function usePromptQueueRunner() {
       unsubscribeLoopDependencies();
       ipcRenderer.removeListener('build-continue:released', releaseBuildContinue);
       unsubscribeMessageLoop();
+      unsubscribeOwnBackgroundWork();
       unsubscribeOrchestration();
       unsubscribeContinuationQueue();
       continuationReleaseListeners.delete(continuationReleaseListener);

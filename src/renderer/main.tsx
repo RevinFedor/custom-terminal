@@ -15,47 +15,17 @@ import './styles/sidebar.css';
 // override any --cb-* token there if needed. See packages/claude-blocks.
 import '@noted/claude-blocks/styles.css';
 
-// === code-inspector: Claude/Cursor-friendly clipboard formatter ===
-// The plugin emits `code-inspector:trackCode` with `detail = HTMLElement` on
-// ⌘+click. We format outerHTML + component path so the clipboard payload is
-// self-contained — you can paste straight into Claude/Cursor and the model
-// has the file:line:col reference plus the actual JSX/DOM snippet.
-window.addEventListener('code-inspector:trackCode', (e: any) => {
-  try {
-    const d = e?.detail || {};
-    const { name = '', path = '', line = '', column = '' } = d;
-    const loc = path ? `${path}:${line}:${column}` : '';
-
-    // Try to locate the actual DOM node by data-insp-path so we can include
-    // its outerHTML (claude/cursor likes seeing the JSX snippet, not just
-    // a file:line ref). data-insp-path format from plugin: "path:line:col".
-    let html = '';
-    if (loc) {
-      const candidates = document.querySelectorAll<HTMLElement>(`[data-insp-path="${loc}"]`);
-      const el = candidates[candidates.length - 1]; // outermost matching node
-      if (el) {
-        const clone = el.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll?.('[data-insp-path]').forEach(n => n.removeAttribute('data-insp-path'));
-        clone.removeAttribute('data-insp-path');
-        html = clone.outerHTML || '';
-        if (html.length > 1200) html = html.slice(0, 1200) + '\n  ...(truncated)';
-      }
-    }
-
-    const text = html
-      ? `${html}\n\nin <${name}> at ${loc}`
-      : `<${name}> at ${loc}`;
-
-    const electron = (window as any).require?.('electron');
-    if (electron?.clipboard?.writeText) {
-      electron.clipboard.writeText(text);
-    } else {
-      navigator.clipboard?.writeText?.(text);
-    }
-  } catch (err: any) {
-    console.error('[code-inspector] copy failed:', err?.message || err);
-  }
-});
+// === component inspector (Option+Shift) ===
+// Hover a UI element with Option+Shift held to frame it, click to copy
+// `file:line:column` + the DOM snippet in the Claude/Cursor-friendly format
+// this project already used; `M` pins an element and the pixel gap to the next
+// hovered one is drawn and copyable. The build stamps `data-insp-path` on every
+// JSX element, so this works in the installed .app without a dev server.
+// The upstream `code-inspector` client was replaced because its un-throttled
+// mousemove handler recalculated style+layout for the whole document on every
+// pointer move. See `src/renderer/utils/componentInspector.ts`.
+import { installComponentInspector } from './utils/componentInspector';
+installComponentInspector();
 
 // === TAG-BASED CONSOLE FILTER ===
 const _origLog = console.log.bind(console);

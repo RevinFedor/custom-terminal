@@ -5,6 +5,7 @@ const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
 const { findPastedContentEnvelope } = require('../shared/pasted-content.cjs');
 
 const fs = require('node:fs');
+const { watchWith } = require('./dir-watch');
 const path = require('node:path');
 const {
   describeClaudeMultitextPromptCarrier,
@@ -91,7 +92,7 @@ async function waitForClaudeTranscriptMaterialization(
             watcher = null;
             watchedDirectory = null;
             try {
-              const nextWatcher = fileSystem.watch(nextDirectory, { persistent: false }, () => {
+              const nextWatcher = watchWith(fileSystem)(nextDirectory, { persistent: false }, () => {
                 void refreshWatch().catch(() => finish(false, 'watch-refresh-failed'));
               });
               nextWatcher.on('error', () => finish(false, 'watch-error'));

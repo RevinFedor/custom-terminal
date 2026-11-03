@@ -12,7 +12,7 @@ const MAIN_PID = 98765; // A port identity only; never queried or signalled on t
 const LOG = '/private/tmp/noted-watchdog-control/watchdog.log';
 const SOCKET = '/private/tmp/noted-watchdog-control/renderer.sock';
 
-function load({ ipc, identityKnown = true, deferInitial = false } = {}) {
+function load({ ipc, identityKnown = true, deferInitial = false, samplerReply = null } = {}) {
   let now = 1, logBytes = 0, snapshots = 0, forcedFlushes = 0;
   const epoch = 1791820300000;
   const timers = new Set(), periods = [], exits = [], logs = [], sends = [];
@@ -72,6 +72,7 @@ function load({ ipc, identityKnown = true, deferInitial = false } = {}) {
       if (name === './perf-stall-sampler') return { createNativeStallSampler: () => ({
         request(meta) {
           samples.push(meta);
+          if (samplerReply) return samplerReply(meta);
           return { reason: deferInitial && meta.stalledMs < 1000
             ? 'native-reserved-for-critical-stall' : 'native-day-quota-exhausted' };
         },
@@ -128,6 +129,43 @@ if (process.argv[2] === '--watchdog-ipc-child') {
   });
   process.send({ t: 'control-ready' });
 } else {
+  test('многоминутное зависание получает снимок из резерва, даже когда обычный лимит выеден', t => {
+    // Шрам 03.11 12:11:45: главный поток стоял 4 минуты, сторож один раз
+    // услышал «лимит исчерпан» и к этому зависанию больше не возвращался.
+    const h = fixture(t, { samplerReply: meta => meta.stalledMs < 5000
+      ? { allowed: false, reason: 'native-day-quota-exhausted', retryAtStalledMs: 5000 }
+      : { allowed: true, reason: 'reserved-severe', admissionClass: 'severe' } });
+    h.heartbeat();
+    h.advance(600000);
+    assert.equal(h.summary().stalls, 1);
+    assert.equal(h.summary().samples, 2, 'первый отказ + один снимок на 5 с, без повторов после допуска');
+    assert.equal(h.samples[0].stallId, h.samples[1].stallId, 'тот же stall, не новое событие');
+    assert.ok(h.samples[1].stalledMs >= 5000 && h.samples[1].stalledMs < 5200, 'повтор на первом такте после 5 с');
+    h.heartbeat();
+  });
+
+  test('без указания повтора сторож к тому же зависанию не возвращается', t => {
+    const h = fixture(t, { samplerReply: () => ({ allowed: false, reason: 'native-day-quota-exhausted' }) });
+    h.heartbeat();
+    h.advance(60000);
+    assert.equal(h.summary().samples, 1, 'исчерпан и резерв: не дёргать сэмплер каждый такт');
+    h.heartbeat();
+  });
+
+  test('повтор только на пороге впереди: короткая пауза без повтора, пройденный порог не крутит запросы', t => {
+    // Ответ «повтори на 5 с» даже после 5 с не должен превращать каждый такт
+    // сторожа в новый запрос к сэмплеру.
+    const h = fixture(t, { samplerReply: () => ({ allowed: false, reason: 'native-day-quota-exhausted', retryAtStalledMs: 5000 }) });
+    h.heartbeat();
+    h.advance(1500);
+    h.heartbeat();
+    assert.equal(h.summary().samples, 1, 'пауза 1.5 с: один запрос, до порога повтора не дошла');
+    h.advance(20000);
+    h.heartbeat();
+    assert.equal(h.summary().samples, 3, 'зависание 20 с: начальный запрос + один повтор на 5 с, не каждый такт');
+    assert.ok(h.samples[2].stalledMs >= 5000);
+  });
+
   test('ten-minute Main silence stays a stall; probes stay bounded and late resume still works', t => {
     const h = fixture(t, { deferInitial: true });
     h.heartbeat();

@@ -179,9 +179,62 @@ async function waitForProdServer({
   throw error;
 }
 
+// Is this process running INSIDE the installed Noted Main it is about to quit?
+//
+// Every Noted PTY shell is a direct child of Main, so a command started from a
+// Noted tab — by a person or an agent — has that Main among its ancestors.
+// Quitting Noted SIGHUPs that PTY and kills the installer mid-flight. Scar
+// 01Nov: `npm run build:i-c` started from the "state terminal - main" tab
+// began maintenance, captured six working tabs, asked Main 89986 to quit and
+// died while waiting for it — no compile, no relaunch, no maintenance
+// complete; the app stayed closed and the stale window wedged the reinstall.
+//
+// Environment markers are not proof: that run used `env -i`. Ancestry is.
+// Three-state like every other process lookup here: an unreadable process
+// table is `unknown`, never `absent`.
+function inspectInstallerHost({ startPid = process.pid,
+  processSnapshot = () => execSync('ps -axo pid=,ppid=,command=', { encoding: 'utf8', timeout: 1500 }) } = {}) {
+  let snapshot;
+  try { snapshot = processSnapshot(); }
+  catch { return { status: 'unknown', reason: 'process_snapshot_failed' }; }
+  const rows = new Map();
+  for (const line of String(snapshot).split('\n')) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+    if (match) rows.set(Number(match[1]), { ppid: Number(match[2]), command: match[3] });
+  }
+  if (!rows.size) return { status: 'unknown', reason: 'empty_process_snapshot' };
+  const mainMarker = PROD_APP_MARKER + '/Contents/MacOS/Noted Terminal';
+  const isMain = command => (command === mainMarker || command.startsWith(mainMarker + ' '))
+    && !command.includes(' --type=') && !command.includes('mcp-hub.js');
+  const seen = new Set();
+  let pid = Number(startPid);
+  while (Number.isInteger(pid) && pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
+    const row = rows.get(pid);
+    if (!row) return { status: 'unknown', reason: 'ancestor_missing', pid };
+    if (isMain(row.command)) return { status: 'inside', mainPid: pid };
+    pid = row.ppid;
+  }
+  return { status: 'outside' };
+}
+
+function assertInstallerOutsideNoted(label, options = {}) {
+  const host = inspectInstallerHost(options);
+  if (host.status === 'outside') return host;
+  const where = host.status === 'inside'
+    ? 'it is running inside Noted Terminal (Main pid ' + host.mainPid + ')'
+    : 'its process ancestry could not be read (' + host.reason + ')';
+  throw Object.assign(new Error(label + ' refused: ' + where + '. Quitting Noted would kill this '
+    + 'installer before it relaunches the app, leaving the app closed and maintenance stuck. Run it from '
+    + 'a separate terminal (Terminal.app), or from an AI tab use build_install_noted_terminal (Terminal MCP).'),
+  { code: host.status === 'inside' ? 'installer_inside_noted' : 'installer_host_unknown', host });
+}
+
 module.exports = {
   DISCOVERY_DIR,
   TOKEN_PATH,
+  assertInstallerOutsideNoted,
+  inspectInstallerHost,
   findProdServer,
   inspectProdServer,
   readToken,

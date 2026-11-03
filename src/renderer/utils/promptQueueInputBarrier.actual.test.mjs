@@ -38,6 +38,7 @@ function fixture() {
     deferredOwnerSends: new Map(), queueShutdownPending: false, queueManualStopping: new Set(),
     autoCompactCoordinator: null, prevBusyRef: new Map(), isOrchestrationCompletionBlocked: () => false,
     capacityWorkflowBlocked: () => false, // no capacity fact in this input-owner fixture
+    tabOwnBackgroundWorkBlocks: () => false, // own-subagent gate is proven in tabOwnBackgroundWork.actual.test.mjs
     promptTabTriggerReady: () => true, hasPendingAgentGoalWork: () => false,
     useWorkspaceStore: { getState: () => ({ openProjects: new Map() }) },
   });

@@ -1,0 +1,732 @@
+{
+ "success": true,
+ "source": "headless-main",
+ "tabId": "tab-c1ea98b8-80f4-4a62-929c-47d11c9e4a45",
+ "reason": "committed-frame:15",
+ "rows": 79,
+ "cols": 78,
+ "baseY": 0,
+ "viewportY": 0,
+ "cursorX": 3,
+ "cursorY": 14,
+ "bufferType": "normal",
+ "mirrorGeneration": "a4ef0a96-5270-4e31-b200-898b8941e8f2",
+ "mirrorGenerationOrdinal": 13,
+ "synchronizedOutputOpen": false,
+ "synchronizedOutputSeq": 14,
+ "synchronizedOutputGeneration": 4,
+ "authoritativeFrameCommitted": true,
+ "committedFrameGeneration": 11,
+ "committedWriteSeq": 15,
+ "preViewportLines": [],
+ "lines": [
+  {
+   "row": 0,
+   "text": "fedor@MacBook-Pro-User fixtures % ",
+   "wrapped": false,
+   "occupiedEndX": 33,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x31"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 31,
+   "activeByInverse": false
+  },
+  {
+   "row": 1,
+   "text": "fedor@MacBook-Pro-User fixtures % claude --dangerously-skip-permissions",
+   "wrapped": false,
+   "occupiedEndX": 71,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x67"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 67,
+   "activeByInverse": false
+  },
+  {
+   "row": 2,
+   "text": " ▐▛███▛█   Claude Code v2.1.316",
+   "wrapped": false,
+   "occupiedEndX": 31,
+   "promptCellX": null,
+   "firstTextStyle": "fg=33554432:174,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1,bold x10",
+    "fg=33554432:246,bg=0:-1 x8",
+    "fg=33554432:174,bg=33554432:16 x6",
+    "fg=33554432:174,bg=0:-1 x1"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": true,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 25,
+   "activeByInverse": false
+  },
+  {
+   "row": 3,
+   "text": "▝▜██████▀  Haiku 5.5 · API Usage Billing",
+   "wrapped": false,
+   "occupiedEndX": 40,
+   "promptCellX": null,
+   "firstTextStyle": "fg=33554432:174,bg=0:-1",
+   "styles": [
+    "fg=33554432:246,bg=0:-1 x24",
+    "fg=33554432:174,bg=33554432:16 x5",
+    "fg=33554432:174,bg=0:-1 x4"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": true,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 33,
+   "activeByInverse": false
+  },
+  {
+   "row": 4,
+   "text": " ▝▝   ▝▝   /private/tmp/ios-e2e-20261101/fixtures",
+   "wrapped": false,
+   "occupiedEndX": 49,
+   "promptCellX": null,
+   "firstTextStyle": "fg=33554432:174,bg=0:-1",
+   "styles": [
+    "fg=33554432:246,bg=0:-1 x38",
+    "fg=33554432:174,bg=0:-1 x4"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 42,
+   "activeByInverse": false
+  },
+  {
+   "row": 5,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 6,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 7,
+   "text": "──────────────────────────────────────────────────────────────────────────────",
+   "wrapped": false,
+   "occupiedEndX": 78,
+   "promptCellX": null,
+   "firstTextStyle": "fg=33554432:153,bg=0:-1",
+   "styles": [
+    "fg=33554432:153,bg=0:-1 x78"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 78,
+   "activeByInverse": false
+  },
+  {
+   "row": 8,
+   "text": " Make auto mode your default permission mode?",
+   "wrapped": false,
+   "occupiedEndX": 45,
+   "promptCellX": null,
+   "firstTextStyle": "fg=33554432:153,bg=0:-1,bold",
+   "styles": [
+    "fg=33554432:153,bg=0:-1,bold x38"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 38,
+   "activeByInverse": false
+  },
+  {
+   "row": 9,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 10,
+   "text": "   Auto mode lets Claude handle permission prompts automatically. Claude",
+   "wrapped": false,
+   "occupiedEndX": 72,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x61"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 61,
+   "activeByInverse": false
+  },
+  {
+   "row": 11,
+   "text": "   checks each tool call for risky actions and prompt injection before",
+   "wrapped": false,
+   "occupiedEndX": 70,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x57"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 57,
+   "activeByInverse": false
+  },
+  {
+   "row": 12,
+   "text": "   executing, runs the ones it assesses as lower-risk, and blocks the rest.",
+   "wrapped": false,
+   "occupiedEndX": 75,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x61"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 61,
+   "activeByInverse": false
+  },
+  {
+   "row": 13,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 14,
+   "text": "   ❯ Yes, set auto mode as my default permission mode",
+   "wrapped": false,
+   "occupiedEndX": 53,
+   "promptCellX": 3,
+   "firstTextStyle": "fg=33554432:153,bg=0:-1",
+   "styles": [
+    "fg=33554432:153,bg=0:-1 x41"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": true,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 41,
+   "activeByInverse": false,
+   "promptSuffixAllDim": false,
+   "promptSuffixHasInverse": false,
+   "promptSuffixHasNonDefaultBg": false,
+   "promptSuffixWrapped": false
+  },
+  {
+   "row": 15,
+   "text": "     No, keep bypass permissions",
+   "wrapped": false,
+   "occupiedEndX": 32,
+   "promptCellX": null,
+   "firstTextStyle": "fg=0:-1,bg=0:-1",
+   "styles": [
+    "fg=0:-1,bg=0:-1 x24"
+   ],
+   "hasInverse": false,
+   "hasNonDefaultBg": false,
+   "hasNonDefaultFg": false,
+   "hasDim": false,
+   "allTextDim": false,
+   "styleCellCount": 24,
+   "activeByInverse": false
+  },
+  {
+   "row": 16,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 17,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 18,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 19,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 20,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 21,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 22,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 23,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 24,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 25,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 26,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 27,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 28,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 29,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 30,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 31,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 32,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 33,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 34,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 35,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 36,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 37,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 38,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 39,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 40,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 41,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 42,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 43,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 44,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 45,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 46,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 47,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 48,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 49,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 50,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 51,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 52,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 53,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 54,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 55,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 56,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 57,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 58,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 59,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 60,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 61,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 62,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 63,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 64,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 65,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 66,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 67,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 68,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 69,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 70,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 71,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 72,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 73,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 74,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 75,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 76,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 77,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  },
+  {
+   "row": 78,
+   "text": "",
+   "wrapped": false,
+   "occupiedEndX": 0,
+   "promptCellX": null
+  }
+ ],
+ "codexActivePrompt": null,
+ "codexCursorComposer": {
+  "row": 14,
+  "cursorX": 3,
+  "text": "Yes, set auto mode as my default permission mode",
+  "hasDraft": true,
+  "cursorOwned": true
+ },
+ "writeSeq": 15,
+ "flushedSeq": 15,
+ "pendingResizeWriteSeq": null,
+ "committedFrameReplay": false,
+ "liveSynchronizedOutputOpen": false
+}

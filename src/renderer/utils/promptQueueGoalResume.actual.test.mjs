@@ -30,6 +30,8 @@ const conditionFunctions = ts.transpileModule(['normalizeQueuedPromptContextCond
 function harness() {
   const head = { id: 'head', text: 'original body', enabled: true, trigger: { kind: 'app-restart', armedInstanceId: 'old' } };
   const queue = { items: [head], autoRun: true, workflowArmedAt: 100, workflowOutcomeFloorAt: null,
+    // Retired Post leftovers stay in the fixture on purpose: a persisted
+    // suffix must no longer reach a fired payload or its identity.
     postPromptEnabled: true, postPromptText: 'post', runAfterTabId: null };
   const pending = new Map(), busy = new Set(), inflight = new Set(), waitingBusy = new Set();
   const sends = [], cards = [], cancels = [], errors = [], subscribers = new Set(), workspaceSubscribers = new Set();
@@ -86,7 +88,7 @@ function harness() {
     hold: () => { let release; pausedPrep = new Promise(r => { release = r; }); return release; },
     change: fn => { fn(); for (const subscriber of subscribers) subscriber(); },
     request: () => ({ tabId: 'T', provider: 'codex', cwd: '/private-fixture', expectedTarget: { sessionId: 'S' },
-      handoffId: buildPromptQueueReceiptHandoffId({ kind: 'queue', itemId: head.id, payload: head.text + '\n\npost', causeKey: null }),
+      handoffId: buildPromptQueueReceiptHandoffId({ kind: 'queue', itemId: head.id, payload: head.text, causeKey: null }),
       intent: { version: 1, kind: 'queue', itemId: head.id, armedAt: 100, triggerTabId: 'T', conditionKey: context.queuedPromptContextConditionKey(head.condition), triggerKey: JSON.stringify(head.trigger) } }),
   };
 }
@@ -129,15 +131,23 @@ test('Pause/head/trigger/arm changes during own preparation abort before any han
   }
 });
 
-test('restored Main admission checks same body/Post/head/arm/owner and waits for hydration/editor/children', () => {
+test('restored Main admission checks same body/head/arm/owner and waits for hydration/editor/children', () => {
   const h = harness(), request = h.request(), read = () => h.context.readPromptQueueSendAdmission(request);
   assert.equal(read().ready, true);
   h.setHydrated(false); assert.equal(read().ready, false); h.setHydrated(true);
   h.setLocked(true); assert.equal(read().ready, false); h.setLocked(false);
   h.busy.add('T'); assert.equal(read().ready, false); h.busy.clear();
-  for (const mutate of [x => x.queue.autoRun = false, x => x.head.text = 'edited', x => x.queue.postPromptText = 'changed',
+  for (const mutate of [x => x.queue.autoRun = false, x => x.head.text = 'edited',
     x => x.queue.workflowArmedAt = 300, x => x.head.id = 'different']) {
     const x = harness(), old = x.request(); mutate(x); assert.equal(x.context.readPromptQueueSendAdmission(old).cancel, true);
   }
+  // Post was retired on 03Nov. Its persisted text no longer joins the payload,
+  // so changing it cannot invalidate an already admitted send — and must not
+  // silently change what that send delivers either.
+  const stale = harness(), admitted = stale.request();
+  stale.queue.postPromptText = 'changed';
+  assert.equal(stale.context.readPromptQueueSendAdmission(admitted).cancel, undefined,
+    'a retired policy does not cancel an admitted send');
+  assert.equal(stale.context.readPromptQueueSendAdmission(admitted).ready, true);
   request.expectedTarget.sessionId = 'foreign'; assert.equal(read().cancel, true);
 });

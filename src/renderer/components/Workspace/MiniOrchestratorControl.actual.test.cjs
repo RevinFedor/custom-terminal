@@ -12,6 +12,7 @@ const sharedBundle = esbuild.buildSync({ stdin: { contents: `export { ComposerCh
 const shared = { exports: {} };
 new Function('require', 'module', 'exports', sharedBundle.outputFiles[0].text)(require, shared, shared.exports);
 
+const pickerCalls = [];
 const source = fs.readFileSync(require('node:path').join(__dirname, 'MiniOrchestratorControl.tsx'), 'utf8');
 const code = esbuild.transformSync(source, { loader: 'tsx', format: 'cjs' }).code;
 const moduleStub = { exports: {} };
@@ -24,6 +25,9 @@ vm.runInNewContext(code, { module: moduleStub, exports: moduleStub.exports, docu
   if (name === '../../hooks/usePointerGesture') return {};
   if (name === './AIConversation/PastedContentPreview') return { default: () => null };
   if (name === '../../utils/tabMessageSourceJump') return { jumpToTerminalMessageTarget: () => Promise.resolve(true) };
+  // The shared Run After picker owns heavy workspace stores; forward mode only
+  // needs its props contract here, so the SSR harness records the call.
+  if (name === './RunAfterTabPicker') return { RunAfterTabPicker: (props) => { pickerCalls.push(props); return null; } };
   if (name === '../../utils/miniOrchestratorGeometry.mjs') return require('../../utils/miniOrchestratorGeometry.mjs');
   if (name === '../../utils/historyResponseTiming.mjs') return require('../../utils/historyResponseTiming.mjs');
   if (name.endsWith('.css')) return {};
@@ -31,7 +35,15 @@ vm.runInNewContext(code, { module: moduleStub, exports: moduleStub.exports, docu
   if (name === './HistoryTranscriptPresentation' || name === '@noted/claude-blocks') return shared.exports;
   throw new Error(name);
 } });
-const { miniEntriesToSteps, miniEntriesByRound, MiniReviewInput, MiniReviewInputContent, miniPopupLayout, MiniOrchestratorToggle, miniStatusPresentation, miniPhaseLabel, MiniOrchestratorStatus, MiniModelControls } = moduleStub.exports;
+const { miniEntriesToSteps, miniEntriesByRound, MiniReviewInput, MiniReviewInputContent, miniPopupLayout, MiniOrchestratorToggle, MiniOrchestratorEdgeControl, miniStatusPresentation, miniPhaseLabel, MiniOrchestratorStatus, MiniModelControls, MiniForwardControls } = moduleStub.exports;
+
+/** The edge control calls ensureLoaded on hover, so a controller stub needs it
+ * even when a case only checks markup. */
+const edgeController = (overrides = {}) => ({
+  tabId: 'work-tab', pending: false, error: '', snapshot: null,
+  ensureLoaded() {}, toggleEnabled() {}, setForward() {},
+  readInstruction: async () => null, ...overrides,
+});
 
 test('source pair and internal notices are not reviewer messages', () => {
   const steps = miniEntriesToSteps([{ id: '1', type: 'request', text: 'question' }, { id: '2', type: 'answer', text: 'answer' }, { id: '3', type: 'notice', text: 'internal' }]);
@@ -195,6 +207,125 @@ test('popup escapes clipping; menus close it and hidden panes cannot retain a bo
   assert.match(source, /position: 'fixed'/);
   assert.match(source, /!popup\.current\?\.contains/);
   assert.match(source, /detail\.presented === false\) setOpen\(false\)/);
+});
+
+test('the robot lives on the Run After edge row, not in the header, and Post is gone', () => {
   const overlay = fs.readFileSync(require('node:path').join(__dirname, 'PromptQueueOverlay.tsx'), 'utf8');
-  assert.match(overlay, /<AutoCompactControl tabId=\{tabId\} \/>\s*<MiniOrchestratorToggle controller=\{miniOrchestrator\} \/>/);
+  // It used to sit in the header right after AutoCompactControl, where Run
+  // After expanding on hover pushed it down and no reviewer name could fit.
+  assert.doesNotMatch(overlay, /<MiniOrchestratorToggle/, 'the header-only toggle is retired');
+  // Anchor on structure, not a character budget: the robot must be inside the
+  // edge-controls row that also owns Loop, with no other row opening between
+  // them. A plain distance limit broke on an unrelated comment.
+  const rowStart = overlay.lastIndexOf('data-prompt-queue-edge-controls', overlay.indexOf('<MiniOrchestratorEdgeControl'));
+  assert.ok(rowStart > 0, 'the robot renders inside the queue-wide policy row');
+  const row = overlay.slice(rowStart, overlay.indexOf('data-prompt-queue-loop-modes', rowStart));
+  assert.ok(row.includes('<MiniOrchestratorEdgeControl'), 'the robot takes the slot Post occupied, before Loop');
+  // Post is retired: its split button, its editor entry point and its local
+  // queue reads must all be gone, or a saved suffix keeps applying invisibly.
+  assert.doesNotMatch(overlay, /postPrompt/, 'no Post control or state remains in the overlay');
+});
+
+test('a retired Post suffix can no longer reach a fired queue item', () => {
+  const runner = fs.readFileSync(require('node:path').join(__dirname, '../../hooks/usePromptQueueRunner.ts'), 'utf8');
+  const body = runner.slice(runner.indexOf('function withPostPrompt'));
+  const fn = body.slice(0, body.indexOf('\n}') + 2);
+  assert.doesNotMatch(fn, /postPromptEnabled|postPromptText/,
+    'the chokepoint must not read the persisted suffix any more');
+  assert.match(fn, /return body;/, 'it passes the payload through unchanged');
+});
+
+test('forward mode offers the shared tab picker, routes its choice, and never shows a Gemini model pair', () => {
+  const chosen = [];
+  const controller = { tabId: 'work-tab', snapshot: { phase: 'idle',
+    forward: { reviewerTabId: 'rev-tab', reviewerName: 'Проверяющий', reviewerAvailable: true, instructionCustom: false, revision: 'forward:1:rev-tab' } },
+    setForward: (target) => { chosen.push(target); }, readInstruction: async () => null };
+  // The picker stub records its props; render through React so hooks run.
+  const html = renderToStaticMarkup(React.createElement(MiniForwardControls, { controller, panelRef: { current: null } }));
+  assert.match(html, /data-mini-forward-controls/);
+  assert.match(html, /data-mini-forward-instruction/, 'instruction editor is reachable');
+  assert.doesNotMatch(html, /Gemini/, 'a real reviewer tab owns its own model');
+  assert.ok(pickerCalls.length >= 1, 'the shared Run After picker is reused, not a new one');
+  const props = pickerCalls.at(-1);
+  assert.equal(props.runAfterTabId, 'rev-tab', 'picker shows the chosen reviewer');
+  assert.equal(props.tabId, 'work-tab', 'owner stays the reviewed tab');
+  assert.equal(props.closeOnSelect, true);
+  props.setRunAfterTab('work-tab', 'other-tab');
+  props.setRunAfterTab('work-tab', null);
+  assert.deepEqual(chosen, ['other-tab', null], 'choosing and clearing both persist through the controller');
+});
+
+test('an unavailable reviewer tab is marked, and the editor is blocked while a review runs', () => {
+  const base = { reviewerTabId: 'rev-tab', reviewerName: 'R', instructionCustom: true, revision: 'forward:1:rev-tab' };
+  const render = phase => renderToStaticMarkup(React.createElement(MiniForwardControls, {
+    controller: { tabId: 't', snapshot: { phase, forward: { ...base, reviewerAvailable: phase === 'sending' } },
+      setForward() {}, readInstruction: async () => null }, panelRef: { current: null } }));
+  assert.match(render('idle'), /role="status"/, 'unavailable reviewer is reported');
+  assert.match(render('sending'), /disabled/, 'instruction cannot change mid-review');
+});
+
+// --- Edge control: one button carries on/off AND the reviewer -------------
+// It replaced a header toggle that showed neither, plus a popup that imitated
+// a chat. These cases pin the parts a user acts on, not the styling.
+
+test('the edge control shows the reviewer name beside the robot', () => {
+  const withReviewer = renderToStaticMarkup(React.createElement(MiniOrchestratorEdgeControl, {
+    controller: edgeController({ snapshot: { phase: 'idle', enabled: true, entries: [],
+      forward: { reviewerTabId: 'rev-tab', reviewerName: 'Проверяющий', reviewerAvailable: true, instructionCustom: false, revision: 'forward:1:rev-tab' } } }) }));
+  assert.match(withReviewer, /Проверяющий/, 'the chosen tab is visible without opening anything');
+  assert.match(withReviewer, /aria-checked="true"/, 'enabled state is exposed, not only coloured');
+
+  const unset = renderToStaticMarkup(React.createElement(MiniOrchestratorEdgeControl, {
+    controller: edgeController({ snapshot: { phase: 'off', enabled: false, entries: [] } }) }));
+  assert.match(unset, /aria-checked="false"/);
+  assert.match(unset, /Правый клик/, 'an unset robot says how to choose a reviewer');
+});
+
+test('compact row keeps the robot usable without the name', () => {
+  const html = renderToStaticMarkup(React.createElement(MiniOrchestratorEdgeControl, {
+    compact: true, controller: edgeController({ snapshot: { phase: 'idle', enabled: true, entries: [],
+      forward: { reviewerTabId: 'rev-tab', reviewerName: 'Длинное имя вкладки', reviewerAvailable: true, instructionCustom: false, revision: 'r' } } }) }));
+  const body = html.slice(html.indexOf('</svg>'));
+  assert.doesNotMatch(body, /Длинное имя вкладки/, 'the narrow overview drops the visible label');
+  assert.match(html, /title="[^"]*Длинное имя вкладки/, 'but the reviewer is still named in the tooltip');
+  assert.match(html, /data-mini-orchestrator-toggle/, 'the switch itself stays');
+});
+
+test('left click toggles; right click opens the picker instead of toggling', () => {
+  const calls = [];
+  const controller = edgeController({ snapshot: { phase: 'idle', enabled: false, entries: [] },
+    toggleEnabled() { calls.push('toggle'); } });
+  // Render through a minimal host so the handlers are reachable as props.
+  let captured = null;
+  const Probe = () => {
+    const element = MiniOrchestratorEdgeControl({ controller });
+    captured = element;
+    return null;
+  };
+  renderToStaticMarkup(React.createElement(Probe));
+  const button = captured.props.children.find(child => child && child.props?.['data-mini-orchestrator-toggle']);
+  assert.ok(button, 'the switch is the first child of the edge control');
+  button.props.onClick();
+  assert.deepEqual(calls, ['toggle'], 'plain click is still the on/off switch');
+  let defaultPrevented = false;
+  button.props.onContextMenu({ preventDefault: () => { defaultPrevented = true; } });
+  assert.equal(defaultPrevented, true, 'right click must not open the OS menu');
+  assert.deepEqual(calls, ['toggle'], 'choosing a reviewer does not flip the switch');
+});
+
+test('an unavailable reviewer is reported on the control itself', () => {
+  const source = fs.readFileSync(require('node:path').join(__dirname, 'MiniOrchestratorControl.tsx'), 'utf8');
+  const card = source.slice(source.indexOf('function MiniEdgeCard'));
+  assert.match(card.slice(0, card.indexOf('\n}\n')), /reviewerAvailable && <CircleAlert/,
+    'the hover card marks a reviewer tab that no longer exists');
+});
+
+test('the hover card is a read-only jump surface, never a second chat', () => {
+  const source = fs.readFileSync(require('node:path').join(__dirname, 'MiniOrchestratorControl.tsx'), 'utf8');
+  const card = source.slice(source.indexOf('function MiniEdgeCard'), source.indexOf('function MiniForwardInstructionRow'));
+  // Delivered remarks already live in History; a second copy would drift.
+  assert.doesNotMatch(card, /ConversationMessage|HistoryTranscriptPresentation|miniEntriesByRound/,
+    'the card must not re-render the conversation');
+  assert.match(card, /navigateMiniReview/, 'the iteration row jumps into History');
+  assert.match(card, /Clock3/, 'the iteration row is present');
 });

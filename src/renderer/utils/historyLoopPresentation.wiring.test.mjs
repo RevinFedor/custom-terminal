@@ -39,13 +39,19 @@ test('only actual MCP and remaining system sources rotate; auto Continue/Loop ca
   assert.match(rail,/let previewColor = entryIsAutomaticContinuation \? '#8f8d88'/);
 });
 
-test('Run After counter replaces only the Loop dot with an existing static SVG; Post keeps its dot', () => {
-  const start=queue.indexOf('{(postPromptEnabled || loopPromptEnabled) && (');
+// Post was retired on 03Nov, so the counter badge carries Loop alone. The
+// static-SVG rule it was guarding is unchanged: an indicator must never
+// animate, because a spinner there reads as live work.
+test('Run After counter shows the Loop state with an existing static SVG', () => {
+  const start=queue.indexOf('{loopPromptEnabled && (');
   const end=queue.indexOf('</ControlHint>',start);const indicator=queue.slice(start,end);
   assert.ok(start>0 && end>start);
-  assert.match(indicator,/postPromptEnabled && <span/);
-  assert.match(indicator,/loopPromptEnabled && <RefreshCw data-prompt-queue-loop-indicator size=\{8\}/);
+  // With Post gone the wrapper itself is the Loop condition, so the icon no
+  // longer repeats it; what must hold is that the badge is this exact static
+  // SVG at its existing size.
+  assert.match(indicator,/<RefreshCw data-prompt-queue-loop-indicator size=\{8\}/);
   assert.doesNotMatch(indicator,/loopPromptEnabled && <span/);
   assert.doesNotMatch(indicator,/animate|animation|pq-spinner/);
+  assert.doesNotMatch(queue,/postPrompt/,'a retired policy must not keep a badge');
   assert.match(queue,/data-prompt-queue-count-label style=\{\{ transform: loopPromptEnabled \? 'translateY\(-3px\)'/);
 });

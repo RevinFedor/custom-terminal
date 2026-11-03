@@ -171,7 +171,7 @@ function createMiniOrchestrator({ review, sendCorrection, loadInstruction, isCur
       if (!fence(s, j)) return { status: 'refused', error: 'stale' };
       const entry = { id: uuid(), type: 'tool', text: prompt, name: 'send_prompt', handoffId: record.handoffId, status: 'sending', round }; s.entries.push(entry); s.phase = 'sending'; changed(s);
       let receipt;
-      try { receipt = await sendCorrection({ tabId, owner: j.owner, turnId, jobId: j.id, prompt, handoffId: record.handoffId, isCurrent: () => fence(s, j) }); }
+      try { receipt = await sendCorrection({ tabId, owner: j.owner, turnId, jobId: j.id, prompt, handoffId: record.handoffId, isCurrent: () => fence(s, j), ...(j.targetTabId ? { targetTabId: j.targetTabId } : {}) }); }
       catch (e) { receipt = { status: 'unknown', error: String(e) }; }
       // The attempted handoff remains real even when the review was invalidated.
       entry.receipt = clone(mergeReceipt(record.receipt, receipt === undefined ? { status: 'unknown' } : receipt)); entry.status = entry.receipt.status || 'unknown';
@@ -190,6 +190,9 @@ function createMiniOrchestrator({ review, sendCorrection, loadInstruction, isCur
       if (!instruction || typeof instruction.text !== 'string' || instruction.text.length > LIMIT) throw new Error('invalid_instruction');
       const startedAt = j.startedAt;
       s.activeReview = { jobId: j.id, model: instruction.model || '', thinkingLevel: instruction.thinkingLevel || '', startedAt };
+      // Forward mode delivers to the reviewer tab chosen by the user. The
+      // owner fence, ledger and receipt still belong to the reviewed tab.
+      if (instruction.mode === 'forward' && typeof instruction.reviewerTabId === 'string' && instruction.reviewerTabId) j.targetTabId = instruction.reviewerTabId;
       const requestIndex = s.entries.findIndex(x => x.round === round);
       s.entries.splice(requestIndex, 0, { id: instruction.id || uuid(), type: 'instruction', text: instruction.text, name: instruction.name, promptRevision: instruction.revision, filePath: Array.isArray(instruction.filePaths) ? instruction.filePaths.join('\n') : undefined, round }); changed(s);
       const previousFeedback = s.ledger.filter(x => x !== record && x.rootHash === rootHash && x.ownerKey === key
@@ -236,7 +239,16 @@ function createMiniOrchestrator({ review, sendCorrection, loadInstruction, isCur
     }
   }
   function clear(tabId) { const s = state(tabId); if (s.job || s.phase === 'sending' || s.phase === 'reviewing') return false; s.entries = []; delete s.reviewSource; delete s.jobId; delete s.error; delete s.correctionState; s.phase = s.enabled ? 'idle' : 'off'; changed(s); return true; }
-  function validateSend({ tabId, handoffId }) { const s = state(tabId), j = s.pendingSend || s.job; return !!(j && j.attempted && j.persistedAttempt && handoffId === 'mini-orchestrator:' + j.id && fence(s, j)); }
+  // In forward mode the recipient is the reviewer tab, while the review and its
+  // durable attempt belong to the REVIEWED tab. Validating only by recipient
+  // would reject the controller's own send, so the owning tab is found by the
+  // handoff id when the recipient itself holds no matching job.
+  function validateSend({ tabId, handoffId }) {
+    const match = s => { const j = s.pendingSend || s.job; return !!(j && j.attempted && j.persistedAttempt && handoffId === 'mini-orchestrator:' + j.id && fence(s, j)); };
+    if (match(state(tabId))) return true;
+    for (const s of tabs.values()) if (s.tabId !== tabId && match(s)) return true;
+    return false;
+  }
   // Adapters supply canonical normalized status: queued, sent, or unknown.
   function observeSendReceipt({ tabId, handoffId, receipt }) {
     const s = state(tabId), record = s.ledger.find(x => x.handoffId === handoffId);

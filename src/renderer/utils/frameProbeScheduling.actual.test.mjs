@@ -4,11 +4,19 @@ import { readFileSync, writeFileSync } from 'node:fs';
 const evidence=[];
 import { EventEmitter } from 'node:events';
 import { transformSync } from 'esbuild';
+import syncWork from '../../shared/perf-sync-work.cjs';
 
-// Compile the actual three modules. Only browser/Electron/socket participants
+// Compile the actual modules. Only browser/Electron/socket participants
 // are substituted: no UI dispatch, real timers, IPC, profiling or network.
-const compiled = new Map(['uiPerformanceDiagnostics.mjs', 'perfIncidentChannel.ts', 'perfFreezeProbe.ts'].map(name => [name,
-  transformSync(readFileSync(process.env.FRAME_PROBE_BASELINE_DIR && name !== 'perfIncidentChannel.ts' ? process.env.FRAME_PROBE_BASELINE_DIR+'/'+name+'.before' : new URL(name, import.meta.url), 'utf8'), { loader: name.endsWith('.ts') ? 'ts' : 'js',
+//
+// `perfSyncWork.mjs` is a dependency of the probe, not a participant of frame
+// scheduling: it is always compiled from the current tree, so the RED baseline
+// below still measures the OLD scheduling against today's sync-work ring.
+// Omitting it from this map was a real failure: the harness asserts every
+// require is declared, so all 16 cases died at load with `./perfSyncWork.mjs`.
+const BASELINE_EXEMPT = new Set(['perfIncidentChannel.ts', 'perfSyncWork.mjs']);
+const compiled = new Map(['uiPerformanceDiagnostics.mjs', 'perfIncidentChannel.ts', 'perfFreezeProbe.ts', 'perfSyncWork.mjs'].map(name => [name,
+  transformSync(readFileSync(process.env.FRAME_PROBE_BASELINE_DIR && !BASELINE_EXEMPT.has(name) ? process.env.FRAME_PROBE_BASELINE_DIR+'/'+name+'.before' : new URL(name, import.meta.url), 'utf8'), { loader: name.endsWith('.ts') ? 'ts' : 'js',
     format: 'cjs', target: 'node18', define: { 'import.meta.env.DEV': 'true' } }).code]));
 
 function harness({deferWatchdogInfo=false}={}) {
@@ -73,6 +81,7 @@ function harness({deferWatchdogInfo=false}={}) {
   const ui = load('uiPerformanceDiagnostics.mjs', {});
   const channel = load('perfIncidentChannel.ts', { './uiPerformanceDiagnostics.mjs': ui });
   const probe = load('perfFreezeProbe.ts', {
+    './perfSyncWork.mjs': load('perfSyncWork.mjs', { '../../shared/perf-sync-work.cjs': syncWork }),
     './uiPerformanceDiagnostics.mjs': ui, './perfIncidentChannel': channel,
     '../store/useWorkspaceStore': { useWorkspaceStore: { getState: () => ({ view: 'workspace', openProjects: new Map() }) } },
     './rendererActivityTrail': { attributeFreeze: () => '', recentRendererActivities: () => '', markRendererActivity: () => {} },

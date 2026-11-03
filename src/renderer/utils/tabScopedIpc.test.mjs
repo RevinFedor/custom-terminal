@@ -189,3 +189,85 @@ test('source: Terminal.tsx routes the addressed channels and keeps terminal:exit
   assert.ok(terminal.includes("ipcRenderer.on('terminal:exit'"),
     'terminal:exit carries a bare tabId string and stays on the raw listener');
 });
+
+test('a channel can be routed by a key other than tabId', () => {
+  // `agent-transcript:changed` addresses a transcript, not a tab, and its
+  // subscribers filter on sessionId. Routing it by tabId would deliver
+  // nothing at all — a silent regression that no tabId-only test would see.
+  const { api, emit } = build();
+  const hits = [];
+  api.onTabScopedIpcMessage('agent-transcript:changed', 'sess-1',
+    (_event, payload) => hits.push(payload.reason), { key: 'sessionId' });
+  emit('agent-transcript:changed', { sessionId: 'sess-1', reason: 'append' });
+  emit('agent-transcript:changed', { sessionId: 'sess-2', reason: 'other' });
+  assert.deepEqual(hits, ['append'], 'only the addressed session is delivered');
+});
+
+test('two routing keys on the same channel stay separate', () => {
+  // A caller asking for a different key must not silently join the existing
+  // route and start receiving payloads matched on the wrong field.
+  const { api, emit, registered } = build();
+  const byTab = [], bySession = [];
+  api.onTabScopedIpcMessage('mixed', 'x', () => byTab.push('tab'));
+  api.onTabScopedIpcMessage('mixed', 'x', () => bySession.push('session'), { key: 'sessionId' });
+  assert.equal(registered.get('mixed').length, 2, 'one real listener per route');
+  emit('mixed', { tabId: 'x' });
+  assert.deepEqual([byTab, bySession], [['tab'], []]);
+  emit('mixed', { sessionId: 'x' });
+  assert.deepEqual([byTab, bySession], [['tab'], ['session']]);
+});
+
+test('source: HistoryPanel routes its broadcast channels', () => {
+  const panel = readFileSync(resolve(HERE, '../components/Workspace/HistoryPanel.tsx'), 'utf8');
+  assert.ok(panel.includes("onTabScopedIpcMessage(\n      'agent-transcript:terminal-preview', tabId"),
+    'terminal-preview must be routed by tabId');
+  assert.ok(panel.includes("'agent-transcript:changed', sessionId, onChanged, { key: 'sessionId' }"),
+    'transcript changes must be routed by sessionId');
+  for (const channel of ['agent-transcript:terminal-preview', 'agent-transcript:changed']) {
+    assert.ok(!panel.includes(`ipcRenderer.on('${channel}'`),
+      `${channel} must not also register a raw broadcast listener`);
+  }
+});
+
+test('source: card and control bar route the context channels', () => {
+  // These two are rendered per tab, so a broadcast reaches every card at once.
+  // Measured 04:13 UTC (after the first round of fixes was installed):
+  // codex:context-update delivery reached 1493ms and was the remaining
+  // offender in the attribution of tab-switch stalls.
+  const signals = readFileSync(resolve(HERE, '../components/Workspace/TabSignals.tsx'), 'utf8');
+  const bar = readFileSync(resolve(HERE, '../components/Workspace/ClaudeControlBar.tsx'), 'utf8');
+  for (const channel of ['claude:bridge-update', 'codex:context-update']) {
+    assert.ok(signals.includes(`onTabScopedIpcMessage('${channel}', tabId`),
+      `TabSignals must route ${channel}`);
+    assert.ok(!signals.includes(`ipcRenderer.on('${channel}'`),
+      `TabSignals must not keep a raw listener for ${channel}`);
+  }
+  assert.ok(bar.includes("onTabScopedIpcMessage('codex:context-update', tabId"),
+    'ClaudeControlBar must route codex:context-update');
+  // Ownership checks must survive the move: routing by tab is not a licence
+  // to accept a frame from a stale session (fix-bridge-stale-takeover.md).
+  assert.ok(signals.includes('isStaleAgainstPending(tabId, frameSessionId)'),
+    'the stale-session guard must remain');
+  assert.ok(signals.includes('data?.tabId !== tabId'),
+    'apply must still reject a foreign tab');
+});
+
+test('source: the control bar has no raw broadcast listeners left', () => {
+  // 24 control bars were live in the 05:49-05:58 window. Every broadcast
+  // channel they listened to ran 24 handlers per event, and the lifecycle
+  // ones also wrote 24 diagnostic lines (23 of them `match=false`).
+  const bar = readFileSync(resolve(HERE, '../components/Workspace/ClaudeControlBar.tsx'), 'utf8');
+  const raw = [...bar.matchAll(/ipcRenderer\.on\('([^']+)'/g)].map(m => m[1]);
+  assert.deepEqual(raw, [], 'every addressed channel must go through the dispatcher');
+  const orphan = [...bar.matchAll(/ipcRenderer\.removeListener\('([^']+)'/g)].map(m => m[1]);
+  assert.deepEqual(orphan, [], 'no removeListener may survive without its on()');
+  // The transcript channel addresses a session, not a tab.
+  assert.ok(bar.includes("'agent-transcript:changed', claudeSessionId, onTranscriptChanged, { key: 'sessionId' }"),
+    'transcript changes must be routed by sessionId');
+  // Spot-check that busy/cache/lifecycle really went through.
+  for (const channel of ['claude:cache-update', 'claude:busy-state', 'codex:busy-state',
+    'terminal:command-finished', 'claude:process-started']) {
+    assert.ok(bar.includes(`onTabScopedIpcMessage('${channel}', tabId`),
+      `${channel} must be routed by tabId`);
+  }
+});

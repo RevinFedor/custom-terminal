@@ -1,4 +1,6 @@
 import { getGeminiApiKey } from './geminiApiKey.mjs';
+import { getOpenAIApiKey } from './openaiApiKey.mjs';
+import { resolveUtilityAIModel, openAIEffortForModel } from '../../shared/utility-ai-provider.mjs';
 import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import {
   DEFAULT_PROMPT_SUMMARY_PROMPT,
@@ -332,6 +334,37 @@ async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPro
   }
 }
 
+// Токены разных провайдеров приводятся к одной форме, которую показывает
+// Settings → AI → Статистика: `in` — вход, `out` — видимый ответ, `think` —
+// рассуждение, `Σ` — всё вместе. У Gemini `candidatesTokenCount` уже не
+// включает размышление, у OpenAI `completion_tokens` включает: если записать
+// его в `out` как есть, рассуждение посчитается дважды и `Σ` разойдётся с
+// суммой колонок. Поэтому для OpenAI видимый ответ = completion − reasoning.
+type NormalizedUsage = { promptTokens: number; candidateTokens: number; thoughtTokens: number; totalTokens: number };
+
+function geminiUsage(usage: any): NormalizedUsage {
+  return {
+    promptTokens: Number(usage?.promptTokenCount || 0),
+    candidateTokens: Number(usage?.candidatesTokenCount || 0),
+    thoughtTokens: Number(usage?.thoughtsTokenCount || 0),
+    totalTokens: Number(usage?.totalTokenCount || 0),
+  };
+}
+
+function openAIUsage(usage: any): NormalizedUsage {
+  const promptTokens = Number(usage?.prompt_tokens || 0);
+  const completion = Number(usage?.completion_tokens || 0);
+  const thoughtTokens = Number(usage?.completion_tokens_details?.reasoning_tokens || 0);
+  return {
+    promptTokens,
+    candidateTokens: Math.max(0, completion - thoughtTokens),
+    thoughtTokens,
+    totalTokens: Number(usage?.total_tokens || promptTokens + completion),
+  };
+}
+
+const EMPTY_USAGE: NormalizedUsage = { promptTokens: 0, candidateTokens: 0, thoughtTokens: 0, totalTokens: 0 };
+
 export async function generateTitleFromPromptWithConfig(
   userPrompt: string,
   promptConfig: AIPrompt | undefined,
@@ -344,50 +377,51 @@ export async function generateTitleFromPromptWithConfig(
     sanitize?: (raw: string) => string;
     sourceChars?: number;
     usageMetadata?: PromptUsageMetadata;
+    // Utility-задачи (названия вкладок и Run After, пересказы промптов, тема
+    // отложенной задачи) идут через выбранного utility-провайдера. Группировка
+    // Timeline его НЕ использует и остаётся на Gemini: этот флаг — её граница.
+    useUtilityProvider?: boolean;
   }
 ): Promise<string | null> {
-  const apiKey = await getGeminiApiKey();
+  // Модель, сохранённая в Settings, принадлежит конкретному провайдеру. Чужую
+  // заменяет `resolveUtilityAIModel`, и в журнал идёт фактически вызванная.
+  const resolved = options.useUtilityProvider
+    ? resolveUtilityAIModel(promptConfig?.model, promptConfig?.thinkingLevel)
+    : { provider: 'gemini' as const, model: promptConfig?.model || 'gemini-3.8-flash',
+        thinking: promptConfig?.thinkingLevel || 'NONE', replacedModel: null };
+  const isOpenAI = resolved.provider === 'openai';
+  const model = resolved.model;
+  const thinkingLevel = resolved.thinking;
+
+  const apiKey = isOpenAI ? await getOpenAIApiKey() : await getGeminiApiKey();
   if (!apiKey) {
-    console.warn('[' + options.logPrefix + '] GEMINI_API_KEY missing');
+    console.warn('[' + options.logPrefix + '] ' + (isOpenAI ? 'OPENAI_API_KEY' : 'GEMINI_API_KEY') + ' missing');
     return null;
   }
 
-  const model = promptConfig?.model || 'gemini-3.8-flash';
-  const thinkingLevel = promptConfig?.thinkingLevel || 'NONE';
   const systemPrompt = await buildSystemPrompt(promptConfig, options.fallbackPrompt, options.logPrefix);
   console.warn(
     '[' + options.logPrefix + '] request' +
     ' task=' + (options.taskType || options.logPrefix) +
     ' promptId=' + (promptConfig?.id || options.promptId || 'none') +
+    ' provider=' + resolved.provider +
     ' model=' + model +
+    (resolved.replacedModel ? ' (replaced saved ' + resolved.replacedModel + ')' : '') +
     ' thinking=' + thinkingLevel +
     ' sourceChars=' + userPrompt.length
   );
-  const requestBody: any = {
-    contents: [{
-      role: 'user',
-      parts: [{ text: `${options.sourceLabel}:\n\n${userPrompt}` }],
-    }],
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-  };
 
-  if (model.includes('gemini-3') && thinkingLevel !== 'NONE') {
-    requestBody.generationConfig = {
-      thinkingConfig: { thinkingLevel },
-    };
-  }
-
-  const logUsage = async (status: 'success' | 'error', usage: any = {}, raw = '', error?: string) => {
+  const logUsage = async (status: 'success' | 'error', usage: NormalizedUsage = EMPTY_USAGE, raw = '', error?: string) => {
     try {
       await ipcRenderer.invoke('ai-prompts:log-call', {
         promptId: promptConfig?.id || options.promptId || null,
         taskType: options.taskType || options.logPrefix,
         model,
         thinkingLevel,
-        promptTokens: Number(usage?.promptTokenCount || 0),
-        candidateTokens: Number(usage?.candidatesTokenCount || 0),
-        thoughtTokens: Number(usage?.thoughtsTokenCount || 0),
-        totalTokens: Number(usage?.totalTokenCount || 0),
+        promptTokens: usage.promptTokens,
+        candidateTokens: usage.candidateTokens,
+        thoughtTokens: usage.thoughtTokens,
+        totalTokens: usage.totalTokens,
         status,
         error: error ? String(error).slice(0, 500) : null,
         sourceChars: Number.isFinite(Number(options.sourceChars)) ? Number(options.sourceChars) : userPrompt.length,
@@ -400,42 +434,96 @@ export async function generateTitleFromPromptWithConfig(
   };
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      {
+    let raw = '';
+    let usage: NormalizedUsage = EMPTY_USAGE;
+
+    if (isOpenAI) {
+      const requestBody: any = {
+        model,
+        messages: [
+          ...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt }] : []),
+          { role: 'user', content: `${options.sourceLabel}:\n\n${userPrompt}` },
+        ],
+        max_completion_tokens: 2048,
+      };
+      const effort = openAIEffortForModel(thinkingLevel, model);
+      if (effort) requestBody.reasoning_effort = effort;
+
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(requestBody),
+      });
+      const data = await response.json();
+      usage = openAIUsage(data?.usage);
+      if (data?.error) {
+        console.warn('[' + options.logPrefix + '] OpenAI error:', data.error.message || response.status);
+        await logUsage('error', usage, '', data.error.message || String(response.status));
+        return null;
       }
-    );
-    const data = await response.json();
-    if (data?.error) {
-      console.warn('[' + options.logPrefix + '] Gemini error:', data.error.message || data.error.status || response.status);
-      await logUsage('error', data?.usageMetadata || {}, '', data.error.message || data.error.status || response.status);
-      return null;
+      const choice = data?.choices?.[0];
+      raw = String(choice?.message?.content || '');
+      if (!raw.trim()) {
+        // Пустой текст при finish_reason 'length' означает, что бюджет вывода
+        // ушёл в рассуждение: это отказ, а не пустой результат.
+        const reason = choice?.finish_reason === 'length'
+          ? 'output budget spent on reasoning (' + usage.thoughtTokens + ' tokens)'
+          : 'empty response' + (choice?.finish_reason ? ' (' + choice.finish_reason + ')' : '');
+        console.warn('[' + options.logPrefix + '] OpenAI ' + reason);
+        await logUsage('error', usage, '', reason);
+        return null;
+      }
+    } else {
+      const requestBody: any = {
+        contents: [{
+          role: 'user',
+          parts: [{ text: `${options.sourceLabel}:\n\n${userPrompt}` }],
+        }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+      };
+      if (model.includes('gemini-3') && thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = { thinkingConfig: { thinkingLevel } };
+      }
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        }
+      );
+      const data = await response.json();
+      usage = geminiUsage(data?.usageMetadata);
+      if (data?.error) {
+        console.warn('[' + options.logPrefix + '] Gemini error:', data.error.message || data.error.status || response.status);
+        await logUsage('error', usage, '', data.error.message || data.error.status || response.status);
+        return null;
+      }
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      raw = parts
+        .filter((p: any) => !p.thought)
+        .map((p: any) => p.text || '')
+        .join('');
     }
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const raw = parts
-      .filter((p: any) => !p.thought)
-      .map((p: any) => p.text || '')
-      .join('');
-    await logUsage('success', data?.usageMetadata || {}, raw);
+
+    await logUsage('success', usage, raw);
     const title = (options.sanitize || sanitizeGeneratedTabTitle)(raw);
     console.warn(
       '[' + options.logPrefix + '] result' +
       ' task=' + (options.taskType || options.logPrefix) +
       ' status=success' +
+      ' provider=' + resolved.provider +
       ' rawChars=' + raw.length +
       ' output=' + JSON.stringify(title || null) +
-      ' promptTokens=' + Number(data?.usageMetadata?.promptTokenCount || 0) +
-      ' candidateTokens=' + Number(data?.usageMetadata?.candidatesTokenCount || 0) +
-      ' thoughtTokens=' + Number(data?.usageMetadata?.thoughtsTokenCount || 0) +
-      ' totalTokens=' + Number(data?.usageMetadata?.totalTokenCount || 0)
+      ' promptTokens=' + usage.promptTokens +
+      ' candidateTokens=' + usage.candidateTokens +
+      ' thoughtTokens=' + usage.thoughtTokens +
+      ' totalTokens=' + usage.totalTokens
     );
     return title || null;
   } catch (err: any) {
     console.warn('[' + options.logPrefix + '] request failed:', err?.message || err);
-    await logUsage('error', {}, '', err?.message || err);
+    await logUsage('error', EMPTY_USAGE, '', err?.message || err);
     return null;
   }
 }
@@ -447,6 +535,7 @@ export async function generateTabTitleFromPrompt(userPrompt: string, promptConfi
     logPrefix: 'TabTitle',
     taskType: 'tab-title',
     promptId: TAB_TITLE_PROMPT_ID,
+    useUtilityProvider: true,
   });
   if (title) return title;
 
@@ -478,6 +567,7 @@ export async function generateTimelinePromptSummaryFromPrompt(
     sanitize: sanitizeGeneratedPromptSummary,
     sourceChars: current.length,
     usageMetadata: options.usageMetadata,
+    useUtilityProvider: true,
   });
 }
 

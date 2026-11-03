@@ -54,7 +54,12 @@ test('preview, fenced/inline code and hosts without an assistant adapter do not 
     assert.doesNotMatch(render(props), /data-history-iteration-link|class="history-iteration-link"/);
   }
   const malformed = render({ text: '[Bad](#noted-message?iteration=42)', renderLink: renderHistoryIterationLink });
-  assert.match(malformed, /Некорректная ссылка/); assert.doesNotMatch(malformed, /<a/);
+  assert.match(malformed, /Неполный или некорректный адрес/); assert.doesNotMatch(malformed, /<a/);
+  // Same treatment for a TRUNCATED address, which used to render clickable and
+  // then fail at the end of the jump (02.11). See terminalMessageLinkTruncation.
+  const truncated = render({ text: '[Итерация 2](#noted-message?tabId=T&provider=claude&sessionId=S&messageId=dd6da706)',
+    renderLink: renderHistoryIterationLink });
+  assert.doesNotMatch(truncated, /<a/); assert.match(truncated, /Неполный или некорректный адрес/);
   assert.equal(calls.length, 0);
 });
 test('click uses the existing target port once, suppresses fragment navigation, and handles cancellation/failure honestly', async () => {

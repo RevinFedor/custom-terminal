@@ -3,14 +3,32 @@
 const SELECTED_MARKER_RE = /^\s*[❯›>]/u;
 const FOOTER_RE = /Enter\s+to\s+confirm\b.*\bEsc\s+to\s+(?:exit|cancel)\b/i;
 
+// CLI 2.1.316 builds the decline label from the CURRENT permission mode
+// (`No, keep ${indicator}`), so it is not always "bypass permissions". These
+// are the exact indicators the CLI ships; an unknown one must stay unmatched
+// rather than be guessed, because the writer presses Enter on the result.
+const DECLINE_MODES = [
+  'bypasspermissions',
+  'planmode',
+  'acceptedits',
+  'automode',
+  "don'task",
+  'donask',
+];
+// New builds dropped the row numbers this matcher used to require (live frame
+// 01.11, CLI 2.1.316: `❯ Yes, set auto mode…` / `  No, keep bypass
+// permissions`). The number is optional; order comes from the actual rows.
+const YES_ROW_RE = /^(?:[❯›>]\s*)?(?:\d+\.\s*)?Yes,?\s*set\s+auto\b/i;
+const NO_ROW_RE = /^(?:[❯›>]\s*)?(?:\d+\.\s*)?No,?\s*keep\b/i;
+
 function looksLikeClaudeAutoModeDefaultPromptText(text) {
   const compact = String(text || '')
     .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, '')
     .toLowerCase();
   return compact.includes('makeautomodeyourdefaultpermissionmode?')
-    || compact.includes('1.yes,setautomodeasmydefaultpermissionmode')
-    || compact.includes('2.no,keepbypasspermissions');
+    || compact.includes('yes,setautomodeasmydefaultpermissionmode')
+    || DECLINE_MODES.some((mode) => compact.includes('no,keep' + mode));
 }
 
 function normalizeLine(line) {
@@ -75,13 +93,13 @@ function inspectClaudeAutoModeDefaultPromptSnapshot(snapshot) {
   let noIndex = -1;
   for (let index = 0; index <= lastIndex; index += 1) {
     const text = lines[index].normalized;
-    if (/^(?:[❯›>]\s*)?1\.\s*Yes,?\s*set\s+auto\b/i.test(text)) {
+    if (YES_ROW_RE.test(text)) {
       yesIndex = index;
     }
     if (
       yesIndex >= 0
       && index > yesIndex
-      && /^(?:[❯›>]\s*)?2\.\s*No,?\s*keep\b/i.test(text)
+      && NO_ROW_RE.test(text)
     ) {
       noIndex = index;
       break;
@@ -109,7 +127,7 @@ function inspectClaudeAutoModeDefaultPromptSnapshot(snapshot) {
     return { visible: false, selectedOption: null, reason: 'footer-not-current' };
   }
   const optionEnd = footerIndex >= 0 ? footerIndex : lastIndex + 1;
-  const yesNeedle = '1.yes,setautomodeasmydefaultpermissionmode';
+  const yesNeedle = 'yes,setautomodeasmydefaultpermissionmode';
   let yesCompleteEnd = -1;
   for (let end = yesIndex + 1; end <= noIndex; end += 1) {
     if (compactText(lines, yesIndex, end).includes(yesNeedle)) {
@@ -123,10 +141,10 @@ function inspectClaudeAutoModeDefaultPromptSnapshot(snapshot) {
   if (lines.slice(yesCompleteEnd, noIndex).some((line) => line.normalized)) {
     return { visible: false, selectedOption: null, reason: 'yes-option-tail-ambiguous' };
   }
-  const noNeedle = '2.no,keepbypasspermissions';
   let noCompleteEnd = -1;
   for (let end = noIndex + 1; end <= optionEnd; end += 1) {
-    if (compactText(lines, noIndex, end).includes(noNeedle)) {
+    const compact = compactText(lines, noIndex, end);
+    if (DECLINE_MODES.some((mode) => compact.includes('no,keep' + mode))) {
       noCompleteEnd = end;
       break;
     }

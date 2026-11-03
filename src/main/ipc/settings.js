@@ -83,6 +83,7 @@ function sanitizeFileForPrompt(raw, filePath) {
 function register({ projectManager, savedPromptService, systemPromptService }) {
   // Local renderer reads the configured runtime key; never bake it into build output.
   ipcMain.handle('settings:get-gemini-api-key', () => String(process.env.GEMINI_API_KEY || ''));
+  ipcMain.handle('settings:get-openai-api-key', () => String(process.env.OPENAI_API_KEY || ''));
 
   // ── Prompts ──
 

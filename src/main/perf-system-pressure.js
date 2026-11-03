@@ -13,7 +13,25 @@ function parseSystemPressure(sysctl, vmstat) {
   const bytes = count => count !== null && pageSize !== null ? count * pageSize : null;
   const swap = /vm\.swapusage:.*?used\s*=\s*([\d.]+)([KMGTP])\b/i.exec(sysctl);
   const pressureLevel = number(sysctl, /kern\.memorystatus_vm_pressure_level:\s*(\d+)/);
-  return { pressureLevel, pageSize,
+  // `os.freemem()` на macOS считает ТОЛЬКО полностью пустые страницы и потому
+  // почти всегда показывает сотни мегабайт — даже когда система свободна.
+  // `inactive` и `speculative` отдаются приложению по первому требованию, это
+  // тоже доступная память.
+  //
+  // Шрам 02.11: по `freeMemoryBytes` я трижды подряд объявил причиной
+  // пользовательских лагов нехватку памяти — 154, 130 и 167МБ «свободно».
+  // Сверка в тот же момент: free+inactive+speculative = 11.7ГБ, разница в 14
+  // раз. Вывод был неверным, и настоящую причину зависаний он скрыл.
+  //
+  // Поэтому отдаются ОБА числа под разными именами. `freeMemoryBytes`
+  // сохраняется как было (его читают прежние потребители), а решение
+  // «мало памяти» принимается по `availableMemoryBytes`.
+  const freePages = pages('Pages free'), inactivePages = pages('Pages inactive');
+  const speculativePages = pages('Pages speculative');
+  const availableMemoryBytes = freePages !== null && inactivePages !== null && pageSize !== null
+    ? (freePages + inactivePages + (speculativePages ?? 0)) * pageSize : null;
+  return { pressureLevel, pageSize, availableMemoryBytes,
+    availableMemoryBasis: 'vm_stat free+inactive+speculative; os.freemem() counts only fully free pages',
     swapUsedBytes: swap ? Number(swap[1]) * 1024 ** ('KMGTP'.indexOf(swap[2].toUpperCase()) + 1) : null,
     swapInBytes: bytes(pages('Swapins')), swapOutBytes: bytes(pages('Swapouts')),
     compressorPhysicalBytes: bytes(pages('Pages occupied by compressor')),

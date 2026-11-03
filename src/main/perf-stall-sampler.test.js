@@ -93,6 +93,50 @@ test('global rolling native quotas, exact process cooldown and exact expiry boun
   assert.equal(nativeCaptureDecision([receipt(at + 1, 0)], at, target).reason, 'quota-clock-unknown');
 });
 
+test('многосекундное зависание получает снимок из отдельного резерва при выеденном обычном лимите', () => {
+  // Шрам 03.11 12:11:45: главный поток стоял 4 минуты, а дневной лимит
+  // израсходовали обычные полусекундные паузы — стек дал только macOS.
+  const at = BASE;
+  const ordinary = Array.from({ length: 24 }, (_, i) => receipt(at - DAY + 1 + i * HOUR, i, { admissionClass: 'initial' }));
+  const short = nativeCaptureDecision(ordinary, at, { ...target, stalledMs: 600 });
+  assert.equal(short.reason, 'native-day-quota-exhausted', 'короткая пауза лимит не обходит');
+  assert.equal(short.retryAtStalledMs, 5000, 'но тот же stall стоит повторить, если он продлится');
+  const severe = nativeCaptureDecision(ordinary, at, { ...target, stalledMs: 5000 });
+  assert.equal(severe.allowed, true);
+  assert.equal(severe.admissionClass, 'severe');
+  assert.deepEqual(severe.severeRemaining, { hour: 1, day: 5 });
+
+  // Резерв тоже ограничен: два в час, шесть в сутки.
+  const twoThisHour = [...ordinary, ...[0, 1].map(i => receipt(at - 1000 * (i + 1), 100 + i, { admissionClass: 'severe' }))];
+  const hourFull = nativeCaptureDecision(twoThisHour, at, { ...target, stalledMs: 60000 });
+  assert.equal(hourFull.allowed, false);
+  assert.equal(hourFull.retryAtStalledMs, undefined, 'исчерпан и резерв — повтор бессмыслен');
+  const sixToday = [...ordinary, ...Array.from({ length: 6 }, (_, i) => receipt(at - 2 * HOUR * (i + 1), 200 + i, { admissionClass: 'severe' }))];
+  assert.equal(nativeCaptureDecision(sixToday, at, { ...target, stalledMs: 60000 }).allowed, false);
+
+  // Тот же stall дважды не снимается; тот же процесс — не чаще раза в 30 с.
+  const same = [...ordinary, receipt(at - 1000, 0, { ...target, admissionClass: 'severe' })];
+  assert.equal(nativeCaptureDecision(same, at, { ...target, stalledMs: 9000 }).reason, 'stall-already-requested');
+  const recentOwn = [...ordinary, receipt(at - 10000, 0, { ...target, stallId: 'previous', admissionClass: 'severe' })];
+  const cooling = nativeCaptureDecision(recentOwn, at, { ...target, stalledMs: 6000 });
+  assert.equal(cooling.reason, 'native-process-cooldown');
+  assert.equal(cooling.retryAtStalledMs, 26000, 'повтор, когда пройдёт охлаждение процесса');
+});
+
+test('снимки из резерва не расходуют обычный лимит', () => {
+  const at = BASE;
+  // Коротким паузам доступны 18 из 24 суточных мест. 17 обычных + 5 резервных:
+  // если бы резерв считался в обычном лимите, их было бы 22 — и отказ.
+  const mixed = [
+    ...Array.from({ length: 17 }, (_, i) => receipt(at - DAY + 1 + i * HOUR, i, { admissionClass: 'initial' })),
+    ...Array.from({ length: 5 }, (_, i) => receipt(at - 2 * HOUR * (i + 1) - 1, 300 + i, { admissionClass: 'severe' })),
+  ];
+  const decision = nativeCaptureDecision(mixed, at, { ...target, stalledMs: 600 });
+  assert.equal(decision.allowed, true, '17 обычных + 5 резервных: обычный слот ещё есть');
+  assert.equal(decision.admissionClass, 'initial');
+  assert.deepEqual(decision.remaining, { hour: 7, day: 6 }, 'остаток считает только обычные снимки');
+});
+
 test('unsupported, invalid, stale, unknown and unfocused targets never reserve or spawn', t => {
   const f = fixture(t);
   for (const [change, reason] of [

@@ -397,6 +397,29 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   animation-name: noted-glow-dark;
 }
 
+/* «Следующая отправка — в Run after», взведено правым кликом по кнопке
+   переноса. Это состояние ждёт отправки и обязано читаться без подсказки —
+   настоящее МИГАНИЕ, не плавное дыхание. Прежняя версия унаследовала у
+   .cb-run-after-hotkey-surface ::before/::after glow (mix-blend-mode:
+   plus-lighter + opacity crossfade) — тот приём читается как «просто
+   меняется бэкграунд», юзер прямо это отличил от мигания. Здесь та же
+   техника и тот же интервал, что у точки диктовки (@keyframes
+   nt-dictation-dot выше в этом файле) — сплошной background-color
+   переключается между двумя цветами, без прозрачности и blend-режима.
+   ::before/::after унаследованного glow для этого состояния выключены. */
+@keyframes cb-run-after-armed-blink {
+  0%, 100% { background-color: #3a241b; }
+  50%      { background-color: #e98b69; }
+}
+.cb-run-after-arm-pulse {
+  animation: cb-run-after-armed-blink 1.1s ease-in-out infinite;
+}
+.cb-run-after-arm-pulse::before,
+.cb-run-after-arm-pulse::after {
+  display: none;
+  animation: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cb-run-after-hotkey-surface {
     animation: none;
@@ -404,6 +427,9 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   }
   .cb-run-after-hotkey-surface::before,
   .cb-run-after-hotkey-surface::after { display: none; animation: none; }
+  /* Без движения состояние всё равно обязано быть видимым: оно меняет, куда
+     уйдёт следующая отправка. Остаётся статичная янтарная заливка. */
+  .cb-run-after-arm-pulse { background-color: rgba(233, 139, 105, 0.34); animation: none; }
 }
 
 @keyframes tab-dot-spin {

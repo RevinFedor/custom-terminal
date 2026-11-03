@@ -23,9 +23,15 @@
 //     same color and thickness.
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  restoreTabOwnBackgroundWork,
+  subscribeTabBackgroundWorkPresentation,
+  tabOwnBackgroundWorkBlocks,
+} from '../../utils/tabOwnBackgroundWork.mjs';
 import { createPortal } from 'react-dom';
 import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
 import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
+import { onTabScopedIpcMessage } from '../../utils/tabScopedIpc';
 import { Archive, ArchiveX, Bell, RefreshCw } from 'lucide-react';
 import { WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
@@ -602,13 +608,19 @@ export function useTabContextUsage(tabId: string): number | null {
     // нечем — проверять здесь нечего.
     const onWindowEvent = (event: Event) => apply((event as CustomEvent).detail || {});
 
-    ipcRenderer.on('claude:bridge-update', onClaudeBridge);
-    ipcRenderer.on('codex:context-update', onCodexContext);
+    // Both channels are broadcast to the window and every card used to receive
+    // every frame. Measured 04:13 UTC after the first round of fixes:
+    // `codex:context-update` delivery reached 1493ms (n=35, median 226ms) and
+    // sat in the attribution of the remaining stalls. Routing by tabId does
+    // not weaken ownership: `apply` still rejects a foreign tab, and the
+    // session checks above stay exactly as they were.
+    const offBridge = onTabScopedIpcMessage('claude:bridge-update', tabId, onClaudeBridge);
+    const offCodexContext = onTabScopedIpcMessage('codex:context-update', tabId, onCodexContext);
     window.addEventListener('sdk-context-update', onWindowEvent);
     return () => {
       disposed = true;
-      ipcRenderer.removeListener('claude:bridge-update', onClaudeBridge);
-      ipcRenderer.removeListener('codex:context-update', onCodexContext);
+      offBridge();
+      offCodexContext();
       window.removeEventListener('sdk-context-update', onWindowEvent);
     };
   }, [boundAgentSessionId, tabId]);
@@ -832,6 +844,25 @@ export function TabSessionAvailabilityMarker({
  *     app-wide listeners keep current for EVERY tab regardless of which one is
  *     on screen (store.setAiBusy).
  * After that, transitions keep both up to date as before.
+ *
+ * THE TAB'S OWN SUBAGENTS COUNT AS BUSY, and this used to be the third signal
+ * that drifted. Main stops the parent turn (`claudeTurnBusy = false`) the
+ * moment the agent's own answer ends, even while its async Task/Agent children
+ * are still running — the live count rides along as a separate
+ * `backgroundWorkCount` field and never touches `busy`. The vertical sidebar
+ * mixed that count into its loader; this hook, which feeds the pane-header
+ * chip, did not. Same tab, two windows, one loader — the exact class of bug
+ * this file was created to end.
+ *
+ * It is not only cosmetic: while that work runs, main refuses Auto-stop and
+ * holds the next Run After step (`getCombinedTabBackgroundWorkCount`). So the
+ * user saw a frozen Auto-stop timer on a tab that looked completely idle, with
+ * nothing on screen explaining what was holding it.
+ *
+ * Scope is main's, not ours: subagents count, a detached background shell does
+ * not (a forgotten `npm run dev` must not hold its tab forever), and a shell
+ * explicitly held through `hold_background_work` does. Reusing main's count
+ * instead of recomputing it is what keeps that boundary single-sourced.
  */
 export type SharedTabActivityMaps = {
   processStatus?: ReadonlyMap<string, boolean>;
@@ -850,6 +881,12 @@ export function useTabActivitySignals(
   const [localHasProcess, setLocalHasProcess] = useState(false);
   const hasSharedProcess = shared?.processStatus !== undefined;
   const hasSharedBusy = shared?.busyTabs !== undefined;
+  // This tab's own running subagents, from main's single count. Seeded from
+  // the already-applied projection (a card can mount mid-work and would
+  // otherwise hear nothing until the last child exits), then kept live by
+  // this tab's own transitions — a neighbour's subagent must not re-render
+  // every card on screen.
+  const [ownBackgroundWork, setOwnBackgroundWork] = useState(() => tabOwnBackgroundWorkBlocks(tabId));
   // Waiting for a delegated session. Same source and same precedence as the
   // sidebar card: a tab answering itself shows its OWN colour, so the two
   // states never paint over each other.
@@ -917,12 +954,24 @@ export function useTabActivitySignals(
     };
   }, [hasSharedBusy, hasSharedProcess, tabId]);
 
+  useEffect(() => {
+    setOwnBackgroundWork(tabOwnBackgroundWorkBlocks(tabId));
+    const unsubscribe = subscribeTabBackgroundWorkPresentation(tabId, setOwnBackgroundWork);
+    // The channel carries transitions; the restore read is what fills in work
+    // that was already running before this renderer started. It is a shared
+    // one-shot promise, so many cards mounting together cost one request.
+    void restoreTabOwnBackgroundWork(tabId).then(() => {
+      setOwnBackgroundWork(tabOwnBackgroundWorkBlocks(tabId));
+    });
+    return unsubscribe;
+  }, [tabId]);
+
   const hasProcess = hasSharedProcess
     ? shared?.processStatus?.get(tabId) === true
     : localHasProcess;
   const sharedBusy = shared?.busyTabs?.get(tabId) === true
     || shared?.pasteBusyTabs?.get(tabId) === true;
-  const effectiveBusy = (hasSharedBusy ? sharedBusy : busy) || sendPending;
+  const effectiveBusy = (hasSharedBusy ? sharedBusy : busy) || sendPending || ownBackgroundWork;
 
   return {
     hasProcess,

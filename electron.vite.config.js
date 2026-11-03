@@ -1,7 +1,7 @@
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
-import { codeInspectorPlugin } from 'code-inspector-plugin';
+import { inspectorStampVitePlugin } from './scripts/lib/inspector-stamp.mjs';
 import { resolve } from 'path';
 import { config } from 'dotenv';
 import { assertNotedShared } from './vendor/noted-shared/build/assert-packages.mjs';
@@ -93,33 +93,21 @@ renderer: {
       rendererSharedCjsDevPlugin(__dirname),
       historyVirtuosoMeasurementVitePlugin(),
       styleModSameRulesVitePlugin(),
-      // code-inspector-plugin MUST come BEFORE react() — it stamps
-      // data-insp-path="src/Foo.tsx:42:6" attributes on every JSX element
-      // at compile time. Works in prod via dev:()=>true override. Pure
-      // build-time DOM injection — no Fiber, no sourcemap, no fetch — so
-      // it survives React 19 (_debugSource gone), Electron file://, and
-      // the lack of a dev server in a packaged .app.
-      codeInspectorPlugin({
-        bundler: 'vite',
-        dev: () => true,
-        // The plugin's HTML injection probes a cwd-relative main.js, which
-        // may be a leftover build artifact. Inject once into the real entry.
-        injectTo: resolve(__dirname, 'src/renderer/main.tsx'),
-        skipSnippets: ['htmlScript'],
-        // Quirk: plugin checks `server !== "close"` (string!), not boolean.
-        // Passing `false` here still starts the TCP listener on :5678 and
-        // hangs `vite build` because event loop never exits.
-        server: 'close',
-        behavior: {
-          locate: false,
-          copy: false, // custom formatter via `code-inspector:trackCode` event
-        },
-        // Shift+Opt — safe from system shortcuts (Cmd-anything conflicts
-        // with paste/copy/save and triggers the inspector overlay on every
-        // Cmd press, which is the wrong default UX).
-        hotKeys: ['altKey', 'shiftKey'],
-        pathType: 'relative',
-      }),
+      // Stamps data-insp-path="src/Foo.tsx:42:6:div" on every JSX element at
+      // compile time, and nothing else. MUST come BEFORE react(): once JSX is
+      // compiled there is no element left to stamp. Pure build-time DOM
+      // injection — no Fiber, no sourcemap, no fetch — so it survives React 19
+      // (_debugSource gone), Electron file://, and a packaged .app with no dev
+      // server.
+      //
+      // The upstream `codeInspectorPlugin()` wrapper is deliberately NOT used:
+      // besides stamping it injected a `code-inspector-component` client whose
+      // un-throttled `mousemove` handler forced a full style+layout recalc per
+      // pointer move (16 getComputedStyle per hovered node), which cost seconds
+      // in a 161k-node window. The renderer half now lives in
+      // `src/renderer/utils/componentInspector.ts`; this plugin also removes
+      // that wrapper's :5678 TCP listener and IDE-locate options entirely.
+      inspectorStampVitePlugin({ pathType: 'relative' }),
       react(),
       tailwindcss(),
     ],

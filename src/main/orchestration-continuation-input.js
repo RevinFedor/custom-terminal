@@ -13,6 +13,38 @@ function createContinuationInputReader({ readResponseState, readRuntimeSnapshot,
       ? { ...state, acceptedResumeSourceSessionId: destination.acceptedResumeSourceSessionId || null } : state;
     const legacy = () => decorate(before, before.known && before.processStatus === 'found'
       ? readSendDestination?.(tabId, before.toolType, before.sessionId) : null);
+    // A restored Claude tab has no observed turn yet, so response busy is null.
+    // Attach the same runtime facts Codex already uses so the input gate can
+    // tell "never observed" from "possibly busy". Read-only; it never makes a
+    // busy tab look idle, and the proof is fenced by the response revision.
+    if (before.known === true && before.exists !== false && before.toolType === 'claude'
+      && before.processStatus === 'found' && before.busy === null
+      && typeof readRuntimeSnapshot === 'function') {
+      let runtime;
+      try { runtime = await readRuntimeSnapshot(tabId); } catch { return legacy(); }
+      const after = await readResponseState(tabId);
+      if (after.known !== true || after.exists === false || !before.revision
+        || before.revision !== after.revision || before.sessionId !== after.sessionId
+        || before.toolType !== after.toolType || before.cwd !== after.cwd
+        || before.busy !== after.busy || before.processStatus !== after.processStatus) {
+        return { ...after, known: false, continuationInput: { ready: false, reason: 'continuation_runtime_changed' } };
+      }
+      const scoped = runtime?.coherent === true && runtime.toolType === 'claude'
+        && runtime.processStatus === 'found' && !!runtime.lifecycleGeneration
+        && runtime.sendTarget?.toolType === 'claude' && runtime.sendTarget.sessionId === after.sessionId;
+      const continuationRuntime = {
+        known: scoped === true,
+        status: runtime?.status || runtime?.sessionStatus || null,
+        inputReady: runtime?.inputReady === true,
+        starting: runtime?.starting === true,
+        stopping: runtime?.stopping === true,
+        turnBusy: runtime?.busy === true,
+        startupDefaultsPending: runtime?.startupDefaultsPending === true,
+      };
+      return { ...decorate(after, runtime?.sendTarget), continuationRuntime,
+        revision: JSON.stringify([after.revision, continuationRuntime, runtime?.lifecycleGeneration,
+          runtime?.terminalRunSeq, runtime?.processPid, runtime?.inputRevision]) };
+    }
     if (!before.known || before.exists === false || before.toolType !== 'codex'
       || before.processStatus !== 'found' || before.busy === true) return legacy();
     if ((before.busy === null || before.busy === false) && typeof readInputAdmission === 'function') {
@@ -82,9 +114,31 @@ function canSubmitContinuationInput(state) {
   if (!['found', 'absent'].includes(state?.processStatus)) return false;
   if (state.busy === false) return true; // Existing stopped/authoritative-idle path.
   if (provisionalContinuationInput(state)) return true;
+  if (claudeRestoredIdleContinuationInput(state)) return true;
   return state.busy === null && state.toolType === 'codex' && state.processStatus === 'found'
     && state.transitioning === false && state.error === 'response_busy_unknown'
     && state.continuationInput?.ready === true && !!state.continuationInput.target;
+}
+
+// A Claude tab that has not run a turn under THIS main process has no entry in
+// the observed-turn journal, so response `busy` stays null — "no turn observed",
+// not "a turn may be running". Codex rebuilds its idle proof from the runtime
+// (process + session + generation + outcome); Claude had no equivalent, so a
+// restored tab could never satisfy the gate and its Continue waited forever
+// while the tab waited for input: the 01Nov operation 8abf840c held five live,
+// input-ready tabs in `runtime-input-pending`.
+//
+// Busy is still proven independently and still wins: `busy === true` (turn or
+// local command), `transitioning`, a live launch/startup transaction, and the
+// caller's own background-work and Goal checks are all evaluated before this.
+// This only stops treating "never observed" as "possibly busy".
+function claudeRestoredIdleContinuationInput(state) {
+  const runtime = state?.continuationRuntime;
+  return state?.known === true && state.toolType === 'claude' && state.busy === null
+    && state.processStatus === 'found' && state.transitioning === false
+    && runtime?.known === true && runtime.status === 'active' && runtime.inputReady === true
+    && runtime.starting !== true && runtime.stopping !== true && runtime.turnBusy !== true
+    && runtime.startupDefaultsPending !== true;
 }
 
 function provisionalContinuationInput(state) {

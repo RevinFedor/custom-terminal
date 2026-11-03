@@ -21,15 +21,27 @@ test('actual stationary toggle stays at input right edge/6px when terminal opens
   const store=selector=>selector(state),useUIStore=selector=>selector(ui);useUIStore.getState=()=>ui;
   const module={exports:{}};vm.runInNewContext(transformSync(read('./SideSurfaceToggleButton.tsx'),{loader:'tsx',format:'cjs'}).code,
     {module,exports:module.exports,require:name=>{
-      if(name==='react')return {createElement,useCallback:fn=>fn};if(name==='lucide-react')return {Bot:'Bot',SquareTerminal:'SquareTerminal'};
+      if(name==='react')return {createElement,Fragment:'Fragment',useCallback:fn=>fn};
+      if(name==='lucide-react')return {Bot:'Bot',ChevronDown:'ChevronDown',SquareTerminal:'SquareTerminal'};
       if(name.endsWith('useUIStore'))return {useUIStore,resolveTabTerminalPrimary:()=>ui.primary};
       if(name.endsWith('useWorkspaceStore'))return {useWorkspaceStore:store};
       if(name.endsWith('ControlHint'))return {__esModule:true,default:'ControlHint'};
+      if(name.endsWith('ScrollToBottomButton'))return {__esModule:true,default:'ScrollToBottom',
+        SCROLL_TO_BOTTOM_SIZE_PX:28};
       if(name.endsWith('controlBarWrap.mjs'))return {RIGHT_CLUSTER_INNER_GAP_PX};throw Error(name);
     }});
-  const component=module.exports,closed=component.StationaryHistorySurfaceToggle({tabId:'T'}),closedButton=descendants(component.default({tabId:'T'})).find(node=>node.type==='button');
+  // Стационарный блок отдаёт ДВА независимых органа: стрелку «в конец» по
+  // центру и кнопку раскладки у правого края. Оба на одном низу (6px над полем
+  // ввода), но у разных краёв — это разные по смыслу действия.
+  const component=module.exports;
+  const slot=key=>descendants(component.StationaryHistorySurfaceToggle({tabId:'T'}))
+    .find(node=>node.props?.[key]!==undefined);
+  const closed=slot('data-history-side-surface-stationary'),arrow=slot('data-history-scroll-to-bottom');
+  const closedButton=descendants(component.default({tabId:'T'})).find(node=>node.type==='button');
   assert.equal(closed.props.style.bottom,6);assert.equal(closed.props.style.right,16);assert.equal(closedButton.props['aria-pressed'],false);
-  closedButton.props.onClick();const opened=component.StationaryHistorySurfaceToggle({tabId:'T'}),openedButton=descendants(component.default({tabId:'T'})).find(node=>node.type==='button');
+  assert.equal(arrow.props.style.bottom,6);assert.equal(arrow.props.style.left,'50%');
+  assert.equal(arrow.props.style.translate,'-50% 0');assert.equal(arrow.props.style.right,undefined);
+  closedButton.props.onClick();const opened=slot('data-history-side-surface-stationary'),openedButton=descendants(component.default({tabId:'T'})).find(node=>node.type==='button');
   assert.deepEqual(opened.props.style,closed.props.style);assert.equal(openedButton.props['aria-pressed'],true);assert.notEqual(openedButton.props.style.backgroundColor,closedButton.props.style.backgroundColor);
   state.splitPanes[0].displayHidden=true;assert.equal(component.StationaryHistorySurfaceToggle({tabId:'T'}),null);
   state.splitPanes=[];assert.ok(component.StationaryHistorySurfaceToggle({tabId:'T'}));state.view='home';assert.equal(component.StationaryHistorySurfaceToggle({tabId:'T'}),null);
@@ -43,12 +55,26 @@ test('actual stationary hosts share the composer height and sit above side termi
     assert.equal(node.props.style.bottom,120);assert.equal(node.props.style.zIndex,140);assert.equal(node.props.style.pointerEvents,'none');
     assert.equal(descendants(node).filter(child=>child.type==='Toggle').length,1);
   }
+  // Стрелка центральной поверхности живёт в стационарном хосте и адресована
+  // вкладкой: в одном окне рядом стоит соседняя панель со своей стрелкой.
+  // Прячет и показывает её по-прежнему транскрипт прямой записью в стиль.
+  const centreArrow=renderExpression(markedElement(read('./SideSurfaceToggleButton.tsx'),'data-history-scroll-to-bottom'),
+    {tabId:'T',RIGHT_CLUSTER_INNER_GAP_PX,ScrollToBottomButton:'ScrollToBottom',window:{dispatchEvent(){}}});
+  assert.equal(centreArrow.props.style.display,'none');
+  assert.equal(centreArrow.props['data-history-scroll-to-bottom-tab'],'T');
+  // Вид кнопки принадлежит общему ScrollToBottomButton; обёртка несёт только
+  // место и видимость, которую пишет транскрипт.
+  assert.equal(descendants(centreArrow).filter(node=>node.type==='ScrollToBottom').length,1);
+  // Боковая панель сохраняет свою стрелку: стационарного хоста там нет, а её
+  // собственный нижний правый угол и так свободен.
   const expression=markedElement(read('./HistoryPanel.tsx'),'data-history-scroll-to-bottom'),calls=[];
-  const base={scrollArrowRef:{current:null},scrollToBottom:smooth=>calls.push(smooth),historyHorizontalPadding:16,HISTORY_FLOATING_CONTROL_SIZE_PX:28,HISTORY_FLOATING_CONTROL_GAP_PX:2,RIGHT_CLUSTER_INNER_GAP_PX,ChevronDown:'Down'};
-  const closed=renderExpression(expression,{...base,mainSurface:true,centerRightInset:0}),opened=renderExpression(expression,{...base,mainSurface:true,centerRightInset:300});
-  assert.equal(closed.props.style.bottom,6);assert.equal(opened.props.style.bottom,6);assert.equal(opened.props.style.right-closed.props.style.right,300);
-  assert.equal(opened.props.style.display,'none');opened.props.onClick();assert.deepEqual(calls,[false]);
-  assert.equal(renderExpression(expression,{...base,mainSurface:false,centerRightInset:300}).props.style.bottom,12);
+  const side=renderExpression(expression,{scrollArrowRef:{current:null},scrollToBottom:smooth=>calls.push(smooth),
+    HISTORY_FLOATING_CONTROL_SIZE_PX:28,ScrollToBottomButton:'ScrollToBottom'});
+  assert.equal(side.props.style.bottom,12);assert.equal(side.props.style.right,12);
+  assert.equal(side.props.style.display,'none');
+  const sideButton=descendants(side).find(node=>node.type==='ScrollToBottom');
+  assert.ok(sideButton,'боковая стрелка использует ту же общую кнопку');
+  sideButton.props.onClick();assert.deepEqual(calls,[false]);
 });
 test('actual composer calls the shared ArrowDown router before CodeMirror; hosted paths remove the former duplicate toggle without adding global listeners',()=>{
   const text=read('./HistoryPanel.tsx'),ast=parsed(text);let call;

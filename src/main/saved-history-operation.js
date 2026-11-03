@@ -19,7 +19,21 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
   const toolType = body.toolType || body.provider || 'codex';
   if (!['codex', 'claude'].includes(toolType) || body.provider && body.toolType && body.provider !== body.toolType) fail('history_operation_provider_unsupported');
   if (body.expectedContentRevision != null && typeof body.expectedContentRevision !== 'string') fail('history_revision_invalid');
-  if (toolType === 'claude' && !text(body.expectedContentRevision)) fail('history_revision_required');
+  // A SELF rewind is issued by the session that is writing this very file, so
+  // a whole-file fingerprint it read earlier is stale by construction: between
+  // the read and the call it necessarily appends its own reasoning, tool calls
+  // and the retained context it is required to author. Production 02.11, tab
+  // 685a08aa97eb: the tab read the revision at 11:12:19.179 and Claude appended
+  // 2538 bytes at 11:12:19.258 — the call 57s later could not have matched.
+  // It also had to fetch that token over raw HTTP, because no tool exposes it.
+  //
+  // Nothing is weakened: this executor checks the revision ONLY while
+  // preparing and deliberately not at rewrite/write time, where it proves the
+  // exact target record hash and an unchanged source instead — after Stop,
+  // when the file no longer grows. An explicitly supplied token is still
+  // honoured. Rewinding ANOTHER tab keeps the requirement: there a third
+  // party really can edit the transcript in between.
+  if (toolType === 'claude' && !body.selfRewind && !text(body.expectedContentRevision)) fail('history_revision_required');
   if (body.targetEntryRef && (!text(body.targetEntryRef.physicalSessionId)
     || !text(body.targetEntryRef.rawUuid) || !text(body.expectedContentRevision))) {
     fail('history_target_partial_identity');

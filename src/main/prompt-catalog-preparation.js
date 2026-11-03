@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const { watchWith } = require('./dir-watch');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { causal } = require('./perf-causal-context');
@@ -251,7 +252,7 @@ class PreparedPromptCatalog {
         entry = { ...spec, key, slots: new Set(), retired: false, watcher: null };
         this.watchers.set(key, entry);
         try {
-          entry.watcher = this.service.fs.watch(spec.target, { recursive: spec.recursive }, (kind, filename) => this.watchEvent(entry, kind, filename));
+          entry.watcher = watchWith(this.service.fs)(spec.target, { recursive: spec.recursive }, (kind, filename) => this.watchEvent(entry, kind, filename));
           const loss = () => {
             if (this.closed || this.watchers.get(key) !== entry) return;
             const affected = [...entry.slots]; this.retire(entry);

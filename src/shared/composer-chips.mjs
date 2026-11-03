@@ -902,6 +902,33 @@ function splitHistoryImageParts(text, imagePaths = []) {
  * Image-looking text inside <pasted_content> is intentionally never parsed:
  * the pasted blob owns those bytes and may contain logs or documentation.
  */
+/**
+ * Claude's own composer wraps the WHOLE input into its `<pasted_content id="…">`
+ * as soon as it passes 800 characters or two lines (its `onTextPaste`), and every
+ * Noted send reaches it as one bracketed paste. So a dictated or queued prompt
+ * comes back wrapped although the user pasted nothing into it.
+ *
+ * A chip means "a foreign blob sits INSIDE my message". When the envelope is the
+ * entire message there is no inside: the body IS the message, and it belongs in
+ * the ordinary text flow with the usual "Раскрыть полностью" control.
+ *
+ * Only the provider's own whole-message envelope qualifies. Our own chips carry
+ * a bare tag or a UUID referenceId, and an envelope surrounded by real text keeps
+ * its chip — that one is a genuine paste.
+ */
+const UUID_PASTE_IDENTITY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+function wholeMessageProviderPasteBody(parts, bindReference) {
+  if (parts.some(part => part.kind !== 'paste' && part.kind !== 'text')) return null;
+  // Only the structural newlines Claude adds around its envelope may remain.
+  if (parts.some(part => part.kind === 'text' && part.text.trim())) return null;
+  const pasted = parts.filter(part => part.kind === 'paste');
+  if (pasted.length !== 1) return null;
+  const [only] = pasted;
+  if (!only.pasteIdentity || UUID_PASTE_IDENTITY.test(only.pasteIdentity)) return null;
+  if (bindReference(only).messageReference) return null;
+  return only.text || null;
+}
+
 export function buildHistoryComposerPresentationParts({
   text = '',
   chips = [],
@@ -983,7 +1010,16 @@ export function buildHistoryComposerPresentationParts({
   if (promptPresentation.chips.length > 0 && promptPresentation.text) {
     parts.push({ kind: 'text', text: '\n\n' });
   }
-  for (const part of parsePastedContentParts(promptPresentation.text, { includePasteIdentity: true })) {
+  const bodyParts = parsePastedContentParts(promptPresentation.text, { includePasteIdentity: true });
+  const wholeMessageBody = wholeMessageProviderPasteBody(bodyParts, bindReference);
+  if (wholeMessageBody !== null) {
+    parts.push(...splitHistoryImageParts(
+      normalizeHistoryProviderImageMarkup(wholeMessageBody, imagePaths),
+      imagePaths,
+    ));
+    return { matchedPromptChips: promptPresentation.matched, parts };
+  }
+  for (const part of bodyParts) {
     if (part.kind === 'paste') {
       parts.push(bindReference(part));
       continue;

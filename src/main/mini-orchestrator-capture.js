@@ -24,7 +24,8 @@ function createMiniOrchestratorCapture({ core, isEnabled, isOwnerCurrent, isRead
     if (!valid(s)) { tabs.delete(tabId); core.invalidate(tabId, 'owner_changed'); return; }
     if (!s.pending) return;
     let ready = false; try { ready = isReady({ tabId, owner: s.owner, turnId: s.turnId }) === true; } catch {}
-    if (!ready) return;
+    // A pending answer that never flushes looks exactly like "no answer".
+    if (!ready) { log('flush-not-ready', { tabId, turnId: s.turnId }); return; }
     const p = s.pending; s.pending = null; s.completed = s.turnId;
     try { Promise.resolve(core.complete(p)).catch(() => log('mini-orchestrator capture completion failed', { tabId })); }
     catch { log('mini-orchestrator capture completion failed', { tabId }); }

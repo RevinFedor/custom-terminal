@@ -114,7 +114,7 @@ function onHeartbeat(key, pid, label, payload) {
     stallSampler?.resumed({ stallId: p.stallId, pid: p.pid, processIdentity: p.processIdentity,
       resumedWallMs: Date.now() });
     p.stalled = false;
-    p.nativeSampleDeferred = false;
+    p.nativeSampleRetryAtMs = null;
     const silentMs = now - p.lastHbAt;
     causalJournal?.record({ sourceBoot: bootId, sourceSeq: nextCausalSourceSeq(pid), emittedAbs: watchdogAbs(),
       kind: 'resume', startAbs: p.stallStartedAbs, durationMs: silentMs,
@@ -200,7 +200,14 @@ function requestNativeStallSample(p, silentMs, stallMs) {
     kind: p.label, state: 'stalled', stalledMs: silentMs,
     stallStartedWallMs: observedWallMs - silentMs, observedWallMs,
     focused: p.focused, thresholdMs: stallMs });
-  p.nativeSampleDeferred = decision?.reason === 'native-reserved-for-critical-stall';
+  // Сэмплер сам говорит, с какой длительности тот же stall стоит повторить:
+  // 1 с для резерва критических, 5 с для резерва многосекундных при
+  // исчерпанном обычном лимите. Без ответа — повтора нет.
+  const retryAt = Number.isFinite(decision?.retryAtStalledMs) ? decision.retryAtStalledMs
+    : decision?.reason === 'native-reserved-for-critical-stall' ? 1000 : null;
+  // Только порог ВПЕРЕДИ: уже пройденный превратил бы повтор в запрос на
+  // каждом такте сторожа.
+  p.nativeSampleRetryAtMs = retryAt !== null && retryAt > silentMs ? retryAt : null;
 }
 
 setInterval(() => {
@@ -218,7 +225,7 @@ setInterval(() => {
   // every observed process froze independently. Re-arm on fresh heartbeats.
   if (observerGap > 2000) {
     wdLog('[Watchdog] observer-gap ms=' + observerGap.toFixed(1) + ' coverage=unknown');
-    for (const p of procs.values()) { p.lastHbAt = 0; p.stalled = false; p.nativeSampleDeferred = false; }
+    for (const p of procs.values()) { p.lastHbAt = 0; p.stalled = false; p.nativeSampleRetryAtMs = null; }
     return;
   }
   for (const p of procs.values()) {
@@ -228,7 +235,7 @@ setInterval(() => {
       // Hidden window: heartbeat interval is legitimately throttled — silence
       // here is not a freeze. Reset without a RESUMED log to avoid noise.
       p.stalled = false;
-      p.nativeSampleDeferred = false;
+      p.nativeSampleRetryAtMs = null;
       continue;
     }
     const silentMs = now - p.lastHbAt;
@@ -259,7 +266,7 @@ setInterval(() => {
       );
       flight?.incident('heartbeat-silence', { pid: p.pid, proc: p.label, durationMs: silentMs });
       requestNativeStallSample(p, silentMs, stallMs);
-    } else if (p.stalled && p.nativeSampleDeferred && silentMs >= 1000) {
+    } else if (p.stalled && p.nativeSampleRetryAtMs != null && silentMs >= p.nativeSampleRetryAtMs) {
       // Existing observer tick and same process/stall identity; no timer,
       // quota reset, extra incident or sample after a fresh heartbeat.
       requestNativeStallSample(p, silentMs, stallMs);
@@ -287,6 +294,13 @@ process.on('message', (m) => {
   if (m.t === 'bye') {
     lameDuck = true;
     wdLog('[Watchdog] bye received — lame duck (no alarms during shutdown)');
+    return;
+  }
+  // A shutdown the user cancelled must restore ordinary freeze detection:
+  // `bye` is sent at the top of before-quit, long before the exit is certain.
+  if (m.t === 'unbye') {
+    lameDuck = false;
+    wdLog('[Watchdog] unbye received — shutdown cancelled, alarms re-armed');
     return;
   }
   if (m.t === 'hb' && m.proc === 'main') {

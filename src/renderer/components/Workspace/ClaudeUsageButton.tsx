@@ -4,15 +4,15 @@
 // windows by default; Claude appends its Fable sublimit. Either half can be
 // hidden from the toolbar without removing its detail from the shared popover.
 // The provider toggle swaps details while shared activity stays mounted.
-// Two affordances per project convention (Cmd+Hover, design.md::Closing /
-// Cmd+Shift pin):
+// Two affordances per project convention (Cmd+Hover, design.md::Closing):
 //
 //   • click          → opens popover, pinned to CURRENT tab. Switching tabs
 //                      closes it. Click outside or Esc closes.
 //   • Cmd+hover      → transient peek. Cursor exit closes.
-//   • Cmd+Shift      → STICKY pin. White border. Survives tab/project switch,
-//                      survives losing Cmd. Cmd+Shift again or click the same
-//                      provider face to release.
+//
+// There is no cross-tab pin. The former Cmd+Shift sticky mode deliberately
+// suppressed the outside-click handler, so a pinned popover ignored clicks on
+// the workspace and could only be dismissed from the chip itself.
 //
 // Popover contents:
 //   1. Provider toggle and account history.
@@ -294,6 +294,12 @@ const CLAUDE_USAGE_IPC_DEADLINE_MS = 12_000;
 const USAGE_DETAILS_IPC_DEADLINE_MS = 12_000;
 const CODEX_USAGE_POLL_INTERVAL_MS = 30_000;
 const CODEX_USAGE_DISCOVERY_INTERVAL_MS = 180_000;
+// Claude's own fallback sweep. Main caches an accepted OAuth snapshot for 170s,
+// so a shorter tick would just re-read the same numbers; 3 minutes is the first
+// cadence where every tick can actually return a fresher sample. Normal updates
+// stay event-driven through the statusline bridge — this only catches auth or
+// quota changes made outside a running session.
+const CLAUDE_USAGE_POLL_INTERVAL_MS = 180_000;
 
 function invokeIpcWithDeadline<T>(
   channel: string,
@@ -402,6 +408,15 @@ function pctRemaining(usedPct: number | null | undefined): number | null {
   return Math.max(0, Math.min(100, 100 - usedPct));
 }
 
+// Anthropic stopped scoping Fable as its own weekly sublimit, but the endpoint
+// still answers 0%, which rendered as a permanent "Fable left 100%" bar.
+// A zero model-scoped limit is treated as absent, like a missing entry.
+function modelScopedUsedPct(usage: { utilization?: number | null } | null | undefined): number | null {
+  const value = usage?.utilization;
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
 function colorForPct(p: number | null | undefined): string {
   if (p == null) return '#888';
   if (p < 50) return '#4ade80';
@@ -467,7 +482,6 @@ interface UsageProviderChipProps {
   visible: boolean;
   standalone: boolean;
   showPopover: boolean;
-  sticky: boolean;
   popoverHost: HTMLDivElement | null;
   onTriggerClick: () => void;
   onTriggerEnter: () => void;
@@ -883,7 +897,7 @@ function ProgressRow({
         <span style={{ fontVariantNumeric: 'tabular-nums', color }}>
           {formatPct(displayPct ?? pct)}
           {resetsAt && (
-            <span style={{ color: '#666', marginLeft: 8, fontSize: 10 }}>
+            <span style={{ color: '#bbb', marginLeft: 8, fontSize: 10 }}>
               resets {formatResetDateTime(resetsAt)}
             </span>
           )}
@@ -1186,7 +1200,6 @@ function ClaudeUsageChip({
   visible,
   standalone,
   showPopover,
-  sticky,
   popoverHost,
   onTriggerClick,
   onTriggerEnter,
@@ -1211,6 +1224,7 @@ function ClaudeUsageChip({
   const { target: refreshFailureTarget, clear: clearRefreshFailureFlash,
     flash: flashRefreshFailure } = useUsageRefreshFailureFlash();
   const refreshSeqRef = useRef(0);
+  const claudeRefreshInFlightRef = useRef(false);
   const refreshContextRef = useRef('');
   refreshContextRef.current = selectedAccountKey || '';
 
@@ -1221,9 +1235,16 @@ function ClaudeUsageChip({
       ? request.accountKey || null
       : selectedAccountKey;
     const flashTarget = usageRefreshFlashTarget(requestedAccountKey, selectedAccountKey, currentAccountKey);
-    clearRefreshFailureFlash();
-    setLoading(true);
-    setCompactLoading(!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey);
+    // A snapshot read only projects main's cache, so it must not raise the
+    // spinner: with several live Claude tabs the statusline bridge fires every
+    // second or two, and an unconditional setLoading made the chip flip between
+    // "updating" and "refresh" nonstop. Same contract as the Codex half.
+    if (request.snapshotOnly && claudeRefreshInFlightRef.current) return;
+    claudeRefreshInFlightRef.current = true;
+    if (!request.snapshotOnly) clearRefreshFailureFlash();
+    setLoading(!request.snapshotOnly);
+    setCompactLoading(!request.snapshotOnly
+      && (!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey));
     try {
       const res = await invokeClaudeUsage({
         force,
@@ -1285,6 +1306,7 @@ function ClaudeUsageChip({
       flashRefreshFailure(`claude:${requestedAccountKey || 'current'}:request-${seq}`, flashTarget);
       console.warn(`[ClaudeUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
+      claudeRefreshInFlightRef.current = false;
       if (seq === refreshSeqRef.current) {
         setLoading(false);
         setCompactLoading(false);
@@ -1304,7 +1326,7 @@ function ClaudeUsageChip({
     let id: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (id) return;
-      id = setInterval(() => refresh(false), 10 * 60 * 1000);
+      id = setInterval(() => refresh(false), CLAUDE_USAGE_POLL_INTERVAL_MS);
     };
     const stop = () => {
       if (id) { clearInterval(id); id = null; }
@@ -1318,7 +1340,12 @@ function ClaudeUsageChip({
       }
     };
     const onBridgeUpdate = () => {
-      if (document.visibilityState === 'visible') refresh(false);
+      // Every live Claude tab publishes its statusline here, so this fires many
+      // times per minute. Main already owns network polling and answers from
+      // its cache, so read the snapshot without the spinner.
+      if (document.visibilityState === 'visible') {
+        void refresh(false, { reason: 'bridge-update', snapshotOnly: true });
+      }
     };
     if (document.visibilityState === 'visible') start();
     document.addEventListener('visibilitychange', onVis);
@@ -1356,27 +1383,55 @@ function ClaudeUsageChip({
   const compactAccountKindLabel = compactAccount?.kind === 'max-oauth'
     ? 'Claude Max'
     : (compactAccount?.kind === 'api-platform' ? 'Claude API' : 'Claude');
-  const weeklyUsedPct = detailData?.seven_day?.utilization ?? null;
-  const fiveHourUsedPct = detailData?.five_hour?.utilization ?? null;
+  // Anthropic removed the 5-hour window from this plan, and the statusline
+  // source answers it as unknown. Reuse the Codex half's presence model so an
+  // absent window disappears entirely instead of rendering an empty bar and a
+  // "/ —" tail in the chip.
+  const detailUsageView = buildCodexMainUsageView(detailData);
+  const weeklyUsedPct = detailUsageView.weeklyUsed;
+  const fiveHourUsedPct = detailUsageView.fiveHourUsed;
+  const hasWeeklyWindow = detailUsageView.hasWeekly;
+  const hasFiveHourWindow = detailUsageView.hasFiveHour;
   const weeklyLeftPct = pctRemaining(weeklyUsedPct);
   const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
   const fableUsage = detailData?.model_scoped?.find((usage) => (
     /^fable(?:\s+\d+)?$/i.test(usage.display_name?.trim() || '')
   )) || null;
-  const fableUsedPct = fableUsage?.utilization ?? null;
+  const fableUsedPct = modelScopedUsedPct(fableUsage);
   const fableLeftPct = pctRemaining(fableUsedPct);
-  const compactWeeklyUsedPct = compactData?.seven_day?.utilization ?? null;
-  const compactFiveHourUsedPct = compactData?.five_hour?.utilization ?? null;
+  const compactUsageView = buildCodexMainUsageView(compactData);
+  const compactWeeklyUsedPct = compactUsageView.weeklyUsed;
+  const compactFiveHourUsedPct = compactUsageView.fiveHourUsed;
+  const compactHasWeekly = compactUsageView.hasWeekly;
+  const compactHasFiveHour = compactUsageView.hasFiveHour;
   const compactWeeklyLeftPct = pctRemaining(compactWeeklyUsedPct);
   const compactFiveHourLeftPct = pctRemaining(compactFiveHourUsedPct);
   const compactFableUsage = compactData?.model_scoped?.find((usage) => (
     /^fable(?:\s+\d+)?$/i.test(usage.display_name?.trim() || '')
   )) || null;
-  const compactFableUsedPct = compactFableUsage?.utilization ?? null;
+  const compactFableUsedPct = modelScopedUsedPct(compactFableUsage);
   const compactFableLeftPct = pctRemaining(compactFableUsedPct);
   const chipColor = colorForPct(compactWeeklyUsedPct);
   const compactFiveHourColor = colorForPct(compactFiveHourUsedPct);
   const compactFableColor = colorForPct(compactFableUsedPct);
+  // Spoken and hover text list only the windows the provider actually returned,
+  // so a removed 5-hour window is silent instead of being read out as "—".
+  const claudeAriaMetrics = [
+    compactHasWeekly ? `weekly left ${formatPct(compactWeeklyLeftPct)}` : null,
+    compactHasFiveHour ? `5-hour left ${formatPct(compactFiveHourLeftPct)}` : null,
+    compactFableUsedPct != null ? `Fable left ${formatPct(compactFableLeftPct)}` : null,
+  ].filter(Boolean).join(', ');
+  const claudeTitleMetrics = [
+    compactHasWeekly
+      ? `weekly left: ${formatPct(compactWeeklyLeftPct)} (used ${formatPct(compactWeeklyUsedPct)})`
+      : null,
+    compactHasFiveHour
+      ? `5-hour left: ${formatPct(compactFiveHourLeftPct)} (used ${formatPct(compactFiveHourUsedPct)})`
+      : null,
+    compactFableUsedPct != null
+      ? `Fable left: ${formatPct(compactFableLeftPct)} (used ${formatPct(compactFableUsedPct)})`
+      : null,
+  ].filter(Boolean).join(' • ');
   // Compact "time until weekly reset" for the chip face. null → no resets_at.
   const resetShort = formatResetShort(compactData?.seven_day?.resets_at);
   const fiveHourResetShort = formatResetShort(compactData?.five_hour?.resets_at);
@@ -1419,18 +1474,29 @@ function ClaudeUsageChip({
   const accountOptions: UsageAccountOption[] = accounts.map((account) => {
     const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
     const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
-    const accountFableUsed = account.usage?.model_scoped?.find((usage) => (
+    const accountFableUsed = modelScopedUsedPct(account.usage?.model_scoped?.find((usage) => (
       /^fable(?:\s+\d+)?$/i.test(usage.display_name?.trim() || '')
-    ))?.utilization ?? null;
+    )));
     const accountCurrent = !!account.accountKey
       && (account.isCurrent || account.accountKey === currentAccountKey);
+    const claudeAccountMetrics = [
+      accountWeeklyUsed != null
+        ? `weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)})`
+        : null,
+      accountFiveHourUsed != null
+        ? `5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})`
+        : null,
+      accountFableUsed != null
+        ? `Fable left ${formatPct(pctRemaining(accountFableUsed))} (used ${formatPct(accountFableUsed)})`
+        : null,
+    ].filter(Boolean).join(' • ');
     return {
       key: account.accountKey,
       label: account.label,
       selected: account.accountKey === (selectedAccount?.accountKey || selectedAccountKey),
       current: accountCurrent,
       onSelect: () => selectAccount(account),
-      title: `${account.label} • ${account.accountHint || account.kind || 'Claude'}${accountWeeklyUsed != null ? ` • weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})${accountFableUsed != null ? ` • Fable left ${formatPct(pctRemaining(accountFableUsed))} (used ${formatPct(accountFableUsed)})` : ''}` : ''}${accountCurrent ? ' • current Claude login' : ''}${account.stale ? ' • stale' : ''}${account.notice ? ` • ${account.notice}` : ''}${account.lastError || account.error ? ` • ${account.lastError || account.error}` : ''}`,
+      title: `${account.label} • ${account.accountHint || account.kind || 'Claude'}${claudeAccountMetrics ? ` • ${claudeAccountMetrics}` : ''}${accountCurrent ? ' • current Claude login' : ''}${account.stale ? ' • stale' : ''}${account.notice ? ` • ${account.notice}` : ''}${account.lastError || account.error ? ` • ${account.lastError || account.error}` : ''}`,
     };
   });
 
@@ -1452,11 +1518,11 @@ function ClaudeUsageChip({
         }}
         onMouseEnter={onTriggerEnter}
         onMouseLeave={onTriggerLeave}
-        aria-label={`Claude usage${compactAccountLabel ? ` for ${compactAccountLabel}` : ''}: weekly left ${formatPct(compactWeeklyLeftPct)}, 5-hour left ${formatPct(compactFiveHourLeftPct)}${compactFableUsedPct != null ? `, Fable left ${formatPct(compactFableLeftPct)}` : ''}`}
+        aria-label={`Claude usage${compactAccountLabel ? ` for ${compactAccountLabel}` : ''}: ${claudeAriaMetrics || 'no limits available'}`}
         aria-expanded={showPopover}
         aria-haspopup="dialog"
         title={compactWeeklyUsedPct != null || compactFiveHourUsedPct != null
-          ? `Claude${compactAccountLabel ? ` ${compactAccountLabel}` : ''} weekly left: ${formatPct(compactWeeklyLeftPct)} (used ${formatPct(compactWeeklyUsedPct)}) • 5-hour left: ${formatPct(compactFiveHourLeftPct)} (used ${formatPct(compactFiveHourUsedPct)})${compactFableUsedPct != null ? ` • Fable left: ${formatPct(compactFableLeftPct)} (used ${formatPct(compactFableUsedPct)})` : ''}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${compactLoading ? ' • updating' : ''}${compactStale ? ' • stale' : ''}  •  right-click → refresh current account  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
+          ? `Claude${compactAccountLabel ? ` ${compactAccountLabel}` : ''} ${claudeTitleMetrics || 'limits unavailable'}${compactHasWeekly && resetShort ? ` • weekly resets in ${resetShort}` : ''}${compactHasFiveHour && fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${compactLoading ? ' • updating' : ''}${compactStale ? ' • stale' : ''}  •  right-click → refresh current account  •  click → pin to tab  •  ⌘+hover → peek`
           : (compactLoading ? 'Claude usage is updating' : (compactAccount?.notice || compactAccount?.lastError || compactAccount?.error || `${compactAccountKindLabel}${compactAccountLabel ? ` ${compactAccountLabel}` : ''}` || 'Claude usage is unavailable'))}
         style={{
           position: 'relative',
@@ -1470,7 +1536,7 @@ function ClaudeUsageChip({
           maxWidth: 260,
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: compactWeeklyUsedPct != null ? chipColor : '#888',
-          border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
+          border: `1px solid ${showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)'}`,
           borderRadius: standalone ? 4 : '0 4px 4px 0',
           fontSize: 11,
           fontWeight: 600,
@@ -1511,11 +1577,15 @@ function ClaudeUsageChip({
               <span>{formatPct(compactWeeklyLeftPct)}</span>
               {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
             </span>
-            <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ color: compactFiveHourUsedPct != null ? compactFiveHourColor : '#6b7280' }}>{formatPct(compactFiveHourLeftPct)}</span>
-              {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
-            </span>
+            {compactHasFiveHour && (
+              <>
+                <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ color: compactFiveHourColor }}>{formatPct(compactFiveHourLeftPct)}</span>
+                  {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
+                </span>
+              </>
+            )}
             {compactFableUsedPct != null && (
               <>
                 <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
@@ -1641,20 +1711,24 @@ function ClaudeUsageChip({
 
           {detailData && (
             <>
-              <ProgressRow
-                label="Weekly left (Claude)"
-                pct={weeklyLeftPct}
-                displayPct={weeklyLeftPct}
-                colorPct={weeklyUsedPct}
-                resetsAt={detailData.seven_day?.resets_at}
-              />
-              <ProgressRow
-                label="5-hour left"
-                pct={fiveHourLeftPct}
-                displayPct={fiveHourLeftPct}
-                colorPct={fiveHourUsedPct}
-                resetsAt={detailData.five_hour?.resets_at}
-              />
+              {hasWeeklyWindow && (
+                <ProgressRow
+                  label="Weekly left (Claude)"
+                  pct={weeklyLeftPct}
+                  displayPct={weeklyLeftPct}
+                  colorPct={weeklyUsedPct}
+                  resetsAt={detailData.seven_day?.resets_at}
+                />
+              )}
+              {hasFiveHourWindow && (
+                <ProgressRow
+                  label="5-hour left"
+                  pct={fiveHourLeftPct}
+                  displayPct={fiveHourLeftPct}
+                  colorPct={fiveHourUsedPct}
+                  resetsAt={detailData.five_hour?.resets_at}
+                />
+              )}
               {fableUsedPct != null && (
                 <ProgressRow
                   label="Fable left"
@@ -1929,7 +2003,6 @@ function CodexUsageChip({
   visible,
   standalone,
   showPopover,
-  sticky,
   popoverHost,
   onTriggerClick,
   onTriggerEnter,
@@ -2500,7 +2573,7 @@ function CodexUsageChip({
           padding: '0 7px',
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: hasWeekly || hasFiveHour ? chipColor : '#888',
-          border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
+          border: `1px solid ${showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)'}`,
           borderRadius: standalone ? 4 : '4px 0 0 4px',
           fontSize: 11,
           fontWeight: 600,
@@ -2747,7 +2820,6 @@ export default function ClaudeUsageButton() {
   const visibleProviders = useUsageVisibilityStore(state => state.visibleProviders);
   const toggleProviderVisibility = useUsageVisibilityStore(state => state.toggleProvider);
   const [clicked, setClicked] = useState(false);
-  const [sticky, setSticky] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
   const [hoveredProvider, setHoveredProvider] = useState<UsageProvider | null>(null);
   const [popoverHover, setPopoverHover] = useState(false);
@@ -2765,7 +2837,7 @@ export default function ClaudeUsageButton() {
   const restoreInvokerFocusRef = useRef(false);
   const invokerProviderRef = useRef<UsageProvider>('codex');
   const activeTabId = useWorkspaceStore((state) => state.getEffectiveTabId());
-  const showPopover = clicked || sticky || (cmdPressed && hoveredProvider !== null) || popoverHover;
+  const showPopover = clicked || (cmdPressed && hoveredProvider !== null) || popoverHover;
 
   useLayoutEffect(() => {
     if (!showPopover) {
@@ -2914,19 +2986,6 @@ export default function ClaudeUsageButton() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey) setCmdPressed(true);
-      if (
-        event.key === 'Shift'
-        && (event.metaKey || event.ctrlKey)
-        && !event.repeat
-        && showPopover
-      ) {
-        event.preventDefault();
-        setSticky((value) => {
-          const next = !value;
-          if (next) setPinnedTabId(activeTabId);
-          return next;
-        });
-      }
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (!event.metaKey && !event.ctrlKey) setCmdPressed(false);
@@ -2951,15 +3010,15 @@ export default function ClaudeUsageButton() {
   }, [activeTabId, cmdPressed, showPopover]);
 
   useEffect(() => {
-    if (!clicked || sticky) return;
+    if (!clicked) return;
     if (pinnedTabId && activeTabId && pinnedTabId !== activeTabId) {
       setClicked(false);
       setPinnedTabId(null);
     }
-  }, [activeTabId, clicked, pinnedTabId, sticky]);
+  }, [activeTabId, clicked, pinnedTabId]);
 
   useEffect(() => {
-    if (!clicked || sticky) return;
+    if (!clicked) return;
     const onMouseDown = (event: MouseEvent) => {
       if (rootRef.current?.contains(event.target as Node)) return;
       setClicked(false);
@@ -2979,15 +3038,9 @@ export default function ClaudeUsageButton() {
       window.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [clicked, sticky]);
+  }, [clicked]);
 
   const handleTriggerClick = (provider: UsageProvider) => {
-    if (sticky && provider === activeProvider) {
-      setSticky(false);
-      setClicked(false);
-      setPinnedTabId(null);
-      return;
-    }
     if (clicked && provider === activeProvider) {
       setClicked(false);
       setPinnedTabId(null);
@@ -3011,7 +3064,7 @@ export default function ClaudeUsageButton() {
 
   const handleTriggerEnter = (provider: UsageProvider) => {
     setHoveredProvider(provider);
-    if (!clicked && !sticky && cmdPressed) setActiveProvider(provider);
+    if (!clicked && cmdPressed) setActiveProvider(provider);
   };
 
   const activitySection = (
@@ -3041,7 +3094,6 @@ export default function ClaudeUsageButton() {
         visible={visibleProviders.codex}
         standalone={!visibleProviders.claude}
         showPopover={showPopover && activeProvider === 'codex'}
-        sticky={sticky}
         popoverHost={popoverHost}
         onTriggerClick={() => handleTriggerClick('codex')}
         onTriggerEnter={() => handleTriggerEnter('codex')}
@@ -3052,7 +3104,6 @@ export default function ClaudeUsageButton() {
         visible={visibleProviders.claude}
         standalone={!visibleProviders.codex}
         showPopover={showPopover && activeProvider === 'claude'}
-        sticky={sticky}
         popoverHost={popoverHost}
         onTriggerClick={() => handleTriggerClick('claude')}
         onTriggerEnter={() => handleTriggerEnter('claude')}
@@ -3104,9 +3155,7 @@ export default function ClaudeUsageButton() {
             overflowY: 'auto',
             overscrollBehavior: 'contain',
             background: '#161616',
-            border: sticky
-              ? '1px solid rgba(255,255,255,0.45)'
-              : '1px solid rgba(255,255,255,0.12)',
+            border: '1px solid rgba(255,255,255,0.12)',
             borderRadius: 6,
             boxShadow: '0 6px 20px rgba(0,0,0,0.55)',
             zIndex: 1000,
@@ -3168,9 +3217,6 @@ export default function ClaudeUsageButton() {
                 );
               })}
             </div>
-            <span style={{ fontSize: 9, color: sticky ? '#999' : '#666', textAlign: 'right', letterSpacing: 0.2 }}>
-              {sticky ? 'Pinned across tabs · ⌘⇧' : '⌘⇧ to pin across tabs'}
-            </span>
           </div>
         </div>
       )}

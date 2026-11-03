@@ -1,9 +1,10 @@
 const { ipcMain, shell } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const dirWatch = require('../dir-watch');
 const path = require('path');
 const { performance } = require('node:perf_hooks');
-const { callGeminiApi } = require('./gemini-api');
+const { resolveGitCommitModel } = require('./git-commit-provider');
 const { buildChildProcessEnv } = require('../child-process-env');
 const { createGitStatusCoordinator } = require('./git-status-coordinator');
 const { causal } = require('../perf-causal-context');
@@ -529,19 +530,23 @@ async function collectDiffForPrompt(root, status, selectedPaths, docsOnlyWhenPre
   };
 }
 
+// Модель и уровень размышления берутся из Settings → AI как есть, без
+// подстановки дефолта конкретного провайдера: привести их к текущему провайдеру
+// — задача `resolveGitCommitModel`, которая одна знает, кому какая модель
+// принадлежит. Пустое значение здесь означает «пользователь не выбирал».
 function getGitCommitPromptConfig(projectManager) {
   try {
     const prompt = projectManager?.getAIPrompts?.().find((item) => item.id === GIT_COMMIT_PROMPT_ID);
     return {
       content: String(prompt?.content || '').trim() || DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
-      model: prompt?.model || 'gemini-3.5-flash-lite',
-      thinking: prompt?.thinkingLevel || 'NONE',
+      model: prompt?.model || '',
+      thinking: prompt?.thinkingLevel || '',
     };
   } catch {
     return {
       content: DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
-      model: 'gemini-3.5-flash-lite',
-      thinking: 'NONE',
+      model: '',
+      thinking: '',
     };
   }
 }
@@ -1223,13 +1228,13 @@ function register({ projectManager }) {
       };
 
       try {
-        state.watchers.push(fs.watch(root, { recursive: true, persistent: false }, (eventType, filename) => {
+        state.watchers.push(dirWatch.watch(root, { recursive: true, persistent: false }, (eventType, filename) => {
           notify(root, eventType, filename);
         }));
         const gitDirResult = await runGit(root, ['rev-parse', '--absolute-git-dir']);
         const gitDir = gitDirResult.success ? gitDirResult.stdout.trim() : '';
         if (gitDir && path.resolve(gitDir) !== path.resolve(root)) {
-          state.watchers.push(fs.watch(gitDir, { recursive: true, persistent: false }, (eventType, filename) => {
+          state.watchers.push(dirWatch.watch(gitDir, { recursive: true, persistent: false }, (eventType, filename) => {
             notify(gitDir, eventType, filename);
           }));
         }
@@ -1422,11 +1427,20 @@ function register({ projectManager }) {
         const diffBundle = await collectDiffForPrompt(root, status, selection.paths, docsOnlyWhenPresent);
         if (!diffBundle.includedPaths.length) throw new Error('No selected files');
         const promptConfig = getGitCommitPromptConfig(projectManager);
-        model = promptConfig.model;
-        thinking = promptConfig.thinking;
+        // Провайдер выбирается в `git-commit-provider.js` одной константой.
+        // Модель, сохранённая в Settings для другого провайдера, заменяется на
+        // модель по умолчанию текущего: иначе запрос уйдёт с чужим именем и
+        // вернётся ошибкой. В журнал пишется фактически вызванная модель.
+        const resolved = resolveGitCommitModel(promptConfig.model, promptConfig.thinking);
+        model = resolved.model;
+        thinking = resolved.thinking;
+        if (resolved.replacedModel) {
+          console.log('[git] commit message provider=' + resolved.provider
+            + ' replaced saved model ' + resolved.replacedModel + ' with ' + model);
+        }
         const built = buildCommitPrompt(status, diffBundle, promptConfig.content);
         prompt = built.prompt;
-        const response = await callGeminiApi(built.system, built.prompt, model, thinking);
+        const response = await resolved.call(built.system, built.prompt, model, thinking);
         output = response.text || '';
 
         projectManager?.logAIPromptCall?.({

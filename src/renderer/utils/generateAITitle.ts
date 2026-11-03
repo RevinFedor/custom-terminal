@@ -1,73 +1,84 @@
 import { getGeminiApiKey } from './geminiApiKey.mjs';
+import { getOpenAIApiKey } from './openaiApiKey.mjs';
+import { resolveUtilityAIModel, openAIEffortForModel } from '../../shared/utility-ai-provider.mjs';
 /**
- * Generates a short title for an AI Paste collapsed block via Gemini Flash.
+ * Короткое название для свёрнутого блока AI Paste.
  *
- * Used as the `onGenerateTitle` callback passed to <MarkdownEditor> — the editor
- * inserts `^^ ⏳` placeholder, calls this function with the pasted text, then
- * replaces `⏳` with the returned title (or 'paste text' fallback on failure).
+ * Передаётся в <MarkdownEditor> как `onGenerateTitle`: редактор вставляет
+ * `^^ ⏳`, вызывает эту функцию с текстом вставки и заменяет `⏳` результатом
+ * (или `paste text [N]` при отказе).
  *
- * Mirrors the same API pattern already used by InfoPanel.handleGenerateDescription —
- * GEMINI_API_KEY from Electron main's runtime ENV via local IPC,
- * gemini-2.0-flash model with a system prompt asking for a 2-5 word title.
+ * Провайдер — общий utility-выбор (`shared/utility-ai-provider.cjs`), тот же,
+ * что у названий вкладок. Собственной сохранённой модели у этого вызова нет:
+ * в Settings он не представлен, поэтому всегда берётся модель по умолчанию
+ * текущего провайдера.
+ *
+ * Цепочки запасных моделей здесь больше нет. Она существовала ради бесплатных
+ * квот Gemini: при 429 вызов перебирал `gemini-2.0-*` в поисках свободной
+ * корзины. У платного ключа это лишние запросы — 429 означает реальный лимит
+ * аккаунта, и следующая модель упрётся в него же. Остаётся один вызов и
+ * локальный fallback.
  */
-// Tried models in order — fall back to next when previous returns 429.
-// flash-lite has the most generous free-tier quota; flash-exp lacks RPM cap.
-// Keep flash-2.0 last so the heavier model isn't tried first.
-const MODEL_FALLBACK_CHAIN = [
-  'gemini-2.0-flash-lite',
-  'gemini-2.0-flash-exp',
-  'gemini-1.5-flash-latest',
-  'gemini-2.0-flash',
-];
+const SYSTEM_PROMPT = 'Дай короткое название (2-5 слов) для этой пасты. Только название, без точки, без кавычек, без префикса.';
 
-async function callGemini(apiKey: string, model: string, text: string): Promise<{ ok: true; title: string } | { ok: false; quota: boolean; msg: string }> {
-  const body = {
-    contents: [{ role: 'user', parts: [{ text }] }],
-    systemInstruction: {
-      parts: [{
-        text: 'Дай короткое название (2-5 слов) для этой пасты. Только название, без точки, без кавычек, без префикса.'
-      }],
-    },
+async function callOpenAI(apiKey: string, model: string, text: string): Promise<string> {
+  const body: any = {
+    model,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: text },
+    ],
+    max_completion_tokens: 2048,
   };
+  const effort = openAIEffortForModel('NONE', model);
+  if (effort) body.reasoning_effort = effort;
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data?.error) throw new Error(data.error.message || 'OpenAI error');
+  return String(data?.choices?.[0]?.message?.content || '').replace(/\n/g, ' ').trim();
+}
+
+async function callGemini(apiKey: string, model: string, text: string): Promise<string> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text }] }],
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      }),
+    }
   );
   const data = await res.json();
-  if (data?.error) {
-    const msg = data.error.message || 'Gemini error';
-    const quota = /exhausted|quota|429|rate/i.test(msg) || data.error.code === 429;
-    return { ok: false, quota, msg };
-  }
-  const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  const title = String(raw || '').replace(/\n/g, ' ').trim();
-  if (!title) return { ok: false, quota: false, msg: 'empty response' };
-  return { ok: true, title };
+  if (data?.error) throw new Error(data.error.message || 'Gemini error');
+  return String(data?.candidates?.[0]?.content?.parts?.[0]?.text || '').replace(/\n/g, ' ').trim();
 }
 
 export async function generateAITitle(text: string): Promise<string> {
-  const apiKey = await getGeminiApiKey();
+  const fallback = `paste text [${text.length}]`;
+  const { provider, model } = resolveUtilityAIModel(undefined, 'NONE');
+  const isOpenAI = provider === 'openai';
+  const apiKey = isOpenAI ? await getOpenAIApiKey() : await getGeminiApiKey();
   if (!apiKey) {
-    console.warn('[AITitle] GEMINI_API_KEY missing, returning fallback');
-    return `paste text [${text.length}]`;
+    console.warn('[AITitle] ' + (isOpenAI ? 'OPENAI_API_KEY' : 'GEMINI_API_KEY') + ' missing, returning fallback');
+    return fallback;
   }
-  // Try each model in the fallback chain. Stop on success or on a non-quota error
-  // (no point retrying a 400 etc.); quota → try the next bucket.
-  for (const model of MODEL_FALLBACK_CHAIN) {
-    try {
-      const r = await callGemini(apiKey, model, text);
-      if (r.ok) {
-        console.warn('[AITitle] success via', model, '→', r.title);
-        // No `[N]` suffix on AI titles — the title itself conveys meaning, the
-        // char-count chip is reserved for the non-AI "+ paste" pill (fallback).
-        return r.title;
-      }
-      console.warn('[AITitle] model', model, 'failed:', r.msg, r.quota ? '(quota — trying next)' : '(stopping chain)');
-      if (!r.quota) break; // non-quota error: stop, don't waste calls
-    } catch (err: any) {
-      console.error('[AITitle] network error on', model, ':', err?.message || err);
-      break;
+  try {
+    const title = isOpenAI ? await callOpenAI(apiKey, model, text) : await callGemini(apiKey, model, text);
+    if (!title) {
+      console.warn('[AITitle] empty response from', provider, model);
+      return fallback;
     }
+    console.warn('[AITitle] success via', provider, model, '→', title);
+    // Без суффикса `[N]`: счётчик символов остаётся у не-AI «+ paste».
+    return title;
+  } catch (err: any) {
+    console.error('[AITitle] request failed on', provider, model, ':', err?.message || err);
+    return fallback;
   }
-  return `paste text [${text.length}]`;
 }

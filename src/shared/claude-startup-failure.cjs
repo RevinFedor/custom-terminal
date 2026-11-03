@@ -62,6 +62,47 @@ function describeClaudeStartupFailure({
   // there tells the user the opposite of what happened, and a late proof may
   // still arrive and settle it. Keep it a distinct pending state so callers can
   // present waiting instead of failure; `pending:true` marks exactly that.
+  // The terminal belongs to another operation right now — a Rewind rewriting
+  // this very session is the usual case. Nothing was rejected and nothing is
+  // broken; the setting simply has not been written yet. Showing it in the
+  // red "Settings error" colour read as a failure of the Rewind that had just
+  // succeeded (02.11). Same pending channel as an unconfirmed outcome.
+  // Matched on the message because that is what actually arrives: the gate
+  // publishes `error=history_input_mutation_pending` with no errorCode
+  // (observed 02.11 13:43:40 and 13:56:27), while the refusal built in
+  // sendClaudeCommandInternal carries its reason as `claude_setting_write_refused`.
+  if (/history_input_mutation_pending|setting-history-input-held/.test(message)) {
+    return {
+      code, message, title: 'Settings pending', pending: true,
+      userMessage: 'Claude: настройки ждут освобождения ввода',
+      subtitle: 'Терминал занят другой операцией',
+      detail: 'Вводом владеет другая операция этой вкладки — обычно Rewind, который'
+        + ' перезапускает сессию. Это не отказ: настройка применится, как только ввод освободится.',
+    };
+  }
+  // Claude answered, but applied something else. The usual cause is the
+  // ANTHROPIC_MODEL environment variable, which overrides the picker and is
+  // named right in Claude's own stdout ("… ANTHROPIC_MODEL is set to `Opus
+  // 5.5`"). Saying only "не удалось применить" hid the single fact the user
+  // needs: the choice lost to an env var, so repeating it changes nothing.
+  if (code === 'claude_setting_applied_different') {
+    const env = /ANTHROPIC_MODEL\s+is\s+set\s+to\s+`?([^`\n]+)`?/i.exec(message)?.[1]?.trim() || null;
+    const actual = /Set model to\s+`?([^`\n]+?)`?(?:\s+and saved|\s*$)/im.exec(message)?.[1]?.trim()
+      || /Set effort level to\s+([a-z-]+)/i.exec(message)?.[1] || null;
+    const target = command.startsWith('/effort') ? 'уровень усилий' : 'модель';
+    return {
+      code, message, title: 'Settings error',
+      userMessage: 'Claude: применил другую ' + (target === 'модель' ? 'модель' : 'настройку')
+        + (actual ? ' — ' + actual : ''),
+      subtitle: env ? 'Выбор перекрыт переменной ANTHROPIC_MODEL' : 'Claude применил не то, что выбрано',
+      detail: env
+        ? 'Переменная окружения ANTHROPIC_MODEL = ' + env + ' сильнее выбора в меню:'
+          + ' Claude ставит её значение и так и записывает в историю. Повтор выбора ничего не изменит —'
+          + ' снимите или смените переменную.'
+        : 'Claude подтвердил другое значение' + (actual ? ' (' + actual + ')' : '')
+          + '. Это не потеря команды: она дошла и была обработана.',
+    };
+  }
   if (code === 'claude_setting_outcome_unknown') {
     const target = command.startsWith('/model') ? 'модель'
       : command.startsWith('/effort') ? 'уровень усилий' : 'настройку';

@@ -164,13 +164,27 @@ function createIngressAuthority(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   return { version: 1, authorityId: randomUUID(), ...ingressLocation(file) }
 }
+function homeDevice() {
+  let stat
+  try { stat = fs.lstatSync(os.homedir(), { bigint: true }) }
+  catch { fail('research_host_ingress_authority_unavailable') }
+  if (!stat.isDirectory()) fail('research_host_ingress_authority_invalid')
+  return String(stat.dev)
+}
 function validateIngressAuthority(authority, expectedFile) {
   if (!authority) fail('research_host_ingress_authority_required')
   if (authority.version !== 1 || !id(authority.authorityId) || typeof authority.file !== 'string'
     || !authority.directory || !['dev', 'ino'].every(k => /^\d+$/.test(authority.directory[k]))
     || Object.keys(authority).some(k => !['version', 'authorityId', 'file', 'directory'].includes(k))) fail('research_host_ingress_authority_invalid')
   const location = ingressLocation(authority.file)
-  if (location.file !== authority.file || digest(location.directory) !== digest(authority.directory)) fail('research_host_ingress_authority_changed')
+  // macOS does not keep st_dev stable across boots, so a recorded volume number
+  // cannot identify the directory: after a reboot the same folder legitimately
+  // reports a different device and the pin failed closed with no substitution.
+  // The inode identifies it; volume membership is proven against the LIVE device
+  // of HOME, never a number from a past boot. The stored record is unchanged, so
+  // digests, enrolled cohorts, receipts and fences stay valid without a write.
+  if (location.file !== authority.file || location.directory.ino !== authority.directory.ino
+    || location.directory.dev !== homeDevice()) fail('research_host_ingress_authority_changed')
   if (expectedFile !== undefined && ingressLocation(expectedFile).file !== authority.file) fail('research_host_ingress_authority_changed')
   return digest(authority)
 }

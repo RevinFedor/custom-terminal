@@ -138,3 +138,71 @@ test('main wires the modal through current-frame proof and selects keep bypass',
   assert.match(clearLaunch, /claudeAutoModeDefaultPromptHintTabs\.delete\(tabId\)/);
   assert.match(clearLaunch, /claudeAutoModeDefaultPromptHintBuffers\.delete\(tabId\)/);
 });
+
+// Live incident 01.11.2026 (CLI 2.1.316, clean CLAUDE_CONFIG_DIR, stand
+// /private/tmp/ios-e2e-20261101, tab 47d11c9e4a45): the shipped dialog has NO
+// row numbers, so the `1.`/`2.`-anchored matcher reported options-missing, the
+// modal was never dismissed, no composer appeared, `/effort low` was refused
+// with cursor-before-composer and the tab stayed unusable on 5 tabs in a row.
+// The fixture is that exact committed frame from the saved diagnostic.
+test('numberless shipped dialog is recognized and its selection is proven', () => {
+  const frame = JSON.parse(fs.readFileSync(
+    path.join(__dirname, 'fixtures', 'claude-auto-mode-default-prompt-nonumbers.json'), 'utf8',
+  ));
+  assert.equal(frame.lines.some(line => /^\s*❯ Yes, set auto mode/.test(String(line.text || ''))), true,
+    'fixture is the real no-number frame');
+  assert.equal(looksLikeClaudeAutoModeDefaultPromptText(
+    frame.lines.map(line => line.text).join('\n')), true);
+  assert.deepEqual(inspectClaudeAutoModeDefaultPromptSnapshot(frame), {
+    visible: true,
+    selectedOption: 1,
+    reason: 'current-auto-mode-default-prompt-proven',
+  });
+});
+
+test('the decline row follows the current permission mode, and unknown modes stay unmatched', () => {
+  const build = (declineLabel, selectedRow) => snapshot([
+    'Make auto mode your default permission mode?',
+    '',
+    'Auto mode lets Claude handle permission prompts automatically.',
+    '',
+    '❯ Yes, set auto mode as my default permission mode',
+    '  ' + declineLabel,
+  ].join('\n'), selectedRow);
+  // `No, keep ${indicator}` — the CLI builds it from the live mode.
+  for (const label of ['No, keep bypass permissions', 'No, keep plan mode',
+    'No, keep accept edits', 'No, keep auto mode', "No, keep don't ask"]) {
+    const result = inspectClaudeAutoModeDefaultPromptSnapshot(build(label, 4));
+    assert.equal(result.visible, true, label);
+    assert.equal(result.selectedOption, 1, label);
+  }
+  // Selecting the decline row is what the writer confirms with Enter.
+  const onNo = inspectClaudeAutoModeDefaultPromptSnapshot(snapshot([
+    'Make auto mode your default permission mode?',
+    '',
+    'Auto mode lets Claude handle permission prompts automatically.',
+    '',
+    '  Yes, set auto mode as my default permission mode',
+    '❯ No, keep bypass permissions',
+  ].join('\n'), 5));
+  assert.equal(onNo.selectedOption, 2);
+  // An unknown future mode must not be guessed: Enter would confirm whatever
+  // row happens to be selected.
+  const unknownMode = inspectClaudeAutoModeDefaultPromptSnapshot(
+    build('No, keep teleport mode', 4));
+  assert.equal(unknownMode.visible, false);
+  assert.equal(unknownMode.reason, 'no-option-incomplete');
+});
+
+test('numbered builds keep working, so an older CLI is not broken by the relaxed match', () => {
+  const numbered = inspectClaudeAutoModeDefaultPromptSnapshot(snapshot([
+    'Make auto mode your default permission mode?',
+    '',
+    'Auto mode lets Claude handle permission prompts automatically.',
+    '',
+    '  1. Yes, set auto mode as my default permission mode',
+    '❯ 2. No, keep bypass permissions',
+  ].join('\n'), 5));
+  assert.equal(numbered.visible, true);
+  assert.equal(numbered.selectedOption, 2);
+});

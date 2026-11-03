@@ -1,12 +1,17 @@
 import { create } from 'zustand';
 import type { GeminiModelId } from '../constants/geminiModels';
+import type { OpenAIUtilityModelId } from '../constants/utilityModels';
 import { RUN_AFTER_LOOP_PROMPT_ID, DEFAULT_LOOP_PROMPT } from '../../shared/prompt-loop.mjs';
 import { DEFAULT_TAB_TITLE_PROMPT } from '../../shared/tab-title-prompt.mjs';
 import { TASK_THEME_PROMPT_ID, DEFAULT_TASK_THEME_PROMPT } from '../../shared/task-theme-prompt.mjs';
 export { DEFAULT_TAB_TITLE_PROMPT };
 export { RUN_AFTER_LOOP_PROMPT_ID };
 
-export type AIModel = GeminiModelId;
+// Модель промпта принадлежит провайдеру, выбранному для его задачи: utility-
+// промпты могут хранить id OpenAI, остальные — Gemini. Сохранённое значение
+// пользовательское и переживает смену провайдера; приводит его к текущему
+// `resolveUtilityAIModel` в момент вызова, а не это объявление типа.
+export type AIModel = GeminiModelId | OpenAIUtilityModelId;
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export const TAB_TITLE_PROMPT_ID = 'tab-title';

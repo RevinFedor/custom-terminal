@@ -893,6 +893,15 @@ class OrchestrationRunStore {
       throw Object.assign(new Error('Invalid startup maintenance handover'), { code: 'research_maintenance_startup_invalid', statusCode: 503 });
     }
     await this.beforeStartupMaintenance?.();
+    // A different Noted install left its window `active` (its installer died
+    // with the app it quit). Close that record before our own begin, or this
+    // Main — and every later reinstall — can never gain store authority.
+    const superseded = researchMaintenance.supersedeStaleNotedInstall(this.researchMaintenance, descriptor.operationId);
+    if (superseded.superseded) {
+      this.researchMaintenance = superseded.value;
+      console.warn('[ResearchMaintenance] startup superseded stale install op=' + superseded.superseded
+        + ' by op=' + descriptor.operationId + ' (its installer no longer controls this app)');
+    }
     const result = researchMaintenance.transition(this.researchMaintenance,
       { action: 'begin', operationId: descriptor.operationId });
     this.researchMaintenance = result.value;

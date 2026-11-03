@@ -82,6 +82,20 @@ function validateAgentProviderModel({ provider, model } = {}) {
       modelProvider: null,
     };
   }
+  // A human-facing LABEL is not a runtime id. Claude prints `Opus 5` /
+  // `Haiku 5.5` after a successful `/model`, and that label was once retained
+  // as the tab's preference and injected back as `/model Opus 5`, which Claude
+  // answers `Model 'Opus5' not found` (03.11, tab 5b20bf267cca). The retain
+  // path now keeps the sent id, but nothing stopped a label from entering the
+  // contract at all — and an already-poisoned preference kept failing every
+  // launch. Labels are recognisable: a real id is lowercase and has no space.
+  if (resolvedProvider === 'claude' && /\s/.test(normalizedModel)) {
+    throw agentContractError(
+      'agent_model_display_label',
+      `'${normalizedModel}' is a display label, not a model id. Use the id that was sent, for example claude-opus-5[1m].`,
+      { provider: resolvedProvider, model: normalizedModel },
+    );
+  }
   const modelProvider = inferAgentModelProvider(normalizedModel);
   if (modelProvider && modelProvider !== resolvedProvider) {
     throw agentContractError(

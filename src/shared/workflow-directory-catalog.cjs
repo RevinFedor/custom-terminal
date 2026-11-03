@@ -101,8 +101,54 @@ function prepareDirectoryCatalog(core, codec) {
   const clocks = { ...core.clocks,
     descriptors: { kind: 'content-hash', value: hash({ rows: core.rows, refs }) },
     tree: { kind: 'content-hash', value: hash(core.workflows) } };
-  const catalogClock = hash({ index, refs, rows: core.rows, workflows: core.workflows,
-    groups: core.groups, provenanceCounts: core.provenanceCounts, clocks,
+  // The basis guard answers one question: "is the directory the client read
+  // still the same directory?" Identity, membership and structure belong in
+  // it. Live runtime state does NOT, and including it made the guard reject
+  // correct requests.
+  //
+  // Measured on the working host 01.11 (iOS brief, 12:54:29-12:54:33): a 409
+  // `directory_catalog_changed` with `organizationRevision=21599` and
+  // `tree=59dd6705` IDENTICAL before and after — only `descriptors` moved. Each
+  // false 409 made the phone re-fetch the whole 813 KB catalog and Main rebuild
+  // and serialize it again (~1.4s), 23 times in one session. It gets worse the
+  // more agents are running, because that is what moves the status.
+  //
+  // Worse, it was circular: `runtime-summary` and `card-signals` exist to ask
+  // "what is the live status of these tabs?", and they carry this clock. The
+  // request for fresh status was rejected *because the status became fresh*.
+  //
+  // Two live fields are excluded, not one (the brief named `sessionStatus` and
+  // `storageRevision`; `core.rows` carried a second copy of `sessionStatus`):
+  //   - `sessionStatus` — a tab going inactive→busy is runtime, not identity;
+  //   - `storageRevision` — an AFTER UPDATE trigger on `tabs` bumps it on ANY
+  //     write to the row (database.js:2117-2119), so an unrelated field like a
+  //     cached context percentage moved the directory clock.
+  // Everything those fields could legitimately protect is still covered: a
+  // rename, a cwd/path/provider change, a move between workflows, a replaced
+  // execution subject and any tree/group/window change all alter the retained
+  // inputs below, so `workflow-directory-catalog.test.js` still gets its 409s.
+  // Live state has its own channels (`project-activity`, SSE, `card-signals`).
+  const stableIndex = Object.create(null);
+  for (const [tabId, entry] of Object.entries(index)) {
+    const { sessionStatus, ...identity } = entry;
+    stableIndex[tabId] = identity;
+  }
+  const stableRefs = Object.create(null);
+  for (const [tabId, ref] of Object.entries(refs)) {
+    const { storageRevision, ...identity } = ref;
+    stableRefs[tabId] = identity;
+  }
+  const stableRows = Object.create(null);
+  for (const [tabId, row] of Object.entries(core.rows)) {
+    const { sessionStatus, ...identity } = row;
+    stableRows[tabId] = identity;
+  }
+  // `clocks.descriptors` is derived from the same live inputs, so feeding the
+  // raw `clocks` object back in would reintroduce exactly what we just removed.
+  const { descriptors, ...stableClocks } = clocks;
+  const catalogClock = hash({ index: stableIndex, refs: stableRefs, rows: stableRows,
+    workflows: core.workflows, groups: core.groups, provenanceCounts: core.provenanceCounts,
+    clocks: { ...stableClocks, descriptors: { kind: 'content-hash', value: hash({ rows: stableRows, refs: stableRefs }) } },
     ...(core.windowLayout ? { windowLayout: core.windowLayout } : {}) });
   // Compatibility witness for the UNCHANGED nativeDrag v1 admission. This is
   // exactly full readCapture's tree hash, not the v2 directory content clock.

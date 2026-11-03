@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
@@ -13,7 +14,7 @@ const { resolveHubConfiguration, CONFIG_HEADER, EXPECTED_CONFIG_ENV } = require(
 // close, so quick app reopen cannot race a port still held by the old hub.
 function createMcpHubController({ port, script, canSpawn = true, log = console.log,
   executable = process.execPath, env = process.env, fetchImpl = fetch, spawnImpl = spawn,
-  startupTimeoutMs = 12000, ingressFile = path.join(env.HOME || os.homedir(), 'Library/Application Support/sc-desktop/research-maintenance-ingress.json'), readConfiguration = () => resolveHubConfiguration(env) } = {}) {
+  startupTimeoutMs = 12000, ingressFile = path.join(env.HOME || os.homedir(), 'Library/Application Support/sc-desktop/research-maintenance-ingress.json'), readConfiguration = () => resolveHubConfiguration(env), io = fs } = {}) {
   const base = 'http://127.0.0.1:' + port;
   let inflight = null;
   const ready = server => server.up && server.initialized && !server.recovering;
@@ -126,16 +127,29 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
       const brokenLaunch = existing && existing.servers.length > 0
         && existing.servers.every(server => !ready(server) && !server.pendingRequests)
         && existing.servers.some(server => /ENOENT|code=127/.test(server.lastError || ''));
+      // A detached hub survives Build Install on purpose, but the installer
+      // deletes the bundle it was launched from. macOS grants file access per
+      // executable identity, so such a hub keeps answering while it and all six
+      // children lose the project directory: EPERM on reads, Browser's host
+      // binding invalid, workers unable to start. Its children stay `ready`
+      // and report no ENOENT, so brokenLaunch never saw it and Main adopted it
+      // as healthy. Compare the reported executable with ours instead.
+      const staleExecutable = !!existing?.executable
+        && existing.executable !== executable
+        && !io.existsSync(existing.executable);
       const idle = existing?.servers.every(server => server.pendingRequests === 0 && !server.recovering);
       const preservesMembers = existing?.servers.every(server => Object.hasOwn(desired.serverDefs, server.name));
       const needsUpgrade = existing && idle && preservesMembers && desired.canLaunch
-        && !existing.capabilities?.launchEnvironment && (upgrade || brokenLaunch);
+        && (staleExecutable
+          || (!existing.capabilities?.launchEnvironment && (upgrade || brokenLaunch)));
       // Configuration mismatch is reported, not an automatic shutdown trigger.
       if (existing && !needsUpgrade) return existing;
       if (!canSpawn) return existing; // E2E may observe, never own/replace global hub
       if (!desired.canLaunch) throw new Error(desired.status.error);
       if (existing) {
-        log('[MCPHub] replacing legacy hub pid ' + existing.pid + ' with repaired launch environment');
+        log('[MCPHub] replacing hub pid ' + existing.pid + (staleExecutable
+          ? ' launched from a removed bundle (' + existing.executable + ')'
+          : ' with repaired launch environment'));
         try { await shutdown(existing.pid); }
         catch (error) {
           const replacement = await status(1200, desired);

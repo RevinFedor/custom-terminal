@@ -23,3 +23,22 @@ test('changed source during endpoint await and lost ACK never replay or become s
   const unknown = createMiniOrchestratorMcpSender({ endpointFor: () => 'http://127.0.0.1:53133/mcp/terminal', fetchImpl: () => { calls++; throw Error('lost'); } });
   assert.equal((await unknown(job)).status, 'unknown'); assert.equal(calls, 1);
 });
+test('local Project API transport carries the same terminal-mcp authorship as the hub', async () => {
+  // Both transports end in the same guarded send, so History must record the
+  // same provenance. The route reads `source` from the body; omitting it left
+  // the delivery authorless and rendered as an ordinary human paste.
+  let body = null;
+  const send = createMiniOrchestratorMcpSender({
+    endpointFor: () => ({ kind: 'project-api', base: 'http://127.0.0.1:7777/api/terminal-tabs/', token: 't' }),
+    fetchImpl: async (url, options) => {
+      assert.equal(url, 'http://127.0.0.1:7777/api/terminal-tabs/own-tab/send');
+      body = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ status: 'queued' }) };
+    },
+  });
+  assert.equal((await send(job)).status, 'queued');
+  assert.equal(body.source, 'terminal-mcp', 'author of the send, so History renders it as a Terminal MCP message');
+  assert.equal(body.prompt, 'One correction');
+  assert.equal(body.handoffId, job.handoffId);
+  assert.ok(!('sendSurface' in body), 'transport/surface stays owned by the route, never claimed by the caller');
+});

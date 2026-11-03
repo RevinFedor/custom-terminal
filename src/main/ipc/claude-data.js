@@ -3168,13 +3168,15 @@ function register({
         console.error('[Claude Fork] Source file is empty:', sourcePath);
         return { success: false, error: 'Source session is empty' };
       }
+      // "Fork from the latest compact" means: start the child at the last
+      // compact boundary. A session that never compacted simply has no such
+      // boundary — the whole conversation IS everything after it, so the
+      // honest result is an ordinary full fork, not a refusal (Fedor 02.11).
+      // Everything downstream already reads `fromLatestCompact` from the
+      // result, so the child is correctly recorded as a full fork.
       if (fromLatestCompact && sourceInspection.lastCompactLineIndex < 0) {
-        console.warn('[Claude Fork] No compact boundary:', sourcePath);
-        return {
-          success: false,
-          reason: 'no-compact',
-          error: 'В этой Claude-сессии ещё нет сжатия контекста',
-        };
+        console.log('[Claude Fork] No compact boundary — forking the whole session:', sourcePath);
+        fromLatestCompact = false;
       }
       const sourceTimelineSnapshot = await parseTimelineUuids(sourcePath, { includeStats: true });
 
@@ -3579,26 +3581,64 @@ function register({
   // non-uuid entries remain), the file is deleted entirely and session_links is cleaned
   // so resolveSessionChain doesn't re-attach a parent session.
   _api.loadOperationSource = async function ({ sessionId, cwd }) {
-    const chain = await resolveSessionChain(sessionId, cwd);
-    if (!chain.historySources?.length || chain.historySources[0].sessionId !== sessionId) {
-      return { success: false, error: 'Session file not found' };
-    }
-    const sources = [];
-    for (const source of chain.historySources) {
-      const exact = await readClaudeMutationFile(source.filePath);
-      // The chain topology must describe the bytes we actually read, not a
-      // cached file prefix from before a concurrent append or replacement.
-      if (source.size !== exact.size || source.mtimeMs !== exact.mtimeMs) {
-        throw Object.assign(new Error('stale_transcript_revision'), { code: 'stale_transcript_revision' });
+    // Two reads must describe the same bytes: the chain walk, and the exact
+    // re-read below. A growing file makes them disagree — which is exactly the
+    // situation of a SELF rewind, where the session issuing it is the process
+    // appending to this very file. Before Stop that is normal, not corruption,
+    // so a disagreement means "read again", not "fail".
+    //
+    // The guarantee is unchanged: what is returned is still one coherent
+    // snapshot whose topology describes its own bytes. Only an append that
+    // keeps winning the race gives up, and then the caller still sees
+    // stale_transcript_revision. The guards that actually protect the rewrite
+    // run after Stop, when the file no longer grows.
+    // E2E 02.11, stand tab 215d81406552: prepare failed here while the tab's
+    // own Claude was mid-turn; the rewrite had not been attempted.
+    const COHERENT_READ_ATTEMPTS = 5;
+    let lastConflict = null;
+    for (let attempt = 1; attempt <= COHERENT_READ_ATTEMPTS; attempt += 1) {
+      const chain = await resolveSessionChain(sessionId, cwd);
+      if (!chain.historySources?.length || chain.historySources[0].sessionId !== sessionId) {
+        return { success: false, error: 'Session file not found' };
       }
-      sources.push({ ...source, ...exact });
+      const sources = [];
+      let conflict = null;
+      for (const source of chain.historySources) {
+        const exact = await readClaudeMutationFile(source.filePath);
+        if (source.size !== exact.size || source.mtimeMs !== exact.mtimeMs) {
+          conflict = source.filePath;
+          break;
+        }
+        sources.push({ ...source, ...exact });
+      }
+      if (!conflict) {
+        const loaded = { success: true, sessionId, cwd, sources, filePath: sources[0].filePath,
+          content: sources[0].content, records: sources[0].records, recordMap: chain.mergedMap };
+        loaded.revision = claudeMutationRevision(loaded);
+        try {
+          assertClaudeMutationCurrent(loaded, { findSessionFile,
+            getSessionParent: id => _projectManager?.db?.getSessionParent?.(id) });
+          if (attempt > 1) {
+            console.log('[ClaudeOperationSource] coherent read after ' + attempt + ' attempts session=' + sessionId);
+          }
+          return loaded;
+        } catch (error) {
+          // Topology problems are real failures; only a fresh append is retried.
+          if (error?.code !== 'stale_transcript_revision' || attempt === COHERENT_READ_ATTEMPTS) throw error;
+          lastConflict = loaded.filePath;
+        }
+      } else {
+        if (attempt === COHERENT_READ_ATTEMPTS) {
+          throw Object.assign(new Error('stale_transcript_revision'), { code: 'stale_transcript_revision' });
+        }
+        lastConflict = conflict;
+      }
+      console.log('[ClaudeOperationSource] source grew during read, retrying ('
+        + attempt + '/' + COHERENT_READ_ATTEMPTS + ') session=' + sessionId
+        + ' file=' + String(lastConflict || '').split('/').pop());
+      await new Promise(resolve => setTimeout(resolve, 60 * attempt));
     }
-    const loaded = { success: true, sessionId, cwd, sources, filePath: sources[0].filePath,
-      content: sources[0].content, records: sources[0].records, recordMap: chain.mergedMap };
-    loaded.revision = claudeMutationRevision(loaded);
-    assertClaudeMutationCurrent(loaded, { findSessionFile,
-      getSessionParent: id => _projectManager?.db?.getSessionParent?.(id) });
-    return loaded;
+    throw Object.assign(new Error('stale_transcript_revision'), { code: 'stale_transcript_revision' });
   };
 
   _api.deleteRange = async function ({ sessionId, cwd, startUuid, endUuid,
@@ -3807,13 +3847,40 @@ function register({
         console.log('[DeleteRange] Orphan cleanup: removed ' + orphanCleaned + ' entries in ' + orphanPass + ' passes');
       }
 
+      // Prompt-queue bookkeeping (`queue-operation`, `last-prompt`) has no uuid
+      // and no parent, so neither the range nor the orphan pass could reach it:
+      // after a Rewind its `enqueue` rows survived and History kept drawing them
+      // as `queued` messages standing alone, with no iteration to answer them
+      // (02.11, session da3b72ff — six rows left after the cut). They are the
+      // trace of queue actions taken DURING the removed stretch, so they go
+      // with it. Timestamp is the only ordering these rows carry.
+      const cutFromTs = (() => {
+        let earliest = null;
+        for (const rec of allRecords) {
+          if (!rec?.uuid || !removeUuids.has(rec.uuid)) continue;
+          const at = Date.parse(rec.timestamp || '');
+          if (Number.isFinite(at) && (earliest === null || at < earliest)) earliest = at;
+        }
+        return earliest;
+      })();
+      let queueRowsDropped = 0;
+
       const outputLines = [];
       for (const rec of allRecords) {
         if (!rec) continue;
         if (rec.uuid && removeUuids.has(rec.uuid)) continue;
         if (rangeStart === 0 && rec.type === 'last-prompt') continue;
+        if (!rec.uuid && cutFromTs !== null && ['queue-operation', 'last-prompt'].includes(rec.type)) {
+          const at = Date.parse(rec.timestamp || '');
+          // Only a row provably inside the removed stretch; an unparsable or
+          // earlier timestamp keeps the row rather than guessing it away.
+          if (Number.isFinite(at) && at >= cutFromTs) { queueRowsDropped++; continue; }
+        }
         if (rec.userType === 'external') delete rec.userType;
         outputLines.push(JSON.stringify(rec));
+      }
+      if (queueRowsDropped > 0) {
+        console.log('[DeleteRange] Dropped ' + queueRowsDropped + ' prompt-queue rows inside the removed range');
       }
 
       const survivingUuidCount = outputLines.reduce((n, l) => {
@@ -5823,6 +5890,13 @@ function register({
         if (!text) return true;
         if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return true;
         if (text.includes('<local-command-stdout>') || text.includes('<local-command-caveat>')) return true;
+        // `<command-name>` without a `/model` or `/effort` body never reaches
+        // slashCommandEntryFromText as a string carrier (array content decodes
+        // to the same text but skips that branch), so it used to fall through
+        // into an ordinary user bubble. The settings pair keeps its compact
+        // slash row below; everything else here is Claude's own command echo,
+        // not something the user typed into this conversation.
+        if (/^\s*<command-name>/.test(text) && !slashCommandDisplayFromText(text)) return true;
         if (text.includes('<bash-notification>') || text.includes('<shell-id>')) return true;
         if (text.includes('<user-prompt-submit-hook>') || text.includes('<task-notification>')) return true;
         if (text.startsWith('Caveat: The messages below')) return true;
@@ -5998,6 +6072,15 @@ function register({
               // takeMatchingQueuedEntry().
               if (!promoteQueuedCompactEntry(pendingQueueEntries, queued, { reason: 'remove' })) {
                 queued.queueStatus = 'sent';
+                // `sent` hides its badge after a few seconds, so a queue row that
+                // never gained a canonical user carrier became indistinguishable
+                // from an ordinary message — the user read a block of their own
+                // prompts "nobody answered". Claude delivers such a prompt as
+                // mid-turn steering inside the RUNNING turn: it is answered by
+                // that turn's reply, not by a new iteration of its own. Mark the
+                // origin so the row can say so; a later canonical user record
+                // still replaces this row entirely via takeMatchingQueuedEntry.
+                queued.queueSettledBy = 'remove';
               }
             }
           } else if (entry.operation === 'popAll') {
@@ -6407,6 +6490,20 @@ function register({
               messageId: entry.message?.id || undefined,
             });
           }
+        } else if (entry.type === 'system' && entry.subtype === 'informational'
+          && typeof entry.content === 'string' && entry.content.trim()) {
+          // Claude's own terminal notices, e.g. `Compacted while idle, before
+          // the prompt cache expired`. They are real transcript records and the
+          // user sees them in the TUI, but History dropped them silently, so a
+          // compact appeared with nothing explaining it.
+          appendProjectedEntry({
+            uuid: entry.uuid,
+            role: 'informational',
+            timestamp: entry.timestamp || '',
+            content: entry.content.trim(),
+            sessionId: entrySid,
+            recordByteOffset: entry.__byteOffset,
+          });
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           // Boundary is the durable completion fallback for Claude versions
           // that did not emit a queue dequeue/remove record. It settles only
@@ -7013,41 +7110,60 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
     // dangling-detection silently miss real cases — hence the user seeing
     // "history truncated" even after a fake-OK audit. Real JSON parsing
     // ignores content fields and only looks at top-level keys.
-    const parsed = []; // null or { uuid, parentUuid, raw_d }
+    // SCAN pass: keep only the two fields the chain check needs, never the
+    // decoded records. Retaining every parsed object cost ~10x the file in
+    // transient heap and dominated the boot sweep: 01.11 measured 17.2s of
+    // main-loop block over 31 files (16.9s of it blocking), peak heap 2261MB,
+    // and 6297ms on a single 37.9MB session — with ZERO repairs found, in
+    // both sweeps this machine has on record. The user felt it as a multi-
+    // second stall on the first workspace switch after an install.
+    //
+    // Correctness is unchanged: detection still uses real JSON.parse (a regex
+    // over raw text matches `"uuid"` inside prompt content and silently
+    // missed real breaks), and the repair pass below re-parses only the few
+    // lines that actually need rewriting.
+    const uuidByLine = new Array(lines.length).fill(null);
+    const parentByLine = new Array(lines.length).fill(null);
     const uuids = new Set();
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      if (!line || line[0] !== '{') { parsed.push(null); continue; }
+      if (!line || line[0] !== '{') continue;
       try {
         const d = JSON.parse(line);
-        parsed.push(d);
-        if (d.uuid) uuids.add(d.uuid);
-      } catch {
-        parsed.push(null);
-      }
+        if (d.uuid) { uuidByLine[i] = d.uuid; uuids.add(d.uuid); }
+        if (d.parentUuid) parentByLine[i] = d.parentUuid;
+      } catch { /* unparsable line: no uuid, no parent, cannot dangle */ }
     }
 
     // Find dangling parentUuid refs and compute predecessor for each.
     const fixes = []; // { lineIdx, oldParent, newParent }
-    for (let i = 0; i < parsed.length; i++) {
-      const d = parsed[i];
-      if (!d || !d.parentUuid || uuids.has(d.parentUuid)) continue;
+    for (let i = 0; i < lines.length; i++) {
+      const parentUuid = parentByLine[i];
+      if (!parentUuid || uuids.has(parentUuid)) continue;
       // search predecessor up to 10 lines back
       let predUuid = null;
       for (let k = i - 1; k >= Math.max(0, i - 10); k--) {
-        if (parsed[k] && parsed[k].uuid) { predUuid = parsed[k].uuid; break; }
+        if (uuidByLine[k]) { predUuid = uuidByLine[k]; break; }
       }
       if (!predUuid) continue;
-      fixes.push({ lineIdx: i, oldParent: d.parentUuid, newParent: predUuid });
+      fixes.push({ lineIdx: i, oldParent: parentUuid, newParent: predUuid });
     }
 
+    // The common case by far: nothing to repair. Return before re-parsing
+    // anything, so a healthy file costs one scan and no retained records.
     if (fixes.length === 0) return { repaired: 0, reason: 'no-dangling' };
+
+    // REPAIR pass: re-parse ONLY the broken lines. A file reaching this point
+    // genuinely needs rewriting, so the cost is proportional to the damage.
+    // This cannot fail: `lines` is the snapshot the scan read, and a line only
+    // reaches `fixes` by having parsed successfully there.
+    const parsed = new Map(fixes.map(fix => [fix.lineIdx, JSON.parse(lines[fix.lineIdx])]));
 
     // Rewrite each affected line by re-serializing the parsed object — avoids
     // ambiguity from string-level replacement (which can hit content fields).
     const newLines = lines.slice();
     for (const { lineIdx, oldParent, newParent } of fixes) {
-      const d = parsed[lineIdx];
+      const d = parsed.get(lineIdx);
       const _classified = _classifyOrphanFlavor(d);
       // Verbose forensic log for post-mortem grep: same fields as
       // [JsonlChainDiag:ChainBreak] so a single grep "JsonlChainDiag" or

@@ -829,6 +829,7 @@ interface PromptQueueStore {
     },
   ) => string[];
   suspendWorkflowsForRestart: () => void;
+  resumeWorkflowsAfterCancelledShutdown: () => void;
   resumeWorkflowsForTrigger: (triggerTabId: string, rendererStartedAt: number) => void;
   applyBuildInstallContinuationFloor: (tabId: string, floorAt: number) => void;
 
@@ -2100,6 +2101,30 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           });
         }
         return { queues: next };
+      });
+    },
+
+    // The quit was CANCELLED: the app keeps running, so the suspension made
+    // at its start must be lifted. `workflowRestartPending` means "wait for a
+    // fresh turn in the NEXT app lifetime" — there is no next lifetime now,
+    // and leaving it set makes every armed Run after silently never fire on a
+    // visibly alive app. The normal `resumeWorkflowsForTrigger` cannot do
+    // this: it needs a new busy edge, which a tab that was never stopped will
+    // not produce.
+    //
+    // Only the suspension flags are cleared. Arm times, floors and queue
+    // contents are untouched, so a queue that was already waiting for
+    // something keeps waiting for exactly that.
+    resumeWorkflowsAfterCancelledShutdown: () => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        let changed = false;
+        for (const [tabId, cur] of state.queues) {
+          if (!cur.workflowRestartPending && !cur.loopRestartPending) continue;
+          next.set(tabId, { ...cur, workflowRestartPending: false, loopRestartPending: false });
+          changed = true;
+        }
+        return changed ? { queues: next } : state;
       });
     },
 

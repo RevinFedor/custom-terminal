@@ -11,6 +11,7 @@ import { validateAsarArchive } from './validate-app-asar.mjs';
 import maintenanceApi from './research-maintenance.cjs';
 import voiceContinuationApi from './voice-install-continuation.cjs';
 import prodApi from './noted-prod-api.js';
+import { refreshTerminalMcpRuntime } from './refresh-terminal-mcp-runtime.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_NAME = 'Noted Terminal.app';
@@ -385,7 +386,20 @@ export async function buildInstallNotedTerminal({
       step = script;
       onPhase({ stage: 'preparing', step });
       log('prepare ' + script + (quitBeforePrepare ? ' (captured app is closed)' : ' (installed app remains available)'));
-      await runStep('npm', ['run', script]);
+      const captureRuntimeChange = script === 'install:terminal-mcp';
+      const stepOutput = await runStep('npm', ['run', script], captureRuntimeChange ? { capture: true } : {});
+      if (captureRuntimeChange) {
+        // Captured output never reached the terminal, so echo it: the install
+        // log must not lose a step's output because we also parse it.
+        if (typeof stepOutput === 'string' && stepOutput) process.stdout.write(stepOutput);
+        // The hub is detached and survives this install: a replaced
+        // terminal-server.mjs would otherwise keep running its old code until
+        // somebody restarts it by hand. Only `terminal`, only on a real change,
+        // and never fatal — see refresh-terminal-mcp-runtime.mjs.
+        step = 'refresh-terminal-mcp';
+        await refreshTerminalMcpRuntime(stepOutput, { log });
+        step = script;
+      }
     }
     step = 'validate-release';
     onPhase({ stage: 'validating', step });
@@ -627,5 +641,12 @@ export async function main({ projectDir = projectRoot, install = buildInstallNot
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(error => { console.error('[NotedInstall] ' + error.message); process.exitCode = 1; });
+  // CLI only: the exported main() stays injectable for tests that agents run
+  // from Noted tabs. Voice Record and an external terminal are outside Noted.
+  let refused = null;
+  try { prodApi.assertInstallerOutsideNoted('build:install'); } catch (error) { refused = error; }
+  if (refused) {
+    console.error('[NotedInstall] ' + refused.message);
+    process.exitCode = 1;
+  } else main().catch(error => { console.error('[NotedInstall] ' + error.message); process.exitCode = 1; });
 }

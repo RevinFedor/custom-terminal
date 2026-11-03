@@ -9,9 +9,29 @@ const id = (value, max = 4096) => {
   const result = text(value, max);
   return result && !/[\s\p{Cc}\p{Cf}]/u.test(result) ? result : null;
 };
+// A message address is an opaque identifier the app issued: a Claude record
+// UUID, or a synthetic `codex-user-<session>-<line>` / `claude-queue:…` key.
+// It is NOT free text, and the one shape it must never take is a TRUNCATED
+// UUID. An assistant writing a link in prose naturally shortens identifiers
+// the way it shortens them for the reader, and `messageId=dd6da706` passed
+// every check here: non-empty, no whitespace. The feed then found no such row
+// and the user got "ссылка устарела или цель недоступна" — on a link whose
+// target was alive, four rows away (02.11, session da3b72ff).
+// A prefix of a UUID is detectable precisely, so refuse it at the door rather
+// than render a promise that cannot be kept.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PREFIX = /^[0-9a-f]{4,}(?:-[0-9a-f]*){0,4}$/i;
+const messageIdentity = value => {
+  const result = id(value);
+  if (!result || UUID.test(result)) return result;
+  // Synthetic keys carry a provider prefix (`codex-user-…`, `claude-queue:…`),
+  // so they never look like a bare hex fragment. Only a hex-and-dashes value
+  // that is not a whole UUID is a truncation.
+  return UUID_PREFIX.test(result) ? null : result;
+};
 export function normalizeTerminalMessageTarget(value) {
   if (!value || typeof value !== 'object') return null;
-  const tabId = id(value.tabId, 1024), messageId = id(value.messageId), sessionId = id(value.sessionId);
+  const tabId = id(value.tabId, 1024), messageId = messageIdentity(value.messageId), sessionId = id(value.sessionId);
   if (!tabId || !messageId || !sessionId || !['claude', 'codex', 'gemini'].includes(value.provider)) return null;
   const optional = {};
   if (Number.isSafeInteger(value.terminalInstancePid) && value.terminalInstancePid > 0) optional.terminalInstancePid = value.terminalInstancePid;

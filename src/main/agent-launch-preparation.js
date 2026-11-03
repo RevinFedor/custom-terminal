@@ -75,6 +75,12 @@ function createAgentLaunchPreparationRegistry({
     accepted = false,
     reason = accepted ? 'launch-accepted' : 'launch-rejected',
     error = null,
+    // Decision 01.11 (Fedor): two launch requests for one tab add up. When the
+    // refusal is only "this very tab is already starting that session", the
+    // request joins the live launch — nothing failed, so it must not leave a
+    // rejection the UI shows as "Claude start failed". It still is not an
+    // acceptance: this caller wrote nothing.
+    joined = false,
   } = {}) {
     const current = byTab.get(tabId);
     if (!current || current.token !== token || current.preparing !== true) return false;
@@ -83,10 +89,23 @@ function createAgentLaunchPreparationRegistry({
       && intent.attempt === current.launchAttempt) {
       // The wrapper has not classified this attempt yet. It alone knows
       // whether the SAME intent retains a legal no-write continuation.
-      intent.preparationOutcome = { accepted: false, reason, error };
+      intent.preparationOutcome = { accepted: false, reason, error, joined };
       return true;
     }
     if (intent?.preparationToken === token) intent.preparationOutcome = null;
+    if (joined === true && accepted !== true) {
+      const joinedState = {
+        ...current,
+        preparing: false,
+        accepted: false,
+        cleared: true,
+        reason,
+        clearedAt: now(),
+      };
+      byTab.set(tabId, joinedState);
+      onChange(publicState(joinedState));
+      return true;
+    }
     const finalState = {
       ...publicState(current),
       preparing: false,
@@ -283,7 +302,10 @@ function createAgentLaunchPreparationRegistry({
     }
     state.preparationOutcome = null;
     finish(state.tabId, current.token, { ...outcome,
-      error: state.result?.error || state.result?.reason || outcome.error });
+      // A joined launch carries no failure, so the intent's own error text
+      // must not resurrect one on the deferred path.
+      error: outcome.joined === true ? null
+        : (state.result?.error || state.result?.reason || outcome.error) });
   }
 
   function beginIntentAttempt(token, attempt, payloadKey, senderId) {

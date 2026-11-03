@@ -153,6 +153,38 @@ test('environment API-key source never consumes a stale OAuth/Keychain identity'
   assert.equal(result.currentKind, 'api-platform'); assert.equal(result.usageEndpointEligible, false);
 });
 
+test('a Dock launch PATH still resolves the CLI, and a truly missing binary is reported instead of read as signed out', async () => {
+  // Launched from the Dock, Noted inherits launchd's PATH, which has no
+  // `claude`. The installer-started app inherited the user's shell PATH, which
+  // is why this only broke after an ordinary launch.
+  const dock = capture({ env: { USER: 'fixture', PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, home: '/fixture/home' });
+  const dirs = dock.env.PATH.split(path.delimiter);
+  assert.ok(dirs.includes('/fixture/home/.local/bin'), 'the usual install location must be reachable');
+  assert.ok(dirs.includes('/fixture/home/.claude/local/bin'));
+  assert.deepEqual(dirs.slice(0, 4), ['/usr/bin', '/bin', '/usr/sbin', '/sbin'], 'the inherited PATH keeps priority');
+  assert.equal(new Set(dirs).size, dirs.length, 'no duplicate entries');
+
+  const modulePath = require.resolve('./claude-usage'), source = fs.readFileSync(modulePath, 'utf8');
+  const load = (execFile) => {
+    const module = { exports: {} };
+    vm.runInNewContext(source, { module, exports: module.exports, console, AbortController, setTimeout, clearTimeout,
+      require: name => name === 'electron' ? { ipcMain: {} } : name === 'child_process' ? { execFile }
+        : require(require.resolve(name, { paths: [path.dirname(modulePath)] })) });
+    return module.exports._api;
+  };
+  // A logged-out CLI answers `{"loggedIn": false}` on stdout: still "no current
+  // account", never an environment failure.
+  const out = load((program, args, options, callback) => callback(null,
+    program === 'claude' ? JSON.stringify({ loggedIn: false }) : ''));
+  assert.equal(await out.readClaudeAuthState({ namespaceReader: () => dock }), null);
+  // ENOENT with empty stdout is a different fact and must surface as such,
+  // instead of blanking the chip as if the user had signed out.
+  const missing = load((program, args, options, callback) => callback(
+    Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }), '', ''));
+  await assert.rejects(() => missing.readClaudeAuthState({ namespaceReader: () => dock }),
+    e => e.code === 'auth_cli_missing');
+});
+
 test('actual default credential adapters pass the SAME captured env and exact account to OS calls, without real subprocesses', async () => {
   const modulePath = require.resolve('./claude-usage'), source = fs.readFileSync(modulePath, 'utf8');
   const a = scope('A'), calls = [];
@@ -217,7 +249,11 @@ test('actual Usage/HTTP DTO preserve two namespace caches and stale history on a
   const conflict = await read({ provider: 'claude', accountKey: b.accountKey });
   assert.equal(conflict.error.code, 'account_mismatch'); assert.equal(conflict.currentAccountKey, null);
   assert.equal(conflict.freshness.stale, true); assert.equal(conflict.windows[0].usedPct, 24);
-  assert.equal(calls.length, 2); assert.equal(conflict.windows[2].resetAt, null);
+  // This fixture answers no model_scoped data, so Fable is absent rather than
+  // a third "unknown" row. What this test pins is the conflict DTO itself; the
+  // Fable sublimit shape has its own coverage in public-agent-usage.test.js.
+  assert.equal(calls.length, 2);
+  assert.deepEqual(conflict.windows.map(row => row.id), ['weekly', 'five-hour']);
   const serialized = JSON.stringify([first, second, conflict, dbWrites]);
   for (const secret of [a.oauthToken, b.oauthToken, a.credentialScopeKey, '/fixture/', 'fixture@example.test']) {
     assert.ok(!serialized.includes(secret), 'DTO/persistence must not leak ' + secret.slice(0, 8));

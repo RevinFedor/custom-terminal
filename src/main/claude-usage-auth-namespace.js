@@ -9,6 +9,26 @@ const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const failure = (code, message) => Object.assign(new Error(message), { code });
 
 /**
+ * Launched from the Dock, Noted inherits launchd's PATH — `/usr/bin:/bin:
+ * /usr/sbin:/sbin` — which holds no `claude`. The installer-started app did
+ * inherit the user's shell PATH, so this only ever broke after an ordinary
+ * Dock/Finder launch: `execFile('claude', …)` answered ENOENT with empty
+ * stdout, the status reader read that as "not logged in", and the toolbar chip
+ * (which, unlike the popover, deliberately has no fallback account) went blank
+ * while the popover still showed the cached snapshot.
+ *
+ * Same directory list and ordering as `buildExternalToolPath()` in main.js and
+ * `buildMcpEnvironment()` in mcp-hub.js: the user's own PATH keeps priority, we
+ * only append the standard install locations it may lack.
+ */
+function claudeToolPath(sourcePath, home) {
+  const entries = [...String(sourcePath || '').split(path.delimiter),
+    '/opt/homebrew/bin', '/usr/local/bin', path.join(home, '.local', 'bin'),
+    path.join(home, '.claude', 'local', 'bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+  return [...new Set(entries.filter(Boolean))].join(path.delimiter);
+}
+
+/**
  * Claude Code 2.1.270 secureStorage iH/Fw/b_: explicit config directory uses
  * SHA256(NFC directory).slice(0,8), AFTER the -credentials suffix; the account
  * selector is USER (or OS username). Do not realpath/trim the hash input: the
@@ -17,7 +37,7 @@ const failure = (code, message) => Object.assign(new Error(message), { code });
  * No credentials are read by this pure address calculation.
  */
 function captureClaudeUsageAuthNamespace({ env = process.env, home = os.homedir(), username } = {}) {
-  const childEnv = Object.freeze(buildChildProcessEnv({}, env));
+  const childEnv = Object.freeze(buildChildProcessEnv({ PATH: claudeToolPath(env?.PATH, home) }, env));
   const configured = childEnv.CLAUDE_CONFIG_DIR;
   const explicit = configured !== undefined;
   const configDir = (explicit ? String(configured) : path.join(home, '.claude')).normalize('NFC');

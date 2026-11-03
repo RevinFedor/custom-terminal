@@ -660,8 +660,11 @@ class McpHub {
     if (parts[0] !== 'mcp') return sendJson(res, 404, { error: 'not found' });
 
     if (parts[1] === '_status') {
-      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid,
-        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, instanceRouting: 1, browserMaintenance: 1 }, ...this.status(),
+      // The bundle this hub was launched from. A detached hub survives Build
+      // Install by design, but the installer deletes that bundle, so the path
+      // lets Main tell a current hub from one running out of a removed copy.
+      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid, executable: process.execPath,
+        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, instanceRouting: 1, browserMaintenance: 1, executableIdentity: 1 }, ...this.status(),
         configurationMatches: this.configuration ? req.headers[CONFIG_HEADER] === this.configuration.fingerprint : null });
     }
     // Control endpoints (used by Noted Terminal main over HTTP — the hub is a

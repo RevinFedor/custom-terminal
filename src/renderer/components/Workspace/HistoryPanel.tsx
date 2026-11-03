@@ -57,7 +57,7 @@ import {currentUIActionId, uiPerformancePhase, uiPerformancePhaseForAction,
   createHistoryCommitWitnessDiagnostics, uiPerformanceDiagnosticsEnabled} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Repeat2, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Repeat2, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText, Square } from 'lucide-react';
 import { type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
@@ -117,6 +117,7 @@ import ControlHint from '../UI/ControlHint';
 import HistoryLoadingStatus from './HistoryLoadingStatus';
 import AgentLifecycleActions from './AgentLifecycleActions';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
+import ScrollToBottomButton from './ScrollToBottomButton';
 import {RIGHT_CLUSTER_INNER_GAP_PX} from '../../utils/controlBarWrap.mjs';
 import {requestFocusedHistoryBottomKey} from '../../utils/workspaceHistoryBottomKey.mjs';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
@@ -142,6 +143,7 @@ import {
 import { showAgentDraftScreenContradictionToast } from '../../utils/agentDraftContradictionToast.mjs';
 import manualActionContract from '../../../shared/agent-manual-action.cjs';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { onTabScopedIpcMessage } from '../../utils/tabScopedIpc';
 import {
   beginCoordinatedAgentSend,
   bindCoordinatedAgentSendHandoff,
@@ -285,6 +287,7 @@ import {
   togglePendingDictationChipAutoSend,
 } from '../../utils/dictationChipRegistry.mjs';
 import { retryVoiceRecordDictation } from '../../utils/voiceRecordClient.mjs';
+import { consumeRunAfterCaptureArm, isRunAfterCaptureArmed } from '../../utils/runAfterCaptureArm.mjs';
 import { resolveOrderedPreviewNavigation } from '../../utils/composerPromptPreviewNavigation.mjs';
 import { resolveHistoryComposerPromptBandLayout } from '../../utils/historyComposerPromptBandLayout.mjs';
 import { observeHistoryComposerHeight } from '../../utils/historyComposerHeightBudget.mjs';
@@ -783,11 +786,15 @@ interface FullHistoryEntry {
   rewriteRenderKey?: string;
   rewriteLayoutUuid?: string;
   uuid: string;
-  role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'usage-limit' | 'provider-error' | 'goal';
+  role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'usage-limit' | 'provider-error' | 'goal' | 'informational';
   timestamp: string;
   recordTime?: HistoryRecordTime;
   content: string;
   queueStatus?: HistoryPromptHandoffStatus;
+  /** Set when Claude's own `remove` settled this queue row without ever writing
+   *  a canonical user record: the prompt was consumed as mid-turn steering, so
+   *  it is answered by the running turn instead of a separate iteration. */
+  queueSettledBy?: 'remove';
   deliveryStatus?: 'editable-last-prompt';
   handoffId?: string;
   applicationQueueId?: number | null;
@@ -3503,6 +3510,101 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
 
 // One docked inspector serves both live and completed agents. It is a sibling
 // of the History viewport, not a scrollable child inside a virtual row.
+/**
+ * «Остановить» для одной фоновой команды (Bash в фоне, Monitor).
+ *
+ * Останавливает Main: он находит процесс задачи по её собственному файлу
+ * вывода и шлёт сигнал его группе. Двух одинаковых по команде задач это
+ * различие не путает — у каждой свой файл. Если однозначного адреса нет
+ * (задача уже кончилась, ID неизвестен, группа не её), кнопка показывает
+ * причину отказа и ничего не убивает: лучше не остановить, чем остановить
+ * чужое.
+ *
+ * Субагентам кнопка не даётся: у них своя остановка и свой lifecycle.
+ */
+const HistoryBackgroundKillButton = memo(({ tabId, chip, compact }: {
+  tabId: string;
+  chip: HistoryBackgroundChip;
+  compact?: boolean;
+}) => {
+  const [state, setState] = useState<'idle' | 'busy' | 'failed'>('idle');
+  const [failure, setFailure] = useState('');
+  const stop = useCallback(async (event: React.MouseEvent) => {
+    // Чип целиком — кнопка раскрытия карточки; остановка не должна её дёргать.
+    event.stopPropagation();
+    event.preventDefault();
+    if (state === 'busy') return;
+    setState('busy');
+    try {
+      // Ключ чипа — это `<вид>:<toolUseId>` (см. места его сборки). Main
+      // адресует задачу по чистому `toolUseId` своего реестра, поэтому префикс
+      // вида снимается здесь, а не угадывается на той стороне.
+      const toolUseId = chip.key.startsWith(chip.kind + ':')
+        ? chip.key.slice(chip.kind.length + 1)
+        : chip.key;
+      const result = await ipcRenderer.invoke('claude:kill-background-task',
+        { tabId, toolUseId });
+      if (result?.ok) { setState('idle'); setFailure(''); return; }
+      setState('failed');
+      setFailure(backgroundKillFailureLabel(result?.reason));
+    } catch (error) {
+      setState('failed');
+      setFailure('Main не ответил: ' + String((error as Error)?.message || error));
+    }
+  }, [chip.key, state, tabId]);
+  const label = state === 'failed' ? failure : 'Остановить команду';
+  return (
+    <button
+      type="button"
+      data-history-background-kill={chip.key}
+      onClick={stop}
+      onMouseDown={(event) => { event.stopPropagation(); event.preventDefault(); }}
+      disabled={state === 'busy'}
+      title={label}
+      aria-label={label}
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        gap: 4, flexShrink: 0,
+        background: 'none',
+        border: compact ? 'none' : '1px solid #333',
+        borderRadius: 4,
+        color: state === 'failed' ? '#ef7777' : '#999',
+        fontSize: '0.9em',
+        padding: compact ? 0 : '1px 7px',
+        width: compact ? 14 : undefined,
+        height: compact ? 14 : undefined,
+        cursor: state === 'busy' ? 'default' : 'pointer',
+      }}
+      onMouseEnter={(e) => { if (state !== 'failed') (e.currentTarget as HTMLElement).style.color = '#ef7777'; }}
+      onMouseLeave={(e) => { if (state !== 'failed') (e.currentTarget as HTMLElement).style.color = '#999'; }}
+    >
+      {state === 'busy'
+        ? <Loader2 size={compact ? 9 : 10} className="animate-spin" />
+        : <Square size={compact ? 9 : 10} fill="currentColor" />}
+      {!compact && (state === 'failed' ? 'Не удалось' : 'Остановить')}
+    </button>
+  );
+});
+
+// Отказ объясняется пользователю его словами: каждая причина означает разное
+// и требует разных действий, а общее «ошибка» здесь бесполезно.
+function backgroundKillFailureLabel(reason?: string) {
+  switch (reason) {
+    case 'already-finished': return 'Команда уже завершилась';
+    case 'not-running': return 'Эта команда больше не выполняется';
+    case 'task-id-unknown':
+    case 'no-output-path': return 'Не удалось определить процесс команды — остановите её в терминале';
+    case 'output-missing': return 'Файл вывода команды не найден';
+    case 'ambiguous-process-group':
+    case 'process-group-unknown':
+    case 'process-group-not-owned':
+      return 'Процесс команды не опознан однозначно — остановите её в терминале';
+    case 'still-running': return 'Команда не ответила на сигнал остановки';
+    case 'signal-failed': return 'Система отклонила сигнал остановки';
+    default: return 'Не удалось остановить команду';
+  }
+}
+
 const HistoryBackgroundDetailPane = memo(({
   chip,
   onJumpToCard,
@@ -3752,6 +3854,9 @@ const HistoryBackgroundDetailPane = memo(({
             {answerCopied ? <Check size={10} /> : <Copy size={10} />}
             {answerCopied ? 'Скопировано' : 'Копировать'}
           </button>
+        )}
+        {running && chip.kind !== 'subagent' && (
+          <HistoryBackgroundKillButton tabId={tabId} chip={chip} />
         )}
         <button
           type="button"
@@ -4076,6 +4181,13 @@ const HistoryBackgroundTasksBar = memo(({
   return (
     <div data-history-agent-catalog-state={catalog?.status}
       data-history-agent-error-stage={catalog?.currentError ? 'presentation' : catalog?.errorStage || undefined}
+      // Ширина — ВСЯ панель, и сужать её нельзя: этот блок задаёт
+      // `position: relative`, от которого считается раскрытый Agent Inspector
+      // (`left:0; right:0` у popover ниже). С шириной по содержимому инспектор
+      // сжимался до ширины чипов. Серую полосу во всю строку рисовала не эта
+      // ширина, а заливка самой полосы чипов — её нет (`background:
+      // transparent` в HistoryBackgroundScrollStrip.css), и красить родителю
+      // нечего: чипы держат свой `width: max-content` сами.
       style={{ position: 'relative', width: '100%', minWidth: 0 }}>
       {popoverOpen && (
         <div
@@ -4164,6 +4276,11 @@ const HistoryBackgroundTasksBar = memo(({
                   style={{ width: 1, background: '#2a2a2a', margin: '4px 0' }}
                 />
               )}
+              {/* Чип и его кнопка остановки — один hover-узел: кнопка стоит
+                  соседом (внутрь `<button>` её вкладывать нельзя), но
+                  появляться должна при наведении на всю пару, иначе исчезает
+                  ровно в момент движения курсора к ней. */}
+              <span className="group/bgchip inline-flex items-center shrink-0">
               <button
                 type="button"
                 onClick={() => onToggleDetail(chip.key)}
@@ -4192,6 +4309,19 @@ const HistoryBackgroundTasksBar = memo(({
                   <span className="text-[0.85em] text-[#666] tabular-nums">{formatBackgroundElapsed(chip.startedAt)}</span>
                 )}
               </button>
+              {/* Остановка стоит СОСЕДОМ чипа, а не внутри него: чип сам
+                  является кнопкой раскрытия, и вложенная кнопка в разметке
+                  недопустима. Появляется по наведению на чип, чтобы полоска
+                  не обрастала постоянными значками. */}
+              {chip.kind !== 'subagent' && (
+                <span
+                  className="opacity-0 group-hover/bgchip:opacity-100 transition-opacity shrink-0"
+                  style={{ display: 'inline-flex', alignItems: 'center', paddingRight: 6 }}
+                >
+                  <HistoryBackgroundKillButton tabId={tabId} chip={chip} compact />
+                </span>
+              )}
+              </span>
             </React.Fragment>
           );
         })}
@@ -4365,7 +4495,18 @@ const HistoryCollapsiblePrompt = ({
     </button>
   );
   return (
-    <div ref={anchorRef}>
+    <div ref={anchorRef} className="hp-collapsible-prompt">
+      {/* Пузырь ужимается по своему содержимому, поэтому первые 400 символов
+          задавали меньшую ширину, чем тот же текст целиком: при «Раскрыть»
+          сообщение прыгало влево. Ширину задаёт невидимая копия ПОЛНОГО текста:
+          она остаётся в потоке, но её высота схлопнута в ноль, так что высоту
+          по-прежнему задаёт видимый превью ниже. Меняется только высота.
+          Копия скрыта от экранных читалок и не ловит мышь. */}
+      {!open && (
+        <div className="hp-collapsible-prompt-width" aria-hidden="true">
+          {markdown ? <CBMarkdown text={text} preview /> : <p className="cb-msg-text">{text}</p>}
+        </div>
+      )}
       {/* Верхняя кнопка только у раскрытого блока: у свёрнутого начало текста
           видно целиком, и дублировать «раскрыть» в двух углах маленькой шапки
           нечего. У раскрытого же конец текста может быть далеко, поэтому
@@ -5355,10 +5496,21 @@ const HistoryUserEntry = memo(({
     : sentStatusChangedAt + HISTORY_PROMPT_SENT_PRESENTATION_MS;
   const [statusPresentationNow, setStatusPresentationNow] = useState(() => Date.now());
   const statusPresentationAt = Math.max(statusPresentationNow, Date.now());
-  const queueStatusPresentation = historyPromptHandoffStatusPresentation(queueStatus, {
-    statusChangedAt: sentStatusChangedAt ?? undefined,
-    now: statusPresentationAt,
-  });
+  const queueStatusPresentation = entry.queueSettledBy === 'remove'
+    // Claude consumed this queued prompt INSIDE the turn that was already
+    // running (mid-turn steering), so it has no iteration of its own: the
+    // answer is that turn's reply. Plain SENT fades after a few seconds and
+    // left a bare bubble that read as "my message nobody answered".
+    ? {
+      label: 'В ОТВЕТЕ ВЫШЕ',
+      tone: 'info' as const,
+      pending: false,
+      title: 'Промпт передан Claude во время уже идущего ответа, поэтому отдельной итерации у него нет — он учтён в ответе выше',
+    }
+    : historyPromptHandoffStatusPresentation(queueStatus, {
+      statusChangedAt: sentStatusChangedAt ?? undefined,
+      now: statusPresentationAt,
+    });
   const canDismissPromptPresentation = isLocalPromptEntry(entry)
     && !!entry.handoffId
     && queueStatus !== 'sent'
@@ -6058,7 +6210,8 @@ const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
 const HistoryInterruptedRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
   <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
     <div className={'hp-history-slash hp-history-interrupted'
-      + (entry.role === 'provider-error' || entry.role === 'usage-limit' ? ' hp-history-provider-error' : '')}
+      + (entry.role === 'provider-error' || entry.role === 'usage-limit' || entry.role === 'informational'
+        ? ' hp-history-provider-error' : '')}
       title={entry.providerFailure?.details || undefined}>
       <SlidersHorizontal size={12} className="hp-history-slash-ic hp-history-interrupted-ic" />
       <span className="hp-history-slash-cmd">{entry.content}</span>
@@ -6133,6 +6286,15 @@ const HistoryEntry = memo(({
   }
 
   if (entry.role === 'compact-error') {
+    return <HistoryInterruptedRow entry={entry} />;
+  }
+
+  if (entry.role === 'informational') {
+    // Claude's own terminal notice (e.g. the idle auto-compact line), shown
+    // with its exact wording. It is service chrome in the SAME voice as an
+    // interrupted turn or a usage limit — one quiet amber line on the shared
+    // glyph rail. A labelled banner was a foreign shape in this feed and the
+    // user rejected it on sight (Fedor 01.11).
     return <HistoryInterruptedRow entry={entry} />;
   }
 
@@ -6547,6 +6709,18 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   padding-left: var(--hp-horizontal-padding, 4px);
   padding-right: var(--hp-horizontal-padding, 4px);
 }
+/* Свёрнутый вид: ширину пузыря держит невидимая копия ПОЛНОГО текста. Она
+   остаётся в потоке (поэтому её самая длинная строка участвует в расчёте
+   ширины), но схлопнута до нулевой высоты — высоту задаёт видимый превью.
+   Свойство position:relative здесь не ставим: точкой отсчёта для абсолютных
+   кнопок «Свернуть» должен остаться сам пузырь, иначе они потеряют его padding.
+   Обратные кавычки в этом блоке запрещены: CSS живёт внутри шаблонной строки. */
+.hp-collapsible-prompt-width {
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
 /* Audited MCP/orchestration prompts default to violet. The per-tab user-view
    preference omits this class without changing provenance; quoted service
    text without metadata keeps the ordinary orange in either mode. */
@@ -6609,10 +6783,15 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   font-size: .84em;
   margin-bottom: 3px;
 }
-/* The top collapse control still occupies half of its 11px seam inside the
-   bubble. Keep its established safe inset while ordinary user text adopts the
-   smaller symmetric top/left padding. */
-.hp-history-transcript .cb-user-bubble:has(.cb-collapse-top) {
+/* Верхняя кнопка «Свернуть» заходит внутрь пузыря на половину своей высоты
+   (~5.5px при потолке шрифта 11px), поэтому ей нужен отступ больше обычных 4px.
+   Но условие «есть верхняя кнопка» означало, что отступ появляется только у
+   раскрытого блока: по «Раскрыть полностью» текст уезжал вниз на 4px, хотя
+   кнопка сидит на рамке и двигать содержимое не должна (Fedor, 03.11).
+   Поэтому место резервируется у ЛЮБОГО сворачиваемого сообщения: нижняя кнопка
+   присутствует в обоих состояниях, в отличие от верхней. Отступ одинаков до и
+   после раскрытия, и текст стоит на месте. */
+.hp-history-transcript .cb-user-bubble:has(.cb-collapse-bottom) {
   padding-top: 8px;
 }
 .hp-history-transcript .cb-collapse-top,
@@ -10912,6 +11091,24 @@ function AgentHistoryControls({
         setDraftWarning('Диктовка ещё не распознана — дождитесь чипа, повторите его или удалите.');
         return;
       }
+      // Правый клик по кнопке переноса взвёл «следующая отправка — в Run after».
+      // Перехват стоит ЗДЕСЬ, после проверки диктовки и перед единственным
+      // `runAction('send')`: так в очередь попадает уже распознанный текст, а не
+      // маркер `[Dictating …]`, и одинаково работают оба пути — ручной Enter и
+      // автоотправка чипа (Option+1), потому что оба приходят этим событием.
+      //
+      // Ожидание забирается одним действием (проверить+снять): между двумя
+      // шагами успевает пройти вторая отправка, и в очередь ушли бы оба текста.
+      // Сам перенос исполняет прежний владелец пайплайна в PromptQueueOverlay —
+      // он один знает про чипы, картинки и точную очистку черновика.
+      if (consumeRunAfterCaptureArm(tabId)) {
+        historyDiag('RUN_AFTER_CAPTURE_ARM_FIRE tab=' + tabId.slice(-12)
+          + ' via=' + (detail.source || 'submit-event'));
+        window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
+          detail: { tabId, source: 'capture-arm' },
+        }));
+        return;
+      }
       void runAction('send', {
         recordWithoutReply: detail.recordWithoutReply === true,
       });
@@ -13259,6 +13456,20 @@ function AgentHistoryControls({
                       .some((entry: any) => entry.status === 'error' || entry.status === 'stale')) {
                       setDraftWarning('Диктовка не распознана — нажмите чип, чтобы повторить, или удалите его.');
                     }
+                    return;
+                  }
+                  // Физическая клавиша Enter в этом textarea никогда не проходит
+                  // через событие `history-panel:submit-composer` — она зовёт
+                  // runAction('send') прямо здесь. Шрам: правый клик взвёл
+                  // «следующая отправка — в Run after», но обычный ручной Enter
+                  // (не через Option+1 и не через кнопку ControlBar) это игнорировал
+                  // и уходил агенту напрямую. Проверка взвода обязана стоять и тут,
+                  // тем же атомарным consume, что и у остальных путей отправки.
+                  if (consumeRunAfterCaptureArm(tabId)) {
+                    historyDiag('RUN_AFTER_CAPTURE_ARM_FIRE tab=' + tabId.slice(-12) + ' via=enter-key');
+                    window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
+                      detail: { tabId, source: 'capture-arm' },
+                    }));
                     return;
                   }
                   if (canSend) runAction('send', { uiActionId: currentUIActionId() });
@@ -16244,7 +16455,11 @@ function HistoryPanel({
     if (!renderClaudeMemoryBoundaryUuid) return -1;
     return displayEntries.findIndex(e => e.uuid === renderClaudeMemoryBoundaryUuid);
   }, [displayEntries, renderClaudeMemoryBoundaryUuid]);
-  const scrollArrowRef = useRef<HTMLDivElement>(null);
+  // Боковая панель держит свою стрелку сама (обычный ref у JSX). У центральной
+  // поверхности узел живёт в стационарном хосте рядом с кнопкой раскладки —
+  // другое поддерево, поэтому ref там заполняется поиском по вкладке и
+  // переиспользуется, пока узел в документе.
+  const scrollArrowRef = useRef<HTMLDivElement | null>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   // This is user intent, not a sample of current geometry. A streaming footer
   // temporarily increases scrollHeight before the follow scroll lands; that
@@ -18531,6 +18746,43 @@ function HistoryPanel({
     return true;
   }, [captureLocalPromptRemoval, removeLocalPromptEntry, tabId]);
 
+  // Retire every local SENT card whose canonical row is among `rows`.
+  // Called when Claude's own records arrive, so a confirmed prompt stops
+  // being drawn twice the moment its real row appears, instead of waiting for
+  // the deferred full reread. The proof is the same exact identity the reread
+  // uses: an equal text or a close timestamp never retires anything.
+  const retireLocalPromptsCoveredByCanonicalRows = useCallback((rows: FullHistoryEntry[]) => {
+    const canonical = rows.filter((entry) => !isLocalPromptEntry(entry)
+      && (entry.role === 'user' || entry.role === 'queued'));
+    if (canonical.length === 0) return;
+    for (const record of getHistoryPromptHandoffsSnapshot(tabId)) {
+      if (record.queueStatus !== 'sent') continue;
+      const proof = record.auditProof || record.providerQueueProof;
+      const sourceIdentity = proof?.sourceIdentity || '';
+      // Claude records a prompt carrying an image as `attachment` +
+      // `queued_command`, and the parser projects THAT record as the user row:
+      // the row's uuid is the attachment's, which our audit never saw. The
+      // audit's own entryUuid then matches nothing and the card stayed beside
+      // its canonical twin (03.11, handoff mw01agh2-d8g4rb, row 72c64b51).
+      // The attachment row does carry the queue item's `sourceIdentity`, and
+      // the card carries it too, so the exact proof still exists — it just has
+      // to be looked for under both ids, not only the audit's.
+      const entryUuid = record.auditProof?.entryUuid
+        || record.providerQueueProof?.entryUuid || '';
+      if (!sourceIdentity && !entryUuid) continue;
+      const covered = canonical.some((entry) => (
+        (!!sourceIdentity && historyEntryHasExactIdentity(entry, sourceIdentity))
+        || (!!entryUuid && historyEntryHasExactIdentity(entry, entryUuid))
+      ));
+      if (!covered) continue;
+      historyDiag('LOCAL_RETIRED_BY_CANONICAL tab=' + tabId.slice(-12)
+        + ' handoff=' + record.handoffId + ' proof=exact-source-identity source=live-row');
+      consumeLocalPromptEntry(record.handoffId, 'canonical-row-already-visible', {
+        operationKey: record.sendOperationKey, attemptId: record.sendAttemptId,
+      });
+    }
+  }, [consumeLocalPromptEntry, tabId]);
+
   const queueMergeIntents = useRef(new Map<string, any>());
   const queueMergeInflight = useRef(new Set<string>());
   const mergeQueuedPrompt = useCallback(async (entry: FullHistoryEntry) => {
@@ -19168,6 +19420,34 @@ function HistoryPanel({
         recordByteOffset: carrierProof?.recordByteOffset,
       };
       const semanticTags: FullHistoryEntry['semanticTags'] = resolveHistoryPromptHandoffSemanticTags(record);
+      // A confirmed send whose canonical row is ALREADY visible must retire
+      // its own local card immediately. Claude settles a prompt that was
+      // queued mid-turn through QUEUE_CONSUMED, and the full History reread is
+      // deliberately deferred while the turn runs, so nothing reconciled the
+      // two: the user saw the same message twice, both SENT, until the turn
+      // ended (01.11 06:52:34 confirmed → 07:01:48 reread, 9 minutes of
+      // duplicate). The exact identity is the same proof the reread uses, so
+      // this only moves the moment, never the rule.
+      if (identity.sourceIdentity && record.queueStatus === 'sent') {
+        const canonicalVisible = [
+          ...(liveProjectionRef.current.ownerKey === historyOwnerKey
+            ? liveProjectionRef.current.entries : []),
+          ...(committedHistoryEntriesRef.current.ownerKey === historyOwnerKeyRef.current
+            ? committedHistoryEntriesRef.current.entries : []),
+        ].some((entry) => !isLocalPromptEntry(entry)
+          && (entry.role === 'user' || entry.role === 'queued')
+          && (historyEntryHasExactIdentity(entry, identity.sourceIdentity!)
+            || (!!identity.auditEntryUuid
+              && historyEntryHasExactIdentity(entry, identity.auditEntryUuid))));
+        if (canonicalVisible) {
+          historyDiag('LOCAL_RETIRED_BY_CANONICAL tab=' + tabId.slice(-12)
+            + ' handoff=' + record.handoffId + ' proof=exact-source-identity');
+          consumeLocalPromptEntry(record.handoffId, 'canonical-row-already-visible', {
+            operationKey: record.sendOperationKey, attemptId: record.sendAttemptId,
+          });
+          continue;
+        }
+      }
       if (identity.sourceIdentity && liveProjectionRef.current.ownerKey === historyOwnerKey) {
         const currentLive = liveProjectionRef.current.entries;
         const retainedLive = retireHistoryLivePromptByExactProof(currentLive, {
@@ -20518,6 +20798,18 @@ function HistoryPanel({
               console.warn(`[HP] refresh: ${prev.length} → ${newEntries.length}`);
               if (!publishHistoryRows(newEntries, isCurrentOwner)) return prev;
               persistVolatileOverlay(historySnapshotOwner, newEntries);
+              // Claude's own row can reach the feed through THIS server read
+              // rather than the live projection — a long turn finishes and the
+              // refresh brings the canonical prompt with it. The live-event
+              // call below covers the streaming path only, so without this the
+              // local SENT card stayed beside its canonical twin until the next
+              // deferred reread: 78s on 02.11 (tab 1ccc61c912ae, handoff
+              // mvzciw0f-9247op — appended 14:20:15, retired 14:21:33).
+              // Same exact-identity proof; scheduled so it runs after this
+              // state update rather than inside the reducer.
+              queueMicrotask(() => {
+                if (isCurrentOwner()) retireLocalPromptsCoveredByCanonicalRows(newEntries);
+              });
               return newEntries;
             });
           });
@@ -20607,7 +20899,8 @@ function HistoryPanel({
       // reported as "(open)" forever and blame this load for later freezes.
       endLoadMark();
     }
-  }, [publishHistoryRows, primarySparsePublicationOwner, sessionId, cwd, historyOwnerKey, historySnapshotOwner, keepHistoryTailPinnedAfterMutation, materializeHistoryWindowForPresentation, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
+  }, [publishHistoryRows, primarySparsePublicationOwner, sessionId, cwd, historyOwnerKey, historySnapshotOwner, keepHistoryTailPinnedAfterMutation, materializeHistoryWindowForPresentation, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs,
+    retireLocalPromptsCoveredByCanonicalRows]);
 
   // One heavyweight History IPC may be active per owner. Events that arrive
   // while it is running collapse into one trailing reconciliation instead of
@@ -20847,6 +21140,37 @@ function HistoryPanel({
     );
   }, [requestHistoryHydrationAt, toolType]);
 
+  // Видимость стрелки «вниз» задаётся прямой записью в стиль, без React-состояния:
+  // она меняется на каждый кадр прокрутки, и перерисовка всей панели была бы
+  // дороже самой стрелки. Плата за это — узел нужно синхронизировать не только
+  // при прокрутке.
+  //
+  // Шрам 01.11: при переключении между рабочими пространствами стрелка пропадала
+  // и не возвращалась до первого движения колеса. Центральная поверхность держит
+  // стрелку в СТАЦИОНАРНОМ хосте (`StationaryHistorySurfaceToggle`), а он
+  // монтируется заново на каждую смену показанной вкладки — с `display:'none'`
+  // в разметке. Панель при этом остаётся смонтированной и никуда не прокручивается,
+  // поэтому события прокрутки, которое вернуло бы стрелку, просто не происходит.
+  //
+  // Поэтому: одна функция, которая читает геометрию и применяет её к узлу, и
+  // вызов из обоих мест — из обработчика прокрутки и после смены поверхности.
+  const syncScrollArrowVisibility = useCallback((distFromBottom?: number) => {
+    if (!scrollArrowRef.current || !scrollArrowRef.current.isConnected) {
+      scrollArrowRef.current = document.querySelector<HTMLDivElement>(
+        `[data-history-scroll-to-bottom-tab="${CSS.escape(tabId)}"]`);
+    }
+    const node = scrollArrowRef.current;
+    if (!node) return;
+    // Вызов после смены поверхности не имеет свежего замера прокрутки — берём
+    // его сам. Обработчик прокрутки передаёт уже снятое расстояние, чтобы не
+    // читать scrollHeight/scrollTop/clientHeight второй раз за кадр.
+    const distance = typeof distFromBottom === 'number'
+      ? distFromBottom
+      : (virtuosoScrollerRef.current ? historyContentDistanceFromBottom(virtuosoScrollerRef.current) : null);
+    if (distance === null) return;
+    node.style.display = distance > 150 ? '' : 'none';
+  }, [tabId]);
+
   const scheduleHistoryHydrationRangeCheck = useCallback(() => {
     if (hydrationRangeIdleTimerRef.current !== null) {
       clearTimeout(hydrationRangeIdleTimerRef.current);
@@ -20883,10 +21207,16 @@ function HistoryPanel({
         || detail.generation !== historyOwnerGenerationRef.current
         || !historyPresentationOwnsWrite(historyPresentationProofRef.current, detail.presentationVisit)) return;
       scheduleHistoryHydrationRangeCheck();
+      // Стрелка «вниз» живёт в стационарном хосте, который перемонтируется на
+      // смену показанной вкладки и приходит с `display:'none'`. Панель при этом
+      // не прокручивается, поэтому обработчик прокрутки её не вернёт. Этот показ
+      // — единственный момент, когда новый узел уже в документе и его владелец
+      // проверен теми же условиями выше.
+      syncScrollArrowVisibility();
     };
     window.addEventListener('history-panel:surface-presented', onPresented);
     return () => window.removeEventListener('history-panel:surface-presented', onPresented);
-  }, [scheduleHistoryHydrationRangeCheck, tabId]);
+  }, [scheduleHistoryHydrationRangeCheck, syncScrollArrowVisibility, tabId]);
 
   useEffect(() => () => {
     if (hydrationRangeIdleTimerRef.current !== null) {
@@ -22998,7 +23328,12 @@ function HistoryPanel({
       }
       acceptPreview(detail.preview, 'event');
     };
-    ipcRenderer.on('agent-transcript:terminal-preview', onTerminalPreview);
+    // Broadcast to the window; every retained HistoryPanel used to receive it
+    // and reject foreign payloads on its first line. Measured 03:55 UTC: this
+    // channel's delivery appeared at 1153ms and 1484ms inside long tasks while
+    // the user was scrolling and switching workspaces.
+    const offTerminalPreview = onTabScopedIpcMessage(
+      'agent-transcript:terminal-preview', tabId, onTerminalPreview);
     void ipcRenderer.invoke('agent-transcript:get-terminal-preview', {
       tabId,
       toolType,
@@ -23014,7 +23349,7 @@ function HistoryPanel({
     return () => {
       disposed = true;
       deferredPreview = null;
-      ipcRenderer.removeListener('agent-transcript:terminal-preview', onTerminalPreview);
+      offTerminalPreview();
       terminalPreviewAnchorSettleCancelRef.current?.();
       terminalPreviewAnchorSettleCancelRef.current = null;
       publishTerminalPreviewClearHandoff(null);
@@ -23603,6 +23938,16 @@ function HistoryPanel({
         liveProjectionRef.current = { ownerKey, entries: projected };
         primaryLiveCoverageOwner.wake('subject');
         setLiveEntries(projected);
+        // Claude's own row for a prompt we sent has just become visible. The
+        // local SENT card carrying the same exact identity is now a duplicate
+        // and must retire HERE: the handoff subscription that also performs
+        // this check only runs when the CARD changes, and the card is already
+        // settled by then — so the duplicate survived until the deferred full
+        // reread, 57s in production 02.11 (tab 16b18cfdeba5, handoff
+        // mvz5b8ea-gzs3aq: confirmed 10:58:23, retired 10:59:20).
+        // Same exact-identity proof as that check and as the reread; this only
+        // adds the moment the canonical row appears.
+        retireLocalPromptsCoveredByCanonicalRows(projected);
       }
       const resultValues = extractHistoryLiveToolResults(detail) as HistoryLiveToolResult[];
       let toolResultsChanged = false;
@@ -23650,6 +23995,7 @@ function HistoryPanel({
     historyOwnerKey,
     keepHistoryTailPinnedAfterMutation,
     primaryLiveCoverageOwner,
+    retireLocalPromptsCoveredByCanonicalRows,
     sessionId,
     setHistoryRewindPreview,
     tabId,
@@ -23745,7 +24091,10 @@ function HistoryPanel({
       }
       queueRefresh(detail?.reason || 'transcript-change');
     };
-    ipcRenderer.on('agent-transcript:changed', onChanged);
+    // Routed by sessionId: this channel addresses a transcript, not a tab, and
+    // `onChanged` filters on exactly that field.
+    const offTranscriptChanged = onTabScopedIpcMessage(
+      'agent-transcript:changed', sessionId, onChanged, { key: 'sessionId' });
     ipcRenderer.invoke('agent-transcript:subscribe', {
       consumerId,
       tabId,
@@ -23772,7 +24121,7 @@ function HistoryPanel({
     });
     return () => {
       disposed = true;
-      ipcRenderer.removeListener('agent-transcript:changed', onChanged);
+      offTranscriptChanged();
       ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
     };
   }, [sessionId, cwd, tabId, toolType, flushLiveHistoryToDurable, historyOwnerKey, historySnapshotOwner]);
@@ -25978,9 +26327,12 @@ function HistoryPanel({
         || recentGestureDirection === 'down'
       ),
     }));
-    if (scrollArrowRef.current) {
-      scrollArrowRef.current.style.display = distFromBottom > 150 ? '' : 'none';
-    }
+    // Стрелка «вниз» центральной поверхности живёт в стационарном хосте рядом с
+    // кнопкой раскладки (один низ — одна линия), поэтому своего ref у неё нет:
+    // хост — другое поддерево. Узел ищется по вкладке, чтобы в том же окне не
+    // задеть соседнюю. Запись остаётся прямой: видимость меняется на каждый
+    // кадр прокрутки, и React-состояние перерисовывало бы всю панель.
+    syncScrollArrowVisibility(distFromBottom);
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
     // Live O(1) patch of the stored geometry's offset. The FULL geometry save
@@ -26087,7 +26439,7 @@ function HistoryPanel({
         });
       } catch { /* geometry is optional; never break position saving */ }
     }, 150);
-  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, historyWheelDiagnostics, tabId, setHistoryScrollPosition, traceHistoryScrollEvent]);
+  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, historyWheelDiagnostics, syncScrollArrowVisibility, tabId, setHistoryScrollPosition, traceHistoryScrollEvent]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(displayEntries);
@@ -27078,7 +27430,9 @@ function HistoryPanel({
             }}
           >
             <HistorySpinner size={16} />
-            Loading...
+            {/* Same sentence as HistoryLoadingStatus: the user must not see
+                three different words for one wait. */}
+            Читаю историю
           </div>
         )}
         <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
@@ -27528,7 +27882,7 @@ function HistoryPanel({
               }}
             >
               <HistorySpinner size={16} />
-              Подготовка отображения…
+              Читаю историю · строю карточки
             </div>
           )}
           </>
@@ -27566,49 +27920,54 @@ function HistoryPanel({
             <SideSurfaceToggleButton tabId={tabId} size={HISTORY_FLOATING_CONTROL_SIZE_PX} />
           </div>
         )}
-        {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll.
-            When this panel is the CENTER surface it must dodge the right-docked
-            side panel, exactly like the Run after strip and the terminal's own
-            arrow (shared arithmetic in surfaceInsets). As a side panel it insets
-            nothing: its own bottom-right corner is already clear, and shifting
-            it would push the control out of the panel it belongs to.
+        {/* Scroll-to-bottom arrow — visibility toggled via `scrollArrowRef` in
+            handleScroll, but the NODE itself lives beside the layout toggle in
+            StationaryHistorySurfaceToggle when this panel is the centre surface.
 
-            Слева от кнопки раскладки, в 2px: пара стоит в одном месте, и стрелка
-            не занимает её позицию, когда прячется. В боковой панели кнопки
-            раскладки нет (она принадлежит центральной поверхности), поэтому там
-            стрелка остаётся у самого края. */}
-        <ControlHint label="Прокрутить History вниз">
-        <div
-          ref={scrollArrowRef}
-          data-history-scroll-to-bottom
-          className="flex items-center justify-center"
-          onClick={() => scrollToBottom(false)}
-          style={{
-            display: 'none',
-            position: 'absolute',
-            bottom: mainSurface ? RIGHT_CLUSTER_INNER_GAP_PX : 12,
-            right: mainSurface
-              ? centerRightInset + historyHorizontalPadding + HISTORY_FLOATING_CONTROL_SIZE_PX + HISTORY_FLOATING_CONTROL_GAP_PX
-              : 12,
-            width: HISTORY_FLOATING_CONTROL_SIZE_PX,
-            height: HISTORY_FLOATING_CONTROL_SIZE_PX,
-            borderRadius: 6,
-            backgroundColor: '#323237',
-            border: '1px solid rgba(167, 139, 250, 0.3)',
-            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.5)',
-            cursor: 'pointer',
-            zIndex: 10,
-          }}
-        >
-          <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
-        </div>
-        </ControlHint>
+            Причина переноса: пара кнопок обязана стоять на одной линии, а низ у
+            двух контейнеров разный — стационарный хост кончается у верхней
+            кромки поля ввода, а область транскрипта ещё выше, над доком чипов
+            субагентов. Пока стрелка стояла здесь, она поднималась над кнопкой
+            раскладки диагональю, тем заметнее, чем выше док.
+
+            В БОКОВОЙ панели кнопки раскладки нет (она принадлежит центральной
+            поверхности) и стационарного хоста тоже — там стрелка остаётся своей,
+            у нижнего правого угла, которому ничего не мешает. */}
+        {!mainSurface && (
+          <div
+            ref={scrollArrowRef}
+            data-history-scroll-to-bottom
+            style={{
+              display: 'none',
+              position: 'absolute',
+              bottom: 12,
+              right: 12,
+              zIndex: 10,
+            }}
+          >
+            {/* Вид — общий со стрелкой центра и терминала
+                (ScrollToBottomButton). Здесь только место: своя панель, свой
+                нижний правый угол. Видимость по-прежнему пишет транскрипт
+                прямо в стиль ЭТОЙ обёртки. */}
+            <ScrollToBottomButton
+              label="Прокрутить History вниз"
+              onClick={() => scrollToBottom(false)}
+            />
+          </div>
+        )}
       </div>
 
       {(primaryAgentCatalogDock || backgroundHistoryChips.length > 0 || historyAgentChips.length > 0) && (
         // Only the compact chip-row owns normal-flow height. Its Inspector is
         // an absolute popover upward, so opening/loading/switching a child
         // transcript never changes the History viewport or a Virtuoso row.
+        //
+        // Ширина — вся панель. Сужать док по содержимому нельзя: раскрытый
+        // Inspector — absolute popover внутри бара, и его ширину задаёт этот
+        // контейнер. С `max-content` инспектор становился шириной с чипы.
+        // Серую полосу во всю строку рисовала заливка самой полосы чипов, а не
+        // ширина дока; заливки больше нет, а чипы держат `width: max-content`
+        // в своём CSS, поэтому пустая часть строки остаётся прозрачной.
         <div data-history-agent-dock style={{ flex: '0 0 auto', width: '100%', minWidth: 0, zIndex: 7 }}>
           <HistoryBackgroundTasksBar
             chips={backgroundHistoryChips}

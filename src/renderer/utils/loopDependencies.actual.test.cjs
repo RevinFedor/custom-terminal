@@ -33,6 +33,7 @@ async function fixture(t) {
   let store = require(outfile); await store.hydratePromptQueueStore(); store.usePromptQueueStore.getState().setLoopPromptEnabled('P', true, 'own-turn');
   const { choosePromptQueueContinuationForOutcome } = await import('./promptQueueReconciliation.mjs');
   const { normalizeAgentTurnEndReason, isNaturalAgentTurnEndReason } = await import('./agentCompletionOutcome.mjs');
+  const { createRunAfterCapacityRecovery } = await import('./runAfterCapacityRecovery.mjs');
   const controls = { orchestration: true, loopOrchestration: false, wait: false, priorInput: false, goal: false, installFloor: 0 };
   const messages = [], inflight = new Set();
   const context = vm.createContext({ Map, Set, Number, Date, console: { log() {}, warn() {} },
@@ -54,6 +55,10 @@ async function fixture(t) {
     queueSendInflight: inflight, queueAwaitingBusyStart: new Set(), autoCompactTurnStarts: new Map(),
     coordinator: { intercept: () => false }, findOwnersWaitingOn: () => [], queueOwnerHasPendingContinuationAt: () => false,
     getEffectiveQueueTrigger: () => 'P', hasRuntimeWorkflowArm: () => false, getReadyTriggerForOwner: () => null,
+    capacityWorkflowRecovery: createRunAfterCapacityRecovery(),
+    capacityWorkflowSession: () => 'S', deferredCapacityNaturalOutcomes: new Map(),
+    capacityWorkflowBlocked: () => false,
+    tabOwnBackgroundWorkBlocks: () => false,
     getPromptQueueAgent: () => 'codex', getPromptQueueSessionId: () => 'S',
     describeQueuesForTriggerLog: () => '', shortQueueTabId: value => value, getTabName: () => 'parent',
     useUIStore: { getState: () => ({ showToast() {} }) }, fireQueueOwner: () => assert.fail('ordinary queue must not bypass inherited gate'),

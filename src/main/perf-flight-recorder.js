@@ -53,8 +53,35 @@ function captureDecision(recent, now, kind = 'unknown', detail = {}) {
     && Number.isFinite(detail.appChildCpu) && detail.appChildCpu < 80 && detail.systemBusy >= 90) {
     return { allowed: false, reason: 'system-pressure-no-electron-hotspot', remaining: Math.max(0, 4 - recent.length), group };
   }
-  if (recent.length >= 4) return { allowed: false, reason: 'rolling-quota-exhausted',
-    nextEligibleWallMs: Math.min(...recent.map(e => e.at)) + DAY, remaining: 0, group };
+  if (recent.length >= 4) {
+    // The quota exists to bound disk and CPU, not to decide WHICH freezes get
+    // explained. Refusing outright meant the first four events of the day kept
+    // their slots and everything afterwards was unexplained: on 01.11 the
+    // slots were gone by 06:11 and the next 765 requests were refused,
+    // including every freeze the user actually reported.
+    //
+    // A materially worse freeze may now take the slot of the mildest held one.
+    // This does not widen the quota: the count stays at 4 and the evicted
+    // receipt is released in the same decision. Only `severityMs` ordering
+    // changes, so a flood of equal events still cannot churn the set.
+    const severity = Number(detail.durationMs);
+    const evictable = recent
+      .filter(entry => entry.group === group && Number.isFinite(entry.severityMs))
+      .sort((a, b) => a.severityMs - b.severityMs)[0];
+    // Twice as long, and at least 250ms worse: a marginal difference must not
+    // trade one explained freeze for another.
+    const decisivelyWorse = Number.isFinite(severity) && evictable
+      && severity >= evictable.severityMs * 2 && severity - evictable.severityMs >= 250;
+    if (decisivelyWorse) {
+      return { allowed: true, reason: 'evicted-milder-capture', nextEligibleWallMs: now,
+        remaining: 0, group, evicts: evictable.name, evictedSeverityMs: evictable.severityMs,
+        severityMs: severity };
+    }
+    return { allowed: false, reason: 'rolling-quota-exhausted',
+      nextEligibleWallMs: Math.min(...recent.map(e => e.at)) + DAY, remaining: 0, group,
+      ...(Number.isFinite(severity) ? { severityMs: severity } : {}),
+      ...(evictable ? { heldMildestMs: evictable.severityMs } : {}) };
+  }
   const ownGroup = recent.filter(e => e.group === group || !e.group);
   // The same four captures/day, with two slots unavailable to recurring
   // ambient CPU. It previously consumed all four before the user's click.
@@ -376,12 +403,30 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
   return { directory, file, write, writeCausal, entries, read, openExclusive, writeExclusive, prune, retentionLedger,
     reserveCaptureDetails(id, now = Date.now(), kind = 'unknown', detail = {}) {
       const recent = kind === 'manual' ? [] : entries().filter(e => HEAVY_RECEIPT.test(e.name) && now - e.at < DAY).map(e => {
-        try { return { ...e, group: JSON.parse(read(e.name)).group }; }
+        try {
+          const receipt = JSON.parse(read(e.name));
+          // `severityMs` is absent on receipts written before eviction existed
+          // and on kinds that carry no duration. Those stay non-evictable
+          // rather than being treated as severity 0 and discarded first.
+          return { ...e, group: receipt.group, severityMs: receipt.severityMs };
+        }
         catch { return e; } // Legacy/unreadable receipt still consumes its slot.
       });
       const decision = captureDecision(recent, now, kind, detail);
       if (decision.allowed) {
-        const receipt = { requestedAt: now, kind, group: decision.group };
+        // Free the evicted slot in the same step that takes it, so a failure
+        // between the two can only leave the quota stricter, never looser.
+        if (decision.evicts) {
+          try { fs.unlinkSync(file(decision.evicts)); }
+          catch (error) {
+            if (error?.code !== 'ENOENT') {
+              log?.('[Perf:CaptureEvictFailed] name=' + decision.evicts + ' code=' + (error?.code || 'unknown'));
+              return { ...decision, allowed: false, reason: 'rolling-quota-exhausted', evicts: undefined };
+            }
+          }
+        }
+        const receipt = { requestedAt: now, kind, group: decision.group,
+          ...(Number.isFinite(detail.durationMs) ? { severityMs: Math.round(detail.durationMs) } : {}) };
         // Repeated explicit requests get distinct IDs; never replace an old
         // receipt or renew its timestamp if a caller reuses one.
         if (kind === 'manual') writeExclusive(id + '.capture.json', receipt);

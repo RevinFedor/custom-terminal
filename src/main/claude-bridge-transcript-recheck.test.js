@@ -59,6 +59,9 @@ async function harness(t, { duringWatch = false, fileAlreadyExists = false, stal
   const launch = { generation: 'launch-2', launchMode: 'fresh', at: now - 1000, pid: null };
   const context = vm.createContext({
     fs: fsImpl, path, bridgeDir: '/fixture/bridge',
+    // Слежение за папкой моста идёт через dirWatch (шрам 03.11); в стенде —
+    // тот же поддельный fs.watch.
+    dirWatch: { watch: (...args) => fsImpl.watch(...args) },
     assertClaudeDataPath: require('./claude-paths').assertClaudeDataPath,
     console: { log: (...args) => logs.push(args.join(' ')), warn: (...args) => logs.push(args.join(' ')), error() {} },
     bridgeFileMtimes: new Map(), bridgeStaleLogged: new Set(), BRIDGE_STALE_SECONDS: 600,

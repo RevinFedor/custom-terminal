@@ -145,7 +145,7 @@ function maskEmail(value) {
 }
 
 function readClaudeAuthStatus(scope, { signal } = {}) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     execFile(
       'claude',
       ['auth', 'status', '--json'],
@@ -157,6 +157,14 @@ function readClaudeAuthStatus(scope, { signal } = {}) {
       },
       (error, stdout) => {
         const raw = String(stdout || '').trim();
+        // A logged-out CLI still answers `{"loggedIn": false}`, so empty stdout
+        // plus ENOENT is a different fact: the binary is not on this PATH. Both
+        // used to resolve null, i.e. "signed out" — which silently blanked the
+        // toolbar chip instead of reporting a broken environment.
+        if (!raw && error && (error.code === 'ENOENT' || error.code === 127)) {
+          return reject(new ClaudeUsageError('auth_cli_missing',
+            'Claude CLI was not found on PATH, so the active login cannot be read'));
+        }
         if (!raw) return resolve(null);
         try {
           const parsed = JSON.parse(raw);
@@ -1264,11 +1272,29 @@ function ensureCurrentAuthAccount(auth, now = Date.now()) {
   return next;
 }
 
+// `claude auth status` can answer without BOTH email and orgId. The key then
+// falls back to the credential fingerprint, minting a SECOND address for the
+// same login — the account list shows one email twice, and the extra row can
+// never display numbers because nothing was ever fetched under it. Hide only
+// that exact shape: same label as the current login, and no observation at all.
+// A real historical account (login switch) has a different label and is kept.
+// Storage is untouched; logging in under this key makes it current again.
+function isDuplicateAddressArtifact(entry, currentAccountKey) {
+  const account = entry?.account;
+  if (!account || !currentAccountKey) return false;
+  if (account.usage || Number(entry.fetchedAt || 0) > 0 || Number(entry.lastAttemptAt || 0) > 0
+    || entry.oauthSnapshot || entry.statuslineSnapshot) return false;
+  const current = claudeUsageByAccount.get(currentAccountKey)?.account;
+  const label = String(account.label || '').trim().toLowerCase();
+  return !!label && label === String(current?.label || '').trim().toLowerCase();
+}
+
 function listClaudeUsageAccounts(currentAccountKey = null, now = Date.now()) {
   return [...claudeUsageByAccount.entries()]
     .map(([accountKey, entry]) => {
       const account = entry?.account;
       if (!account) return null;
+      if (accountKey !== currentAccountKey && isDuplicateAddressArtifact(entry, currentAccountKey)) return null;
       const isCurrent = accountKey === currentAccountKey;
       const fetchedAt = Number(entry.fetchedAt || 0);
       return {

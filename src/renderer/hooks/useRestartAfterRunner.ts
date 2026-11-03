@@ -103,7 +103,15 @@ function install() {
     if (data.phase === 'starting' && !data.commandOperationId) coordinator.cancel(data.tabId, 'manual-stop-main');
   });
   ipcRenderer.on('shutdown:overlay', (_event: unknown, data: { show?: boolean }) => {
-    shuttingDown = data?.show === true;
+    const nowShuttingDown = data?.show === true;
+    // `show:false` arrives both when the app is really going away (nothing
+    // reads this again) and when the USER CANCELLED the quit. In the second
+    // case the app keeps running, so the gate must reopen — otherwise every
+    // later Restart after is refused for the rest of this lifetime, with no
+    // visible reason. Already-cancelled jobs are not resurrected: those were
+    // given up when the shutdown began.
+    if (!nowShuttingDown && shuttingDown) log('shutdown-cancelled', { owner: 'app' });
+    shuttingDown = nowShuttingDown;
     if (shuttingDown) coordinator.cancelAll('shutdown');
   });
   subscribeOrchestrationRunChanges(change => coordinator.orchestration(change));

@@ -1372,3 +1372,57 @@ test('moveTabsToPane reorders an existing chip without duplicating it', () => {
   assert.deepEqual(paneTabs(result.panes[0]).map((entry) => entry.tabId), ['b', 'c', 'a']);
   assert.equal(result.panes[0].tabId, 'b', 'plain reorder does not change the shown chip');
 });
+
+// ── Закрытие показанной вкладки возвращает окно на предыдущую ──────────────
+
+// Реальное окно полосы всегда имеет windowId: без него одиночная панель
+// схлопывается в одиночный центр, и проверять шаг назад было бы не на чем.
+const win = (windowId, projectId, tabId, tabs) => ({
+  windowId, projectId, tabId, tabs: tabs || [p(projectId, tabId)],
+});
+
+test('закрытие показанной вкладки возвращает окно на предыдущую, а не оставляет пустоту', () => {
+  // Человек смотрел вкладку 1, открыл 2, закрыл 2 — он ожидает снова увидеть 1.
+  // Прежнее правило оставляло окно пустым со страницей «Двойной клик — новая
+  // вкладка», хотя возвращаться было куда.
+  const base = [win('w1', 'p1', 'one'), win('w2', 'p2', 'other')];
+  const opened = resolveSplitActivation(base, 0, 'p1', 'two').panes;
+  assert.equal(opened[0].tabId, 'two');
+
+  const res = emptyPaneByClosedTab(opened, 0, 'two', { stepBack: () => true });
+  assert.equal(res.panes[0].tabId, 'one', 'окно вернулось на прежнюю вкладку');
+  assert.ok(!isEmptyPane(res.panes[0]));
+  assert.equal(res.panes.length, 2, 'оба окна на месте');
+  assert.equal(res.panes[1].tabId, 'other', 'соседнее окно не тронуто');
+});
+
+test('без stepBack то же закрытие по-прежнему оставляет окно пустым', () => {
+  // «Убрать из окна» — другой жест: вкладка жива в боковом списке, и место
+  // осознанно ждёт явного выбора. Общая функция не должна менять его смысл.
+  const base = [win('w1', 'p1', 'one'), win('w2', 'p2', 'other')];
+  const opened = resolveSplitActivation(base, 0, 'p1', 'two').panes;
+  const res = emptyPaneByClosedTab(opened, 0, 'two');
+  assert.equal(res.panes[0].tabId, '', 'окно опустело');
+});
+
+test('шаг назад пропускает мёртвую и уже видимую запись, как это делает ⌘[', () => {
+  const base = [win('w1', 'p1', 'gone'), win('w2', 'p2', 'other')];
+  const opened = resolveSplitActivation(base, 0, 'p1', 'shown').panes;
+  // «gone» больше не существует — возвращаться некуда, окно честно пустеет.
+  const dead = emptyPaneByClosedTab(opened, 0, 'shown', { stepBack: (_, id) => id !== 'gone' });
+  assert.equal(dead.panes[0].tabId, '', 'мёртвая запись не воскрешается');
+
+  // Та же запись, но вкладка уже открыта в соседнем окне: перетягивать нельзя.
+  const elsewhere = resolveSplitActivation(
+    [win('w1', 'p1', 'gone'), win('w2', 'p2', 'other')], 0, 'p1', 'shown').panes
+    .map((pane, index) => (index === 1 ? { ...pane, tabId: 'gone', tabs: [p('p1', 'gone')] } : pane));
+  const visible = emptyPaneByClosedTab(elsewhere, 0, 'shown', { stepBack: () => true });
+  assert.equal(visible.panes[0].tabId, '', 'видимая в другом окне не перетягивается');
+});
+
+test('шаг назад не трогает окно, которое вкладку только ДЕРЖАЛО, не показывая', () => {
+  const holder = win('w1', 'p1', 'a', [p('p1', 'a'), p('p1', 'b')]);
+  const res = emptyPaneByClosedTab([holder, win('w2', 'p2', 'other')], 0, 'b', { stepBack: () => true });
+  assert.equal(res.panes[0].tabId, 'a', 'показанная вкладка не менялась');
+  assert.deepEqual(paneTabs(res.panes[0]), [p('p1', 'a')]);
+});

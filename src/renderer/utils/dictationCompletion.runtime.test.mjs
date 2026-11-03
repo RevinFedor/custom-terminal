@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 import * as registry from './dictationChipRegistry.mjs';
+import * as captureArm from './runAfterCaptureArm.mjs';
 
 const panelUrl = new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url);
 const appUrl = new URL('../App.tsx', import.meta.url);
@@ -27,7 +28,7 @@ async function imports(source, url) {
   for (const statement of syntax.statements) {
     if (!ts.isImportDeclaration(statement)) continue;
     const specifier = statement.moduleSpecifier.text;
-    if (!/\/(dictationChips|dictationChipRegistry|promptImageAttachments|composerClipboard|historyImageImportOwnership)\.mjs$/.test(specifier)) continue;
+    if (!/\/(dictationChips|dictationChipRegistry|promptImageAttachments|composerClipboard|historyImageImportOwnership|runAfterCaptureArm)\.mjs$/.test(specifier)) continue;
     const dependency = await import(new URL(specifier, url));
     for (const binding of statement.importClause?.namedBindings?.elements || []) {
       values[binding.name.text] = dependency[(binding.propertyName || binding.name).text];
@@ -44,6 +45,10 @@ const bridgeSource = part(app, "        if (action === 'dictationChipResolve')",
 function harness({ armed = true, mounted = true, text = '[Dictating vr-101]', failEditor = false,
   selectionStart = 0, selectionEnd = selectionStart, focused = true, imagePaths = [] } = {}) {
   registry.__resetDictationChips();
+  // No "next send goes to Run after" arming in these cases: they prove the
+  // ordinary dictation→send path. Its interaction with the arming lives in
+  // runAfterCaptureArm.actual.test.mjs.
+  captureArm.resetRunAfterCaptureArmForTest();
   registry.beginDictationChip({ id: 'vr-101', tabId: 'T', label: 'tail', autoSend: armed });
   const state = { historyPromptDrafts: { T: text }, historyPromptDraftImages: { T: imagePaths },
     historyPromptDraftChips: { T: [] }, historyPromptDraftPendingImages: { T: [] } };

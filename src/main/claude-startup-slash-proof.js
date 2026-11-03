@@ -68,11 +68,35 @@ function classifyClaudeStartupSlashRecord(record, target) {
     ? normalizeClaudeLocalCommandText(argsMatch[1])
     : '';
 
-  if (
-    text.startsWith('<command-name>/' + target.kind + '</command-name>')
-    && (target.kind === 'effort' ? commandArgs.toLowerCase() : commandArgs) === target.value
-  ) {
-    return 'wrapper';
+  if (text.startsWith('<command-name>/' + target.kind + '</command-name>')) {
+    if ((target.kind === 'effort' ? commandArgs.toLowerCase() : commandArgs) === target.value) {
+      return 'wrapper';
+    }
+    // Claude can record the command under DIFFERENT args than the ones we
+    // submitted. Observed 02.11, tab b765ffed534b: we sent
+    // `/model claude-sonnet-5[1m]`, and the transcript shows
+    // `<command-args>claude-opus-5[1m]` with stdout "Set model to `Opus 5` …
+    // ANTHROPIC_MODEL is set to `Opus 5.5`" — the environment variable wins
+    // over the picker. Requiring an exact args match made this wrapper
+    // invisible, so the paired stdout had no parent to attach to and the whole
+    // proof ended as `wrapper-not-found`: "не подтверждено", when in truth the
+    // command WAS answered and answered with a different model.
+    // Accept it as our wrapper when nothing else can own it: same kind, and
+    // Main already bound this scan to one exact command checkpoint
+    // (afterMs + sessionId, often wrapperUuid). The stdout comparison below
+    // still decides success, so a foreign value reports
+    // `command-applied-different`, never a false success.
+    //
+    // ONE exception, and it is the reason this is not just a looser match:
+    // when the args differ only by case, the args are the whole evidence.
+    // `/model VendorCase` answered by `<command-args>vendorcase` with stdout
+    // `Set model to VendorCase` would compare EQUAL at the stdout stage and
+    // silently confirm a command we never sent that way. Custom model IDs are
+    // case-sensitive, so that pair stays unowned exactly as before.
+    if (target.kind !== 'effort' && commandArgs.toLowerCase() === String(target.value).toLowerCase()) {
+      return null;
+    }
+    return 'wrapper-other-args';
   }
   const observation = parseClaudeSettingObservation(record, target);
   if (observation && observation.kind === target.kind) {
@@ -106,6 +130,7 @@ function scanClaudeStartupSlashRecords(records, command, {
   const wrapperUuids = new Set();
   let wrapperSeen = false;
   let stdoutSeen = false;
+  let argsDiverged = false;
   let latestTs = 0;
   let latestKind = null;
 
@@ -120,10 +145,14 @@ function scanClaudeStartupSlashRecords(records, command, {
     latestTs = Number.isFinite(timestampMs) ? timestampMs : latestTs;
     latestKind = kind;
 
-    if (kind === 'wrapper') {
+    if (kind === 'wrapper' || kind === 'wrapper-other-args') {
       if (wrapperUuid && record?.uuid !== wrapperUuid) continue;
       wrapperSeen = true;
       if (record?.uuid) wrapperUuids.add(record.uuid);
+      // A wrapper recorded under other args is ours only by position, so note
+      // it: the outcome below must read as "applied something else", not as a
+      // confirmation of what we asked for.
+      if (kind === 'wrapper-other-args') argsDiverged = true;
       continue;
     }
 
@@ -136,6 +165,7 @@ function scanClaudeStartupSlashRecords(records, command, {
       stdoutSeen: true,
       wrapperUuid: record.parentUuid,
       stdoutUuid: record?.uuid || null,
+      ...(argsDiverged ? { wrapperArgsDiverged: true } : {}),
     };
     const observation = parseClaudeSettingObservation(record, target);
     if (kind === 'stdout-success') {

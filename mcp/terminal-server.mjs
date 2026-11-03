@@ -966,7 +966,7 @@ function historyArgumentError(message) {
   });
 }
 
-function historyOperationArgs(args, { read = false } = {}) {
+function historyOperationArgs(args, { read = false, selfRewind = false } = {}) {
   const allowed = read
     ? ['tabId', 'operationId', 'projectId', 'includeStatus']
     : ['tabId', 'operationId', 'projectId', 'expectedSessionId', 'targetUuid', 'toolType',
@@ -989,9 +989,15 @@ function historyOperationArgs(args, { read = false } = {}) {
     if (args.includeStatus !== undefined && typeof args.includeStatus !== 'boolean') throw historyArgumentError('includeStatus must be boolean');
     return { tabId, operationId };
   }
-  const toolType = args.toolType === undefined ? 'codex' : args.toolType;
-  if (!['codex', 'claude'].includes(toolType)) throw historyArgumentError('toolType must be codex or claude');
-  const request = { operationId, kind: 'rewind', toolType,
+  // `rewind_history` addresses someone else's conversation and keeps its
+  // historical codex default. A SELF rewind cannot default: the provider is a
+  // property of the calling tab, and guessing it wrong made the app refuse the
+  // mutation at the input fence with `history_input_owner_changed` — a Claude
+  // tab being asked to rewind as Codex. The caller resolves it instead.
+  const toolType = args.toolType === undefined ? (selfRewind ? null : 'codex') : args.toolType;
+  if (selfRewind ? toolType !== null && !['codex', 'claude'].includes(toolType)
+    : !['codex', 'claude'].includes(toolType)) throw historyArgumentError('toolType must be codex or claude');
+  const request = { operationId, kind: 'rewind', ...(toolType ? { toolType } : {}),
     expectedSessionId: string(args.expectedSessionId, 'expectedSessionId'),
     targetUuid: string(args.targetUuid, 'targetUuid') };
   if (args.repairOfOperationId !== undefined) {
@@ -1004,7 +1010,12 @@ function historyOperationArgs(args, { read = false } = {}) {
   for (const key of ['targetSourceIdentity', 'expectedContentRevision']) {
     if (args[key] !== undefined) request[key] = args[key] === null ? null : string(args[key], key);
   }
-  if (toolType === 'claude' && !request.expectedContentRevision) throw historyArgumentError('Claude saved-history requires expectedContentRevision');
+  // A self rewind cannot supply a stable whole-file revision: the calling
+  // session keeps writing to that very file between reading it and calling.
+  // The app proves the exact target record after Stop instead. A token passed
+  // anyway is still forwarded and still checked. See
+  // saved-history-operation.js::normalizeSavedHistoryRequest.
+  if (toolType === 'claude' && !selfRewind && !request.expectedContentRevision) throw historyArgumentError('Claude saved-history requires expectedContentRevision');
   if (args.targetEntryRef === null) request.targetEntryRef = null;
   else if (args.targetEntryRef !== undefined) {
     const ref = args.targetEntryRef;
@@ -1115,12 +1126,13 @@ const STRUCTURED_JSON_TOOLS = new Set([
 const TOOLS = [
   {
     name: 'rewind_self',
-    description: 'Only on the user\'s explicit instruction, rewind THIS full session with the existing saved-history executor. Save a concise factual retainedContext first: code/server changes, deployment outcome, findings, constraints and unresolved effects; Rewind does not undo files or external actions. Resolve the requested iteration to an exact user UUID, never guess by index/text. To SHOW a proposed target before mutation, use the blue navigation-only Markdown link described by list_turns; clicking it is NOT Rewind. Read current_context/get_tab_context after final working-file edits; copy revision and rewindSnapshot from that SAME observation into expectedContextRevision/expectedContextSnapshot and incorporate its notes. Do not refresh the proof behind an old summary. Delivery/read acknowledgement alone does not invalidate the signed snapshot; new facts or composition changes fail before Stop. By default all observed updates are covered; explicit coveredContextUpdateIds can narrow the set. Old chips are superseded only after binding; later changed/new updates remain. With no nextPrompt the removed prompt is restored as a draft beside a Rewind context chip; with nextPrompt the app queues ONE ordinary model task through the existing FIFO. Choose operationId before calling. This is the LAST tool action of the old turn: finish immediately after acceptance; the app owns Stop/rewrite/Resume/followup. Lost ACK/UNKNOWN must be read by the SAME tabId/operationId using get_history_operation, never rerun or send the followup yourself. Requires savedHistory.selfRewind:{version:1,contextSnapshot:1} in the loaded app; no native-menu/raw-history fallback.',
+    description: 'Only on the user\'s explicit instruction, rewind THIS full session with the existing saved-history executor. Save a concise factual retainedContext first: code/server changes, deployment outcome, findings, constraints and unresolved effects; Rewind does not undo files or external actions. Resolve the requested iteration to an exact user UUID, never guess by index/text; that address is all the target identity this tool needs — do NOT fetch a transcript content revision for it. This session keeps writing the file, so such a token is stale before the call; the app proves the exact record after Stop. Before proposing a rewind point, show the user a compact map of the iterations in a ```text fenced block: one line per iteration as `N  short topic`, with a right-hand margin marking what the rewind keeps versus what it removes (for example `← сохранить` above the cut and a bracket spanning the discarded ones), and the candidate target marked. Group consecutive minor iterations instead of listing every one. This map is how the user actually decides; prose alone is not enough. Then give the blue navigation-only Markdown link described by list_turns for the exact candidate; clicking it is NOT Rewind. Read current_context/get_tab_context after final working-file edits; copy revision and rewindSnapshot from that SAME observation into expectedContextRevision/expectedContextSnapshot and incorporate its notes. Do not refresh the proof behind an old summary. Delivery/read acknowledgement alone does not invalidate the signed snapshot; new facts or composition changes fail before Stop. By default all observed updates are covered; explicit coveredContextUpdateIds can narrow the set. Old chips are superseded only after binding; later changed/new updates remain. With no nextPrompt the removed prompt is restored as a draft beside a Rewind context chip; with nextPrompt the app queues ONE ordinary model task through the existing FIFO. Choose operationId before calling. This is the LAST tool action of the old turn: finish immediately after acceptance; the app owns Stop/rewrite/Resume/followup. Lost ACK/UNKNOWN must be read by the SAME tabId/operationId using get_history_operation, never rerun or send the followup yourself. Requires savedHistory.selfRewind:{version:1,contextSnapshot:1} in the loaded app; no native-menu/raw-history fallback.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {
       operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' },
       expectedSessionId: { type: 'string', minLength: 1 }, targetUuid: { type: 'string', minLength: 1 },
       toolType: { type: 'string', enum: ['codex', 'claude'] },
-      targetSourceIdentity: { type: ['string', 'null'] }, expectedContentRevision: { type: ['string', 'null'] },
+      targetSourceIdentity: { type: ['string', 'null'] },
+      expectedContentRevision: { type: ['string', 'null'], description: 'Optional for a self rewind and normally omitted: this session keeps writing the file, so any token it reads is stale before the call. The app proves the exact target record after Stop. A token passed anyway is still checked.' },
       targetEntryRef: { type: ['object', 'null'], properties: { physicalSessionId: { type: 'string' },
         rawUuid: { type: 'string' }, sourceIdentity: { type: ['string', 'null'] }, segmentId: { type: 'string' },
         viewOwnerSessionId: { type: 'string' }, contentRevision: { type: 'string' } },
@@ -1787,7 +1799,7 @@ const TOOLS = [
   },
   {
     name: 'list_turns',
-    description: 'Map turns inside one already-selected session; this is not a cross-session search tool. Use search_sessions first for topic/feature lookup, then call list_turns only when its match preview is insufficient to reconstruct chronology. Inspect one session at a time, normally with kind="user", from="latest_compact" or from="end", and a small page; paginate only as evidence requires. Never call it across several candidate sessions just to find a phrase, and never repeat the same call with unchanged arguments. Returns zero-based iterationIndex values, compact boundaries, previews, block sizes, UUIDs, tools, notes, and docs markers; read full content only through targeted turn tools. When asked to identify/show a Rewind iteration, put a readable label in ordinary answer Markdown, NOT code/backticks: [Iteration N - short prompt](#noted-message?tabId=T&provider=codex&sessionId=S&messageId=U). Substitute exact public tab/provider/entry.sessionId/entry.uuid and URL-encode values; retain available physicalSessionId,rawUuid,viewOwnerSessionId,transcriptSegmentId,sourceIdentity. A display number is never an address. This requires the updated desktop History link adapter; it only navigates/highlights, never Rewind/Stop/Send, and does not authorize mutation.',
+    description: 'Map turns inside one already-selected session; this is not a cross-session search tool. Use search_sessions first for topic/feature lookup, then call list_turns only when its match preview is insufficient to reconstruct chronology. Inspect one session at a time, normally with kind="user", from="latest_compact" or from="end", and a small page; paginate only as evidence requires. Never call it across several candidate sessions just to find a phrase, and never repeat the same call with unchanged arguments. Returns zero-based iterationIndex values, compact boundaries, previews, block sizes, UUIDs, tools, notes, and docs markers; read full content only through targeted turn tools. When asked to identify/show a Rewind iteration, put a readable label in ordinary answer Markdown, NOT code/backticks: [Iteration N - short prompt](#noted-message?tabId=T&provider=codex&sessionId=S&messageId=U). Substitute exact public tab/provider/entry.sessionId/entry.uuid and URL-encode values; retain available physicalSessionId,rawUuid,viewOwnerSessionId,transcriptSegmentId,sourceIdentity. A display number is never an address, and NEVER abbreviate the id the way identifiers are shortened in prose: copy entry.uuid whole, all 36 characters. A truncated address is refused and the link is rendered as plain text. This requires the updated desktop History link adapter; it only navigates/highlights, never Rewind/Stop/Send, and does not authorize mutation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2281,6 +2293,19 @@ const TOOLS = [
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId'],
+    },
+  },
+  {
+    name: 'hold_background_work',
+    description: 'Keep this tab counted as BUSY while one background shell command runs, so its loader stays on and Auto-stop, Run After and build install wait for it. Use it when the user asks to hold the tab for a specific script. Subagents already hold their tab automatically and need no call; ordinary background shells do not, so a long-running dev server cannot wedge the app. Pass the task id the background command reported (bash-7, monitor-1) or its tool_use id, right after starting it. There is no release call: the hold ends when that command finishes, is stopped, or the tab process ends. Only a currently running background Bash/Monitor of this tab can be held; anything else is refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab that owns the background command. Use current_context for this tab.' },
+        taskRef: { type: 'string', description: 'Task id reported when the command went to the background (for example bash-7 or monitor-1), or its tool_use id.' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId', 'taskRef'],
     },
   },
   {
@@ -3905,6 +3930,20 @@ async function callTool(name, args) {
       return 'AI stop requested for tab ' + args.tabId + ' through Project API scenario layer.';
     }
 
+    case 'hold_background_work': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiPost(target,
+        '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/background-hold',
+        { taskRef: args.taskRef });
+      const name = result.taskId || result.toolUseId || args.taskRef;
+      if (result.repeated === true) {
+        return 'Background command ' + name + ' was already held in tab ' + args.tabId + '; nothing changed.';
+      }
+      return 'Tab ' + args.tabId + ' is held busy while background command ' + name + ' runs'
+        + (Number.isFinite(result.heldCount) ? ' (held commands: ' + result.heldCount + ')' : '')
+        + '. The hold releases itself when that command finishes or is stopped.';
+    }
+
     case 'interrupt_ai': {
       const target = projectHint(args, args.tabId);
       const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/interrupt', {});
@@ -3960,10 +3999,27 @@ async function callTool(name, args) {
         || nextPrompt !== undefined && (typeof nextPrompt !== 'string' || !nextPrompt.trim())) throw historyArgumentError('Invalid retained context, revision, covered member IDs or nextPrompt');
       if (Object.keys(targetArgs).some(key => !['operationId', 'expectedSessionId', 'targetUuid', 'toolType',
         'targetSourceIdentity', 'targetEntryRef', 'expectedContentRevision'].includes(key))) throw historyArgumentError('Self Rewind cannot address another tab or repair an old operation');
-      const { operationId, request } = historyOperationArgs({ ...targetArgs, tabId });
+      const { operationId, request } = historyOperationArgs({ ...targetArgs, tabId }, { selfRewind: true });
       let mutationAttempted = false;
       try {
         const target = projectHint({}, tabId);
+        // The provider of THIS session is a fact about this tab, not a caller
+        // argument. Read it before any mutation; an unresolved or mismatched
+        // one stops here rather than reaching the app as the wrong provider.
+        if (!request.toolType) {
+          const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD_()), 'color='];
+          if (target.projectId) params.push('parentProjectId=' + encodeURIComponent(target.projectId));
+          const endpoint = '/terminal/tabs?' + params.join('&');
+          const listed = target.port ? await httpGetOnPort(target.port, endpoint)
+            : await httpGet(endpoint, target.cwd);
+          const own = (listed?.tabs || []).find(tab => tab && tab.tabId === tabId);
+          const resolved = String(own?.commandType || '');
+          if (!['claude', 'codex'].includes(resolved)) {
+            throw Object.assign(new Error('Could not resolve this tab\'s provider for a self rewind; pass toolType explicitly'),
+              { code: 'self_rewind_provider_unresolved' });
+          }
+          request.toolType = resolved;
+        }
         const capability = await ensureSavedHistorySupport(target, request.toolType, request);
         if (capability.selfRewind?.version !== 1 || capability.selfRewind.contextSnapshot !== 1) throw Object.assign(new Error('Update Noted Terminal for observed-context Self Rewind snapshots; no fallback was attempted'), { code: 'app_update_required' });
         if (!expectedContextSnapshot) throw historyArgumentError('Read current_context/get_tab_context and pass its rewindSnapshot together with that observation revision');

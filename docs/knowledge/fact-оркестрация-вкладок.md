@@ -520,6 +520,21 @@ completed операцию, чужой complete не снимает активн
 освобождения UNKNOWN. Обычные сообщения между вкладками и FULL completion не
 подавляются. Проверено SOURCE/private на actual JSON/SQLite/HTTP; отсутствие этой
 capability в installed Main означает необходимость установки, не live quiet ACK.
+**Мёртвый установщик Noted не клинит следующий старт.** Активным может быть только
+одно окно обслуживания. Если установщик закрыл Noted и умер, не перезапустив его, его
+`install:noted:*` навсегда оставался `active`: стартовый `begin` следующего Main
+получал `research_maintenance_busy`, RunStore не получал authority, и падали AutoResume,
+Resume, Send и `orchestration:list-active`. Операторский `complete` тоже был заперт:
+`transitionResearchMaintenance` сначала требует тот же стартовый handover. Теперь Noted
+Main, стартующий под СВОИМ install-handover, закрывает чужое активное `install:noted:*`
+окно (`completed`, не удаляется — старый begin его не переоткроет) и логирует
+`[ResearchMaintenance] startup superseded stale install op=…`. Окно другого приложения
+(`install:sc-*`) не трогается: перезапуск Noted ничего не доказывает о его установщике,
+там прежний busy, выход — обычный запуск без handover + операторский `complete`.
+Шрам 01Nov: `build:i-c` из вкладки Noted оставил `install:noted:continue:3b09b59d`;
+ручная переустановка (handover `432ed5e8`) клинилась. Проверено живьём 05:17:09 UTC:
+новый Main закрыл 3b09b59d, установщик подтвердил свою операцию, ошибок 0.
+
 SOURCE startup handover передаёт один operationId через
 `--research-maintenance-operation=<ID>`: RunStore не допускает restore до готовности
 receipt owner, strict begin и exact cancellation queued operational input. Initial

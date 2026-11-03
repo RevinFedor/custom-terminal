@@ -87,6 +87,18 @@ if (process.env.NOTED_USER_DATA_DIR) {
     const userDataDir = path.resolve(process.env.NOTED_USER_DATA_DIR);
     fs.mkdirSync(userDataDir, { recursive: true });
     app.setPath('userData', userDataDir);
+    // `logs` is a SEPARATE Electron path and does not follow userData: an
+    // isolated instance kept writing into the shared
+    // ~/Library/Logs/noted-terminal (01.11: 124 lines from the
+    // /private/tmp/ios-e2e-20261101 stand mixed into the user's own
+    // production.log, with its PTY/Store/Renderer tags). Diagnostics follow
+    // the private profile, as every other durable artifact does.
+    if (userDataDir !== canonicalNotedUserDataDir) {
+      const logsDir = path.join(userDataDir, 'logs');
+      fs.mkdirSync(logsDir, { recursive: true });
+      app.setPath('logs', logsDir);
+      console.log('[Startup] logs override:', logsDir);
+    }
     console.log('[Startup] userData override:', userDataDir);
   } catch (error) {
     console.warn('[Startup] userData override failed:', error?.message || error);
@@ -553,6 +565,7 @@ const {
 } = require(path.join(srcMainDir, 'claude-prompt-transport'));
 const { projectClaudePromptAuditToRequest } = require(path.join(srcMainDir, 'claude-prompt-request-projection'));
 const { claudeProviderFailureFromHook } = require(path.join(srcMainDir, '../shared/claude-provider-failure.cjs'));
+const { claudeStreamCutFromRecord } = require(path.join(srcMainDir, '../shared/claude-stream-cut-retry.cjs'));
 const { reduceClaudeAccessFailure, isClaudeAccessFailureBlocked, claudeSettingAccessOutcome } = require(path.join(srcMainDir, 'claude-access-failure-stop'));
 const {
   STORE_STATES: AGENT_SEND_DURABLE_STATES,
@@ -633,6 +646,9 @@ app.once('will-quit', () => {
   miniOrchestratorHookRelease?.();
   miniOrchestratorRuntime?.dispose();
 });
+// Last turn id proven finished by a Stop hook. finishTurn() erases the registry
+// entry, so post-Stop consumers would otherwise lose the turn identity.
+const claudeLastFinishedTurnId = new Map();
 function readMiniOrchestratorOwner(tabId) {
   const generation = getTerminalLifecycleGeneration(tabId);
   if (!generation || !terminals.has(tabId) || aiStoppingTabs.has(tabId)) return null;
@@ -655,6 +671,20 @@ function readMiniOrchestratorOwner(tabId) {
       ready: turn.active !== true && claudeTurnBusy.get(tabId) === false
         && claudeHookLastEvent.get(tabId)?.event === 'Stop' && getCombinedTabBackgroundWorkCount(tabId) === 0 };
   }
+  // The Stop handler runs finishTurn() before publishing the completion, and
+  // finishTurn removes the turn from the registry. Without this branch the
+  // owner disappears exactly at the moment a finished answer is observed, so
+  // every post-Stop consumer (Mini capture and its flush) silently sees null.
+  // The bridge session is the same proof the branch above relies on.
+  const bridgeSession = bridgeKnownSessions.get(tabId);
+  const lastHook = claudeHookLastEvent.get(tabId);
+  if (bridgeSession && lastHook?.event === 'Stop' && lastHook.sessionId === bridgeSession) {
+    // Keep the turn id the finished turn actually had: callers compare it, and
+    // a null here reads as "a different turn" and invalidates the capture.
+    return { owner: { provider: 'claude', sessionId: bridgeSession, generation },
+      turnId: claudeLastFinishedTurnId.get(tabId) || null,
+      ready: claudeTurnBusy.get(tabId) === false && getCombinedTabBackgroundWorkCount(tabId) === 0 };
+  }
   return null;
 }
 function getMiniOrchestratorRuntime() {
@@ -662,6 +692,16 @@ function getMiniOrchestratorRuntime() {
   const { createMiniOrchestratorRuntime } = require(path.join(srcMainDir, 'mini-orchestrator-runtime'));
   miniOrchestratorRuntime = createMiniOrchestratorRuntime({ db: projectManager.db, systemPromptService,
     readOwner: readMiniOrchestratorOwner,
+    // Presentation/validation only: the reviewer must be a live AI tab, and
+    // the forwarded prompt names both tabs for the human reading that chat.
+    describeTab: tabId => {
+      const row = projectManager.db.db.prepare('SELECT name,command_type AS commandType FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId);
+      return row ? { name: row.name || '', provider: row.commandType || '' } : {};
+    },
+    isAiTab: tabId => {
+      const row = projectManager.db.db.prepare('SELECT command_type AS commandType FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId);
+      return !!row && ['claude', 'codex', 'gemini'].includes(String(row.commandType || ''));
+    },
     automaticCorrections: process.env.NOTED_E2E_TEST === 'true' && !!process.env.NOTED_MINI_REPLAY_PROFILE
       && process.env.NOTED_MINI_AUTOMATIC_CORRECTIONS === '1',
     ...(process.env.NOTED_E2E_TEST === 'true' && process.env.NOTED_MINI_REPLAY_PROFILE ? {
@@ -674,6 +714,18 @@ function getMiniOrchestratorRuntime() {
         throw new Error('mini_review_owner_changed');
       const row = projectManager.db.db.prepare('SELECT COALESCE(project_id,execution_namespace) AS projectId,cwd FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId);
       if (!row) throw new Error('mini_review_tab_missing');
+      // An isolated E2E instance owns no MCP hub (canOwnGlobalHub is false),
+      // and the shared hub on :53133 routes to the USER's app, not this one.
+      // Fall back to this instance's own Project API, which is the same
+      // scenario layer the hub's send_prompt ends up calling.
+      if (!MCP_HUB_CAN_SPAWN) {
+        const own = require(path.join(srcMainDir, 'web-server')).getOwnApiEndpoint?.();
+        if (!own?.port) throw new Error('mini_review_local_api_unavailable');
+        // The recipient is chosen by the caller (forward mode sends to the
+        // reviewer tab), so the sender appends it; this base must stay neutral.
+        return { kind: 'project-api', base: 'http://127.0.0.1:' + own.port + '/api/terminal-tabs/',
+          token: own.token };
+      }
       return mcpServersViaHub({ terminal: {} }, { tabId, projectId: row.projectId, cwd: row.cwd || '' }).terminal.url;
     },
     publish: (tabId, snapshot) => {
@@ -691,9 +743,40 @@ function getMiniOrchestratorRuntime() {
     },
   });
   miniOrchestratorHookRelease = getAgentResponseObservationReader().onAgentResponseCompletion(event => {
-    if (!miniOrchestratorRuntime?.isEnabled(event.tabId) || event.subject?.toolType !== 'claude') return;
-    const owner = readMiniOrchestratorOwner(event.tabId)?.owner;
-    if (!owner || owner.sessionId !== event.subject.sessionId) return;
+    const miniTrace = (stage, extra = '') => {
+      try {
+        console.log('[MiniOrchestrator] completion-skip stage=' + stage
+          + ' tab=' + String(event.tabId).slice(-12) + extra);
+      } catch {}
+    };
+    if (!miniOrchestratorRuntime?.isEnabled(event.tabId) || event.subject?.toolType !== 'claude') {
+      miniTrace('enabled-or-tooltype', ' enabled=' + String(miniOrchestratorRuntime?.isEnabled(event.tabId))
+        + ' toolType=' + String(event.subject?.toolType)); return;
+    }
+    // The Stop handler calls finishTurn() BEFORE observeClaudeHook, and
+    // finishTurn deletes the turn from the registry. By the time this listener
+    // runs, readMiniOrchestratorOwner has no turn left and returns null, so the
+    // completed answer was silently dropped. The completion event itself proves
+    // the identity: it already carries the verified session/generation that the
+    // registry would have supplied. Verify against the live terminal instead.
+    const ownerState = readMiniOrchestratorOwner(event.tabId);
+    const generation = getTerminalLifecycleGeneration(event.tabId);
+    const owner = ownerState?.owner?.sessionId === event.subject.sessionId
+      ? ownerState.owner
+      : generation && terminals.has(event.tabId) && !aiStoppingTabs.has(event.tabId)
+        && bridgeKnownSessions.get(event.tabId) === event.subject.sessionId
+        ? { provider: 'claude', sessionId: event.subject.sessionId, generation }
+        : null;
+    if (!owner) {
+      miniTrace('owner-mismatch', ' registry=' + String(ownerState?.owner?.sessionId || null).slice(-12)
+        + ' subject=' + String(event.subject.sessionId).slice(-12)
+        + ' bridge=' + String(bridgeKnownSessions.get(event.tabId) || null).slice(-12)
+        + ' generation=' + String(generation || null).slice(-12)); return;
+    }
+    console.log('[MiniOrchestrator] completion-accepted tab=' + String(event.tabId).slice(-12)
+      + ' turn=' + String(event.subject.targetExecutionContext.turnId)
+      + ' complete=' + String(event.result.complete) + ' chars=' + String(event.result.assistantText?.length ?? 0)
+      + ' ready=' + String(ownerState?.ready));
     miniOrchestratorRuntime.capture.observeClaudeCompletion({ tabId: event.tabId, owner,
       turnId: event.subject.targetExecutionContext.turnId,
       answerId: 'claude-final:' + event.subject.providerPromptId,
@@ -785,8 +868,8 @@ function observeMiniOrchestratorCodex(state, record, suppressed, outcome, audit 
     + String(state.tabId).slice(-12) + ' event=' + event + ' turn=' + String(turnId || '-')
     + ' offset=' + offset + ' mode=' + (sourceProofReplay ? 'source-proof-replay' : 'live'));
 }
-for (const [channel, action] of [['mini-orchestrator:get', 'get'], ['mini-orchestrator:set-enabled', 'setEnabled'], ['mini-orchestrator:clear', 'clear'], ['mini-orchestrator:set-settings', 'setSettings']]) {
-  ipcMain.handle(channel, async (_event, { tabId, enabled, model, thinkingLevel, expectedRevision } = {}) => {
+for (const [channel, action] of [['mini-orchestrator:get', 'get'], ['mini-orchestrator:set-enabled', 'setEnabled'], ['mini-orchestrator:clear', 'clear'], ['mini-orchestrator:set-settings', 'setSettings'], ['mini-orchestrator:set-forward', 'setForward'], ['mini-orchestrator:read-instruction', 'readInstruction']]) {
+  ipcMain.handle(channel, async (_event, { tabId, enabled, model, thinkingLevel, expectedRevision, reviewerTabId, instruction } = {}) => {
     try {
       if (typeof tabId !== 'string' || !projectManager.db.db.prepare('SELECT tab_id FROM tabs WHERE tab_id=? AND execution_archived=0 LIMIT 1').get(tabId))
         return { success: false, error: 'Вкладка недоступна.' };
@@ -794,13 +877,15 @@ for (const [channel, action] of [['mini-orchestrator:get', 'get'], ['mini-orches
       const runtime = getMiniOrchestratorRuntime();
       if (action === 'setEnabled') runtime.setEnabled(tabId, enabled);
       if (action === 'setSettings') runtime.setSettings(tabId, { model, thinkingLevel, expectedRevision });
+      if (action === 'setForward') runtime.setForwardTarget(tabId, { reviewerTabId, instruction, expectedRevision });
+      if (action === 'readInstruction') return { success: true, instruction: await runtime.forwardInstructionText(tabId) };
       if (action === 'clear' && !runtime.clear(tabId)) return { success: false, error: 'Дождитесь текущей проверки.' };
       return { success: true, snapshot: runtime.get(tabId) };
     } catch (error) {
-      if (action === 'setSettings') console.log('[MiniOrchestrator] settings-rejected tab=' + String(tabId || '-').slice(-12)
+      if (['setSettings', 'setForward'].includes(action)) console.log('[MiniOrchestrator] ' + action + '-rejected tab=' + String(tabId || '-').slice(-12)
         + ' reason=' + String(error.code || error.message || 'unknown').slice(0, 160));
       return { success: false, error: String(error.code || error.message || 'mini_reviewer_unavailable').slice(0, 240),
-      ...(action === 'setSettings' && miniOrchestratorRuntime ? { snapshot: miniOrchestratorRuntime.get(tabId) } : {}) }; }
+      ...(['setSettings', 'setForward'].includes(action) && miniOrchestratorRuntime ? { snapshot: miniOrchestratorRuntime.get(tabId) } : {}) }; }
   });
 }
 const savedPromptService = createSavedPromptService({
@@ -892,6 +977,9 @@ const conversationOwners = new ConversationOwners({
   publish: (tabId, conversationOwner) => _webBroadcast(tabId, { type: 'conversation-owner', conversationOwner }),
 });
 const { TabWorkContext } = require(path.join(srcMainDir, 'tab-work-context'));
+// Слежение за ПАПКАМИ — во вспомогательном процессе: зависшая служба слежения
+// macOS не должна останавливать главный поток (шрам 03.11, см. dir-watch.js).
+const dirWatch = require(path.join(srcMainDir, 'dir-watch'));
 let projectCardSignals = null;
 const tabWorkContext = new TabWorkContext({
   db: projectManager.db.db,
@@ -1027,6 +1115,7 @@ const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSes
 const {
   createClaudeBackgroundAgentActivityTracker,
 } = require(path.join(srcMainDir, 'claude-background-agent-activity'));
+const { killClaudeBackgroundTask } = require(path.join(srcMainDir, 'claude-background-task-kill'));
 const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
 const { proveEmptyClaudeRestore, isEmptyClaudeRestoreCurrent } = require(path.join(srcMainDir, 'claude-empty-restore'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
@@ -2730,10 +2819,23 @@ const tabBackgroundWorkRevisionByTab = new Map();
 const claudeBackgroundTranscriptBindings = new Map();
 const claudeBackgroundSidecarTimers = new Map();
 
+// The tab's own live background work, as every consumer sees it: the tab
+// loader, Auto-stop/Stop idle, the Run After next step, the mini-orchestrator
+// and the continuation input gate.
+//
+// Subagents (Claude async Agent/Task and Codex subagents) always count: that
+// work belongs to this session and the tab must look busy while it runs.
+//
+// Background shells (`Bash run_in_background`, `Monitor`) do NOT count by
+// default — otherwise a detached `npm run dev` would hold its tab, and the
+// install, forever. A shell counts only while it is explicitly held through
+// `hold_background_work`, which the user asks for in words ("hold the tab
+// while this script runs"). The hold releases itself when that command
+// finishes, and dies with the process generation that owns it.
 function getCombinedTabBackgroundWorkCount(tabId) {
-  const claudeCount = claudeBackgroundAgentActivity.snapshot(tabId).count;
+  const claude = claudeBackgroundAgentActivity.snapshot(tabId);
   const codexCount = codexTabLiveSubagents.get(tabId)?.size || 0;
-  return claudeCount + codexCount;
+  return claude.count + claude.heldTaskCount + codexCount;
 }
 
 function getTabBackgroundWorkAgents(tabId) {
@@ -2929,6 +3031,7 @@ function observeClaudeBackgroundRawRecord(detail) {
   if (detail?.toolType !== 'claude' || !detail?.tabId || !detail?.sessionId) return;
   const record = detail.message;
   observeClaudeSettingsSemanticRecord(detail.tabId, record);
+  observeClaudeStreamCutRecord(detail, record);
   const notifications = [];
   for (const text of claudeDataApi.extractClaudeTaskNotificationTexts?.(record) || []) {
     const parsed = claudeDataApi.parseClaudeTaskNotification?.(text, record?.timestamp);
@@ -2941,6 +3044,81 @@ function observeClaudeBackgroundRawRecord(detail) {
     recordByteOffset: detail.recordByteOffset,
     notifications,
   });
+}
+
+// Anthropic can cut the response stream mid-answer. Claude Code writes a
+// synthetic error record and the turn simply ends with a partial reply —
+// nothing continues it, so the user had to notice and type "продолжай"
+// themselves (production 02.11, session be82a19d, record 15ce6c4b).
+//
+// Decision 02.11 (Fedor): continue automatically, exactly like the Codex
+// model-capacity retry — a manual button would send the same word and
+// protect nothing. This reuses that policy whole: its attempt budget, its
+// delays, and its rule that real progress replenishes the budget. The only
+// Claude-specific part is recognising the record.
+const claudeStreamCutOwners = new Map(); // tabId -> owner snapshot
+let claudeStreamCutRuntime = null;
+
+function getClaudeStreamCutRuntime() {
+  if (claudeStreamCutRuntime) return claudeStreamCutRuntime;
+  const web = () => require(path.join(srcMainDir, 'web-server'));
+  claudeStreamCutRuntime = createCodexCapacityRetryRuntime({
+    getSettings: () => web().getOrchestrationSettings(),
+    loadState: tabId => projectManager.db.getAppState('claude-stream-cut-retry-state:' + tabId),
+    saveState: (tabId, state) => projectManager.db.setAppState('claude-stream-cut-retry-state:' + tabId, state),
+    // The same tab, the same terminal, the same launch generation and the same
+    // conversation. A Stop in flight withdraws the retry.
+    isCurrent: owner => terminals.get(owner.tabId) === owner.terminal
+      && getTerminalLifecycleGeneration(owner.tabId) === owner.generation
+      && getPersistedAiSessionBindingForShutdown(owner.tabId)?.claude_session_id === owner.sessionId
+      && !aiStoppingTabs.has(owner.tabId),
+    send: (owner, effect, isCurrent) => web().sendClaudeStreamCutContinuation({
+      tabId: owner.tabId, sessionId: owner.sessionId, errorId: effect.errorId,
+      generation: owner.generation, handoffId: effect.handoffId, isCurrent,
+    }),
+    cancelSend: (tabId, handoffId, reason) => agentSendCancellations.cancel(tabId, handoffId, { reason }),
+    notify: async (owner, effect, failure = null) => {
+      console.warn('[ClaudeStreamCutRetry] ' + (failure ? 'not-submitted' : 'exhausted')
+        + ' tab=' + String(owner.tabId).slice(-12) + ' session=' + String(owner.sessionId).slice(0, 8)
+        + ' error=' + effect.errorId + ' handoff=' + effect.handoffId
+        + (failure ? ' reason=' + JSON.stringify(String(failure)) : ''));
+    },
+    log: message => console.log('[ClaudeStreamCutRetry] ' + message),
+  });
+  return claudeStreamCutRuntime;
+}
+
+function observeClaudeStreamCutRecord(detail, record) {
+  // Ordinary assistant output replenishes the retry budget, so a conversation
+  // that is genuinely progressing can survive many separate cuts, while a
+  // session that only ever produces cuts stops after the configured attempts.
+  const isProgress = record?.type === 'assistant'
+    && record.isApiErrorMessage !== true
+    && record.isSidechain !== true;
+  const cut = isProgress ? null : claudeStreamCutFromRecord(record);
+  if (!cut && !isProgress) return;
+  const terminal = terminals.get(detail.tabId);
+  if (!terminal) return;
+  const owner = {
+    tabId: detail.tabId, sessionId: detail.sessionId, terminal,
+    generation: getTerminalLifecycleGeneration(detail.tabId),
+  };
+  const runtime = getClaudeStreamCutRuntime();
+  const at = Number.isSafeInteger(Number(detail.recordByteOffset))
+    ? Number(detail.recordByteOffset) : Date.now();
+  if (isProgress) {
+    if (claudeStreamCutOwners.has(detail.tabId)) {
+      runtime.progress(owner, { type: 'progress', at, eventId: String(at) });
+    }
+    return;
+  }
+  claudeStreamCutOwners.set(detail.tabId, owner);
+  console.log('[ClaudeStreamCutRetry] observed tab=' + String(detail.tabId).slice(-12)
+    + ' session=' + String(detail.sessionId).slice(0, 8)
+    + ' cause=' + cut.cause + ' truncatedAfterOutput=' + cut.truncatedAfterOutput
+    + ' error=' + cut.errorId);
+  void runtime.capacity(owner, { type: 'capacity', errorId: cut.errorId, at })
+    .catch(error => console.warn('[ClaudeStreamCutRetry] observation failed: ' + error.message));
 }
 
 async function catchUpClaudeBackgroundActivity(binding) {
@@ -9103,6 +9281,26 @@ async function handleClaudeAutoModeDefaultPrompt({
       && getTerminalLifecycleGeneration(tabId) === expectedLifecycleGeneration
       && getTerminalInputRevision(tabId) === ownedInputRevision
     );
+    // Claude's own select widget REFUSES input for its first 150 ms after the
+    // options change (CLI 2.1.316: `SM=150`, `refusedWithin` → `refuse(...)`
+    // instead of `answer(...)`). Our Down→Enter pair was 6 ms apart
+    // (01.11 06:46:13.243 → .249, tab 2c7d56003b22), so the arrow landed, the
+    // highlight moved to "No, keep bypass permissions", and the Enter was
+    // swallowed: no frame after it, the dialog stayed on screen and the CLI
+    // never wrote `hasSeenAutoModeEntryWarning`. This is a property of the
+    // widget, not of our frame proof, so no snapshot can replace the wait.
+    const CLAUDE_SELECT_INPUT_REFUSAL_MS = 150;
+    const CLAUDE_SELECT_INPUT_REFUSAL_MARGIN_MS = 60;
+    let lastSelectFrameAt = Date.now();
+    const waitOutSelectRefusal = async (phase) => {
+      const elapsed = Date.now() - lastSelectFrameAt;
+      const remaining = CLAUDE_SELECT_INPUT_REFUSAL_MS
+        + CLAUDE_SELECT_INPUT_REFUSAL_MARGIN_MS - elapsed;
+      if (remaining <= 0) return;
+      console.log('[ClaudeAutoModeDefault] waiting out select refusal window tab='
+        + String(tabId).slice(-12) + ' phase=' + phase + ' remainingMs=' + remaining);
+      await new Promise((resolve) => setTimeout(resolve, remaining));
+    };
     const observeAfterWrite = (data, phase, acceptInspection, timeoutMs = 2500) => {
       const afterWriteSeq = Number(snapshot?.writeSeq || 0);
       operation.phase = phase;
@@ -9153,6 +9351,9 @@ async function handleClaudeAutoModeDefaultPrompt({
       }
       snapshot = moved.snapshot;
       inspection = moved.inspection;
+      // The accepted frame IS the options change that restarts the widget's
+      // refusal window; measure from it, not from our own write.
+      lastSelectFrameAt = Date.now();
     }
 
     if (inspection.selectedOption !== 2 || !stillOwns()) {
@@ -9164,6 +9365,15 @@ async function handleClaudeAutoModeDefaultPrompt({
       };
     }
 
+    await waitOutSelectRefusal('confirm-keep-bypass');
+    if (!stillOwns()) {
+      return {
+        success: false,
+        handled: true,
+        submitted: false,
+        error: 'auto_mode_prompt_identity_changed',
+      };
+    }
     console.log('[ClaudeAutoModeDefault] keep-bypass proven; writing Enter tab='
       + String(tabId).slice(-12));
     const dismissed = await observeAfterWrite(
@@ -9364,6 +9574,21 @@ async function handleClaudeTrustFolderPrompt({
     if (!stillOwns(ownedInputRevision)) {
       return { success: false, handled: false, error: 'trust_folder_identity_changed' };
     }
+    // Claude's select widget refuses input for its first 150 ms after the
+    // options change (CLI 2.1.316 `SM=150`: `refuse(...)` instead of
+    // `answer(...)`). Proven on the auto-mode twin, where a 6 ms Down→Enter
+    // pair left the dialog on screen. Same widget, same arrow→Enter pair here.
+    const CLAUDE_SELECT_INPUT_REFUSAL_MS = 150;
+    const CLAUDE_SELECT_INPUT_REFUSAL_MARGIN_MS = 60;
+    let lastSelectFrameAt = Date.now();
+    const waitOutSelectRefusal = async (phase) => {
+      const remaining = CLAUDE_SELECT_INPUT_REFUSAL_MS
+        + CLAUDE_SELECT_INPUT_REFUSAL_MARGIN_MS - (Date.now() - lastSelectFrameAt);
+      if (remaining <= 0) return;
+      console.log('[ClaudeTrustFolder] waiting out select refusal window tab='
+        + String(tabId).slice(-12) + ' phase=' + phase + ' remainingMs=' + remaining);
+      await new Promise((resolve) => setTimeout(resolve, remaining));
+    };
     if (inspection.selectedOption === 2) {
       const selectKey = getClaudeTrustFolderSelectionKey(snapshot);
       if (!selectKey) return {
@@ -9413,6 +9638,9 @@ async function handleClaudeTrustFolderPrompt({
       };
       snapshot = moved.snapshot;
       inspection = moved.inspection;
+      // The accepted frame IS the options change that restarts the widget's
+      // refusal window; measure the wait from it, not from our own write.
+      lastSelectFrameAt = Date.now();
     }
     // More than one redraw may have committed before the selection waiter
     // resumed. Confirm the current frame, not an earlier observed Yes.
@@ -9428,6 +9656,11 @@ async function handleClaudeTrustFolderPrompt({
     };
     const afterWriteSeq = Number(snapshot?.writeSeq || 0);
     operation.phase = 'confirm-trust-folder';
+    await waitOutSelectRefusal('confirm-trust-folder');
+    if (!stillOwns(ownedInputRevision)) return {
+      success: false, handled: true, submitted: false,
+      error: 'trust_folder_identity_changed',
+    };
     console.log('[ClaudeTrustFolder] Yes proven; writing one Enter tab='
       + String(tabId).slice(-12));
     const dismissed = await waitForCommittedSemanticFrame({
@@ -9942,10 +10175,22 @@ function computeActiveLoaders() {
     );
   };
 
-  // tabId → { project, name } label, resolved from terminalProjectIds → SQLite
-  // tabs row → projects row. Per-call project-name cache keeps it to ~1 query
-  // per distinct project even with many tabs.
+  // tabId → { project, workflow, name } label.
+  //
+  // TWO different answers to "where is this tab", and a blocker list needs
+  // both. `project` is the EXECUTION namespace — the directory its CLI runs
+  // in. `workflow` is where the user actually sees the tab in the sidebar.
+  // They diverge whenever a tab is moved between workflows: moving changes
+  // the workflow and deliberately keeps cwd/execution identity (see
+  // fact-workspace.md::Workflow, вкладка и исполнение).
+  //
+  // Reported 02Nov for build:i-obs: a blocker printed as `sc-desktop`, and
+  // the user went looking for that tab in the sc-desk workflow — where it
+  // has not been for a while. It lives in `main` and only RUNS in
+  // ~/Desktop/sc-desktop. Naming only the execution side made a correct
+  // answer unusable for finding the tab.
   const projNameCache = new Map();
+  const workflowNameCache = new Map();
   const labelFor = (tabId) => {
     let projectId = terminalProjectIds.get(tabId) || null;
     let tabName = null;
@@ -9965,8 +10210,24 @@ function computeActiveLoaders() {
         projNameCache.set(projectId, projectName);
       }
     }
+    // Organization is the owner of this answer; a direct membership read is
+    // the same source the sidebar uses. Before migration there is no
+    // workflow layer at all, and `null` keeps the old single-name output.
+    let workflowName = null;
+    try {
+      const workflowId = workflowOrganization.ready()
+        ? workflowOrganization.service.getMembership(tabId)?.workflowId || null : null;
+      if (workflowId) {
+        if (workflowNameCache.has(workflowId)) workflowName = workflowNameCache.get(workflowId);
+        else {
+          workflowName = workflowOrganization.service.getWorkflow(workflowId)?.metadata?.name || null;
+          workflowNameCache.set(workflowId, workflowName);
+        }
+      }
+    } catch {}
     return {
       project: projectName,
+      workflow: workflowName,
       name: tabName || ('tab ' + String(tabId).slice(-6)),
       cwd: terminalProjects.get(tabId) || null,
       commandType: row?.command_type || null,
@@ -10539,6 +10800,36 @@ function readClaudeStartupGateSnapshot(tabId) {
     revision: claudeStartupGateRevisions.get(tabId) || 0 };
 }
 
+// Остановить ОДНУ фоновую команду вкладки (Bash run_in_background / Monitor).
+//
+// Адрес берётся из живого реестра Main, а не из аргументов renderer: клиент
+// присылает только `toolUseId` вызова, по которому карточка и нарисована.
+// Цель ищется среди ЗАПУЩЕННЫХ задач именно этой вкладки — закрытая карточка
+// или чужой ID ничего не убивают.
+//
+// Отказ возвращается как ответ с причиной: кнопка обязана показать его
+// пользователю. Молчаливое «ничего не нашли» здесь запрещено, потому что
+// внешне это неотличимо от успешной остановки.
+ipcMain.handle('claude:kill-background-task', async (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const toolUseId = String(payload?.toolUseId || '');
+  if (!tabId || !toolUseId) return { ok: false, reason: 'bad-request' };
+  const snapshot = claudeBackgroundAgentActivity.snapshot(tabId);
+  const task = (snapshot?.tasks || []).find((item) => item.toolUseId === toolUseId);
+  if (!task) return { ok: false, reason: 'not-running' };
+  // Без ID задачи у неё нет собственного файла вывода, а значит и
+  // однозначного процесса: такую карточку останавливать нечем.
+  if (!task.taskId) return { ok: false, reason: 'task-id-unknown' };
+  const result = await killClaudeBackgroundTask({
+    acceptance: task.acceptance || '',
+    sessionId: snapshot?.sessionId || '',
+    taskId: task.taskId,
+  });
+  console.log('[BackgroundKill] tab=' + tabId.slice(-12) + ' task=' + task.taskId
+    + ' ok=' + result.ok + (result.ok ? ' signal=' + result.signal : ' reason=' + result.reason));
+  return { ...result, toolUseId, label: task.label || '' };
+});
+
 ipcMain.handle('claude:dismiss-startup-defaults-failure', (_event, payload = {}) => {
   const tabId = String(payload?.tabId || '');
   const gate = currentClaudeStartupDefaultsGate(tabId);
@@ -10628,7 +10919,10 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
       const persisted = projectManager?.db?.db?.prepare(
         'SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1'
       ).get(tabId) || null;
-      if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
+      // Startup defaults are RUNTIME readiness, not an organization change.
+      // See `scheduleProjectRuntimeBroadcast`: flagging the project here made
+      // native clients drop their catalog snapshot mid-flight.
+      if (persisted?.project_id) scheduleProjectRuntimeBroadcast(persisted.project_id, reason);
       else scheduleProjectActivityBroadcast(reason);
     } catch {
       scheduleProjectActivityBroadcast(reason);
@@ -10706,7 +11000,9 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     const persisted = projectManager?.db?.db?.prepare(
       'SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1'
     ).get(tabId) || null;
-    if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
+    // Same boundary as the `cleared` branch above: a launch becoming
+    // pending/ready/failed changes runtime, never the organization.
+    if (persisted?.project_id) scheduleProjectRuntimeBroadcast(persisted.project_id, reason);
     else scheduleProjectActivityBroadcast(reason);
   } catch {
     scheduleProjectActivityBroadcast(reason);
@@ -11489,6 +11785,28 @@ function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
   scheduleProjectActivityBroadcast(reason);
 }
 
+// Runtime changed, the ORGANIZATION did not.
+//
+// `layoutChangedProjectIds` is one of three things native clients treat as
+// "the workflow organization moved": they invalidate their catalog snapshot
+// and bump a generation counter on it. A run going inactive is not that — the
+// tree, the membership and the publication are untouched.
+//
+// Measured scar 01.11 (iOS, real phone): one drag produced TWO publication
+// changes (22128, 22129) but FIVE `organization-wake`s on the client. The
+// extra ones came from here. Each wake bumped the client's generation while a
+// 842KB catalog response was still crossing a slow tunnel, so by the time it
+// arrived it no longer belonged to the current generation and was discarded —
+// twice, byte-identical to the third response that was accepted. The user saw
+// a red error and empty workspace statuses.
+//
+// Card signals still wake: a stopped run must gray out its card immediately.
+// Only the organization-changed flag is withheld.
+function scheduleProjectRuntimeBroadcast(projectId, reason) {
+  noteProjectCardSignalsChanged(projectId);
+  scheduleProjectActivityBroadcast(reason);
+}
+
 function scheduleProjectOrderBroadcast(reason = 'project-order') {
   projectOrderChanged = true;
   scheduleProjectActivityBroadcast(reason);
@@ -11842,9 +12160,25 @@ let providerProxyReady = false;
 // (e.g. external Claude started outside spawn-with-watcher).
 const providerStates = new Map();
 const PROVIDER_DEFAULT = Object.freeze({ type: 'anthropic' });
+// A tab preference written before 03.11 can hold Claude's printed LABEL
+// (`Opus 5`) instead of the id we sent. Every later launch injected
+// `/model Opus 5` and got `Model 'Opus5' not found` — the retain fix stops new
+// labels, but a stored one keeps failing for ever. Drop it on read: a Claude
+// model id never contains whitespace, so this cannot discard a real id, and an
+// absent preference simply falls back to the normal default.
+function withoutClaudeDisplayLabelPreference(state) {
+  const model = typeof state?.startupModel === 'string' ? state.startupModel : '';
+  if (!model || !/\s/.test(model) || (state.type && state.type !== 'anthropic')) return state;
+  console.warn('[ProviderState] dropping display-label model preference '
+    + JSON.stringify(model) + ' — it is not a runtime id');
+  const { startupModel: _label, ...rest } = state;
+  return rest;
+}
+
 function getProviderState(tabId) {
-  if (!tabId) return providerStates.get('global') || PROVIDER_DEFAULT;
-  return providerStates.get(tabId) || providerStates.get('global') || PROVIDER_DEFAULT;
+  if (!tabId) return withoutClaudeDisplayLabelPreference(providerStates.get('global') || PROVIDER_DEFAULT);
+  return withoutClaudeDisplayLabelPreference(
+    providerStates.get(tabId) || providerStates.get('global') || PROVIDER_DEFAULT);
 }
 function setProviderState(tabId, state) {
   providerStates.set(tabId || 'global', state);
@@ -12630,6 +12964,39 @@ async function proxyGracefulShutdown() {
     console.log('[ProviderProxy] Force-closing ' + proxyActiveConnections.size + ' connections after timeout');
     for (const socket of proxyActiveConnections) socket.destroy();
   }
+}
+
+// Undo proxyGracefulShutdown for a CANCELLED quit.
+//
+// The drain is destructive on purpose: it stops accepting connections and
+// destroys whatever is left. Leaving the app alive after that would keep every
+// surviving tab pointed at a dead ANTHROPIC_BASE_URL — the tab looks fine and
+// fails on its next turn. An http.Server can listen again after close, so the
+// same instance comes back on the same port; the port is part of each tab's
+// env and must not change under a running CLI.
+async function restoreProviderProxyAfterCancel() {
+  if (providerProxyReady) return true;
+  const port = PROVIDER_PROXY_PORT;
+  const listening = await new Promise((resolve) => {
+    const onListening = () => { providerProxy.removeListener('error', onError); resolve(true); };
+    const onError = (error) => {
+      providerProxy.removeListener('listening', onListening);
+      console.error('[ProviderProxy] restore after cancelled shutdown failed:', error.message);
+      resolve(false);
+    };
+    providerProxy.once('listening', onListening);
+    providerProxy.once('error', onError);
+    try { providerProxy.listen(port, '127.0.0.1'); }
+    catch (error) {
+      providerProxy.removeListener('listening', onListening);
+      providerProxy.removeListener('error', onError);
+      console.error('[ProviderProxy] restore listen threw:', error.message);
+      resolve(false);
+    }
+  });
+  providerProxyReady = listening;
+  console.log('[ProviderProxy] restore after cancelled shutdown port=' + port + ' ready=' + listening);
+  return listening;
 }
 
 // Try port 4001, fallback to 4002-4010 if busy (e.g. dev + test running simultaneously)
@@ -14010,6 +14377,21 @@ function rememberClaudeStartupIntentUse(tabId, generation, intent) {
   });
 }
 
+/**
+ * Decision 01.11 (Fedor): a manual model/effort choice belongs to the TAB and
+ * outlives restarts until the user changes it. The StatusBar default applies to
+ * newly created tabs only.
+ *
+ * Before, the stored choice was deleted the first time it was applied. Every
+ * later launch fell back to session history, and `/effort` is process-local
+ * (its own confirmation says "this session only"), so the history proof is not
+ * attributed to a new launch — leaving the global default. Live incident:
+ * tab c41a18522055 was set to high at 02:34 and 03:29, and came back as max at
+ * 03:46. Keeping the choice makes the applied value the user's own every time.
+ *
+ * Marking it applied (rather than deleting it) also keeps the control bar
+ * honest: an applied pair is confirmed state, not "waiting for next launch".
+ */
 function consumeClaudeStartupIntent(tabId, generation) {
   const used = claudeStartupIntentUseByTab.get(tabId) || null;
   if (!used || used.generation !== generation) return false;
@@ -14019,18 +14401,20 @@ function consumeClaudeStartupIntent(tabId, generation) {
     claudeStartupIntentUseByTab.delete(tabId);
     return false;
   }
-  delete current.startupModel;
-  delete current.startupEffort;
+  claudeStartupIntentUseByTab.delete(tabId);
+  const appliedGeneration = String(generation);
+  if (current.startupIntentAppliedGeneration === appliedGeneration) return false;
+  current.startupIntentAppliedGeneration = appliedGeneration;
   setProviderState(tabId, current);
   if (tabId && projectManager?.db) {
     projectManager.db.updateTabProviderState(tabId, current);
   }
-  claudeStartupIntentUseByTab.delete(tabId);
   broadcastProviderState(tabId, current);
-  console.log('[StartupTx] intent-consumed tab=' + String(tabId).slice(-12)
+  console.log('[StartupTx] intent-applied tab=' + String(tabId).slice(-12)
     + ' gen=' + generation
     + ' model=' + used.model
-    + ' effort=' + used.effort);
+    + ' effort=' + used.effort
+    + ' retained=tab-preference');
   return true;
 }
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
@@ -14562,7 +14946,7 @@ function startSessionBridge() {
 
   // Method 1: fs.watch for instant detection
   try {
-    bridgeWatcher = fs.watch(bridgeDir, (eventType, filename) => {
+    bridgeWatcher = dirWatch.watch(bridgeDir, (eventType, filename) => {
       if (filename?.endsWith('.json') && !filename.startsWith('_')) {
         processFile(filename);
       }
@@ -16894,7 +17278,7 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtim
       materializationReason: materialization?.reason || null,
     };
     if (sessionStatus === 'inactive' && persisted?.project_id) {
-      scheduleProjectLayoutBroadcast(persisted.project_id, 'claude-runtime-inactive');
+      scheduleProjectRuntimeBroadcast(persisted.project_id, 'claude-runtime-inactive');
     }
   } else if (toolType === 'codex') {
     let persisted = null;
@@ -16936,7 +17320,7 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtim
       resumeSourceSessionId: codexLastRunCommandPayload.get(tabId)?.sessionId || null,
     };
     if (sessionStatus === 'inactive' && persisted?.project_id) {
-      scheduleProjectLayoutBroadcast(persisted.project_id, 'codex-runtime-inactive');
+      scheduleProjectRuntimeBroadcast(persisted.project_id, 'codex-runtime-inactive');
     }
   }
   _webBroadcast(tabId, {
@@ -17433,6 +17817,94 @@ function rememberClaudeQueuedPromptSubmit(tabId, msg, reason) {
   claudeQueuedPromptSubmits.set(tabId, { msg: { ...msg }, stopBoundary: null, at: Date.now() });
   console.log('[ClaudeQueueContinuation] remembered tab=' + String(tabId).slice(-12)
     + ' promptId=' + JSON.stringify(msg.prompt_id ?? null) + ' chars=' + msg.prompt.length);
+}
+
+/**
+ * A message sent into a BUSY Claude tab is queued by Claude, and its
+ * UserPromptSubmit arrives carrying the ACTIVE turn's prompt_id. Main drops
+ * that event as `duplicate-prompt-start` (it is not a new turn), so the
+ * PasteAudit waiting on the next admitted UserPromptSubmit never sees it:
+ * the card stayed CONFIRMING for the whole running turn and then became
+ * delivery-unknown, even though Claude had accepted the text
+ * (01.11 05:37:31 tab 5b20bf267cca handoff mvxeergg-roqznl — the user saw the
+ * prompt land in Claude Code while the card spun).
+ *
+ * The dropped hook still carries the exact prompt and transcript path, so it
+ * is enough to CONFIRM an expectation — it only may not start a turn. Reuse
+ * the same transcript scan every other confirmation path uses; a record that
+ * matches no pending expectation leaves them all pending, as before.
+ */
+function confirmClaudePasteAuditsFromQueuedHook(tabId, msg) {
+  const audits = getPendingClaudePasteAudits(tabId).filter((audit) => audit?.finished !== true);
+  if (audits.length === 0) return;
+  const transcriptPath = typeof msg?.transcript_path === 'string' && msg.transcript_path
+    ? msg.transcript_path
+    : null;
+  if (!transcriptPath) return;
+  // The dropped hook carries the text Claude ACCEPTED. When images are attached
+  // the canonical record is the same text prefixed with `[Image #N]` markers,
+  // whose numbers we cannot predict — so a raw len+hash comparison against our
+  // pasted payload never matches and the card span CONFIRMING until it expired
+  // (01.11 12:09:53 tab 1ccc61c912ae handoff mvxsfc3q-j2xsy3: pasted 1095 chars,
+  // record 1152, delivered correctly). Bind that accepted text through the SAME
+  // owner selector the admitted hook uses; it is the existing image-marker rule,
+  // not a new text heuristic, and an ambiguous owner still binds nothing.
+  if (typeof msg?.prompt === 'string' && msg.prompt) {
+    const owner = selectUniqueClaudePromptSubmitAudit(audits, msg.prompt, {
+      hashText: pasteAuditHash,
+      hookTabId: tabId,
+      hookPpid: msg.ppid ?? null,
+      hookPidTabId: bridgePidCache.get(Number(msg.ppid)) || null,
+      hookInputRevision: getTerminalInputRevision(tabId),
+    });
+    if (owner.audit && owner.reason === 'unique-owned-provider-transform'
+      && owner.audit.providerAcceptedHash == null) {
+      owner.audit.providerAcceptedText = msg.prompt;
+      owner.audit.providerAcceptedLen = msg.prompt.length;
+      owner.audit.providerAcceptedHash = pasteAuditHash(msg.prompt);
+      console.log('[ClaudeQueueContinuation] provider transform bound tab=' + String(tabId).slice(-12)
+        + ' handoff=' + String(owner.audit.handoffId || '-')
+        + ' expectedLen=' + owner.audit.expectedLen
+        + ' providerLen=' + msg.prompt.length);
+    }
+  }
+  (async () => {
+    const claimedByteOffsets = new Set();
+    // Claude writes the queued user record around the same moment; a short
+    // bounded retry covers the flush without polling.
+    for (const delay of [0, 120, 400, 1200]) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      const alive = getPendingClaudePasteAudits(tabId).filter((audit) => audit?.finished !== true);
+      if (alive.length === 0) return;
+      for (const audit of alive) {
+        if (audit.finished === true) continue;
+        try {
+          const candidates = await readClaudeUserRecords(
+            transcriptPath,
+            audit.preSubmitBoundary || null,
+          );
+          const selection = selectClaudePendingPromptAudit([audit], candidates, {
+            hashText: pasteAuditHash,
+            claimedByteOffsets,
+          });
+          if (!selection) continue;
+          claimedByteOffsets.add(selection.candidate.byteOffset);
+          const accepted = confirmClaudePasteAuditFromTranscriptSelection(
+            tabId, audit, selection, 'queued-prompt-hook-scan',
+          );
+          if (accepted?.success === true) {
+            console.log('[ClaudeQueueContinuation] audit-confirmed tab=' + String(tabId).slice(-12)
+              + ' handoff=' + String(audit.handoffId || '-')
+              + ' chars=' + selection.candidate.text.length);
+          }
+        } catch (error) {
+          console.warn('[ClaudeQueueContinuation] audit scan failed tab=' + String(tabId).slice(-12)
+            + ' error=' + String(error?.message || error));
+          return;
+        }
+      }
+    }
+  })();
 }
 
 function markClaudeQueuedPromptStopBoundary(tabId, msg) {
@@ -18380,6 +18852,33 @@ async function ensureClaudeSettingEvidenceProcessOwner(tabId, options = {}) {
   if (initialOperationFailure) return { success: false, reason: initialOperationFailure };
   if (!claudeSettingEvidenceProcessScopeCurrent(tabId, scope)) {
     return { success: false, reason: 'setting-process-scope-unavailable' };
+  }
+
+  // A Rewind restarts Claude itself and only releases the input hold once the
+  // new session proves it accepts input. Startup settings see the fresh
+  // process a moment earlier and used to write immediately, get refused with
+  // `history_input_mutation_pending`, and show a red "Settings error" — for a
+  // Rewind that had fully succeeded (02.11: refused at 13:43:40.720, hold
+  // released at 13:43:41.311, a 0.6s miss). The refusal itself is right: the
+  // rewrite owns the terminal. Waiting for the existing release is what was
+  // missing. This is a bounded wait on an existing signal, not a new queue.
+  if (historyMutationInput.held(tabId)) {
+    const until = Date.now() + 15000;
+    console.log('[ClaudeSettingOwner] waiting for history-input release tab=' + String(tabId).slice(-12));
+    while (historyMutationInput.held(tabId) && Date.now() < until) {
+      if (!claudeSettingEvidenceProcessScopeCurrent(tabId, scope)) {
+        return { success: false, reason: 'setting-process-scope-changed' };
+      }
+      const pending = checkOperation();
+      if (pending) return { success: false, reason: pending };
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    // Still held after the deadline: report the hold as the reason instead of
+    // writing into a terminal that another operation owns.
+    if (historyMutationInput.held(tabId)) {
+      return { success: false, reason: 'setting-history-input-held' };
+    }
+    console.log('[ClaudeSettingOwner] history input released, continuing tab=' + String(tabId).slice(-12));
   }
 
   const acceptance = await waitForAiLaunchAccepted(tabId, 'claude', {
@@ -20205,6 +20704,11 @@ function startClaudeHookServer() {
             + ' agentId=' + JSON.stringify(msg.agent_id ?? null)
             + ' promptId=' + JSON.stringify(msg.prompt_id ?? null));
           rememberClaudeQueuedPromptSubmit(tabId, msg, hookAdmission.reason);
+          // The dropped event may not start a turn, but it proves the queued
+          // text reached Claude: let a pending expectation confirm from it.
+          if (event === 'UserPromptSubmit' && hookAdmission.reason === 'duplicate-prompt-start') {
+            confirmClaudePasteAuditsFromQueuedHook(tabId, msg);
+          }
           continue;
         }
         if (event === 'Stop' || event === 'StopFailure') {
@@ -20588,6 +21092,9 @@ function startClaudeHookServer() {
         const taskTurnId = taskTurnSnapshot?.generation
           ? 'claude:' + taskTurnSnapshot.generation
           : null;
+        // Remember the identity of the turn that just finished: finishTurn()
+        // already dropped it from the registry, and post-Stop readers need it.
+        if (!busy && taskTurnId) claudeLastFinishedTurnId.set(tabId, taskTurnId);
         getAgentResponseObservationReader().observeClaudeHook({
           tabId, message: msg, turn: taskTurnSnapshot,
           admitted: hookAdmission.accepted, matched: !busy && taskTurn?.matched === true,
@@ -27304,6 +27811,16 @@ app.whenReady().then(async () => {
       readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
       readAgentRuntimeSnapshot: readMainPublicRuntimeSnapshot,
+      requestProgrammaticQuit,
+      holdTabBackgroundWork: (tabId, taskRef) => {
+        const result = claudeBackgroundAgentActivity.hold(tabId, taskRef);
+        console.log('[BackgroundHold] tab=' + String(tabId).slice(-12)
+          + ' ref=' + String(taskRef)
+          + ' held=' + (result.held === true)
+          + (result.held ? ' task=' + (result.taskId || result.toolUseId) + ' repeated=' + (result.repeated === true)
+            : ' reason=' + result.reason));
+        return result;
+      },
       readAgentInputRuntimeSnapshot: tabId => readMainPublicRuntimeSnapshot(tabId, { inputOnly: true }),
       readAgentContinuationInputAdmission,
       readAutomaticSendFrame: (tabId, wake) => automaticSendFrameGate.read(tabId, wake),
@@ -27616,6 +28133,120 @@ let _gracefulShutdownAiSessions = null;
 let _gracefulShutdownLiveTabIds = null;
 const SHUTDOWN_OVERLAY_MIN_VISIBLE_MS = 400;
 
+// Cancel while the shutdown overlay is up.
+//
+// Cmd+Q is one keystroke away from Cmd+W and Cmd+Tab, and it took five live
+// Claude sessions with no way back (01Nov 11:42 UTC). The overlay already
+// stays on screen for the whole graceful flow while `before-quit` holds the
+// exit open with preventDefault(), so an abort needs no new waiting: the user
+// presses Отмена and the flow stops where it is.
+//
+// What cancel CAN do: keep the app, and keep every tab the Ctrl+C fan-out has
+// not reached yet. What it CANNOT do: revive a tab that already got Ctrl+C —
+// that process is gone and stays marked as interrupted for the next launch.
+//
+// An installer-driven quit never offers it: build:i-c would be left with no
+// app to relaunch. That flow passes `cancellable:false`.
+let _shutdownCancelRequested = false;
+let _shutdownCancellable = false;
+let _shutdownClosedTabs = 0;
+// Tabs that already received Ctrl+C in this flow. Their PTY shell stays in
+// `terminals` (only the CLI child exits), so membership there does NOT mean a
+// tab survived — this set is the authority on who is lost to a cancel.
+const _shutdownSignalledTabIds = new Set();
+// Set by an app-owned quit that must run to completion (build:i-c capture,
+// Voice install). A user Cmd+Q never sets it, so only those flows lose Отмена.
+let _programmaticQuitRequested = false;
+function requestProgrammaticQuit(reason) {
+  _programmaticQuitRequested = true;
+  console.log('[Shutdown] programmatic quit reason=' + String(reason || 'unspecified'));
+  app.quit();
+}
+
+function publishShutdownOverlay(payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send('shutdown:overlay', payload); } catch {}
+}
+
+// Checked after every abortable step. Once true the flow unwinds instead of
+// reaching app.quit(); already-stopped tabs are not resurrected.
+function shutdownCancelled() {
+  return _shutdownCancellable && _shutdownCancelRequested;
+}
+
+// Unwind a cancelled shutdown and return the app to normal work.
+//
+// Order matters. The flow marked every live session `was_interrupted` up front
+// (deliberately, so a killed install never loses them), so a cancel must clear
+// that flag for the tabs that are STILL RUNNING — otherwise they would offer a
+// pointless "continue interrupted work" on the next launch. Tabs already given
+// Ctrl+C keep the mark: for them it is true.
+async function abandonGracefulShutdown(stage) {
+  const stoppedTabs = _shutdownClosedTabs;
+  let restored = 0;
+  try {
+    if (projectManager?.db?.db) {
+      // A survivor was never signalled and still owns its PTY. Tabs in
+      // `_shutdownSignalledTabIds` keep the interrupted mark — for them it is
+      // true, and the next launch should offer to continue them.
+      const survivors = [...(_gracefulShutdownLiveTabIds || [])]
+        .filter(tabId => terminals.has(tabId) && !_shutdownSignalledTabIds.has(tabId));
+      const clear = projectManager.db.db.prepare(
+        'UPDATE tabs SET was_interrupted = 0 WHERE tab_id = ? AND was_interrupted = 1 AND overlay_dismissed = 0');
+      for (const tabId of survivors) restored += clear.run(tabId).changes;
+    }
+  } catch (error) {
+    console.error('[Shutdown:Cancel] clearing interrupted marks failed:', error.message);
+  }
+  // Undo the two destructive steps the flow may already have taken. Both are
+  // revocations made at quit admission, and an app that stays alive must get
+  // them back: without the proxy every surviving tab's next turn fails on a
+  // dead base URL, and without the catalog every Codex model/effort control
+  // answers CODEX_MODEL_CATALOG_CLOSED for the rest of the lifetime.
+  //
+  // The catalog reopens only from a SETTLED disposal with no surviving child;
+  // an unknown child is not proof of a free owner, so a refused reopen is
+  // reported rather than forced.
+  if (stage !== 'before-drain') {
+    try { await restoreProviderProxyAfterCancel(); }
+    catch (error) { console.error('[Shutdown:Cancel] proxy restore failed:', error.message); }
+  }
+  let catalogReopened = null;
+  try { catalogReopened = codexDataModule._api.reopenCodexModelCatalog(); }
+  catch (error) { console.error('[Shutdown:Cancel] catalog reopen failed:', error.message); }
+  if (catalogReopened === false) {
+    console.warn('[Shutdown:Cancel] Codex model catalog stays closed: its owned child did not settle');
+  }
+  _gracefulShutdownInProgress = false;
+  _gracefulShutdownAiSessions = null;
+  _gracefulShutdownLiveTabIds = null;
+  _shutdownCancelRequested = false;
+  _shutdownCancellable = false;
+  _shutdownClosedTabs = 0;
+  _shutdownSignalledTabIds.clear();
+  // The watchdog was put in lame-duck mode at the top of the flow; a cancelled
+  // shutdown must restore ordinary freeze detection.
+  try { if (perfWatchdog && perfWatchdog.connected) perfWatchdog.send({ t: 'unbye' }); } catch {}
+  publishShutdownOverlay({ show: false });
+  console.log('[Shutdown:Cancel] shutdown abandoned at stage=' + stage
+    + ' stoppedTabs=' + stoppedTabs + ' interruptedMarksCleared=' + restored
+    + ' proxyReady=' + providerProxyReady + ' catalogReopened=' + String(catalogReopened));
+}
+
+ipcMain.on('shutdown:cancel', () => {
+  if (!_gracefulShutdownInProgress || _gracefulShutdownDone || !_shutdownCancellable) {
+    console.log('[Shutdown:Cancel] ignored'
+      + ' inProgress=' + _gracefulShutdownInProgress
+      + ' done=' + _gracefulShutdownDone
+      + ' cancellable=' + _shutdownCancellable);
+    return;
+  }
+  if (_shutdownCancelRequested) return;
+  _shutdownCancelRequested = true;
+  console.log('[Shutdown:Cancel] requested by user; stopped tabs so far=' + _shutdownClosedTabs);
+  publishShutdownOverlay({ show: true, cancelling: true });
+});
+
 app.on('before-quit', async (event) => {
   if (_gracefulShutdownDone) return;          // second pass — let Electron quit
   if (_gracefulShutdownInProgress) {           // user mashed ⌘Q during shutdown
@@ -27624,6 +28255,12 @@ app.on('before-quit', async (event) => {
   }
   _gracefulShutdownInProgress = true;
   event.preventDefault();
+  _shutdownCancelRequested = false;
+  _shutdownClosedTabs = 0;
+  // An installer owns the relaunch, so its quit must not be abortable:
+  // aborting build:i-c would leave no app to come back to. Those quits are
+  // flagged by the app-owned caller, never guessed from timing.
+  _shutdownCancellable = !_programmaticQuitRequested;
   const modelCatalogDisposal = codexDataModule._api.disposeCodexModelCatalog();
   let activeAiSessions = getInterruptedAiSessionEntries();
   let liveAiTabIds = initialShutdownLiveTabIds(activeAiSessions);
@@ -27671,7 +28308,7 @@ app.on('before-quit', async (event) => {
   try {
     const tabsCount = liveAiTabIds.size;
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('shutdown:overlay', { show: true, tabsCount });
+      publishShutdownOverlay({ show: true, tabsCount, closedTabs: 0, cancellable: _shutdownCancellable });
       shutdownOverlayShownAt = Date.now();
     }
   } catch {}
@@ -27696,20 +28333,26 @@ app.on('before-quit', async (event) => {
       + ' cleared=' + reconciled.cleared
       + ' marked=' + reconciled.marked
       + ' ids=[' + formatInterruptedAiSessionIds(activeAiSessions) + ']');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('shutdown:overlay', {
-        show: true,
-        tabsCount: liveAiTabIds.size,
-      });
-    }
+    publishShutdownOverlay({
+      show: true,
+      tabsCount: liveAiTabIds.size,
+      closedTabs: _shutdownClosedTabs,
+      cancellable: _shutdownCancellable,
+    });
   } catch (error) {
     console.warn('[Shutdown:ProcessProof] augmentation failed:', error?.message || error);
   }
+
+  // Nothing has been stopped yet: cancelling here costs the user nothing.
+  if (shutdownCancelled()) return await abandonGracefulShutdown('before-drain');
 
   // Drain active proxy connections before killing terminals
   try { await proxyGracefulShutdown(); } catch (e) {
     console.error('[Shutdown] proxyGracefulShutdown error:', e.message);
   }
+
+  // Last point where every live CLI is still untouched.
+  if (shutdownCancelled()) return await abandonGracefulShutdown('before-ctrl-c');
 
   // Graceful Ctrl+C to every live AI CLI BEFORE PTY kill. Direct term.kill()
   // delivers SIGHUP, which bypasses Ink TUI and cancels any in-flight SSE chunk
@@ -27724,6 +28367,9 @@ app.on('before-quit', async (event) => {
       console.log('[Shutdown:GracefulCtrlC] Sending Ctrl+C to ' + tabs.length + ' live AI tab(s) before kill');
       await Promise.race([
         Promise.all(tabs.map(async ([tabId, term]) => {
+          // Cancel reaches each tab that has not been signalled yet. The fan-out
+          // is concurrent, so this is checked per tab, not once for the batch.
+          if (shutdownCancelled()) return;
           const sessionInfo = activeAiSessions.get(tabId) || null;
           let childPid = null;
           try {
@@ -27739,13 +28385,21 @@ app.on('before-quit', async (event) => {
             }
           } catch {}
           if (!childPid) return;
+          // The `ps` lookup above awaited: re-check before the irreversible
+          // write. After \x03 this tab is lost to cancel.
+          if (shutdownCancelled()) return;
           const sid = sessionInfo?.sessionId || null;
           console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) +
             ' engine=' + (sessionInfo?.engine || 'ai') +
             ' childPid=' + childPid +
             ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') +
             ' — \\x03 → waiting for graceful exit');
+          _shutdownSignalledTabIds.add(tabId);
           try { term.write('\x03'); } catch (err) { console.log('[Shutdown:GracefulCtrlC] write failed: ' + err.message); }
+          _shutdownClosedTabs += 1;
+          publishShutdownOverlay({ show: true, tabsCount: liveAiTabIds.size,
+            closedTabs: _shutdownClosedTabs, cancellable: _shutdownCancellable,
+            ...(shutdownCancelled() ? { cancelling: true } : {}) });
           // Poll until process is gone or 1200ms passes.
           await new Promise((resolve) => {
             const start = Date.now();
@@ -27771,6 +28425,10 @@ app.on('before-quit', async (event) => {
   } catch (e) {
     console.error('[Shutdown:GracefulCtrlC] error:', e.message);
   }
+
+  // Cancel pressed mid fan-out: the tabs already signalled are gone, the rest
+  // were skipped by the per-tab guards and keep running.
+  if (shutdownCancelled()) return await abandonGracefulShutdown('after-ctrl-c');
 
   // IPC delivery is not paint. On an idle/fast exit the old code sent the
   // overlay and destroyed the renderer in the same perceptual instant, so the
@@ -38735,29 +39393,121 @@ const claudeSettingsSendRuntime = require(path.join(srcMainDir, 'claude-settings
     log: message => console.log(message),
   });
 
+// The raw PTY window is pinned for a MANUAL choice too, not only for the
+// startup auto-inject. `captureClaudeSettingFailureBytes` hung on `publishGate`,
+// which only the startup path calls: a user clicking a level in the control bar
+// got a toast and nothing else. 03.11, tab 5b20bf267cca: `/effort max` was
+// refused twice, the transcript held no `<command-name>/effort` record at all,
+// and with no byte window there was no way to tell whether the bytes never
+// reached the terminal, Claude swallowed them into an already-open picker, or
+// it applied them without recording the pair. Observation only: this pins an
+// already-recorded window and never writes input, retries or settles anything.
+function captureClaudeManualSettingFailureBytes(request, outcome) {
+  const tabId = String(request?.tabId || '');
+  if (!tabId || outcome?.success === true) return;
+  const failedCommand = outcome?.failedCommand
+    || (request?.kind ? '/' + request.kind + ' ' + String(request.value ?? '') : null)
+    || [request?.model ? '/model ' + request.model : null,
+      request?.effort ? '/effort ' + request.effort : null].filter(Boolean).join(' + ') || null;
+  captureClaudeSettingFailureBytes({
+    status: 'failed',
+    tabId,
+    failedCommand,
+    errorCode: outcome?.code || null,
+    error: outcome?.error || null,
+    proofOutcome: outcome?.proofOutcome || null,
+    reason: outcome?.reason || null,
+    attemptId: outcome?.settingCommandId || outcome?.attemptId || null,
+    resultRevision: outcome?.resultRevision || null,
+    generation: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+    userRetryable: outcome?.userRetryable === true,
+  });
+}
+
 ipcMain.handle('claude:apply-setting', async (_event, request = {}) => {
   try {
-    return await claudeSettingsSendRuntime.applySetting({
+    const applied = await claudeSettingsSendRuntime.applySetting({
       tabId: String(request.tabId || ''),
       kind: request.kind,
       value: request.value,
       source: String(request.source || 'claude-pty-setting'),
     });
+    if (applied?.success === true && (request.kind === 'model' || request.kind === 'effort')) {
+      // `applied.value` is what Claude PRINTED — a menu label like `Opus 5`,
+      // not a runtime id. Retaining it meant the next launch injected
+      // `/model Opus 5`, which Claude answers `Model 'Opus5' not found`
+      // (03.11, tab 5b20bf267cca, launch-14). Keep what we SENT; the printed
+      // label stays display-only.
+      retainClaudeManualSettingChoice(request.tabId,
+        { [request.kind]: applied.requestedValue ?? request.value }, request.source);
+    } else {
+      captureClaudeManualSettingFailureBytes(request, applied);
+    }
+    return applied;
   } catch (error) {
-    return { success: false, error: error?.message || String(error), code: error?.code || null,
+    const outcome = { success: false, error: error?.message || String(error), code: error?.code || null,
       failedCommand: error?.failedCommand || null };
+    captureClaudeManualSettingFailureBytes(request, outcome);
+    return outcome;
   }
 });
 
+// Decision 01.11 (Fedor): a manual model/effort choice is the TAB's preference
+// and must survive restarts. The live `/model`+`/effort` path applies to the
+// running process only, so without this a user who changed settings on a
+// RUNNING Claude lost that choice at the next launch and fell back to the
+// StatusBar default (incident: tab c41a18522055, high → max). Record the
+// confirmed values as the retained pair, already marked applied for this
+// launch so the control bar does not show them as pending.
+function retainClaudeManualSettingChoice(tabId, appliedSettings, source) {
+  const id = String(tabId || '').trim();
+  if (!id) return;
+  const model = typeof appliedSettings?.model === 'string' ? appliedSettings.model.trim() : '';
+  const effort = typeof appliedSettings?.effort === 'string' ? appliedSettings.effort.trim() : '';
+  if (!model && !effort) return;
+  const current = { ...getProviderState(id) };
+  if (current.type && current.type !== 'anthropic') return;
+  const next = { ...current };
+  if (model) next.startupModel = model;
+  if (effort) next.startupEffort = effort;
+  const generation = claudeLaunchGenerationByTab.get(id)?.generation || null;
+  if (generation) next.startupIntentAppliedGeneration = String(generation);
+  else delete next.startupIntentAppliedGeneration;
+  if (next.startupModel === current.startupModel && next.startupEffort === current.startupEffort
+    && next.startupIntentAppliedGeneration === current.startupIntentAppliedGeneration) return;
+  setProviderState(id, next);
+  if (projectManager?.db) projectManager.db.updateTabProviderState(id, next);
+  broadcastProviderState(id, next);
+  console.log('[StartupTx] manual-choice-retained tab=' + id.slice(-12)
+    + ' model=' + (next.startupModel || '-')
+    + ' effort=' + (next.startupEffort || '-')
+    + ' gen=' + (generation || '-')
+    + ' source=' + String(source || '-'));
+}
+
 ipcMain.handle('claude:apply-settings', async (_event, request = {}) => {
   try {
-    return await claudeSettingsSendRuntime.applySettings({
+    const applied = await claudeSettingsSendRuntime.applySettings({
       tabId: String(request.tabId || ''), model: request.model, effort: request.effort,
       source: String(request.source || 'claude-pty-settings'),
     });
+    if (applied?.success === true) {
+      // Same rule for the pair: retain the ids we sent, never Claude's labels.
+      // `appliedSettings` carries the printed values, so a retained `Opus 5`
+      // came back as `/model Opus 5` on the next launch and was rejected.
+      retainClaudeManualSettingChoice(request.tabId, {
+        ...(request.model ? { model: request.model } : {}),
+        ...(request.effort ? { effort: request.effort } : {}),
+      }, request.source);
+    } else {
+      captureClaudeManualSettingFailureBytes(request, applied);
+    }
+    return applied;
   } catch (error) {
-    return { success: false, error: error?.message || String(error), code: error?.code || null,
+    const outcome = { success: false, error: error?.message || String(error), code: error?.code || null,
       failedCommand: error?.failedCommand || null, appliedSettings: error?.appliedSettings || {} };
+    captureClaudeManualSettingFailureBytes(request, outcome);
+    return outcome;
   }
 });
 
@@ -38962,6 +39712,11 @@ ipcMain.handle('provider:switch', (event, opts) => {
     if (oldState.effort) next.effort = oldState.effort;
     if (oldState.startupModel) next.startupModel = oldState.startupModel;
     if (oldState.startupEffort) next.startupEffort = oldState.startupEffort;
+    // The tab's retained manual pair keeps its applied mark across a switch
+    // inside the same provider; otherwise it would look pending forever.
+    if (oldState.startupIntentAppliedGeneration) {
+      next.startupIntentAppliedGeneration = oldState.startupIntentAppliedGeneration;
+    }
   }
   if (typeof oldState.codexFastIntent === 'boolean') {
     next.codexFastIntent = oldState.codexFastIntent;
@@ -39009,6 +39764,14 @@ function updateProviderOptionsForTab(tabId, opts) {
   const cur = { ...getProviderState(tabId) };
   if (typeof opts?.thinking === 'string') cur.thinking = opts.thinking;
   if (typeof opts?.effort === 'string') cur.effort = opts.effort;
+  // A new choice is not yet applied: drop the applied-generation mark so the
+  // control bar shows it as pending until the next launch confirms it.
+  if (typeof opts?.startupModel === 'string' && opts.startupModel !== cur.startupModel) {
+    delete cur.startupIntentAppliedGeneration;
+  }
+  if (typeof opts?.startupEffort === 'string' && opts.startupEffort !== cur.startupEffort) {
+    delete cur.startupIntentAppliedGeneration;
+  }
   if (typeof opts?.startupModel === 'string') cur.startupModel = opts.startupModel;
   if (typeof opts?.startupEffort === 'string') cur.startupEffort = opts.startupEffort;
   setProviderState(tabId, cur);
@@ -45947,12 +46710,10 @@ ipcMain.handle('tab:persist-context-pct', (event, { tabId, pct }) => {
 // Seed value for the meter on control-bar mount — survives CLI exit / restart.
 // `requireExact` is the stricter automation path: it refuses SQLite last-known
 // data and returns only a main-owned snapshot for the requested provider/session.
-ipcMain.handle('tab:get-context-pct', async (event, {
-  tabId,
-  provider = null,
-  sessionId = null,
-  requireExact = false,
-} = {}) => {
+// Тело вынесено из обработчика, чтобы объединённый `tab:get-header-signals`
+// звал ТУ ЖЕ логику, а не копию: расхождение двух реализаций процента контекста
+// было бы хуже, чем лишний запрос.
+async function readTabContextPct({ tabId, provider = null, sessionId = null, requireExact = false } = {}) {
   try {
     let row = projectManager?.db?.db?.prepare(
       'SELECT claude_session_id, codex_session_id, command_type, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
@@ -46012,7 +46773,11 @@ ipcMain.handle('tab:get-context-pct', async (event, {
   } catch {
     return { pct: null, exact: false, reason: 'context-read-failed' };
   }
-});
+}
+
+// Прежний канал сохранён: его зовут очередь промптов, Run After и мост
+// приложения — у каждого свой момент и свои аргументы.
+ipcMain.handle('tab:get-context-pct', (_event, request = {}) => readTabContextPct(request));
 
 // Point-wise cache-stats persistence for the control-bar cooldown chip. One write
 // per turn (message_start). stats = {cacheRead,cacheCreate,input,ts}. Persisted so
@@ -46027,6 +46792,42 @@ ipcMain.handle('tab:persist-cache-stats', (event, { tabId, stats }) => {
 ipcMain.handle('tab:get-cache-stats', (event, { tabId }) => {
   try { return { stats: projectManager?.db?.getTabCacheStats?.(tabId) ?? null }; }
   catch { return { stats: null }; }
+});
+
+// Один ответ на показатели шапки вкладки вместо трёх отдельных запросов.
+//
+// Шрам 02.11 (прод): первый скролл сразу после перехода на вкладку стоил до
+// 345мс, при том что максимальная СИНХРОННАЯ блокировка главного потока в том
+// же окне — 45мс. Поток не считал, он разгребал очередь: на один переход
+// прилетало до 189 операций, и почти все — мелкие запросы об одной и той же
+// вкладке (`get-context-pct`, `get-cache-stats`, `provider:get-status`,
+// `get-presence`, `getCommandState`, `availability-batch`). Колесо вставало
+// за ними.
+//
+// Здесь объединены ровно те три, которые шлёт шапка при монтировании: они
+// независимы, дёшевы и читаются из уже открытых источников. Каждый прежний
+// канал СОХРАНЁН — их зовут и другие места (очередь промптов, Run After,
+// мост приложения), и у них свои моменты вызова.
+//
+// Это транспорт, не контракт: те же значения, тот же владелец, ни одной
+// возможности не убавилось. `partial` отмечает, что часть показателей не
+// удалось прочитать — потребитель отличает «нет данных» от «ноль».
+ipcMain.handle('tab:get-header-signals', async (event, { tabId, provider = null, sessionId = null } = {}) => {
+  if (!tabId) return { contextPct: null, cacheStats: null, provider: null, partial: true, reason: 'tab-required' };
+  const errors = [];
+  const read = async (name, fn) => {
+    try { return await fn(); }
+    catch (error) { errors.push(name + ':' + String(error?.message || error).slice(0, 60)); return null; }
+  };
+  // Последовательно, а не Promise.all: смысл правки — СНЯТЬ нагрузку с
+  // очереди, а не поставить три задачи в один тик. Каждое чтение здесь
+  // занимает единицы миллисекунд.
+  const contextPct = await read('contextPct', () => readTabContextPct({ tabId, provider, sessionId }));
+  const cacheStats = await read('cacheStats', () => projectManager?.db?.getTabCacheStats?.(tabId) ?? null);
+  const providerState = await read('provider', () => ({ ...getProviderState(tabId),
+    codexLiveSettings: codexLiveSettingsObserver?.read(tabId) || null }));
+  return { contextPct, cacheStats, provider: providerState,
+    partial: errors.length > 0, ...(errors.length ? { errors } : {}) };
 });
 
 // Synchronous version for beforeunload (pkill-safe)
@@ -50926,7 +51727,7 @@ ipcMain.handle('file:watch-folder', async (event, folderPath) => {
     const watchers = [];
     const addWatch = (dir) => {
       try {
-        const w = fs.watch(dir, { persistent: true }, (evType, filename) => {
+        const w = dirWatch.watch(dir, { persistent: true }, (evType, filename) => {
           if (!filename || filename.startsWith('.')) return;
           const fp = path.join(dir, filename);
           const key = fp + evType;
@@ -54009,7 +54810,7 @@ function armCodexDelayedWriterObserver(tabId, armedSubmit) {
   state.observe = observe;
   try {
     fs.mkdirSync(codexSessionsDir(), { recursive: true });
-    state.watcher = fs.watch(codexSessionsDir(), { recursive: true }, () => {
+    state.watcher = dirWatch.watch(codexSessionsDir(), { recursive: true }, () => {
       observe('fs.watch');
     });
   } catch (error) {
@@ -65008,7 +65809,7 @@ function startCodexSessionWatcher(sender, {
 
   try {
     fs.mkdirSync(sessionsDir, { recursive: true });
-    observerState.watcher = fs.watch(sessionsDir, { recursive: true }, () => {
+    observerState.watcher = dirWatch.watch(sessionsDir, { recursive: true }, () => {
       detect('fs.watch');
     });
   } catch (e) {
@@ -68560,7 +69361,7 @@ function waitForCodexModelEffortConfig(expected, {
     };
 
     try {
-      watcher = fs.watch(configDir, (_eventType, filename) => {
+      watcher = dirWatch.watch(configDir, (_eventType, filename) => {
         if (!filename || String(filename) === configName) {
           scheduleCheck('fs.watch');
         }
@@ -69808,7 +70609,7 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, bareResume, yesMod
     }
 
     console.log('[Gemini Sniper] Setting up fs.watch (no timeout - waits for first message)...');
-    watcher = fs.watch(chatsDir, (eventType, filename) => {
+    watcher = dirWatch.watch(chatsDir, (eventType, filename) => {
       if (sessionFound) return;
 
       // Gemini session files: session-2026-01-22T22-19-788e351c.json
@@ -69879,7 +70680,7 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, bareResume, yesMod
           // Snapshot existing files in new dir
           const recheckExisting = new Set();
           try { for (const f of fs.readdirSync(chatsDir)) recheckExisting.add(f); } catch {}
-          watcher = fs.watch(chatsDir, (eventType, filename) => {
+          watcher = dirWatch.watch(chatsDir, (eventType, filename) => {
             if (sessionFound) return;
             if (!filename || !filename.startsWith('session-') || !filename.endsWith('.json')) return;
             if (eventType === 'change' && recheckExisting.has(filename)) return; // ignore old files
@@ -73257,7 +74058,16 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             + ' reason=' + boundary.reason);
           break;
         }
-        if (payload.historyOperation) {
+        // A held history-input reservation needs the launch generation to be
+        // reserved BEFORE the bytes: its gate claims the launch at the write
+        // boundary and compares it against the tab's current generation. The
+        // ordinary branch below opens its generation only AFTER the write, so
+        // the claim saw the stopped process' old generation and refused with
+        // history_input_launch_changed — leaving a rewritten history and a
+        // dead tab (01.11 10:38:42, tab f16371ad31df, manual History Rewind).
+        // This is the same guarded writer, not a second launch path; without a
+        // historyOperation receipt its saved-history validation is a no-op.
+        if (payload.historyOperation || payload.historyInput) {
           launchResult = await writeClaudeSavedHistoryResume(term, payload, cmdLine, shellRunSeqBeforeLaunch);
           break;
         }
@@ -73607,9 +74417,26 @@ async function runClaudeCommandSerialized(event, payload = {}) {
           tabId,
         });
         if (repairResult?.success !== true) {
+          // Decision 01.11 (Fedor): two launch requests for the same tab add up
+          // instead of failing. AutoResume and Run After both ask on restore;
+          // the first starts Claude, the second legitimately finds that very
+          // session alive. That refusal keeps the launch from being duplicated,
+          // but it is not a failed start and must not surface as a red card
+          // (01.11 03:46:02 tab 876b4ac1376c: the message was delivered 1s
+          // later while the card said "Claude start failed"). A DIFFERENT
+          // tab/process owning the session stays a real refusal.
+          const sameTabOwner = repairResult?.reason === 'claude-jsonl-owner-alive'
+            && !!repairResult.ownerTabId && repairResult.ownerTabId === tabId;
+          if (sameTabOwner) {
+            console.log('[ClaudeRunCommand] launch already live in this tab tab=' + String(tabId).slice(-12)
+              + ' session=' + sessionId.slice(0, 8)
+              + ' ownerReason=' + String(repairResult.ownerReason || '-')
+              + ' outcome=join-existing-launch');
+          }
           return {
             success: false,
             accepted: false,
+            ...(sameTabOwner ? { alreadyLaunching: true, code: 'claude_launch_already_live' } : {}),
             error: repairResult?.error || repairResult?.reason || 'resume_preparation_failed',
             reason: repairResult?.reason || 'resume_preparation_failed',
             tabId,
@@ -73681,10 +74508,17 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         contextForkBinding: payload.contextForkBinding };
       throw error;
     } finally {
+      // `alreadyLaunching` means this very tab is already starting the same
+      // session: nothing failed, so the preparation is cleared instead of
+      // leaving a rejection card. The caller still gets success:false and
+      // waits for the launch that is already running.
+      const joined = result?.alreadyLaunching === true && result?.accepted !== true;
       agentLaunchPreparations.finish(tabId, preparation.token, {
         accepted: result?.accepted === true,
-        reason: result?.accepted === true ? 'launch-accepted' : 'launch-rejected',
-        error: result?.accepted === true ? null : (result?.error || result?.reason || null),
+        joined,
+        reason: result?.accepted === true ? 'launch-accepted'
+          : joined ? 'launch-already-live' : 'launch-rejected',
+        error: result?.accepted === true || joined ? null : (result?.error || result?.reason || null),
       });
     }
   }).catch(returnAgentSendLaunchRefusal));
@@ -74330,7 +75164,7 @@ function startJsonlWatcher(tabId, sessionId, cwd) {
   }
   try {
     const fileBasename = path.basename(w.filePath);
-    w.dirWatcher = fs.watch(w.projectDir, { persistent: false }, (_evt, filename) => {
+    w.dirWatcher = dirWatch.watch(w.projectDir, { persistent: false }, (_evt, filename) => {
       if (filename !== fileBasename) return;
       if (!fs.existsSync(w.filePath)) return;
       try { w.dirWatcher.close(); } catch {}

@@ -1143,6 +1143,8 @@ let responseObservationEvidence = null;
 let releaseAgentResponseCompletion = null;
 let readAgentLifecycleIdentity = null;
 let readAgentRuntimeSnapshot = null;
+let holdTabBackgroundWork = null;
+let requestProgrammaticQuit = null;
 let readAgentInputRuntimeSnapshot = null;
 let readAgentContinuationInputAdmission = null;
 let readAutomaticSendFrame = null;
@@ -1258,6 +1260,28 @@ function runAfterMainScope(target) {
     commandType: row?.command_type || null, conversationOwner: conversationOwners?.current(target) || null,
     loopTextHash: systemPromptService
       ? fingerprintAgentSendRequest(systemPromptService.get('run-after-loop').content) : null };
+}
+
+// WHERE a tab lives for the user, as the sidebar names it.
+//
+// A tab has two different "where"s: the workflow it is shown in, and the
+// execution namespace its CLI runs in. Moving a tab between workflows
+// deliberately keeps cwd/execution identity, so these diverge by design
+// (fact-workspace.md::Workflow, вкладка и исполнение). A reader that reports
+// only execution sends the user looking in a workflow the tab already left —
+// reported 02Nov for a build:i-obs blocker line.
+//
+// Before the workflow migration there is no such layer at all; null keeps the
+// old execution-only answer instead of inventing a name.
+function tabWorkflowLabel(tabId) {
+  try {
+    const projectManager = require('./project-manager');
+    if (!projectManager.workflowOrganization?.ready()) return null;
+    const organization = projectManager.workflowOrganization.service;
+    const workflowId = organization.getMembership(tabId)?.workflowId || null;
+    if (!workflowId) return null;
+    return { workflowId, workflow: organization.getWorkflow(workflowId)?.metadata?.name || null };
+  } catch { return null; }
 }
 
 async function prepareRunAfterAuthoring(args, ticket, journal) {
@@ -10239,7 +10263,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
     await agentSendReceiptStartupReady;
     if (loopMessageStartupReady) await loopMessageStartupReady;
     return require('./build-continue-api').handleBuildContinueApi({ req, res, parsed,
-      service: getBuildContinueOperations(), readBody, sendJson, quit: () => app.quit() });
+      service: getBuildContinueOperations(), readBody, sendJson,
+      // build:i-c owns the relaunch: this quit must not show a cancel button.
+      quit: () => (requestProgrammaticQuit ? requestProgrammaticQuit('build-continue-capture') : app.quit()) });
   }
 
   // Immutable boot snapshot of the Claude/Codex PTYs stopped by the previous
@@ -14133,7 +14159,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' command=' + (data?.commandType || '-') +
         ' tool=' + (data?.toolType || '-') +
         ' ms=' + (Date.now() - started));
-      return sendJson(res, 200, { ...data, ...tabActivityProjection({ tabId }) });
+      return sendJson(res, 200, { ...data, ...tabWorkflowLabel(tabId), ...tabActivityProjection({ tabId }) });
     } catch (e) {
       clearPending();
       console.warn(statusPrefix + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
@@ -14526,6 +14552,34 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // goes through the terminal scenario layer; legacy SDK still uses query.close()
   // as a warm interrupt. Distinct from /stop, which kills the terminal process.
   // See fact-mobile-claude-pty.md.
+  // Hold one live background shell so the tab counts as busy while it runs.
+  // Subagents already hold their tab unconditionally; background shells do not,
+  // so a long `npm run dev` cannot wedge Auto-stop or the install. This is the
+  // explicit opt-in for the shells that DO matter ("hold the tab while this
+  // script runs"). It releases itself when the command finishes.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/background-hold$/);
+  if (m && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    const tabId = decId(m[1]);
+    let body;
+    try { body = await readBody(req); }
+    catch { return sendJson(res, 400, { ok: false, code: 'invalid_background_hold_request' }); }
+    const taskRef = cleanOptionalString(body?.taskRef, '');
+    if (!body || typeof body !== 'object' || Array.isArray(body) || !taskRef
+      || Object.keys(body).some(key => key !== 'taskRef')) {
+      return sendJson(res, 400, { ok: false, code: 'invalid_background_hold_request' });
+    }
+    if (typeof holdTabBackgroundWork !== 'function') {
+      return sendJson(res, 503, { ok: false, code: 'background_hold_unavailable' });
+    }
+    const result = holdTabBackgroundWork(tabId, taskRef);
+    if (result?.held !== true) {
+      return sendJson(res, 409, { ok: false, code: result?.reason || 'background_hold_refused', tabId, taskRef });
+    }
+    return sendJson(res, 200, { ok: true, tabId, taskRef, held: true, repeated: result.repeated === true,
+      toolUseId: result.toolUseId, taskId: result.taskId || null, heldCount: result.heldTaskCount });
+  }
+
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/interrupt$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
@@ -15845,7 +15899,7 @@ async function startClaudeTabWatcher(tabId) {
       // Watch the projects/ root since cwd-encoded subdir may itself not
       // exist yet for a brand-new project.
       const watchDir = require(path.join(srcMainDir, 'claude-paths')).claudeProjectsDir();
-      dirWatcher = fs.watch(watchDir, { recursive: true }, (_, fname) => {
+      dirWatcher = require(path.join(srcMainDir, 'dir-watch')).watch(watchDir, { recursive: true }, (_, fname) => {
         if (fname && fname.includes(status.sessionId)) tryPromote();
       });
       claudeTabDirectoryWatchers.set(tabId, dirWatcher);
@@ -16108,6 +16162,8 @@ function start({
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
   readAgentRuntimeSnapshot: readAgentRuntimeSnapshotFn,
+  holdTabBackgroundWork: holdTabBackgroundWorkFn,
+  requestProgrammaticQuit: requestProgrammaticQuitFn,
   readAgentInputRuntimeSnapshot: readAgentInputRuntimeSnapshotFn,
   readAgentContinuationInputAdmission: readAgentContinuationInputAdmissionFn,
   readAutomaticSendFrame: readAutomaticSendFrameFn,
@@ -16417,6 +16473,8 @@ function start({
   }
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;
   readAgentRuntimeSnapshot = readAgentRuntimeSnapshotFn || null;
+  holdTabBackgroundWork = holdTabBackgroundWorkFn || null;
+  requestProgrammaticQuit = requestProgrammaticQuitFn || null;
   readAgentInputRuntimeSnapshot = typeof readAgentInputRuntimeSnapshotFn === 'function' ? readAgentInputRuntimeSnapshotFn : null;
   readAgentContinuationInputAdmission = readAgentContinuationInputAdmissionFn || null;
   readAutomaticSendFrame = readAutomaticSendFrameFn || null;
@@ -16696,6 +16754,8 @@ function stop() {
   orchestrationContinuationService = null;
   readAgentLifecycleIdentity = null;
   readAgentRuntimeSnapshot = null;
+  holdTabBackgroundWork = null;
+  requestProgrammaticQuit = null;
   readAgentInputRuntimeSnapshot = null;
   readAgentContinuationInputAdmission = null;
   readAutomaticSendFrame = null;
@@ -16872,6 +16932,31 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
     sendOperationKey: `project:${tabId}:${handoffId}`, sendSurface: 'project-api',
     prepareSend: async () => {
       if (!await isCurrent()) throw Object.assign(new Error('capacity_retry_cancelled'), { code: 'capacity_retry_cancelled', statusCode: 409 });
+      return { descriptor: findOrchestrationTabDescriptor(tabId) };
+    },
+  });
+}
+
+// Claude's stream was cut mid-answer; ask it to continue. This is an ordinary
+// project Send through the shared scenario — the same admission, FIFO, receipt
+// and cancellation rules as any other programmatic prompt. It owns no new
+// authority: `isCurrent` is rechecked immediately before the payload, so a
+// Stop, a relaunch or a session change between the error and this call
+// withdraws it. Decision 02.11 (Fedor): always automatic, like Codex capacity.
+async function sendClaudeStreamCutContinuation({ tabId, sessionId, errorId, generation, handoffId, isCurrent }) {
+  if (!await isCurrent()) {
+    return { submitted: false, code: 'claude_stream_cut_cancelled', error: 'claude_stream_cut_cancelled' };
+  }
+  return runAgentSendScenario({
+    tabId, prompt: 'продолжай', handoffId, source: 'claude-stream-cut-retry', queue: true,
+    provider: 'claude', sessionId: null, ownership: 'project', requireLive: true,
+    expectedTarget: { toolType: 'claude', sessionId, lifecycleGeneration: generation },
+    sendOperationKey: `project:${tabId}:${handoffId}`, sendSurface: 'project-api',
+    prepareSend: async () => {
+      if (!await isCurrent()) {
+        throw Object.assign(new Error('claude_stream_cut_cancelled'),
+          { code: 'claude_stream_cut_cancelled', statusCode: 409 });
+      }
       return { descriptor: findOrchestrationTabDescriptor(tabId) };
     },
   });
@@ -17064,6 +17149,15 @@ async function admitQueuedAgentSend(request) {
 }
 
 module.exports = {
+  // Own loopback API identity. The isolated E2E instance owns no MCP hub, so
+  // in-app senders need its real port to reach their own scenario layer.
+  getOwnApiEndpoint: () => {
+    const health = webServerServiceHealth();
+    if (!health.listening || !health.port) return null;
+    let token = null;
+    try { token = require('node:fs').readFileSync(TOKEN_PATH, 'utf8').trim() || null; } catch {}
+    return { port: health.port, token };
+  },
   readBuildInstallStatus,
   cancelBuildInstallFromDock,
   readBuildInstallContinuations,
@@ -17231,6 +17325,7 @@ module.exports = {
   updateOrchestrationSettings,
   coordinateCodexCapacityContinuation,
   sendCodexCapacityContinuation,
+  sendClaudeStreamCutContinuation,
   performE2eBoundaryAction,
   performOrchestrationAction,
   handleOrchestrationTabClosed,

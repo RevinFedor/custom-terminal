@@ -8485,12 +8485,12 @@ function planCodexForkFromLatestCompact(records, sessionId) {
       break;
     }
   }
+  // No compact boundary means the whole rollout is already "everything after
+  // the last compact". Degrade to an ordinary full fork instead of refusing
+  // (Fedor 02.11); index 0 copies every visible record.
   if (compactIndex < 0) {
-    return {
-      success: false,
-      reason: 'no-compact',
-      error: 'В этой Codex-сессии ещё нет сжатия контекста',
-    };
+    console.log('[Codex Fork] No compact boundary — forking the whole session:', sessionId);
+    compactIndex = 0;
   }
 
   const outputRecords = [];
@@ -12460,13 +12460,32 @@ function createCodexModelCatalogLifecycle(run = execFile, config = {}) {
     }
     return disposal;
   }
-  return { request, dispose, bindRuntime, snapshot, newCycle, reportPublication, get closing() { return closing; }, cancelled };
+  // A cancelled application quit keeps this Main alive, so the revocation made
+  // at quit admission must be given back: without it every Codex model/effort
+  // control would answer CODEX_MODEL_CATALOG_CLOSED for the rest of the
+  // lifetime. Only a settled disposal with no surviving handle may reopen —
+  // an unknown child is not proof of a free owner, and the accumulated
+  // diagnostic counters/receipts are deliberately kept.
+  function reopen() {
+    if (!closing) return true;
+    if (!disposal || !disposalFacts?.deadlineOutcome?.settled || children.size > 0) return false;
+    closing = false; disposal = null;
+    disposalFacts = { ...disposalFacts, reopenedAt: stamp() };
+    wake();
+    console.log('[CodexModels] catalog reopened after cancelled shutdown');
+    return true;
+  }
+  return { request, dispose, reopen, bindRuntime, snapshot, newCycle, reportPublication, get closing() { return closing; }, cancelled };
 }
 
 const codexModelCatalogLifecycle = createCodexModelCatalogLifecycle();
 
 function disposeCodexModelCatalog() {
   return codexModelCatalogLifecycle.dispose();
+}
+
+function reopenCodexModelCatalog() {
+  return codexModelCatalogLifecycle.reopen();
 }
 
 function bindCodexModelCatalogRuntime(identity, onChange) {
@@ -13359,6 +13378,7 @@ module.exports = {
     listCodexModels,
     getCachedCodexPickerCatalog,
     disposeCodexModelCatalog,
+    reopenCodexModelCatalog,
     bindCodexModelCatalogRuntime,
     getCodexModelCatalogLifecycle,
     findCodexSessionFile,

@@ -180,11 +180,39 @@ function createAgentResponseObservationReader({
   }
 
   function observeClaudeHook({ tabId, message, turn, admitted, matched, backgroundWorkCount }) {
-    if (admitted !== true || !['UserPromptSubmit', 'Stop', 'StopFailure'].includes(message?.event)) return false;
-    if (!admitClaudeMainHook({ message, currentTurn: message.event === 'UserPromptSubmit' ? null : turn,
-      currentProcessId: turn?.processId }).accepted) return false;
+    const trace = (stage, extra = '') => {
+      if (message?.event === 'UserPromptSubmit') return;
+      try {
+        console.log('[AgentResponseObservation] hook-skip stage=' + stage + ' tab=' + String(tabId).slice(-12)
+          + ' event=' + String(message?.event).slice(0, 24) + ' admitted=' + String(admitted)
+          + ' matched=' + String(matched) + extra);
+      } catch {}
+    };
+    if (admitted !== true || !['UserPromptSubmit', 'Stop', 'StopFailure'].includes(message?.event)) {
+      trace('admitted-or-event'); return false;
+    }
+    const admission = admitClaudeMainHook({ message, currentTurn: message.event === 'UserPromptSubmit' ? null : turn,
+      currentProcessId: turn?.processId });
+    if (!admission.accepted) {
+      trace('main-hook-admission', ' reason=' + String(admission.reason || admission.code || '-').slice(0, 48)
+        + ' turnPid=' + String(turn?.processId || '-') + ' hookPpid=' + String(message.ppid || '-'));
+      return false;
+    }
     revision(tabId, true);
-    if (message.event === 'UserPromptSubmit' || matched !== true) return false;
+    if (message.event === 'UserPromptSubmit' || matched !== true) {
+      // A refusal must explain itself: a silent drop here looks identical to
+      // "no answer happened" for every completion consumer downstream.
+      if (message.event !== 'UserPromptSubmit') {
+        try {
+          console.log('[AgentResponseObservation] completion-gate-skip tab=' + String(tabId).slice(-12)
+            + ' event=' + String(message.event).slice(0, 24) + ' matched=' + String(matched)
+            + ' turnActive=' + String(turn?.active) + ' turnSession=' + String(turn?.sessionId || '-').slice(-12)
+            + ' hookSession=' + String(message.session_id || '-').slice(-12)
+            + ' turnPid=' + String(turn?.processId || '-') + ' hookPpid=' + String(message.ppid || '-'));
+        } catch {}
+      }
+      return false;
+    }
     const subject = normalizeSubject({ kind: 'claude-hook', toolType: 'claude', sessionId: turn?.sessionId,
       providerPromptId: turn?.providerPromptId, targetExecutionContext: {
         provider: 'claude', sessionId: turn?.sessionId, turnId: turn?.generation ? 'claude:' + turn.generation : null,

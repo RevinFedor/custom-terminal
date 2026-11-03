@@ -12,6 +12,7 @@
 
 const { ipcMain } = require('electron');
 const fs = require('fs');
+const dirWatch = require('../dir-watch');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
@@ -211,7 +212,7 @@ function startWatching(projectId, projectPath, mainWindow) {
   // 1) Watch the index file itself (atomic rewrite by docs_reindex)
   try {
     const indexPath = path.join(projectPath, INDEX_FILE_NAME);
-    const w = fs.watch(path.dirname(indexPath), { persistent: true }, (_evt, filename) => {
+    const w = dirWatch.watch(path.dirname(indexPath), { persistent: true }, (_evt, filename) => {
       if (filename === INDEX_FILE_NAME) onEvent();
     });
     state.watchers.push(w);
@@ -223,7 +224,7 @@ function startWatching(projectId, projectPath, mainWindow) {
   const docsDir = path.join(projectPath, DOCS_SUBDIR);
   const attachDocsWatcher = (dir) => {
     try {
-      const w = fs.watch(dir, { persistent: true }, (_evt, filename) => {
+      const w = dirWatch.watch(dir, { persistent: true }, (_evt, filename) => {
         if (!filename) return;
         if (!filename.endsWith('.md')) {
           // Could be a newly created subdir → re-walk later via debounce

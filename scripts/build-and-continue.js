@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
+  assertInstallerOutsideNoted,
   findProdServer,
   readToken,
   requestJson,
@@ -228,7 +229,13 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
+  // Fail before waiting: its build:install child would quit this host.
+  let refused = null;
+  try { assertInstallerOutsideNoted('build:i-cont'); } catch (error) { refused = error; }
+  if (refused) {
+    console.error('[build:i-cont] ' + refused.message);
+    process.exitCode = 1;
+  } else main().catch((error) => {
     console.error('[build:i-cont] ' + (error?.stack || error?.message || error));
     process.exitCode = 1;
   });

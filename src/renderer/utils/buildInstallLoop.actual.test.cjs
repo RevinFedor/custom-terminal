@@ -73,6 +73,7 @@ test('Loop ON survives context-bound install restart; actual Main natural final 
     getPromptQueueAgent: () => 'codex', describeQueuesForTriggerLog: () => '', shortQueueTabId: value => value,
     // New Loop-review readers are controlled leaves here; this cohort proves
     // the unchanged install hold/floor, not external-wait admission.
+    tabOwnBackgroundWorkBlocks: () => false,
     getPromptQueueSessionId: () => 'S', loopNaturalCausesByOwner: new Map(), isTabWorkflowBlocked: () => held,
     queueOwnerHasPendingContinuationAt: () => false, getEffectiveQueueTrigger: () => '753', hasRuntimeWorkflowArm: () => false,
     getReadyTriggerForOwner: () => null, fireQueueOwner: () => assert.fail('Loop has no queue cards'),

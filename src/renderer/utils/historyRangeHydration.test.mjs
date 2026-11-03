@@ -15,6 +15,12 @@ const source = readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', 
 const from = source.indexOf('  const scheduleHistoryHydrationRangeCheck = useCallback(');
 const to = source.indexOf('  const flushLiveHistoryToDurable = useCallback(', from);
 assert.ok(from >= 0 && to > from);
+// Cutting up to the NEXT useCallback also swallows whatever sits between the
+// two — on 26.10 that became `hydrationRangeCheckRef.current = …`, a ref this
+// harness does not provide, and all 4 cases died at load with the ref's name
+// as the only clue. Declare that ref instead of narrowing the slice: the
+// assignment is part of the wiring under test, and a slice that silently drops
+// a line is exactly how this harness stops noticing the real code.
 const code = transformSync(source.slice(from, to), { loader: 'ts' }).code;
 
 function harness(presented = true) {
@@ -34,6 +40,14 @@ function harness(presented = true) {
     setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
     clearTimeout: (id) => timers.delete(id),
     hydrationRangeIdleTimerRef: { current: null },
+    // The real component publishes the scheduler here so the presentation
+    // effect can call it without depending on declaration order.
+    hydrationRangeCheckRef: { current: null },
+    // The presentation effect inside this slice also restores the
+    // scroll-to-bottom arrow (its node remounts with display:'none' on every
+    // workspace switch). Its behaviour is covered by
+    // `historyScrollArrowPresentation.test.mjs`; here it only has to exist.
+    syncScrollArrowVisibility: () => {},
     historyPresentationProofRef: presentation,
     historyOwnerKeyRef: owner,
     historyOwnerGenerationRef: generation,

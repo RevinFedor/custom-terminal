@@ -2,6 +2,8 @@ import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMe
 import { useUIStore, type DisplayContext, type DisplaySizeKey, type PaneStripInterfacePreferenceKey } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID, RUN_AFTER_LOOP_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS, legacyGeminiModelLabel } from '../../constants/geminiModels';
+import { modelOptionsForPrompt } from '../../constants/utilityModels';
+import { UTILITY_AI_PROVIDER } from '../../../shared/utility-ai-provider.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
@@ -3280,10 +3282,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     {legacyGeminiModelLabel(localPromptModel)} (saved)
                   </span>
                 )}
-                {GEMINI_MODEL_OPTIONS.map((model) => (
+                {modelOptionsForPrompt(editingAIPrompt.id, UTILITY_AI_PROVIDER).map((model) => (
                   <button
                     key={model.value}
-                    onClick={(e) => { e.stopPropagation(); setLocalPromptModel(model.value); saveField({ model: model.value }); }}
+                    onClick={(e) => { e.stopPropagation(); setLocalPromptModel(model.value as any); saveField({ model: model.value }); }}
                     style={{ padding: '4px 10px', backgroundColor: localPromptModel === model.value ? localPromptColor : VR_FIELD, color: localPromptModel === model.value ? '#fff' : VR_DIM, border: `1px solid ${localPromptModel === model.value ? localPromptColor : VR_BORDER}`, borderRadius: 7, fontSize: 11.5, cursor: 'pointer' }}
                   >
                     {model.label}

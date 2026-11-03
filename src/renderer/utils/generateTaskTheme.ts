@@ -9,6 +9,7 @@ export async function generateTaskTheme(body: string): Promise<{ shortTitle: str
     fallbackPrompt: DEFAULT_TASK_THEME_PROMPT, sourceLabel: 'Исходный текст отложенной задачи',
     logPrefix: 'TaskTheme', taskType: TASK_THEME_PROMPT_ID, promptId: TASK_THEME_PROMPT_ID,
     sanitize: text => text.trim(),
+    useUtilityProvider: true,
   });
   if (!raw) throw new Error('AI не вернул название задачи');
   const value = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));

@@ -137,10 +137,14 @@ test('cursor HMAC/parent/epoch/clock/offset/previousID reject without retargetin
   assert.equal((await f.api.readFilePage({ cursor: token })).start, 5);
 });
 
-test('descriptor/name/path/provider/subject/cwd/storage/tree changes invalidate clock without org revision', async t => {
+test('descriptor/name/path/provider/subject/cwd/tree changes invalidate clock without org revision', async t => {
   const f = await directoryFixture(t); family(f, 7); const revision = f.api.read().publication.revision;
+  // `execution_storage_revision` deliberately LEFT this list on 01.11: an
+  // AFTER UPDATE trigger on `tabs` (database.js:2117) bumps it on any write to
+  // the row, so it reported identity changes that had not happened. The live
+  // columns now have their own negative test below.
   for (const [column, value] of [['name','renamed'], ['file_path','/new-path'], ['command_type','claude'], ['cwd','/new-cwd'],
-    ['execution_storage_revision',15], ['visual_parent_tab_id',null]]) {
+    ['visual_parent_tab_id',null]]) {
     const old = await f.api.readCatalogV2();
     f.db.prepare('UPDATE tabs SET ' + column + '=? WHERE tab_id=?').run(value, 'file-6');
     const current = await f.api.readCatalogV2(); assert.notEqual(current.catalogClock, old.catalogClock, column);
@@ -158,6 +162,53 @@ test('descriptor/name/path/provider/subject/cwd/storage/tree changes invalidate 
   const replaced = await f.api.readCatalogV2(); assert.notEqual(replaced.catalogClock, old.catalogClock);
   assert.equal(replaced.details['file-6'].executionRef.subject.subjectId, 'new-subject');
   assert.equal(f.api.read().publication.revision, revision);
+});
+
+test('live runtime state does NOT move the directory clock', async t => {
+  // 01.11, working host: a 409 `directory_catalog_changed` arrived with
+  // `organizationRevision=21599` and `tree=59dd6705` identical on both sides —
+  // only the live-derived `descriptors` had moved. Each false 409 cost the
+  // phone a second 813 KB catalog and Main a second ~1.4s rebuild, 23 times in
+  // one session, and it degraded further the more agents were running.
+  const f = await directoryFixture(t); family(f, 7);
+  for (const [column, value] of [['session_status', 'busy'], ['execution_storage_revision', 15],
+    ['session_status', 'inactive'], ['context_pct', 42]]) {
+    const old = await f.api.readCatalogV2();
+    f.db.prepare('UPDATE tabs SET ' + column + '=? WHERE tab_id=?').run(value, 'file-6');
+    const current = await f.api.readCatalogV2();
+    assert.equal(current.catalogClock, old.catalogClock, column + ' must not move the basis guard');
+    // A request the client already had in flight must still be admitted.
+    await f.api.readTabDetail('root', { ...basis(old), workflowId: 'main' });
+  }
+});
+
+test('asking for live status is not rejected because the status changed', async t => {
+  // The circular case: `runtime-summary` and `card-signals` exist to report
+  // live state, and they carry the same clock that used to contain it.
+  const f = await directoryFixture(t); family(f, 7);
+  const before = await f.api.readCatalogV2();
+  f.db.prepare("UPDATE tabs SET session_status='busy' WHERE tab_id='root'").run();
+  await f.api.readRuntimeSummary({ ...basis(before), tabIds: ['root'] });
+  await f.api.readCardSignals({ ...basis(before), tabIds: ['root'] });
+});
+
+test('excluding live state from the clock does not remove it from responses', async t => {
+  // The fields leave the GUARD, not the payload. `getDirectoryTabDetail`
+  // rejects a ref whose `storageRevision` no longer matches the row
+  // (database.js:2458-2460), so dropping it from `executionRef` would silently
+  // disable that check.
+  const f = await directoryFixture(t); family(f, 7);
+  // `file-6` sits past FIRST_FILES, so it is withheld from `details` until the
+  // client pages for it; use the tab that is always rendered.
+  f.db.prepare("UPDATE tabs SET session_status='busy' WHERE tab_id='root'").run();
+  const current = await f.api.readCatalogV2();
+  assert.equal(current.index.root.sessionStatus, 'busy', 'status still reaches the client');
+  const ref = current.details.root.executionRef;
+  assert.ok(Number.isInteger(ref.storageRevision), 'the storage revision still travels in the ref');
+  const row = f.db.prepare('SELECT execution_storage_revision AS r FROM tabs WHERE tab_id=?').get('root');
+  assert.equal(ref.storageRevision, row.r, 'and it is the CURRENT value, not a stale one');
+  // The ref must still be accepted by the database guard it exists for.
+  assert.ok(f.database.getDirectoryTabDetail(ref), 'the live ref resolves against the row');
 });
 
 test('21 direct group/root files and nonleaf file/chat descendants stay reachable; ordinary chats are not capped', async t => {

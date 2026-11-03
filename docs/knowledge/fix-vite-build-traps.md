@@ -217,6 +217,14 @@ source column не заявляется. Проверка включает actua
 Тест отдельного helper не заменяет compose maps в готовой сборке. Default build
 остаётся без private maps; opt-in флаг сам не устанавливает inspector load hook.
 
+Клиентская часть inspector удалена: `code-inspector-plugin` больше не вызывается,
+штампует собственный `scripts/lib/inspector-stamp.mjs` поверх того же
+`@code-inspector/core`. Load hook приватных карт патчит именно эту функцию, поэтому
+проверка SHA ядра и форма результата (`string` без hook, `{code,map}` под ним)
+остаются прежними. Прежняя ловушка `server: 'close'` строкой исчезла вместе с
+плагином: свой плагин сокет не открывает, и тест сборки требует ноль `listen()`.
+Сам жест и контракт производительности — `fact-инспектор-компонентов.md`.
+
 Raw Main-модуль, загружаемый через `srcMainDir`, может вообще не входить в compiler
 graph. В isolated stream-overlay разрешено переиспользовать проверенные compiled
 assets, если полный source manifest изменился только в явно названных raw modules,

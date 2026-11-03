@@ -96,7 +96,7 @@ import {
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { pendingPromptTabIds } from '../../utils/promptQueueDependencies.mjs';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
-import { MiniOrchestratorControl, MiniOrchestratorToggle, useMiniOrchestrator } from './MiniOrchestratorControl';
+import { MiniOrchestratorControl, MiniOrchestratorEdgeControl, useMiniOrchestrator } from './MiniOrchestratorControl';
 import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
@@ -649,8 +649,6 @@ export function PromptQueueOverlay({
   const promptTransportPending = !!promptTransportProgress;
   const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
-  const postPromptEnabled = queue?.postPromptEnabled ?? false;
-  const postPromptText = queue?.postPromptText ?? '';
   const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
   const ownTurnLoopEnabled = loopPromptEnabled && loopPromptMode(queue) === 'own-turn';
   const standardLoopEnabled = loopPromptEnabled && !ownTurnLoopEnabled;
@@ -737,7 +735,8 @@ export function PromptQueueOverlay({
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const editorSessionRef = useRef(0);
   const editorSavedToQueueRef = useRef(false);
-  type SpecialPromptMode = 'post' | 'loop';
+  // Post was retired on 03Nov; Loop is the only queue-wide prompt policy.
+  type SpecialPromptMode = 'loop';
   // Special prompts reuse the queue editor surface but never become queue
   // chips. The explicit mode keeps blur-save ownership deterministic.
   const [specialPromptMode, setSpecialPromptMode] = useState<SpecialPromptMode | null>(null);
@@ -1382,6 +1381,7 @@ export function PromptQueueOverlay({
           logPrefix: 'RunAfterTitle',
           taskType: 'run-after-title',
           promptId: RUN_AFTER_TITLE_PROMPT_ID,
+          useUtilityProvider: true,
         });
         if (!title) return;
         const current = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === id);
@@ -1413,8 +1413,7 @@ export function PromptQueueOverlay({
 
     if (initial.specialMode) {
       if (!acquireEditorPayloadLock(null)) return false;
-      if (initial.specialMode === 'post') setPostPromptText(tabId, nextText);
-      else setLoopPromptText(tabId, nextText);
+      setLoopPromptText(tabId, nextText);
       editorLastWrittenRef.current = {
         id: null,
         specialMode: initial.specialMode,
@@ -2018,7 +2017,7 @@ export function PromptQueueOverlay({
       title: false,
       special: false,
     };
-    const text = mode === 'post' ? postPromptText : loopPromptText;
+    const text = loopPromptText;
     setPreviewId(tabId, null);
     setEditorText(text);
     setEditorChips([]);
@@ -2049,11 +2048,7 @@ export function PromptQueueOverlay({
     };
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, commitEditor, editorOpen, loopPromptText, postPromptText, setPreviewId, specialPromptMode, tabId]);
-
-  const openPostPromptEditor = useCallback(() => {
-    openSpecialPromptEditor('post');
-  }, [openSpecialPromptEditor]);
+  }, [anchorEditor, commitEditor, editorOpen, loopPromptText, setPreviewId, specialPromptMode, tabId]);
 
   const openLoopPromptEditor = useCallback(() => {
     openSpecialPromptEditor('loop');
@@ -3419,79 +3414,26 @@ export function PromptQueueOverlay({
             alignItems: 'center',
             gap: effectiveWidth < 150 ? 2 : 3,
             padding: effectiveWidth < 150 ? '0 2px' : '0 4px',
+            // The row is absolutely positioned from the panel's left edge, so
+            // adding controls grew it past the panel — and `overflow: hidden`
+            // on the surrounding History composer boundary cut the overflow
+            // off. The `⋯` settings button ended up outside the clip, where
+            // the Timeline rail below received its clicks. Measured 03Nov:
+            // row right 2565 vs clip right 2526. Bounding the row to the panel
+            // keeps every control inside the clipped area; its own `gap` and
+            // `overflow` then handle a width the controls cannot fit.
+            maxWidth: overview ? undefined : 'calc(100% - 24px)',
+            overflow: 'hidden',
             background: PANEL_BG,
             borderRadius: 6,
           }}
         >
-          <div
-            style={{
-              display: 'inline-flex',
-              height: overview ? 20 : 22,
-              border: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
-              borderRadius: 6,
-              overflow: 'hidden',
-              background: PANEL_BG,
-            }}
-          >
-            <ControlHint
-              label={postPromptEnabled ? 'Не добавлять post-prompt к сообщениям очереди' : 'Добавлять post-prompt к каждому сообщению очереди'}
-              side="left"
-            >
-              <button
-                type="button"
-                className="pq-edge-action"
-                aria-pressed={postPromptEnabled}
-                onClick={() => {
-                  setPostPromptEnabled(tabId, !postPromptEnabled);
-                }}
-                title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
-                style={{
-                  minWidth: effectiveWidth >= 220 ? 34 : 22,
-                  height: overview ? 18 : 20,
-                  padding: '0 6px',
-                  background: postPromptEnabled ? `${TINT}26` : 'transparent',
-                  border: 0,
-                  color: postPromptEnabled ? TINT : TEXT_MUTED,
-                  cursor: 'pointer',
-                  fontSize: overview ? 7 : 9,
-                  fontFamily: 'inherit',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 3,
-                }}
-              >
-                <span aria-hidden style={{ fontSize: 10, lineHeight: 1 }}>▣</span>
-                {effectiveWidth >= 220 && <span>Post</span>}
-              </button>
-            </ControlHint>
-            <ControlHint label="Изменить post-prompt" side="left">
-              <button
-                type="button"
-                className="pq-edge-action"
-                data-editor-trigger="post"
-                onClick={() => {
-                  openPostPromptEditor();
-                }}
-                aria-label="Изменить post-prompt"
-                style={{
-                  width: 22,
-                  height: overview ? 18 : 20,
-                  padding: 0,
-                  background: 'transparent',
-                  border: 0,
-                  borderLeft: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
-                  color: postPromptEnabled ? TINT : TEXT_MUTED,
-                  cursor: 'pointer',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-              >
-                <Pencil size={10} strokeWidth={2.2} aria-hidden />
-              </button>
-            </ControlHint>
-          </div>
+          {/* The retired `▣ Post │✎` split button stood here. Loop covers the
+              same policy slot, and the reviewer robot is the queue-wide policy
+              that actually needed a permanent home: it carries state the user
+              must see at a glance (on/off and which tab reviews), which a
+              header-only icon could not show. */}
+          <MiniOrchestratorEdgeControl controller={miniOrchestrator} compact={overview} panelRef={panelRef} />
 
           <div
             style={{
@@ -4250,8 +4192,10 @@ export function PromptQueueOverlay({
             queueVisible={panelOpen || queueHoverPreviewVisible}
             miniOrchestrator={miniOrchestrator}
           />
+          {/* The robot moved to the Run After edge row (MiniOrchestratorEdgeControl).
+              Here it jumped whenever Run After expanded on hover, and an icon in
+              the header could not show which tab reviews. */}
           <AutoCompactControl tabId={tabId} />
-          <MiniOrchestratorToggle controller={miniOrchestrator} />
           <ControlHint
             label={collapsed ? 'Закрепить очередь Run after' : 'Закрыть очередь Run after'}
             shortcut={`${activeItemCount} активных шагов`}
@@ -4279,7 +4223,7 @@ export function PromptQueueOverlay({
               <span data-prompt-queue-count-label style={{ transform: loopPromptEnabled ? 'translateY(-3px)' : undefined }}>
                 {activeItemCount > 99 ? '99' : activeItemCount}
               </span>
-              {(postPromptEnabled || loopPromptEnabled) && (
+              {loopPromptEnabled && (
                 <span
                   aria-hidden
                   style={{
@@ -4292,8 +4236,7 @@ export function PromptQueueOverlay({
                     pointerEvents: 'none',
                   }}
                 >
-                  {postPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
-                  {loopPromptEnabled && <RefreshCw data-prompt-queue-loop-indicator size={8} strokeWidth={2.2} style={{ color: PULSE }} aria-hidden="true" />}
+                  <RefreshCw data-prompt-queue-loop-indicator size={8} strokeWidth={2.2} style={{ color: PULSE }} aria-hidden="true" />
                 </span>
               )}
             </button>

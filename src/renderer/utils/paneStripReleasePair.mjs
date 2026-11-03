@@ -161,6 +161,22 @@ export function enqueuePaneStripLocalRelease({getState,setState,committer,snapsh
   return pending;
 }
 
+/** A deferral asks Main to SAVE canonical W untouched while this rejected pair
+ * stays local. That claim only holds while the workflow's own saved state still
+ * equals the canonical read: Main compares the deferral against the very spaces
+ * entry this snapshot sends. Once the local layout/field has moved on to a third
+ * value, the pair describes nothing that can be deferred — it is not "W unchanged",
+ * and every organization write (group collapse, Ungroup, Add, CREATE) would be
+ * refused by that comparison for as long as the dead pair survives. Retire it
+ * here instead: the local state is the user's own current workspace and is saved
+ * normally, exactly as it would be with no pair at all. */
+function deferralRetired(state,id,item) {
+  const space=state.spaces.find(space=>space.id===id);
+  if(!space)return true;
+  return !pairMatches(layoutOf(state,space),space.stripColorGroups,item.canonical.layout,item.canonical.field)
+    &&!pairMatches(layoutOf(state,space),space.stripColorGroups,item.layout,item.field);
+}
+
 /** Full snapshots include every current lawful local release. An in-flight
  * command is committed only by its existing immutable command, never smuggled
  * into the preflush of that same command. */
@@ -171,6 +187,7 @@ export function paneStripReleaseSnapshot(state) {
   for(const [id,item] of Object.entries(envelope.workflows)) {
     if(item.status==='unreconciled') {
       if(!item.canonical)fail('workflow_strip_groups_canonical_read_required');
+      if(deferralRetired(state,id,item))continue;
       deferrals.push({workflowId:id,basis:paneStripColorGroupsBasis(item.canonical.field),placement:dragPlacement(item.canonical.layout)});
       continue;
     }
@@ -212,7 +229,15 @@ export function applyPaneStripReleasePublication(state,patch,publishedSpaces,pub
       &&pairMembershipAccepted(state,pending,tabWorkflowMembership)) {
       delete envelope.workflows[space.id];return space;
     }
-    if(pending.status==='unreconciled'&&!pairMatches(currentLayout,current.stripColorGroups,pending.layout,pending.field))return space;
+    // A rejected pair survives a newer publication only while the workflow still
+    // holds it. Once the local state equals neither the pair nor the freshly
+    // published canonical value, nothing is left to reconcile and keeping it
+    // would block every later organization write (see deferralRetired).
+    if(pending.status==='unreconciled'&&!pairMatches(currentLayout,current.stripColorGroups,pending.layout,pending.field)) {
+      if(!pairMatches(currentLayout,current.stripColorGroups,published.layout,published.stripColorGroups))
+        delete envelope.workflows[space.id];
+      return space;
+    }
     // Keep the latest local pair even if a current read reports an unrelated
     // edit. Main checks its frozen basis; a read is not a new release.
     let retained=withField({...space,layout:currentLayout},current.stripColorGroups);

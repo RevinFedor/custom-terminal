@@ -84,13 +84,38 @@ test('delivery is unchanged: arguments, `this`, and return value', () => {
   assert.deepEqual(returned, ['result'], 'the return value passes through');
 });
 
-test('a throwing listener still throws, and its mark is closed', () => {
+test('a throwing listener is isolated, reported, and its mark is closed', () => {
+  // Contract CHANGED on 01.11 and this test was updated to the new one.
+  // It used to assert that the throw propagates. In production that was the
+  // bug: ipcRenderer is a plain EventEmitter, so a throwing listener stopped
+  // every LATER subscriber of the same channel — History received none of 141
+  // `agent-transcript:changed` events and nothing was logged. Delivery to
+  // siblings now outranks propagating one subscriber's failure.
   const marks = [];
-  const { ipc, deliver } = build({ marks });
+  const logs = [];
+  const { ipc, deliver } = build({ marks, logs });
+  const reached = [];
   ipc.on('claude:busy-state', () => { throw new Error('listener exploded'); });
-  assert.throws(() => deliver('claude:busy-state', {}), /listener exploded/);
+  ipc.on('claude:busy-state', () => reached.push('sibling'));
+  assert.doesNotThrow(() => deliver('claude:busy-state', {}));
+  assert.deepEqual(reached, ['sibling'], 'a later subscriber of the same channel still runs');
+  assert.ok(logs.some(line => line.includes('[IpcListenerError]') && line.includes('listener exploded')),
+    'the failure is reported, not swallowed silently');
   assert.ok(marks.length >= 1, 'the delivery was marked');
   assert.ok(marks.every(mark => !mark.open), 'no mark is left open after a throw');
+});
+
+test('a throwing ATTRIBUTION mark never breaks delivery', () => {
+  // The 01.11 regression itself: `markRendererActivity` was only re-exported,
+  // so calling it threw on every marked delivery and starved all later
+  // subscribers. Diagnostics must never be able to do that again.
+  const marks = [];
+  const { ipc, deliver, sandbox } = build({ marks });
+  sandbox.markRendererActivity = () => { throw new Error('mark is not defined'); };
+  const reached = [];
+  ipc.on('agent-transcript:changed', () => reached.push('history'));
+  assert.doesNotThrow(() => deliver('agent-transcript:changed', {}));
+  assert.deepEqual(reached, ['history'], 'the real listener still receives the event');
 });
 
 test('removeListener finds the wrapper, so unmount really detaches', () => {

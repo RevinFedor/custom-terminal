@@ -17,6 +17,15 @@ const HEADER_BYTES = 64 * 1024;
 // Preserve the previous helper's symbolication allowance. Sampling is still
 // one second; producing the full report can take longer than that interval.
 const TIMEOUT_MS = 20000;
+// Отдельный резерв для МНОГОСЕКУНДНОГО зависания. Шрам 03.11 12:11:45: главный
+// поток стоял 4 минуты, а сторож один раз ответил `native-day-quota-exhausted`
+// (дневной лимит выели обычные полусекундные паузы) и к этому зависанию больше
+// не возвращался; стек дал только отчёт macOS. Частые короткие паузы не должны
+// вытеснять данные тяжёлого зависания. Резерв считается отдельно и обычный
+// лимит не расходует; сам он тоже ограничен.
+const SEVERE_STALL_MS = 5000;
+const SEVERE_PER_HOUR = 2;
+const SEVERE_PER_DAY = 6;
 const gates = new Map();
 let sequence = 0;
 const textId = value => typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\x00-\x1f]/.test(value);
@@ -27,15 +36,32 @@ function nativeCaptureDecision(recent, now, target) {
   if (recent.some(r => !wallTime(r.requestedWallMs) || r.requestedWallMs > now)) {
     return { allowed: false, reason: 'quota-clock-unknown' };
   }
-  const day = recent.filter(r => now - r.requestedWallMs < DAY);
+  const all = recent.filter(r => now - r.requestedWallMs < DAY);
+  // Снимки из резерва тяжёлых зависаний не расходуют обычный лимит.
+  const day = all.filter(r => r.admissionClass !== 'severe');
   const hour = day.filter(r => now - r.requestedWallMs < HOUR);
   const remaining = { hour: Math.max(0, 8 - hour.length), day: Math.max(0, 24 - day.length) };
-  const duplicate = day.find(r => r.pid === target.pid && r.processIdentity === target.processIdentity && r.stallId === target.stallId);
+  const duplicate = all.find(r => r.pid === target.pid && r.processIdentity === target.processIdentity && r.stallId === target.stallId);
   if (duplicate) return { allowed: false, reason: 'stall-already-requested', id: duplicate.id, remaining };
   const expiry = (rows, limit, span) => rows.map(r => r.requestedWallMs).sort((a, b) => a - b)[rows.length - limit] + span;
   if (day.length >= 24 || hour.length >= 8) {
-    return { allowed: false, reason: day.length >= 24 ? 'native-day-quota-exhausted' : 'native-hour-quota-exhausted', remaining,
+    const exhausted = { allowed: false, reason: day.length >= 24 ? 'native-day-quota-exhausted' : 'native-hour-quota-exhausted', remaining,
       nextEligibleWallMs: Math.max(day.length >= 24 ? expiry(day, 24, DAY) : 0, hour.length >= 8 ? expiry(hour, 8, HOUR) : 0) };
+    const severeDay = all.filter(r => r.admissionClass === 'severe');
+    const severeHour = severeDay.filter(r => now - r.requestedWallMs < HOUR);
+    const severeRemaining = { hour: Math.max(0, SEVERE_PER_HOUR - severeHour.length), day: Math.max(0, SEVERE_PER_DAY - severeDay.length) };
+    if (!severeRemaining.hour || !severeRemaining.day) return { ...exhausted, severeRemaining };
+    // Короткая пауза обычно проходит раньше, чем её успели бы снять. Тот же
+    // stall повторяется на такте сторожа и получит снимок, если продлится.
+    if (!(Number(target.stalledMs) >= SEVERE_STALL_MS)) return { ...exhausted, severeRemaining, retryAtStalledMs: SEVERE_STALL_MS };
+    const ownSevere = all.filter(r => r.pid === target.pid && r.processIdentity === target.processIdentity);
+    const lastSevere = ownSevere.length ? Math.max(...ownSevere.map(r => r.requestedWallMs)) : -Infinity;
+    if (now - lastSevere < 30000) {
+      return { allowed: false, reason: 'native-process-cooldown', remaining, severeRemaining, nextEligibleWallMs: lastSevere + 30000,
+        retryAtStalledMs: Number(target.stalledMs) + (lastSevere + 30000 - now) };
+    }
+    return { allowed: true, reason: 'reserved-severe', admissionClass: 'severe', remaining,
+      severeRemaining: { hour: severeRemaining.hour - 1, day: severeRemaining.day - 1 } };
   }
   // Initial 500ms alarms often resume before sampling begins. Keep two hourly
   // and six daily slots for an observed, still-running >=1s stall. Total caps
@@ -48,7 +74,7 @@ function nativeCaptureDecision(recent, now, target) {
       nextEligibleWallMs: Math.max(initialHour.length >= 6 ? expiry(initialHour, 6, HOUR) : 0,
         initialDay.length >= 18 ? expiry(initialDay, 18, DAY) : 0) };
   }
-  const own = day.filter(r => r.pid === target.pid && r.processIdentity === target.processIdentity);
+  const own = all.filter(r => r.pid === target.pid && r.processIdentity === target.processIdentity);
   const last = own.length ? Math.max(...own.map(r => r.requestedWallMs)) : -Infinity;
   if (now - last < 30000) return { allowed: false, reason: 'native-process-cooldown', remaining, nextEligibleWallMs: last + 30000 };
   return { allowed: true, reason: 'reserved', admissionClass: critical ? 'critical' : 'initial',
@@ -397,4 +423,4 @@ function createNativeStallSampler({ artifacts, verifyTarget, log = () => {}, env
   return { request, resumed, stop };
 }
 
-module.exports = { createNativeStallSampler, nativeCaptureDecision, parseNativeSampleHeader, sampleOverlap };
+module.exports = { createNativeStallSampler, nativeCaptureDecision, parseNativeSampleHeader, sampleOverlap, SEVERE_STALL_MS };

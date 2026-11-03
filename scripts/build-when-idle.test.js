@@ -129,3 +129,108 @@ test('an invalid final idle proof cannot approve the canonical staged installer'
   assert.equal(await f.pending,1);assert.equal(f.steps.some(s=>s.cmd==='bash'),false);
   assert.equal(fs.readFileSync(path.join(f.installed,'candidate'),'utf8'),'old');
 });
+
+// 01Nov: input blockers printed "input · (no project) · ?", busy tabs appeared
+// twice, and delivery-unknown receipts from 29 Sep / 02 Oct on tabs with no
+// process kept build:i-obs from ever reaching zero.
+const { enrichBuildInstallBlockers, groupLoadersByTab, loaderLabel } = require('./build-when-idle');
+
+test('input blockers get a name from their tab; busy twins collapse to one line', async () => {
+  const described = [];
+  const snap = { loaders: [
+    { tabId: 'A', kind: 'claude', status: 'busy', project: 'custom-terminal', name: 'state terminal - main' },
+    { tabId: 'A', kind: 'input', status: 'busy' },
+    { tabId: 'B', kind: 'input', status: 'physical-input' },
+  ] };
+  const out = await enrichBuildInstallBlockers(snap, { describe: async id => {
+    described.push(id); return { name: 'shell tab', cwd: '/Users/fedor/Desktop/sc-desktop', processStatus: 'found' }; } });
+  assert.deepEqual(described, ['B'], 'a tab already labelled by its runtime row needs no lookup');
+  assert.equal(out.loaders[1].name, 'state terminal - main');
+  assert.deepEqual({ project: out.loaders[2].project, name: out.loaders[2].name }, { project: 'sc-desktop', name: 'shell tab' });
+  const grouped = groupLoadersByTab(out.loaders);
+  assert.equal(grouped.length, 2, 'one line per tab');
+  assert.equal(grouped.find(g => g.key === 'A').loader.kind, 'claude', 'the runtime row wins over its input twin');
+});
+
+test('an old unknown delivery on a tab with no process is reported, not waited for', async () => {
+  const snap = { loaders: [
+    { tabId: 'T754', kind: 'input', status: 'delivery-unknown', operationKey: 'k1', attemptId: 'a1' },
+    { tabId: 'LIVE', kind: 'input', status: 'delivery-unknown', operationKey: 'k2', attemptId: 'a2' },
+    { tabId: 'UNK', kind: 'input', status: 'evicted-unknown', operationKey: 'k3', attemptId: 'a3' },
+  ] };
+  const status = { T754: { name: 'суббтитры в браузере', cwd: '/x/sc-desktop', processStatus: 'absent' },
+    LIVE: { name: 'live codex', cwd: '/x/y', processStatus: 'found' }, UNK: null };
+  const out = await enrichBuildInstallBlockers(snap, { describe: async id => status[id] });
+  assert.deepEqual(out.passiveInputs.map(l => l.tabId), ['T754']);
+  assert.deepEqual(out.loaders.map(l => l.tabId), ['LIVE', 'UNK'],
+    'a found process may still hold a native queue; an unreadable status stays a blocker');
+});
+
+// 02Nov: a blocker printed `sc-desktop`, so the user went looking in the
+// sc-desk workflow — but that tab had been MOVED to `main` long before and
+// only still RUNS in ~/Desktop/sc-desktop. Moving a tab between workflows
+// deliberately keeps its execution identity, so these two names diverge by
+// design and the line must name the one the user navigates by.
+test('the line names the workflow the tab lives in, and its execution directory only when they differ', () => {
+  const plain = s => String(s).replace(/\x1b\[[0-9;]*m/g, '');
+  assert.equal(plain(loaderLabel({ kind: 'input', status: 'delivery-unknown',
+    workflow: 'main', project: 'sc-desktop', name: 'позиционирование анализ конкурентов' })),
+    'ввод · main (sc-desktop) · позиционирование анализ конкурентов [delivery-unknown]');
+  assert.equal(plain(loaderLabel({ kind: 'claude', status: 'busy',
+    workflow: 'custom-terminal', project: 'custom-terminal', name: 'loop' })),
+    'claude · custom-terminal · loop', 'one name when the tab runs where it lives');
+  assert.match(plain(loaderLabel({ kind: 'claude', status: 'busy', project: 'sc-desktop', name: 'pre-migration' })),
+    /^claude · sc-desktop · pre-migration$/, 'no workflow layer: the old single name stays');
+  assert.match(plain(loaderLabel({ kind: 'input', status: 'physical-input', name: 'nowhere' })), /\(no workflow\)/);
+});
+
+test('an enriched input blocker keeps the workflow its runtime twin reported', async () => {
+  const out = await enrichBuildInstallBlockers({ loaders: [
+    { tabId: 'A', kind: 'claude', status: 'busy', workflow: 'main', project: 'sc-desktop', name: 'moved tab' },
+    { tabId: 'A', kind: 'input', status: 'busy' },
+  ] }, { describe: async () => { throw new Error('a labelled tab needs no lookup'); } });
+  assert.equal(out.loaders[1].workflow, 'main');
+  assert.equal(out.loaders[1].project, 'sc-desktop');
+});
+
+// The reported line had no runtime twin at all: both rows were passive
+// delivery-unknown receipts, so their ONLY source of names is /status. Taking
+// the workflow from `cwd` there would repeat the original bug — cwd is the
+// execution directory, which a moved tab deliberately keeps.
+test('a passive row takes its workflow from /status, not from its cwd', async () => {
+  const out = await enrichBuildInstallBlockers({ loaders: [
+    { tabId: 'T257', kind: 'input', status: 'delivery-unknown', operationKey: 'k', attemptId: 'a' },
+  ] }, { describe: async () => ({ name: 'позиционирование анализ конкурентов',
+    cwd: '/Users/fedor/Desktop/sc-desktop', workflow: 'main', processStatus: 'absent' }) });
+  const row = out.passiveInputs[0];
+  assert.equal(row.workflow, 'main');
+  assert.equal(row.project, 'sc-desktop');
+  assert.match(String(loaderLabel(row)).replace(/\x1b\[[0-9;]*m/g, ''),
+    /^ввод · main \(sc-desktop\) · позиционирование анализ конкурентов \[delivery-unknown\]$/);
+});
+
+test('an old app that reports no workflow still prints its execution name', async () => {
+  const out = await enrichBuildInstallBlockers({ loaders: [
+    { tabId: 'T754', kind: 'input', status: 'delivery-unknown', attemptId: 'a' },
+  ] }, { describe: async () => ({ name: 'суббтитры в браузере',
+    cwd: '/Users/fedor/Desktop/sc-desktop', processStatus: 'absent' }) });
+  assert.equal(out.passiveInputs[0].workflow, null);
+  assert.match(String(loaderLabel(out.passiveInputs[0])).replace(/\x1b\[[0-9;]*m/g, ''),
+    /^ввод · sc-desktop · суббтитры в браузере \[delivery-unknown\]$/);
+});
+
+test('real waitForIdle reaches idle when only passive old receipts remain', async () => {
+  const lines = [];
+  const proof = await waitForIdle('token', {
+    inspect: () => ({ status: 'found', server: { pid: 1, port: 7878 } }),
+    read: async () => ({ version: 1, known: true, eligible: false, idle: false,
+      loaders: [{ tabId: 'T257', kind: 'input', status: 'delivery-unknown', attemptId: 'a' }], count: 1 }),
+    describe: async () => ({ name: 'позиционирование анализ конкурентов', cwd: '/x/sc-desktop', processStatus: 'absent' }),
+    idleConfirm: 2, pollMs: 1, report: line => lines.push(line),
+  });
+  assert.equal(proof.status, 'idle');
+  const text = lines.join('\n');
+  assert.match(text, /позиционирование анализ конкурентов/);
+  assert.match(text, /not waited for/);
+  assert.doesNotMatch(text, /\(no project\) · \?/);
+});

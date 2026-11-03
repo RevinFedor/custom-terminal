@@ -221,3 +221,64 @@ test('SC tracker navigation uses exact run identity, waits for commit and coales
     ['orchestration:acknowledge', 'exact-run']]);
   assert.equal(errors.at(-1)['exact-run'], '');
 });
+
+// --- Reviewer send chip: a tracker, not a permanent archive readout --------
+// It previously read the last `tool` entry of the presentation archive, which
+// never empties, so one old "не подтверждено" stayed in the dock all session
+// and nothing could clear it.
+
+test('the reviewer chip follows the live send and never reads the archive directly', () => {
+  const start = source.indexOf('function useMiniSendFeedback');
+  const hook = source.slice(start, source.indexOf('\n}\n', start) + 2);
+  assert.match(hook, /phase === 'sending'/, 'a send in flight is shown even before a receipt exists');
+  assert.match(hook, /dismissed === key \|\| faded === key/, 'dismissed and faded deliveries disappear');
+  assert.match(hook, /status !== 'sent'/, 'only a settled delivery fades by itself');
+  assert.match(hook, /\$\{controller\?\.tabId\}:\$\{entry\.id\}:\$\{status \|\| ''\}/,
+    'a new delivery reappears after an earlier one was dismissed');
+
+  // The chip row must consume the hook, not the raw entry receipt again.
+  const rowStart = source.indexOf('{miniFeedback && <RequestTrackerRow');
+  const row = source.slice(rowStart, source.indexOf('</RequestTrackerRow>}', rowStart));
+  assert.doesNotMatch(row, /miniFeedback\.receipt/, 'the row reads the resolved live status');
+  assert.match(row, /data-mini-orchestrator-send-dismiss/, 'an unresolved delivery can be dismissed');
+  assert.match(row, /!miniFeedback\.live &&/, 'a send still in flight offers no dismiss');
+  assert.match(row, /toggle: true/, 'the chip closes the panel it opened');
+});
+
+test('reviewer chip lifecycle: running, settled, unknown', () => {
+  const start = source.indexOf('function useMiniSendFeedback');
+  const hook = source.slice(start, source.indexOf('\n}\n', start) + 2);
+  const states = [];
+  // Execute the real hook body with minimal React stand-ins; the timer branch
+  // is recorded instead of fired so the case stays synchronous.
+  const run = (snapshot) => {
+    let dismissed = null, faded = null, timerArmed = false;
+    const context = {
+      useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+      useEffect: (fn) => { const cleanup = fn(); if (typeof cleanup === 'function') cleanup(); },
+      setTimeout: () => { timerArmed = true; return 1; },
+      clearTimeout: () => {},
+      MINI_SEND_SETTLED_MS: 4000,
+    };
+    const feedback = vm.runInNewContext(transformSync(hook, { loader: 'ts' }).code + '\nuseMiniSendFeedback',
+      context)({ tabId: 't', snapshot });
+    states.push({ feedback, timerArmed, dismissed, faded });
+    return { feedback, timerArmed };
+  };
+
+  const sending = run({ phase: 'sending', entries: [{ id: 'a', type: 'tool' }] });
+  assert.equal(sending.feedback.live, true, 'an in-flight send is visible');
+  assert.equal(sending.feedback.status, 'sending');
+  assert.equal(sending.timerArmed, false, 'a running send must not be scheduled to disappear');
+
+  const sent = run({ phase: 'complete', entries: [{ id: 'a', type: 'tool', receipt: { status: 'sent' } }] });
+  assert.equal(sent.feedback.status, 'sent');
+  assert.equal(sent.timerArmed, true, 'a delivered send clears itself');
+
+  const unknown = run({ phase: 'unknown', entries: [{ id: 'a', type: 'tool', receipt: { status: 'unknown' } }] });
+  assert.equal(unknown.feedback.status, 'unknown');
+  assert.equal(unknown.timerArmed, false, 'an unresolved send waits for the user');
+
+  const idle = run({ phase: 'idle', entries: [{ id: 'a', type: 'tool' }] });
+  assert.equal(idle.feedback, null, 'an archived entry with no outcome shows nothing');
+});

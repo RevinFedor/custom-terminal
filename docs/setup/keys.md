@@ -5,7 +5,8 @@ API-ключи Noted нужны только для выбранных допо�
 
 | Переменная | Когда нужна |
 |---|---|
-| `GEMINI_API_KEY` | AI-названия, описания, summaries и Gemini AI-Rewind |
+| `GEMINI_API_KEY` | AI-Rewind, группировка Timeline, мини-оркестратор, семантический индекс |
+| `OPENAI_API_KEY` | Utility-вызовы: сообщение Git-коммита, названия вкладок и Run After, пересказы, описания (провайдер — `shared/utility-ai-provider.cjs`) |
 | `OPENCODE_ZEN_KEY` | Claude-compatible provider Zen |
 | `DEEPSEEK_API_KEY` | Provider DeepSeek |
 | `SONIOX_API_KEY` | Голосовая диктовка Soniox |
